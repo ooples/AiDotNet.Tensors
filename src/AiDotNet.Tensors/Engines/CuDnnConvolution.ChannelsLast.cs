@@ -1,4 +1,4 @@
-// Copyright (c) CrowdTrainer LLC. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Convolutions whose activations are channels-last (NHWC): every pass with a format per tensor, so a compiled plan that
 // keeps its activations NHWC runs cuDNN's tensor-core kernels on them directly, without the NCHW <-> NHWC passes cuDNN
 // runs around them for NCHW tensors.
@@ -45,12 +45,48 @@ public sealed partial class CuDnnConvolution
     // A cached search that found no algorithm for the formats.
     private const int UnsupportedFormats = int.MinValue;
 
-    /// <summary>The workspace an algorithm found for a channels-last pass may use.</summary>
-    internal const ulong ChannelsLastMaxWorkspace = 64UL << 20;
+    /// <summary>
+    /// The workspace an algorithm found for a channels-last pass may use. 256 MB: at 64 MB the BF16 tensor-core forward
+    /// of a DCGAN layer (64 -> 128 channels, 32x32, batch 64, 4x4 stride 2) could not run in the search (it asks 75.5 MB)
+    /// and cuDNN's generic engine won at 0.80 ms against the tensor-core kernel's 0.03-0.3 ms. The search scratch is
+    /// freed after the search; the shared workspace grows only to what the chosen algorithm asks, and among algorithms
+    /// within 3% of the fastest the one asking least is taken.
+    /// </summary>
+    internal const ulong ChannelsLastMaxWorkspace = 256UL << 20;
 
-    // The measured algorithm per (pass, geometry, formats, math, determinism).
+    /// <summary>
+    /// One channels-last pass ready to launch: its descriptors, the measured algorithm and the workspace it asks. Kept
+    /// per shape because building them is the pass's host cost: four descriptors set and a workspace query per call
+    /// (cuDNN 9 answers the legacy query through its heuristics) left the GPU idle 0.2-1.8 ms around every eager
+    /// convolution of a BF16 DCGAN generator, several times the convolution itself.
+    /// </summary>
+    private sealed class ChannelsLastPlan : IDisposable
+    {
+        internal readonly CuDnnTensorDescriptor Input = new();
+        internal readonly CuDnnTensorDescriptor Output = new();
+        internal readonly CuDnnFilterDescriptor Filter = new();
+        internal readonly CuDnnConvolutionDescriptor Convolution = new();
+        internal int Algorithm = UnsupportedFormats;
+        internal ulong Workspace;
+
+        public void Dispose()
+        {
+            Convolution.Dispose();
+            Filter.Dispose();
+            Output.Dispose();
+            Input.Dispose();
+        }
+    }
+
+    // The plan per (pass, geometry, formats, math, determinism); an unsupported shape keeps a plan whose algorithm says so.
     private readonly ConcurrentDictionary<(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int),
-        int> _channelsLastAlgorithms = new();
+        ChannelsLastPlan> _channelsLastPlans = new();
+
+    private void DisposeChannelsLastPlans()
+    {
+        foreach (var plan in _channelsLastPlans.Values) plan.Dispose();
+        _channelsLastPlans.Clear();
+    }
 
     /// <summary>Algorithm searches run for channels-last passes (tests).</summary>
     internal static long ChannelsLastSearches;
@@ -69,56 +105,98 @@ public sealed partial class CuDnnConvolution
     internal bool ConvolutionChannelsLast(int pass, IntPtr a, IntPtr b, IntPtr c, int n, int channels, int h, int w,
         int k, int filterH, int filterW, int outputHeight, int outputWidth, int padH, int padW, int strideH, int strideW,
         int dilationH, int dilationW, bool inputNhwc, bool outputNhwc, CuDnnNative.CudnnMathType mathType,
-        bool deterministic, bool capturing, bool filterNhwc = false)
+        bool deterministic, bool capturing, bool filterNhwc = false,
+        CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
         if (pass is < 0 or > 2) throw new ArgumentOutOfRangeException(nameof(pass));
-        const CuDnnNative.CudnnDataType f32 = CuDnnNative.CudnnDataType.Float;
-        using var inputDesc = new CuDnnTensorDescriptor();
-        using var outputDesc = new CuDnnTensorDescriptor();
-        using var filterDesc = new CuDnnFilterDescriptor();
-        using var convDesc = new CuDnnConvolutionDescriptor();
-        inputDesc.Set4D(inputNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW, f32, n,
-            channels, h, w);
-        outputDesc.Set4D(outputNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW, f32, n, k,
-            outputHeight, outputWidth);
-        filterDesc.Set4D(f32, k, channels, filterH, filterW,
-            filterNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW);
-        SetConvolution(convDesc, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
-
         var key = (pass, n, channels, h, w, k, filterH, filterW, padH, padW, strideH, strideW,
-            dilationH * 64 + dilationW, (inputNhwc ? 1 : 0) | (outputNhwc ? 2 : 0) | (deterministic ? 4 : 0) | (filterNhwc ? 8 : 0),
+            dilationH * 64 + dilationW,
+            (inputNhwc ? 1 : 0) | (outputNhwc ? 2 : 0) | (deterministic ? 4 : 0) | (filterNhwc ? 8 : 0) | ((int)dataType << 8),
             (int)mathType, outputHeight * 65536 + outputWidth);
-        if (!_channelsLastAlgorithms.TryGetValue(key, out int algorithm))
+        ChannelsLastPlan? transient = null;
+        try
         {
-            algorithm = capturing ? -1 : FindChannelsLast(pass, a, b, c, inputDesc.Handle, outputDesc.Handle,
-                filterDesc.Handle, convDesc.Handle, mathType, deterministic);
-            if (algorithm < 0 && !capturing)
+            if (!_channelsLastPlans.TryGetValue(key, out var plan))
             {
-                // The search measured every algorithm and none runs these formats: remembered, so the caller's
-                // other formats are tried at once on later calls.
-                _channelsLastAlgorithms[key] = UnsupportedFormats;
-                return false;
-            }
-            if (algorithm < 0)
-                algorithm = pass == 0 ? (int)CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm
+                plan = BuildChannelsLastPlan(n, channels, h, w, k, filterH, filterW, outputHeight, outputWidth, padH,
+                    padW, strideH, strideW, dilationH, dilationW, inputNhwc, outputNhwc, filterNhwc, mathType, dataType);
+                // Inside a capture no search can run: the pass takes a fixed algorithm, for this call only.
+                int algorithm = capturing ? -1 : FindChannelsLast(pass, a, b, c, plan.Input.Handle, plan.Output.Handle,
+                    plan.Filter.Handle, plan.Convolution.Handle, mathType, deterministic);
+                if (algorithm < 0 && !capturing)
+                {
+                    // The search measured every algorithm and none runs these formats: remembered, so the caller's
+                    // other formats are tried at once on later calls.
+                    plan.Algorithm = UnsupportedFormats;
+                    plan.Dispose();
+                    _channelsLastPlans[key] = plan;
+                    return false;
+                }
+                plan.Algorithm = algorithm >= 0 ? algorithm
+                    : pass == 0 ? (int)CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm
                     : (int)CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo1;   // Algo1 for both backward passes
-            else _channelsLastAlgorithms[key] = algorithm;
+                if (!TryQueryChannelsLastWorkspace(pass, plan)) { plan.Dispose(); return false; }
+                if (capturing) transient = plan;
+                else if (!_channelsLastPlans.TryAdd(key, plan)) { plan.Dispose(); plan = _channelsLastPlans[key]; }
+            }
+            if (plan.Algorithm == UnsupportedFormats) return false;
+            return LaunchChannelsLastPlan(pass, plan, a, b, c, capturing);
         }
-        if (algorithm == UnsupportedFormats) return false;
+        finally
+        {
+            transient?.Dispose();
+        }
+    }
 
-        IntPtr x = inputDesc.Handle, y = outputDesc.Handle, wd = filterDesc.Handle, cd = convDesc.Handle;
+    private ChannelsLastPlan BuildChannelsLastPlan(int n, int channels, int h, int w, int k, int filterH,
+        int filterW, int outputHeight, int outputWidth, int padH, int padW, int strideH, int strideW, int dilationH,
+        int dilationW, bool inputNhwc, bool outputNhwc, bool filterNhwc, CuDnnNative.CudnnMathType mathType,
+        CuDnnNative.CudnnDataType dataType)
+    {
+        // The operands' element type; accumulation is FP32 whatever it is (the convolution descriptor's compute type).
+        var plan = new ChannelsLastPlan();
+        try
+        {
+            plan.Input.Set4D(inputNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW,
+                dataType, n, channels, h, w);
+            plan.Output.Set4D(outputNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW,
+                dataType, n, k, outputHeight, outputWidth);
+            plan.Filter.Set4D(dataType, k, channels, filterH, filterW,
+                filterNhwc ? CuDnnNative.CudnnTensorFormat.NHWC : CuDnnNative.CudnnTensorFormat.NCHW);
+            SetConvolution(plan.Convolution, padH, padW, strideH, strideW, dilationH, dilationW, mathType);
+            return plan;
+        }
+        catch
+        {
+            plan.Dispose();
+            throw;
+        }
+    }
+
+    private bool TryQueryChannelsLastWorkspace(int pass, ChannelsLastPlan plan)
+    {
+        IntPtr x = plan.Input.Handle, y = plan.Output.Handle, wd = plan.Filter.Handle, cd = plan.Convolution.Handle;
         ulong workspaceSize;
         CuDnnNative.CudnnStatus status = pass switch
         {
             0 => CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(_context.Handle, x, wd, cd, y,
-                (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm, out workspaceSize),
+                (CuDnnNative.CudnnConvolutionFwdAlgo)plan.Algorithm, out workspaceSize),
             1 => CuDnnNative.cudnnGetConvolutionBackwardDataWorkspaceSize(_context.Handle, wd, y, cd, x,
-                (CuDnnNative.CudnnConvolutionBwdDataAlgo)algorithm, out workspaceSize),
+                (CuDnnNative.CudnnConvolutionBwdDataAlgo)plan.Algorithm, out workspaceSize),
             _ => CuDnnNative.cudnnGetConvolutionBackwardFilterWorkspaceSize(_context.Handle, x, y, cd, wd,
-                (CuDnnNative.CudnnConvolutionBwdFilterAlgo)algorithm, out workspaceSize),
+                (CuDnnNative.CudnnConvolutionBwdFilterAlgo)plan.Algorithm, out workspaceSize),
         };
-        if (status != CuDnnNative.CudnnStatus.Success) return false;
+        plan.Workspace = workspaceSize;
+        return status == CuDnnNative.CudnnStatus.Success;
+    }
+
+    private bool LaunchChannelsLastPlan(int pass, ChannelsLastPlan plan, IntPtr a, IntPtr b, IntPtr c, bool capturing)
+    {
+        IntPtr x = plan.Input.Handle, y = plan.Output.Handle, wd = plan.Filter.Handle, cd = plan.Convolution.Handle;
+        int algorithm = plan.Algorithm;
+        ulong workspaceSize = plan.Workspace;
+        CuDnnNative.CudnnStatus status;
 
         lock (_context.StreamBindingLock)
         lock (_workspaceLock)

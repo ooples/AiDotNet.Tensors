@@ -2417,6 +2417,7 @@ public sealed partial class CuDnnConvolution : IDisposable
     {
         if (_disposed) return;
 
+        DisposeChannelsLastPlans();
         if (_workspace != IntPtr.Zero)
         {
             CuBlasNative.cuMemFree(_workspace);

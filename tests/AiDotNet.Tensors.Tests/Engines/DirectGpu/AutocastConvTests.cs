@@ -1,6 +1,7 @@
 #if NETCOREAPP
 using System;
 using System.Linq;
+using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -121,6 +122,8 @@ public sealed class AutocastConvTests : IDisposable
         { 1, 16, 16, 13, 3, 1, 2, 2, 4 },  // dilation 2
         { 4, 3, 24, 16, 5, 2, 2, 1, 5 },   // 5x5, 3 input channels (a stem)
         { 2, 64, 64, 8, 3, 1, 1, 1, 6 },   // deeper channels, small plane
+        { 3, 64, 1, 4, 4, 1, 0, 1, 7 },   // a discriminator head: one output channel, 4x4 kernel over a 4x4 plane
+        { 2, 5, 12, 10, 3, 1, 1, 1, 8 },   // neither channel count a multiple of 8
     };
 
     [SkippableTheory]
@@ -184,6 +187,118 @@ public sealed class AutocastConvTests : IDisposable
             Assert.Equal(before.BackwardFilter + 1, after.BackwardFilter);
             AssertClose(refDx, dx, precision, $"{precision} dX");
             AssertClose(refDw, dw, precision, $"{precision} dW");
+        }
+    }
+
+    // The channels-last staging (IChannelsLastMixedConvBackend): every pass narrows FP32 NCHW straight into 16-bit NHWC,
+    // runs cuDNN on its native layout and widens back. Each pass must take that route (the counter) and agree with the
+    // rounded reference, and the NCHW route it replaces must give the same values.
+    [SkippableTheory]
+    [MemberData(nameof(Shapes))]
+    public void ChannelsLastStaging_RunsEveryPass_AndMatchesTheNchwRouteAndTheReference(int batch, int inC, int outC,
+        int size, int k, int stride, int pad, int dilation, int salt)
+    {
+        bool prior = AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastMixedConv;
+        try
+        {
+            foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
+            {
+                using var engine = RequireCudnnEngine(PrecisionMode.Float16);
+                if (precision == PrecisionMode.BFloat16
+                    && engine.GetBackend()!.MixedPrecisionConv is not { SupportsBFloat16Conv: true })
+                    continue;
+                int outSize = (size + 2 * pad - dilation * (k - 1) - 1) / stride + 1;
+                var x = Random([batch, inC, size, size], 70 + salt);
+                var w = Random([outC, inC, k, k], 80 + salt, 0.3f);
+                var dy = Random([batch, outC, outSize, outSize], 90 + salt);
+                int[] s = [stride, stride], p = [pad, pad], d = [dilation, dilation];
+                IEngine cpu = new CpuEngine();
+                var refY = cpu.Conv2D(Rounded(x, precision), Rounded(w, precision), s, p, d).ToArray();
+                var refDx = cpu.Conv2DBackwardInput(Rounded(dy, precision), Rounded(w, precision), x._shape, s, p, d).ToArray();
+                var refDw = cpu.Conv2DBackwardKernel(Rounded(dy, precision), Rounded(x, precision), w._shape, s, p, d).ToArray();
+
+                (float[] Y, float[] Dx, float[] Dw, long Staged) Run(bool channelsLast)
+                {
+                    AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastMixedConv = channelsLast;
+                    long before = Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ChannelsLastMixedConvolutions);
+                    using (new AutocastScope(precision))
+                    {
+                        var y = ((IEngine)engine).Conv2D(x, w, s, p, d).ToArray();
+                        var dx = ((IEngine)engine).Conv2DBackwardInput(dy, w, x._shape, s, p, d).ToArray();
+                        var dw = ((IEngine)engine).Conv2DBackwardKernel(dy, x, w._shape, s, p, d).ToArray();
+                        return (y, dx, dw,
+                            Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ChannelsLastMixedConvolutions) - before);
+                    }
+                }
+
+                var staged = Run(channelsLast: true);
+                var nchw = Run(channelsLast: false);
+                _output.WriteLine($"{precision} [{batch},{inC},{size},{size}] k{k} s{stride} p{pad} d{dilation} -> {outC}: " +
+                                  $"{staged.Staged} channels-last passes");
+                Assert.Equal(3, staged.Staged);
+                Assert.Equal(0, nchw.Staged);
+                AssertClose(refY, staged.Y, precision, $"{precision} channels-last Y");
+                AssertClose(refDx, staged.Dx, precision, $"{precision} channels-last dX");
+                AssertClose(refDw, staged.Dw, precision, $"{precision} channels-last dW");
+                AssertClose(nchw.Y, staged.Y, precision, $"{precision} channels-last vs NCHW Y");
+                AssertClose(nchw.Dx, staged.Dx, precision, $"{precision} channels-last vs NCHW dX");
+                AssertClose(nchw.Dw, staged.Dw, precision, $"{precision} channels-last vs NCHW dW");
+            }
+        }
+        finally
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.s_channelsLastMixedConv = prior;
+        }
+    }
+
+    public static TheoryData<int, int, int, int, int, int, int, int> TransposedShapes => new()
+    {
+        // batch, inC, outC, size, kernel, stride, pad, outputPad
+        { 2, 16, 8, 4, 4, 2, 1, 0 },     // a DCGAN generator block: 4x4 -> 8x8
+        { 2, 100, 32, 1, 4, 1, 0, 0 },   // the generator's stem: a 100-channel latent, 1x1 -> 4x4
+        { 3, 8, 3, 6, 4, 2, 1, 0 },      // the generator's head: three image channels
+        { 2, 12, 16, 5, 3, 2, 1, 1 },    // output padding 1
+    };
+
+    // A transposed convolution under autocast runs its three passes as the convolution's passes with the roles swapped
+    // (forward = data gradient, dX = forward, dW = filter gradient): each takes the 16-bit route and agrees with the
+    // rounded reference.
+    [SkippableTheory]
+    [MemberData(nameof(TransposedShapes))]
+    public void TransposedConvolution_RunsEveryPassIn16Bit_AndMatchesTheRoundedReference(int batch, int inC, int outC,
+        int size, int k, int stride, int pad, int outputPad)
+    {
+        foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
+        {
+            using var engine = RequireCudnnEngine(PrecisionMode.Float16);
+            if (precision == PrecisionMode.BFloat16
+                && engine.GetBackend()!.MixedPrecisionConv is not { SupportsBFloat16Conv: true })
+                continue;
+            int outSize = (size - 1) * stride - 2 * pad + k + outputPad;
+            var x = Random([batch, inC, size, size], 110 + inC);
+            var w = Random([inC, outC, k, k], 120 + outC, 0.3f);
+            var dy = Random([batch, outC, outSize, outSize], 130 + k);
+            int[] s = [stride, stride], p = [pad, pad], op = [outputPad, outputPad];
+            IEngine cpu = new CpuEngine();
+            var refY = cpu.ConvTranspose2D(Rounded(x, precision), Rounded(w, precision), s, p, op).ToArray();
+            var refDx = cpu.ConvTranspose2DBackwardInput(Rounded(dy, precision), Rounded(w, precision), x._shape, s, p).ToArray();
+            var refDw = cpu.ConvTranspose2DBackwardKernel(Rounded(dy, precision), Rounded(x, precision), w._shape, s, p).ToArray();
+
+            var before = engine.AutocastConvDispatchCounts;
+            float[] y, dx, dw;
+            using (new AutocastScope(precision))
+            {
+                y = ((IEngine)engine).ConvTranspose2D(x, w, s, p, op).ToArray();
+                dx = ((IEngine)engine).ConvTranspose2DBackwardInput(dy, w, x._shape, s, p).ToArray();
+                dw = ((IEngine)engine).ConvTranspose2DBackwardKernel(dy, x, w._shape, s, p).ToArray();
+            }
+            var after = engine.AutocastConvDispatchCounts;
+            Assert.Equal(before.BackwardData + 1, after.BackwardData);     // the forward
+            Assert.Equal(before.Forward + 1, after.Forward);               // dX
+            Assert.Equal(before.BackwardFilter + 1, after.BackwardFilter); // dW
+            AssertClose(refY, y, precision, $"{precision} transposed Y");
+            AssertClose(refDx, dx, precision, $"{precision} transposed dX");
+            AssertClose(refDw, dw, precision, $"{precision} transposed dW");
         }
     }
 

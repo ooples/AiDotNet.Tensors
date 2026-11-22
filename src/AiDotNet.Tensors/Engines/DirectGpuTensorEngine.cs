@@ -11697,7 +11697,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             int outputSize = batch * outChannels * outHeight * outWidth;
             int spatialSize = outHeight * outWidth;
-            if (bias != null && backend is AiDotNet.Tensors.Engines.DirectGpu.IConvTranspose2DBiasBackend fusedBias)
+            if (typeof(T) == typeof(float) && TryAutocastConvTranspose2DForward(backend, inputBuffer.Buffer,
+                    kernelBuffer.Buffer, outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, out _))
+            {
+                // Under FP16/BF16 autocast the transposed convolution ran in that precision; the bias follows in FP32.
+                if (bias != null)
+                {
+                    using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                }
+            }
+            else if (bias != null && backend is AiDotNet.Tensors.Engines.DirectGpu.IConvTranspose2DBiasBackend fusedBias)
             {
                 // CUDA adds the bias inside the transposed convolution where its route allows (the overlap-add of the
                 // single-GEMM route): one write of the biased output instead of a second pass.
@@ -26937,7 +26948,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // capture. The eager path below uses FinishGpuOp, whose deferred materializer races activation-cache
         // eviction under capture (issue #226). Float, rank-4, no active tape (inference) — same kernel, so
         // numerically identical; tape training still records via the eager path below.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Under autocast the resident route runs the transposed convolution in the autocast precision (below).
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && input.Rank == 4 && kernel.Rank == 4 && !IsTapeActive<T>()
             && input.IsContiguous && HasResidentReplayRoutes(backend) && backend is IGpuBatchExecution rbkT)
         {
@@ -26956,6 +26968,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (bufInR.Buffer.Handle != System.IntPtr.Zero && bufKR.Buffer.Handle != System.IntPtr.Zero
                     && outBufR.Handle != System.IntPtr.Zero && outBufR.Size >= outLenR)
                 {
+                    if (!TryAutocastConvTranspose2DForward(rbkT, bufInR.Buffer, bufKR.Buffer, outBufR, batchR, inChR, inHR,
+                            inWR, outChR, outHR, outWR, kHR, kWR, stride[0], stride[1], padding[0], padding[1], out _))
                     rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
                         batchR, inChR, inHR, inWR, outChR, outHR, outWR,
                         kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
@@ -26979,10 +26993,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufK = GetOrAllocateBuffer(backend, kernel);
             var bufOut = AllocateOutputBuffer(backend, batch * outChannels * outH * outW);
-            backend.ConvTranspose2D(bufIn.Buffer, bufK.Buffer, bufOut.Buffer,
-                batch, inChannels, inH, inW, outChannels, outH, outW,
-                kH, kW, stride[0], stride[1], padding[0], padding[1],
-                outputPadding[0], outputPadding[1]);
+            // Under FP16/BF16 autocast the transposed convolution runs in that precision (its whole output written);
+            // the tape replays that precision in its backward.
+            AutocastConvRoute executedRoute = default;
+            bool autocastConv = typeof(T) == typeof(float) && input.Rank == 4 && kernel.Rank == 4
+                && TryAutocastConvTranspose2DForward(backend, bufIn.Buffer, bufK.Buffer, bufOut.Buffer, batch, inChannels,
+                    inH, inW, outChannels, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1],
+                    out executedRoute);
+            if (!autocastConv)
+                backend.ConvTranspose2D(bufIn.Buffer, bufK.Buffer, bufOut.Buffer,
+                    batch, inChannels, inH, inW, outChannels, outH, outW,
+                    kH, kW, stride[0], stride[1], padding[0], padding[1],
+                    outputPadding[0], outputPadding[1]);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outH * outW,
                 new[] { batch, outChannels, outH, outW });
             // Record the autodiff op — WITHOUT this, the GPU path returns an
@@ -26993,9 +27015,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // dropped it (Softmax/Conv2D above record correctly — this was the
             // odd one out). Backward reuses ConvTranspose2DBackward, which reads
             // savedState[0]=stride, savedState[1]=padding.
+            // The precision the forward ran in rides along for the backward (BackwardFunctions reads stride and padding
+            // by index); a graph recording keeps the two-element state its fusion patterns match.
             Autodiff.DifferentiableOps.RecordBinary("ConvTranspose2D", output, input, kernel,
                 Autodiff.BackwardFunctions<T>.ConvTranspose2DBackward,
-                new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+                Compilation.GraphMode.IsActive
+                    ? new object[] { (int[])stride.Clone(), (int[])padding.Clone() }
+                    : new object[] { (int[])stride.Clone(), (int[])padding.Clone(),
+                        autocastConv ? new RecordedConvPrecision(executedRoute) : RecordedConvPrecision.Fp32 });
             return output;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose2D", capabilityGap);
