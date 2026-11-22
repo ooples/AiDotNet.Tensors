@@ -2145,9 +2145,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // whose value the caller supplies and every execution advances, not a computed intermediate.
         var producedOutOfPlace = new HashSet<Tensor<T>>(steps.Where(step => !IsInPlaceStep(step)).Select(step => step.OutputBuffer),
             ReferenceEqualityComparer<Tensor<T>>.Instance);
-        foreach (var step in steps)
-            if (IsInPlaceStep(step) && !producedOutOfPlace.Contains(step.OutputBuffer))
-                leaves.Add(step.OutputBuffer);
+        foreach (var step in steps.Where(step => IsInPlaceStep(step) && !producedOutOfPlace.Contains(step.OutputBuffer)))
+            leaves.Add(step.OutputBuffer);
 
         for (int i = 0; i < explicitInputs.Length; i++)
         {

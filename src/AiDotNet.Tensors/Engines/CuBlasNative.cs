@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -196,7 +197,7 @@ public static class CuBlasNative
             if (roots.Count == 0)
             {
                 // Scan the standard install location for the newest version.
-                var basePath = System.IO.Path.Combine(
+                var basePath = Under(
                     Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
                     "NVIDIA GPU Computing Toolkit", "CUDA");
                 if (System.IO.Directory.Exists(basePath))
@@ -217,14 +218,22 @@ public static class CuBlasNative
         {
             // Windows: CUDA 13+ uses bin\x64; older versions use bin. Linux: lib64 (standard), lib (fallback).
             var subdirs = windows
-                ? new[] { System.IO.Path.Combine(root, "bin", "x64"), System.IO.Path.Combine(root, "bin") }
-                : new[] { System.IO.Path.Combine(root, "lib64"), System.IO.Path.Combine(root, "lib") };
-            foreach (var dir in subdirs)
-                if (System.IO.Directory.Exists(dir))
-                    dirs.Add(dir);
+                ? new[] { Under(root, "bin", "x64"), Under(root, "bin") }
+                : new[] { Under(root, "lib64"), Under(root, "lib") };
+            dirs.AddRange(subdirs.Where(System.IO.Directory.Exists));
         }
 
         return dirs.ToArray();
+    }
+
+    // root + separator + each part. Not Path.Combine, which discards everything before an argument that is itself
+    // rooted: a directory under a root is always under that root here.
+    private static string Under(string root, params string[] parts)
+    {
+        char separator = System.IO.Path.DirectorySeparatorChar;
+        var path = new System.Text.StringBuilder(root.TrimEnd(separator, System.IO.Path.AltDirectorySeparatorChar));
+        foreach (var part in parts) path.Append(separator).Append(part);
+        return path.ToString();
     }
 
     /// <summary>

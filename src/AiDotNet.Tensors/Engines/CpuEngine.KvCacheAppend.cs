@@ -89,8 +89,13 @@ public partial class CpuEngine
             throw new NotSupportedException(
                 $"KvCacheAppend's mask holds negative infinity, which {typeof(T).Name} cannot represent; use a floating-point element type.");
         // For a binary floating-point type, capacity and capacity - 1 both exact means every integer up to capacity is.
-        if (ops.ToDouble(ops.FromDouble(capacity)) != capacity || ops.ToDouble(ops.FromDouble(capacity - 1)) != capacity - 1)
+        if (!CountsExactly(ops, capacity) || !CountsExactly(ops, capacity - 1))
             throw new NotSupportedException(
                 $"A {typeof(T).Name} position cannot count {capacity} cache slots exactly; use a wider element type or a smaller capacity.");
     }
+
+    // Whether T holds the integer exactly. A floating-point type rounds an integer it cannot hold to another integer
+    // (or to infinity), so the round trip is then off by at least one: no equality test on floating-point values.
+    private static bool CountsExactly<T>(Interfaces.INumericOperations<T> ops, int count)
+        => Math.Abs(ops.ToDouble(ops.FromDouble(count)) - count) < 0.5;
 }
