@@ -7330,7 +7330,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryGroupNormSwishResidentInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
         var arr = output.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return false;
@@ -7552,7 +7552,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryEmbeddingFromFloatIndicesResidentInto<T>(Tensor<T> output, Tensor<T> embeddings, Tensor<T> floatIndices, int numIndices, int embeddingDim)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !embeddings.IsContiguous || !floatIndices.IsContiguous) return false;
         if ((long)numIndices * embeddingDim != output.Length) return false;
         try
@@ -7632,7 +7632,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, object lookupKey, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return null;
         if (!TryGetBackend(out var backend) || !TryGetEmbeddingIndexBuffer(lookupKey, numIndices, out var idxBuf)) return null;
         if ((long)numIndices * embeddingDim != gradOutput.Length) return null;
         var grad = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
@@ -9507,9 +9507,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         => !(typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>));
 
     /// <summary>
-    /// Whether an autocast scope routes elementwise ops through the GPU precision policy (typed FP16/FP8 kernels, and
+    /// Whether an autocast scope routes elementwise, normalization, index and reduction ops through the GPU precision policy (typed FP16/FP8 kernels, and
     /// the explicit FP32 plans of a nested Float32 scope such as FP32 gradient accumulation), which the resident FP32
-    /// fast paths must then leave alone. BFloat16 is the exception: it has no typed elementwise kernels, so under it
+    /// fast paths must then leave alone. BFloat16 is the exception: it has no typed kernels for them (only its convolutions and GEMMs are typed), so under it
     /// those ops run FP32 as everywhere else, and gating them off the resident paths sent a BF16 step's in-place
     /// updates, divides and activations to host round trips (DCGAN BF16: about 20 device-to-host reads a step,
     /// 111 ms against 12 ms in FP32).
@@ -9710,7 +9710,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pre-pass binds, such as a BatchNorm running statistic) runs in place on that buffer and stays resident, as
         // TryRunBinaryInPlace does: the host path below uploaded it again and downloaded the result with a blocking
         // read on every call - three transfers per op, the larger part of a GPU ResNet training step.
-        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
+        if (!AutocastUsesTypedElementwise && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
             && ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is { } resident
             && resident.Handle != System.IntPtr.Zero && resident.Size >= tensor.Length)
         {
@@ -9736,7 +9736,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // TryCreateDeviceStateTensor binds its state - so every later in-place op on it takes the resident branch
         // above. The host path below uploaded it and downloaded the result every call: 40 blocking round trips a
         // step on ResNet-18.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && tensor is Tensor<float> floatTensor && tensor.IsContiguous
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && tensor is Tensor<float> floatTensor && tensor.IsContiguous
             && !IsPartialView(tensor) && tensor._gpuBuffer is null)
         {
             IGpuBuffer? state = null;
@@ -9821,7 +9821,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         bool isRecording = Gpu.DeferredScope.Current?.IsRecording == true;
         if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         // The kernel writes the tensor's device buffer in place, and a copy-on-write peer (CloneShared) shares that
         // buffer and its pending download: privatize first, as GpuOptimizer does before its in-place device update.
@@ -17273,7 +17273,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
 
                 // PR #638 A1: resident-step softmax backward into a resident-bound output (no temp/download).
-                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
                     && gradOutput.Length == output.Length)
                 {
                     var gR = ResolveResidentBufferNoUpload(backend, gradOutput, output.Length);
@@ -20397,7 +20397,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // On the resident step (and so in capture) give the output its resident buffer, as the float-index gather does:
         // declining here sent the int-id gather to the host, which a captured graph cannot replay.
         var outBuf = output.TryGetGpuBuffer()
-            ?? (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && output.IsContiguous
+            ?? (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise && output.IsContiguous
                 ? GetOrCreateResidentBuffer(backend, output, n * embeddingDim) : null);
         if (outBuf is null || tableBuf is null) return false;
         if ((long)n * embeddingDim > outBuf.Size) return false;
@@ -23968,7 +23968,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryReluBackwardInto<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> into)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !ResidentStepActive) return false;
         if (gradOutput.Length != input.Length || !gradOutput.IsContiguous || !input.IsContiguous) return false;
         if (!TryGetBackend(out var backend)) return false;
         int n = input.Length;
@@ -24610,7 +24610,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Only inside a resident step, as TensorMultiplyScalar's: eagerly, the resident output's host array was a
         // fresh allocation on every call (SwishBackward negates once per SiLU per step), where the deferred result
         // below allocates nothing on the host.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float))
         {
             using var __gpuOp = EnterGpuOp();
             if (s_graphCaptureDebugEnv
@@ -24775,7 +24775,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 // PR #638 A1: resident-step ReLU backward into a resident-bound output (no download), keeping the
                 // FFN fused-linear-relu backward's grad resident for capture.
-                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
                     && gradOutput.Length == input.Length)
                 {
                     var gR = ResolveResidentBufferNoUpload(backend, gradOutput, gradOutput.Length);
@@ -25389,7 +25389,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { doubleScalar });
             return onDevice;
         }
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
         {
             float sf = scalar is float f0 ? f0 : Convert.ToSingle(scalar);
@@ -28587,7 +28587,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             float alphaFloat = ToFloatScalar(alpha);
             Tensor<T>? gpuOutput = null;
-            if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled)
+            if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise)
             {
                 var resident = CreateResidentOutput<T>(backend, tensor.Shape._dims);
                 if (TryUnaryResidentInto(resident, tensor,
@@ -28739,7 +28739,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // resident operand mid-capture. On the capture path, do it resident on-device via Conv2DBiasAdd
         // (copy a → out, then add bias per channel). Gated on ResidentStepActive so non-capture inference
         // is unchanged.
-        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+        if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise
             && a.Rank == 4 && b.Rank == 4 && a.IsContiguous && b.IsContiguous
             && b.Shape._dims[0] == 1 && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
@@ -30088,7 +30088,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"The accumulator must hold exactly one element; it holds {scalarAccumulator.Length}.",
                 nameof(scalarAccumulator));
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !TryGetBackend(out var backend))
             return false;
         if (tensor.Length == 0)
             return true;
