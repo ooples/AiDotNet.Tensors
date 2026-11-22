@@ -7473,7 +7473,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryMultiplyScalarResidentInto<T>(Tensor<T> output, Tensor<T> a, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || a.Length != output.Length) return false;
         try
@@ -7501,7 +7501,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, string opName)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
         try
@@ -7523,7 +7523,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
         try
@@ -7701,7 +7701,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryBroadcastAddResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         Tensor<T> full, bias;
         if (a.Length == output.Length && b.Length > 0 && b.Length < a.Length) { full = a; bias = b; }
@@ -7915,7 +7915,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // GPU-RESIDENT compiled-step path (see TryRunBinaryInto): op into destination's stable buffer, no temp
         // alloc / no download — keeps the activation chain on-device for CUDA-graph capture.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled)
+        if (ResidentStepActive && !AutocastUsesTypedElementwise)
         {
             try
             {
@@ -8524,7 +8524,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // non-capturable inside CUDA-graph capture. Do it on-device via Conv2DBiasAdd (per-channel a += b) on
         // a's resident buffer (mutated in place; a stays bound). Gated on ResidentStepActive so non-capture
         // inference is unchanged. Mirrors the resident conv-bias TensorBroadcastAdd path.
-        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+        if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise
             && a.Rank == 4 && b.Rank == 4 && a.IsContiguous
             && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
@@ -8547,7 +8547,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // inference adds its output bias this way, which made the add 18% of a GPU ViT b32 forward.
         // Only where `a` already has a current device buffer (resolved without an upload or a download); a host tensor
         // keeps the host add.
-        if (typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && a.IsContiguous && !IsPartialView(a)
+        if (typeof(T) == typeof(float) && !AutocastUsesTypedElementwise && a.IsContiguous && !IsPartialView(a)
             && TryTrailingBroadcast(a, b, out int biasRows, out int biasCols) && TryGetBackend(out var beBias)
             && ResolveResidentBufferNoUpload(beBias, a, a.Length, includePersistentWeightCache: false) is { } aResident
             && aResident.Handle != System.IntPtr.Zero && aResident.Size >= a.Length)
@@ -8615,7 +8615,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool TryChannelBiasAddInPlace<T>(Tensor<T> tensor, Tensor<T> bias)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || tensor.Rank < 2 || tensor.Length == 0
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || tensor.Rank < 2 || tensor.Length == 0
             || !tensor.IsContiguous || IsPartialView(tensor) || bias.Rank != 1 || bias.Length != tensor._shape[1]
             || !TryGetBackend(out var backend))
             return false;
@@ -8632,7 +8632,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private bool TryResidentActivationInPlace<T>(Tensor<T> tensor, bool capAtSix)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !tensor.IsContiguous || IsPartialView(tensor)
             || !TryGetBackend(out var backend))
             return false;
         if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
@@ -8682,7 +8682,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float))
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float))
         { AliasDiag($"{opName}-resident SKIP gate1 residentStep={ResidentStepActive} autocast={Gpu.AutocastScope.IsEnabled} T={typeof(T).Name}"); return false; }
         if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length)
         { AliasDiag($"{opName}-resident SKIP gate2 contig={input.IsContiguous} inLen={input.Length} outLen={output.Length}"); return false; }
@@ -9506,6 +9506,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static bool IsFloatConvertible<T>()
         => !(typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>));
 
+    /// <summary>
+    /// Whether an autocast scope routes elementwise ops through the GPU precision policy (typed FP16/FP8 kernels, and
+    /// the explicit FP32 plans of a nested Float32 scope such as FP32 gradient accumulation), which the resident FP32
+    /// fast paths must then leave alone. BFloat16 is the exception: it has no typed elementwise kernels, so under it
+    /// those ops run FP32 as everywhere else, and gating them off the resident paths sent a BF16 step's in-place
+    /// updates, divides and activations to host round trips (DCGAN BF16: about 20 device-to-host reads a step,
+    /// 111 ms against 12 ms in FP32).
+    /// </summary>
+    private static bool AutocastUsesTypedElementwise
+        => Gpu.AutocastScope.IsEnabled && Gpu.AutocastScope.ActivePrecision != Gpu.PrecisionMode.BFloat16;
+
     private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
         using var __gpuOp = EnterGpuOp();
@@ -9557,7 +9568,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // an FP16 activation buffer (!e.IsFp16) nor one shorter than the float length. Excluding it sent every
         // accumulation of an autocast training step to the host path below, whose download aborted whole-step capture
         // (CUDA 900): an FP16 transformer step ran eager at 13x its FP32 step time (#1549 head-to-head).
-        if ((!Gpu.AutocastScope.IsEnabled || InGradAccumulation) && typeof(T) == typeof(float)
+        if ((!AutocastUsesTypedElementwise || InGradAccumulation) && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && !IsPartialView(a) && !IsPartialView(b) && a.Length == b.Length
             // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
             // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
@@ -23883,7 +23894,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return ShapesMatch(a.Shape._dims, b.Shape._dims)
                 ? TryBinaryFloat64(leftDoubles, rightDoubles, callerName) as Tensor<T>
                 : null;
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
 
