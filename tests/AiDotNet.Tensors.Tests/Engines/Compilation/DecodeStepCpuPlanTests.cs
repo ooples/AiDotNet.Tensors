@@ -276,6 +276,46 @@ public class DecodeStepCpuPlanTests
         Assert.Equal(cacheBefore, cache.ToArray());
     }
 
+    // The outer trace realizes an append (position 1 -> 2), then a nested scope realizes another (2 -> 3) and is
+    // abandoned: the nested write alone is undone (back to 2), and the outer trace's own abandonment undoes the rest.
+    [Fact]
+    public void An_abandoned_nested_scope_rolls_back_only_its_own_realized_write()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 4, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var cacheBefore = cache.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        using (new EngineScope(cpu))
+        {
+            Assert.Throws<DeliberateFailure>((Action)(() =>
+            {
+                using var outer = GraphMode.EnableInference();
+                var first = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                Assert.Equal(4, first.ToArray().Length);      // realizes the outer append
+                Assert.Equal(2f, position.ToArray()[0]);
+                var afterOuter = cache.ToArray();
+                try
+                {
+                    using var inner = GraphMode.EnableInference();
+                    var second = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                    Assert.Equal(4, second.ToArray().Length);  // realizes the nested append
+                    Assert.Equal(3f, position.ToArray()[0]);
+                    throw new DeliberateFailure();
+                }
+                catch (DeliberateFailure)
+                {
+                    // The inner trace is abandoned; the outer one goes on.
+                }
+                Assert.Equal(2f, position.ToArray()[0]);
+                Assert.Equal(afterOuter, cache.ToArray());
+                throw new DeliberateFailure();
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
+    }
+
     // A trace that never realizes its decode op takes no snapshot of the op's state (a KV cache can be large).
     [Fact]
     public void A_trace_that_never_realizes_its_decode_op_copies_no_state()

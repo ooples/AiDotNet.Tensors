@@ -280,6 +280,23 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private void ShareGpuStateWith(Tensor<T> view)
     {
+        // A partial view that was uploaded on its own holds ITS elements, packed in logical order. A view of it with
+        // other elements (a slice of the slice) would find its own at an offset inside that packed buffer, which
+        // nothing records: read as the child's logical upload, the buffer's first elements landed where the child's
+        // belong. Such a child is not lent the buffer. The packed copy is brought home first when it is the current
+        // one, so the host-backed child reads current values; a view with the same elements (a reshape) still borrows.
+        bool packedOwnCopy = !CoversWholeVector && _gpuBuffer is not null && !_viewGpuBufferIsStorageOrder;
+        bool sameElements = IsContiguous && view.IsContiguous && view._storageOffset == _storageOffset && view.Length == Length;
+        if (packedOwnCopy && !sameElements)
+        {
+            if (_device != TensorDevice.CPU && _gpuBufferVersion == GpuCacheVersion)
+            {
+                if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(DataVector);
+                DownloadBoundBufferIntoHost();
+            }
+            return;
+        }
         view._device = _device;
         view._gpuDeviceIndex = _gpuDeviceIndex;
         view._gpuBuffer = _gpuBuffer;

@@ -109,7 +109,8 @@ fn f(v: vec2<f32>, a: array<vec3<f32>, 4>) -> f32 {
     return tanh(u.x) + tanh(a[1].y) + tanh(a[2][0]) + t.x + e.x;
 }";
         string prepared = WebGpuShaderPrelude.Prepare(source);
-        foreach (var kept in new[] { "tanh(u) ", "tanh(w)", "= tanh(a[1]);" })
+        // Whole statements: "tanh(u)" alone is also found inside "wgsl_tanh(u)".
+        foreach (var kept in new[] { "let t = tanh(u) + tanh(w);", "let e = tanh(a[1]);" })
             Assert.Contains(kept, prepared);
         foreach (var rewritten in new[] { "wgsl_tanh(u.x)", "wgsl_tanh(a[1].y)", "wgsl_tanh(a[2][0])" })
             Assert.Contains(rewritten, prepared);
@@ -169,6 +170,34 @@ fn main() {
                  })
             Assert.Contains(kept, prepared);
         Assert.Contains("wgsl_log(data[1]) + wgsl_tanh(data[2])", prepared);
+    }
+
+    // WGSL lets a module function hide a builtin: its calls are not the builtin's.
+    [Fact]
+    public void Calls_to_a_module_function_named_like_a_builtin_are_left_alone()
+    {
+        const string source = @"
+fn log(x: f32) -> f32 { return x; }
+fn f(x: f32) -> f32 { return log(1.0) + tanh(x) + log2(x); }";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("return log(1.0) + wgsl_tanh(x) + wgsl_log2(x);", prepared);
+        Assert.DoesNotContain("fn wgsl_log(", prepared);
+    }
+
+    // Parameters are function-scoped: `a` is a vector in one function and an array of vectors in another.
+    [Fact]
+    public void A_name_is_typed_by_the_function_that_declares_it()
+    {
+        const string source = @"
+fn g(a: vec2<f32>) -> f32 { return tanh(a[0]) + tanh(a).x; }
+fn f(a: array<vec2<f32>, 2>) -> vec2<f32> {
+    return tanh(a[0]);
+}
+fn h(a: f32) -> f32 { return tanh(a); }";
+        string prepared = WebGpuShaderPrelude.Prepare(source);
+        Assert.Contains("{ return wgsl_tanh(a[0]) + tanh(a).x; }", prepared);   // g: a component, then the vector
+        Assert.Contains("    return tanh(a[0]);", prepared);                    // f: an element, itself a vector
+        Assert.Contains("fn h(a: f32) -> f32 { return wgsl_tanh(a); }", prepared);
     }
 
     [Fact]

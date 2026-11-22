@@ -595,14 +595,16 @@ internal sealed class LazyTensorScope : IDisposable
     private void SnapshotTraceStateTargets<T>(LazyNode<T> node, Tensor<T>[] targets)
     {
         var root = RootScope();
-        // The snapshot belongs to the TARGET, and every op that writes it can take it: whichever of them the trace
-        // realizes first sees the pre-trace state. Tied to the first registering op alone, a nested scope that
-        // registered a target and was abandoned before its op ran left an entry with no snapshot that kept a later
-        // writer from taking one, and the outer trace's abandonment then restored nothing.
+        // One snapshot per target AND scope, which every op of that scope writing the target can take: whichever of
+        // them the trace realizes first sees the state as the scope found it. A nested scope keeps its own, apart
+        // from its parent's: its abandonment rolls back to the state the parent's trace had reached (the parent may
+        // already have realized a write of its own), and the parent's later abandonment to the pre-trace state. A
+        // target an enclosing op already wrote is registered too - at the op's run the target shows the producer it
+        // had when recorded, already realized, so the snapshot reads its value.
         var entries = new List<(TraceStateSnapshot Entry, Tensor<T> Target)>();
-        foreach (var target in targets.Where(t => t.LazySource is null))
+        foreach (var target in targets)
         {
-            var entry = root._traceStateSnapshots?.Find(s => ReferenceEquals(s.Target, target));
+            var entry = root._traceStateSnapshots?.Find(s => ReferenceEquals(s.Target, target) && ReferenceEquals(s.Owner, this));
             if (entry is null)
             {
                 entry = new TraceStateSnapshot(target, this);
@@ -641,8 +643,11 @@ internal sealed class LazyTensorScope : IDisposable
     private void RestoreTraceStateTargets()
     {
         if (TakeTraceStateTargets() is not { } snapshots) return;
-        foreach (var entry in snapshots)
+        // Newest first: where several scopes hold a snapshot of one target, the oldest (the outermost scope's, the
+        // earliest state) is written last and stands.
+        for (int i = snapshots.Count - 1; i >= 0; i--)
         {
+            var entry = snapshots[i];
             entry.Live = false;
             if (entry.Snapshot is { } snapshot) entry.Target.CopyLeafFrom(snapshot);
             entry.Snapshot = null;

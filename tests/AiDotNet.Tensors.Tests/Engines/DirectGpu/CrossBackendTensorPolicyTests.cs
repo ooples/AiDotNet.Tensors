@@ -387,6 +387,56 @@ public sealed class CrossBackendTensorPolicyTests
         finally { AiDotNetEngine.Current = previous; }
     }
 
+    // The recording scope is an ENCLOSING one: a nested scope on the consumer's backend is current when the consumer
+    // meets the outer scope's unexecuted result.
+    [SkippableFact]
+    public void An_enclosing_scopes_unexecuted_result_is_not_migrated()
+    {
+        using var engines = CreateEngines();
+        var input = new Tensor<float>(new[] { 0f, 0f }, new[] { 2 });
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try
+        {
+            var outer = engines.Placer.BeginDeferredScope();
+            Skip.If(outer is null, "Backend has no deferred execution");
+            using (outer)
+            using (new PolicyScope(CrossBackendTensorPolicy.Migrate))
+            {
+                var recorded = engines.Placer.TensorSigmoid(input);
+                Skip.If(recorded._gpuBuffer is null, "The op did not record a device result.");
+                var inner = engines.Consumer.BeginDeferredScope();
+                Skip.If(inner is null, "The consumer's backend has no deferred execution");
+                using (inner)
+                {
+                    var error = Assert.Throws<CrossBackendTensorException>(() => engines.Consumer.TensorSigmoid(recorded));
+                    Assert.Contains("not executed", error.Message);
+                }
+                outer.Execute();
+                Assert.Equal(new[] { 0.5f, 0.5f }, recorded.ToArray());
+                // Executed: the result now migrates like any other tensor.
+                Assert.Equal(2, engines.Consumer.TensorSigmoid(recorded).ToArray().Length);
+            }
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
+    // A slice of a slice that was uploaded on its own must not read the packed parent buffer as its own upload.
+    [SkippableFact]
+    public void A_view_of_a_packed_partial_view_migrates_its_own_elements()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        var middle = whole.Slice(0, 1, 3);                  // [2, 3]
+        Skip.If(middle.CoversWholeVector, "The slice is not a partial view here.");
+        PlaceOn(engines.Placer, middle);                    // packed upload of [2, 3]
+        var last = middle.Slice(0, 1, 2);                   // [3]
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zero = new Tensor<float>(new float[1], new[] { 1 });
+        Assert.Equal(new[] { 3f }, engines.Consumer.TensorAdd(last, zero).ToArray());
+        Assert.Equal(new[] { 1f, 2f, 3f, 4f }, whole.ToArray());
+    }
+
     // A rejection whose op returned its lease from another thread never reached that op's rethrow.
     [SkippableFact]
     public void A_rejection_left_pending_by_an_op_that_ended_elsewhere_does_not_surface_in_the_next_op()

@@ -923,7 +923,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_optimizerGpuParams is not { } gpuParam || _optimizerGpuBackends is not { } gpuBackends
             || !_engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
-            Volatile.Write(ref _migrationEpochSeen, epoch);   // no device optimizer state to repair
+            // No device optimizer state to repair, but the captured step graph still baked the parameters' addresses.
+            RetireStepGraphIfParametersMoved();
+            Volatile.Write(ref _migrationEpochSeen, epoch);
             return;
         }
         using var operation = gpuEngine.EnterGpuOp();
@@ -958,6 +960,33 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
         Volatile.Write(ref _migrationEpochSeen, epoch);
+    }
+
+    // Each parameter's binding when a migration epoch was last acknowledged by a plan with no device optimizer.
+    private Engines.DirectGpu.IGpuBuffer?[]? _parameterBindingsAtEpoch;
+
+    /// <summary>
+    /// For a plan with no device optimizer: retires the captured step graph when a parameter is no longer bound to
+    /// the buffer it had at the last acknowledged migration epoch. A migration by another backend released that
+    /// buffer and rebound the parameter elsewhere, and the graph would replay against the old address; the replay
+    /// guard watches foreign leaves only. With no baseline yet (the first migration this plan sees) the graph is
+    /// retired once, unconditionally. Nothing here reads a device buffer: a plan without a captured optimizer holds
+    /// no ping-pong set to copy back, and the bindings are compared by reference.
+    /// </summary>
+    private void RetireStepGraphIfParametersMoved()
+    {
+        lock (_stepSync)
+        {
+            var seen = _parameterBindingsAtEpoch;
+            bool moved = seen is null || seen.Length != _parameters.Length;
+            for (int p = 0; !moved && seen is not null && p < seen.Length; p++)
+                moved = !ReferenceEquals(seen[p], _parameters[p]._gpuBuffer);
+            if (moved && _stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // After the retirement, which may itself restore a binding.
+            var now = new Engines.DirectGpu.IGpuBuffer?[_parameters.Length];
+            for (int p = 0; p < now.Length; p++) now[p] = _parameters[p]._gpuBuffer;
+            _parameterBindingsAtEpoch = now;
+        }
     }
 
     /// <summary>

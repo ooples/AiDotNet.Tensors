@@ -321,14 +321,33 @@ public sealed class ExecutionGraphBuilder : IDisposable
         }
     }
 
+    // Whether this builder's recorded writes have run: set once its scope executed successfully, or from the start
+    // when the recorder also executes each op as it records it. Shared with the per-buffer markers below.
+    private sealed class WriteState
+    {
+        internal volatile bool Ran;
+    }
+
+    private readonly WriteState _writes = new();
+
+    // Buffers a recorded, not yet executed node writes, for every builder in the process: weak on the buffer, so an
+    // entry lives exactly as long as the buffer whose contents it describes.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IGpuBuffer, WriteState> s_recordedWrites = new();
+
+    /// <summary>The recorder runs each op as it records it (trace by execution): recorded outputs hold real data.</summary>
+    internal void MarkWritesRunWhileRecording() => _writes.Ran = true;
+
+    /// <summary>The graph executed: every recorded output now holds its result.</summary>
+    internal void MarkWritesExecuted() => _writes.Ran = true;
+
     /// <summary>
-    /// Whether a recorded node that has not run yet writes <paramref name="buffer"/>: its contents are not the
-    /// recorded result until the graph executes. An upload does not count - the recording backend uploads the data
-    /// when it allocates the buffer and records the transfer for the graph only.
+    /// Whether <paramref name="buffer"/> is the output of a node some deferred scope recorded and has not run: its
+    /// contents are not the recorded result. True for any scope, current or enclosing, and it stays true when the
+    /// scope's execution failed or never happened - only a successful execution writes the buffer. An upload does
+    /// not count: the recording backend uploads the data when it allocates the buffer.
     /// </summary>
-    internal bool HasUnexecutedWriter(IGpuBuffer buffer)
-        => _lastWriteNode.TryGetValue(buffer, out var writer)
-           && !(writer is TransferNode { TransferType: TransferDirection.HostToDevice });
+    internal static bool IsUnexecutedWrite(IGpuBuffer buffer)
+        => s_recordedWrites.TryGetValue(buffer, out var state) && !state.Ran;
 
     // RAW: depend on the buffer's last writer; record this node as a reader (for later WAR edges).
     private void AddRawAndRecordReader(ExecutionNode node, IGpuBuffer buffer)
@@ -369,6 +388,9 @@ public sealed class ExecutionGraphBuilder : IDisposable
         }
 
         _lastWriteNode[buffer] = node;
+        if (node is TransferNode { TransferType: TransferDirection.HostToDevice }) return;
+        s_recordedWrites.Remove(buffer);   // a later scope's write supersedes an earlier scope's marker
+        s_recordedWrites.Add(buffer, _writes);
     }
 
     private void ValidateGraph()

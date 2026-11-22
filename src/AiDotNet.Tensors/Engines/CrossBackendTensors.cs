@@ -111,10 +111,10 @@ internal static class CrossBackendTensors
 
         // A result a recording-only deferred scope has recorded and not run is unwritten memory: migrating it would
         // download that, and executing the scope afterwards could not repair what the consumer computed from it. No
-        // policy can move it; the scope must execute first. Tensors the scope did not produce migrate as usual.
-        if (tensor._gpuBuffer is { } bound && Gpu.DeferredScope.Current is { IsRecording: true } scope
-            && scope.RecordingBackend is Gpu.RecordingGpuBackend recorder && SameAddressSpace(recorder, owner)
-            && recorder.HoldsUnexecutedResult(bound))
+        // policy can move it; the scope must execute first. Asked of the buffer, not of the current scope: the scope
+        // may be an enclosing one (a nested scope on another backend is current), or one whose execution failed and
+        // left the buffer unwritten for good. Tensors no scope produced migrate as usual.
+        if (tensor._gpuBuffer is { } bound && Gpu.Graph.ExecutionGraphBuilder.IsUnexecutedWrite(bound))
             throw Reject(
                 $"A tensor of shape [{Shape(tensor)}] is the result of an operation a deferred scope on the {Describe(owner)} "
                 + $"backend has recorded but not executed, so it cannot be moved to {Describe(consumer)}. Execute the scope "

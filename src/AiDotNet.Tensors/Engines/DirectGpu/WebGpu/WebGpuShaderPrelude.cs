@@ -118,10 +118,9 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
         DirectivesEnd(source, out bool enablesF16);
         if (!enablesF16)
         {
-            SourceTypes? types = null;
-            if (!source.Contains("fn wgsl_tanh(")) source = Rewrite(source, BuiltinTanh, "wgsl_tanh(", ref types);
-            if (!source.Contains("fn wgsl_log2(")) source = Rewrite(source, BuiltinLog2, "wgsl_log2(", ref types);
-            if (!source.Contains("fn wgsl_log(")) source = Rewrite(source, BuiltinLog, "wgsl_log(", ref types);
+            if (!source.Contains("fn wgsl_tanh(")) source = Rewrite(source, BuiltinTanh, "tanh", "wgsl_tanh(");
+            if (!source.Contains("fn wgsl_log2(")) source = Rewrite(source, BuiltinLog2, "log2", "wgsl_log2(");
+            if (!source.Contains("fn wgsl_log(")) source = Rewrite(source, BuiltinLog, "log", "wgsl_log(");
         }
         string helpers = "";
         if (source.Contains("wgsl_f32_bits(") && !source.Contains("fn wgsl_f32_bits(")) helpers += F32Bits;
@@ -232,21 +231,82 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
         return types;
     }
 
-    private static string Rewrite(string source, Regex builtin, string helper, ref SourceTypes? types)
+    // A function declaration: its name, parameter list and body, by offset into the comment-masked source.
+    private readonly struct FunctionSpan
+    {
+        public FunctionSpan(string name, int parametersOpen, int parametersClose, int bodyOpen, int bodyClose)
+        {
+            Name = name;
+            ParametersOpen = parametersOpen;
+            ParametersClose = parametersClose;
+            BodyOpen = bodyOpen;
+            BodyClose = bodyClose;
+        }
+
+        public string Name { get; }
+        public int ParametersOpen { get; }
+        public int ParametersClose { get; }
+        public int BodyOpen { get; }
+        public int BodyClose { get; }
+    }
+
+    private static readonly Regex FunctionHeader = new(@"\bfn\s+(\w+)\s*\(", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+
+    private static List<FunctionSpan> ReadFunctions(string code)
+    {
+        var functions = new List<FunctionSpan>();
+        foreach (Match header in FunctionHeader.Matches(code))
+        {
+            int open = header.Index + header.Length - 1;
+            int close = Matching(code, open, '(', ')');
+            int body = close < 0 ? -1 : code.IndexOf('{', close);
+            int end = body < 0 ? -1 : Matching(code, body, '{', '}');
+            if (end >= 0) functions.Add(new FunctionSpan(header.Groups[1].Value, open, close, body, end));
+        }
+        return functions;
+    }
+
+    // The source as the function `visible` sees it: module-scope declarations and every function's signature, with
+    // the parameters and body of every OTHER function blanked. Parameters and locals are function-scoped in WGSL, so
+    // a name declared a vector in one function says nothing about the same name in another.
+    private static string ScopeOf(string code, List<FunctionSpan> functions, int visible)
+    {
+        var scoped = new System.Text.StringBuilder(code);
+        for (int f = 0; f < functions.Count; f++)
+        {
+            if (f == visible) continue;
+            Blank(scoped, functions[f].ParametersOpen + 1, functions[f].ParametersClose);
+            Blank(scoped, functions[f].BodyOpen + 1, functions[f].BodyClose);
+        }
+        return scoped.ToString();
+    }
+
+    private static void Blank(System.Text.StringBuilder text, int from, int to)
+    {
+        for (int k = from; k < to; k++)
+            if (text[k] != '\n') text[k] = ' ';
+    }
+
+    private static string Rewrite(string source, Regex builtin, string name, string helper)
     {
         string code = MaskComments(source);
         var calls = builtin.Matches(code);
         if (calls.Count == 0) return source;
-        types ??= ReadTypes(code);
+        var functions = ReadFunctions(code);
+        // WGSL lets a module function hide a builtin: calls to that name are calls to the module's function.
+        if (functions.Exists(function => function.Name == name)) return source;
+        var typesByFunction = new SourceTypes?[functions.Count];
         var result = new System.Text.StringBuilder(source.Length + calls.Count * 5);
         int copied = 0;
         foreach (Match call in calls)
         {
             int open = call.Index + call.Length - 1;
             int close = Matching(code, open, '(', ')');
-            if (close < 0 || IsEarlyEvaluated(code, call.Index)
-                || IsVector(code.Substring(open + 1, close - open - 1), types))
-                continue;
+            int enclosing = functions.FindIndex(function => function.BodyOpen < call.Index && call.Index < function.BodyClose);
+            // Outside every function body the call is at module scope, where only const-expressions are allowed.
+            if (close < 0 || enclosing < 0 || IsEarlyEvaluated(code, call.Index)) continue;
+            var types = typesByFunction[enclosing] ??= ReadTypes(ScopeOf(code, functions, enclosing));
+            if (IsVector(code.Substring(open + 1, close - open - 1), types)) continue;
             result.Append(source, copied, call.Index - copied).Append(helper);
             copied = open + 1;
         }
