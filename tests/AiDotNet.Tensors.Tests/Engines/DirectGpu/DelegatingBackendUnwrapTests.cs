@@ -28,6 +28,21 @@ public class DelegatingBackendUnwrapTests
         Assert.Same(physical, backend);
     }
 
+    // A wrapper answers for the backend it wraps: without the forwards it reported the interface's float32-only
+    // default and allocated float32 whatever the wrapped backend supports.
+    [Fact]
+    public void Element_type_support_and_typed_allocation_are_the_wrapped_backends()
+    {
+        var state = new MockBackendState();
+        var outer = new DelegatingGpuBackend(new DelegatingGpuBackend(MockDirectGpuBackend.Create(state)));
+
+        Assert.True(outer.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32));
+        Assert.False(outer.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float64));
+        var buffer = outer.AllocateBuffer(6, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType.Float32);
+        Assert.Same(buffer, Assert.Single(state.AllocatedBuffers));
+        Assert.Equal(6, buffer.Size);
+    }
+
     // Every wrapper implements the index conversions by forwarding, so a recording wrapper over a backend without them
     // used to record the conversion and fail only when the graph replayed, outside the engine's capability fallback.
     [Fact]

@@ -152,4 +152,43 @@ public sealed class HostSyncTests
         HostSync.ClearReleased(v);
         Assert.Equal(0f, v.AsSpan()[0]);
     }
+
+    // Settle leaves nothing pending: it runs the pending download, and does nothing for a key with none.
+    [Fact]
+    public void Settle_RunsThePendingDownloadOnce()
+    {
+        var array = new float[3];
+        var v = Vector<float>.Wrap(array);
+        int downloads = 0;
+        HostSync.Register(v, _ => { Interlocked.Increment(ref downloads); Fill(array, 4f); });
+
+        HostSync.Settle(v);
+        Assert.Equal(1, downloads);
+        Assert.False(HostSync.IsPending(v));
+        Assert.Equal(4f, array[2]);
+
+        HostSync.Settle(v);                                  // nothing pending any more
+        HostSync.Settle(Vector<float>.Wrap(new float[1]));   // never registered
+        Assert.Equal(1, downloads);
+    }
+
+    // A download that fails stays pending and its exception reaches the caller that was about to free the buffer.
+    [Fact]
+    public void Settle_SurfacesAFailedDownloadAndLeavesItPending()
+    {
+        var array = new float[2];
+        var v = Vector<float>.Wrap(array);
+        bool fail = true;
+        HostSync.Register(v, _ =>
+        {
+            if (fail) throw new System.InvalidOperationException("device busy");
+            Fill(array, 9f);
+        });
+
+        Assert.Throws<System.InvalidOperationException>(() => HostSync.Settle(v));
+        Assert.True(HostSync.IsPending(v));
+        fail = false;
+        HostSync.Settle(v);
+        Assert.Equal(9f, array[0]);
+    }
 }

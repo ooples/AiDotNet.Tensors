@@ -186,6 +186,15 @@ public class MockDirectGpuBackend : DispatchProxy
                 _state.AllocatedBuffers.Add(buffer);
                 return buffer;
             }
+            case "SupportsElementType":
+                return args[0] is GpuElementType.Float32;
+            case "AllocateBuffer" when args.Length == 2 && args[0] is int typedSize && args[1] is GpuElementType.Float32:
+            {
+                _state.AllocationSizes.Add(typedSize);
+                var buffer = new MockGpuBuffer(new float[typedSize]);
+                _state.AllocatedBuffers.Add(buffer);
+                return buffer;
+            }
             case "AllocateBuffer" when args.Length == 1 && args[0] is int size:
             {
                 long bytes = (long)size * sizeof(float);
