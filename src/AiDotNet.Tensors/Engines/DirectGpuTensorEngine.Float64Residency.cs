@@ -618,22 +618,33 @@ public partial class DirectGpuTensorEngine
     private long _float64AllocatedSinceCollect;
 
     // Callers hold _float64Lock.
-    private bool TryTakePooledFloat64(IDirectGpuBackend backend, int length, out IGpuBuffer buffer)
+    private bool TryTakePooledFloat64(IDirectGpuBackend backend, int length,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IGpuBuffer? buffer)
     {
-        buffer = null!;
+        buffer = null;
         if (!_float64Pool.TryGetValue(length, out var stack)) return false;
+        bool sameBackend = ReferenceEquals(_float64PoolBackend, backend);
         while (stack.Count > 0)
         {
             var candidate = stack.Pop();
             _float64PoolBytes -= (long)length * sizeof(double);
-            if (IsLiveDeviceBuffer(candidate) && ReferenceEquals(_float64PoolBackend, backend))
+            // Once popped, the candidate is either handed to the caller or disposed here, whatever the liveness check
+            // does: a buffer of a backend that is gone, or already released, has only its wrapper left to dispose.
+            bool usable = false;
+            try
+            {
+                usable = sameBackend && IsLiveDeviceBuffer(candidate);
+            }
+            finally
+            {
+                if (!usable) candidate.Dispose();
+            }
+
+            if (usable)
             {
                 buffer = candidate;
                 return true;
             }
-
-            // A buffer of a backend that is gone, or already released: only its wrapper is left to dispose.
-            candidate.Dispose();
         }
 
         return false;
