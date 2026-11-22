@@ -22,11 +22,12 @@ public enum GpuOperationFamily
 public readonly struct GpuOperationCapability : IEquatable<GpuOperationCapability>
 {
     /// <summary>Creates a row.</summary>
-    public GpuOperationCapability(GpuOperationFamily family, GpuElementType elementType, bool isNative)
+    public GpuOperationCapability(GpuOperationFamily family, GpuElementType elementType, bool isNative, bool isEmulated = false)
     {
         Family = family;
         ElementType = elementType;
         IsNative = isNative;
+        IsEmulated = isNative && isEmulated;
     }
 
     /// <summary>The operation family.</summary>
@@ -37,15 +38,23 @@ public readonly struct GpuOperationCapability : IEquatable<GpuOperationCapabilit
     /// the engine runs the operation on the CPU in the tensor's own type; it never narrows the type to fit a kernel.</summary>
     public bool IsNative { get; }
 
+    /// <summary>
+    /// Whether the device computes the family in <see cref="ElementType"/> by integer emulation rather than with native
+    /// instructions (doubles on Metal and WebGPU). The results are the same, but slower than the CPU's, so the engine
+    /// uses such a route only under a policy with <see cref="Gpu.GpuExecutionPolicy.AllowEmulatedFloat64"/> and runs the
+    /// operation on the CPU otherwise. Storage is never emulated.
+    /// </summary>
+    public bool IsEmulated { get; }
+
     /// <inheritdoc />
     public bool Equals(GpuOperationCapability other)
-        => Family == other.Family && ElementType == other.ElementType && IsNative == other.IsNative;
+        => Family == other.Family && ElementType == other.ElementType && IsNative == other.IsNative && IsEmulated == other.IsEmulated;
     /// <inheritdoc />
     public override bool Equals(object? obj) => obj is GpuOperationCapability other && Equals(other);
     /// <inheritdoc />
-    public override int GetHashCode() => ((int)Family * 397 ^ (int)ElementType) * 2 + (IsNative ? 1 : 0);
+    public override int GetHashCode() => ((int)Family * 397 ^ (int)ElementType) * 4 + (IsNative ? 1 : 0) + (IsEmulated ? 2 : 0);
     /// <inheritdoc />
-    public override string ToString() => $"{Family}<{ElementType}>: {(IsNative ? "native" : "CPU")}";
+    public override string ToString() => $"{Family}<{ElementType}>: {(IsEmulated ? "emulated (on request)" : IsNative ? "native" : "CPU")}";
 }
 
 /// <summary>
@@ -105,9 +114,11 @@ public static class GpuOperationCapabilities
     {
         if (backend is null) throw new ArgumentNullException(nameof(backend));
         var rows = new List<GpuOperationCapability>(Families.Length * Types.Length);
+        bool emulatesFloat64 = Gpu.GpuPrecisionPlanner.EmulatesFloat64(Unwrap(backend));
         foreach (var type in Types)
             foreach (var family in Families)
-                rows.Add(new GpuOperationCapability(family, type, backend.SupportsOperation(family, type)));
+                rows.Add(new GpuOperationCapability(family, type, backend.SupportsOperation(family, type),
+                    emulatesFloat64 && type == GpuElementType.Float64 && family != GpuOperationFamily.Storage));
         return rows;
     }
 

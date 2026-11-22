@@ -21,6 +21,9 @@ public abstract class GpuFloat64BackendContractTests
     /// <summary>Why <see cref="Device"/> returned null.</summary>
     protected abstract string SkipReason { get; }
 
+    /// <summary>Whether this backend computes doubles in integer arithmetic (its shading language has no 64-bit float).</summary>
+    protected abstract bool EmulatesDoubles { get; }
+
     private static IGpuFloat64Elementwise Elementwise(IDirectGpuBackend backend)
         => backend as IGpuFloat64Elementwise ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double element-wise kernels.");
 
@@ -40,6 +43,16 @@ public abstract class GpuFloat64BackendContractTests
         Assert.True(Reductions(backend).SupportsFloat64Reductions);
         Assert.True(MatrixMultiply(backend).SupportsFloat64MatrixMultiply);
         Assert.True(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Float64));
+
+        // The table says whether those kernels are native or integer emulation, the same answer the planner routes on.
+        bool emulated = AiDotNet.Tensors.Engines.Gpu.GpuPrecisionPlanner.EmulatesFloat64(backend);
+        Assert.Equal(EmulatesDoubles, emulated);
+        foreach (var row in backend.DescribeOperations())
+        {
+            if (row.ElementType != GpuElementType.Float64) Assert.False(row.IsEmulated);
+            else if (row.Family == GpuOperationFamily.Storage) Assert.False(row.IsEmulated);
+            else Assert.Equal(emulated, row.IsEmulated);
+        }
     }
 
     // Full 53-bit mantissas, mixed signs and magnitudes: a float round trip, a contracted multiply-add or a
@@ -314,6 +327,93 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
     protected override IDirectGpuBackend? Device() => _backend;
 
     protected override string SkipReason => "No Vulkan device with shaderFloat64 and libshaderc.";
+
+    protected override bool EmulatesDoubles => false;
+}
+
+/// <summary>Metal: binary64 computed in integer arithmetic, Metal Shading Language having no 64-bit float.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class MetalFloat64Tests : GpuFloat64BackendContractTests, IDisposable
+{
+    private readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend? _backend;
+
+    public MetalFloat64Tests()
+    {
+        // AIDOTNET_REQUIRE_METAL=1 (the macOS lane) turns "no device" from a skip into a failure, so the Metal
+        // translation of the library cannot go unverified there.
+        bool required = string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_METAL"), "1", StringComparison.Ordinal);
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+        {
+            if (required) throw new InvalidOperationException("AIDOTNET_REQUIRE_METAL=1 on a host that is not macOS.");
+            return;
+        }
+
+        var backend = new AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend();
+        if (backend.IsAvailable)
+        {
+            _backend = backend;
+            return;
+        }
+
+        backend.Dispose();
+        if (required) throw new InvalidOperationException("AIDOTNET_REQUIRE_METAL=1 but the Metal backend is not available.");
+    }
+
+    protected override IDirectGpuBackend? Device() => _backend;
+
+    protected override string SkipReason => "Metal exists only on macOS with a Metal device.";
+
+    protected override bool EmulatesDoubles => true;
+
+    public void Dispose() => _backend?.Dispose();
+}
+
+/// <summary>
+/// The soft-float library is written in WGSL and translated to Metal Shading Language. The translation is checked here
+/// on every host, the device results in <see cref="MetalFloat64Tests"/> where a Metal device exists.
+/// </summary>
+public sealed class GpuSoftFloat64TranslationTests
+{
+    [Fact]
+    public void The_metal_source_has_no_wgsl_left_and_declares_every_function_first()
+    {
+        string metal = GpuSoftFloat64.MetalArithmetic + GpuSoftFloat64.MetalElementary;
+        foreach (string wgsl in new[] { "vec2<", "vec4<", "countLeadingZeros", " -> ", "let ", "var ", "\nfn " })
+            Assert.DoesNotContain(wgsl, metal);
+        // A WGSL conversion is the whole word u32( or i32(; a function such as f64_from_i32( only ends in one.
+        Assert.DoesNotMatch(new System.Text.RegularExpressions.Regex(@"\b[ui]32\(", System.Text.RegularExpressions.RegexOptions.None, TimeSpan.FromSeconds(5)), metal);
+
+        // Each function is declared (its signature and a semicolon) ahead of every definition, so the order in which
+        // the functions use one another does not matter. The prelude's own helpers come first and are not counted.
+        string translated = GpuSoftFloat64.ToMetal(GpuSoftFloat64.WgslArithmetic);
+        int firstDefinition = translated.IndexOf(") {", StringComparison.Ordinal);
+        foreach (string name in new[] { "f64_add", "f64_sub", "f64_mul", "f64_div", "f64_sqrt", "f64_lt", "f64_is_nan", "f64_neg", "f64_abs" })
+        {
+            int declared = translated.IndexOf(" " + name + "(", StringComparison.Ordinal);
+            Assert.InRange(declared, 0, firstDefinition);
+            int end = translated.IndexOf(';', declared);
+            string signature = translated.Substring(declared, end - declared);
+            Assert.Contains(signature + " {", translated);
+        }
+
+        string elementary = GpuSoftFloat64.MetalElementary;
+        foreach (string name in new[] { "f64_exp_fn", "f64_log_fn", "f64_tanh_fn", "f64_sigmoid_fn" })
+            Assert.Contains("static inline uint2 " + name + "(uint2 ", elementary);
+    }
+
+    [Fact]
+    public void A_function_is_translated_to_a_metal_definition()
+    {
+        string metal = GpuSoftFloat64.ToMetal("fn pick(a: vec2<u32>, n: u32) -> u32 {\n    let k = select(a.x, a.y, n > 1u);\n    return u32(countLeadingZeros(k));\n}\n");
+        Assert.Contains("static inline uint pick(uint2 a, uint n);", metal);
+        Assert.Contains("static inline uint pick(uint2 a, uint n) {", metal);
+        Assert.Contains("auto k = sf_select(a.x, a.y, n > 1u);", metal);
+        Assert.Contains("return uint(clz(k));", metal);
+    }
+
+    [Fact]
+    public void A_type_the_translation_does_not_know_is_refused()
+        => Assert.Throws<InvalidOperationException>(() => GpuSoftFloat64.ToMetal("fn f(a: f32) -> f32 {\n    return a;\n}\n"));
 }
 
 #if NET7_0_OR_GREATER
@@ -324,6 +424,8 @@ public sealed class WebGpuFloat64Tests : GpuFloat64BackendContractTests
     protected override IDirectGpuBackend? Device() => DawnHostedWebGpu.BackendOrNull();
 
     protected override string SkipReason => "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).";
+
+    protected override bool EmulatesDoubles => true;
 }
 #endif
 

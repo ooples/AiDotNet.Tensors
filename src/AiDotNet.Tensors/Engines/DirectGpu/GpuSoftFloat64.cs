@@ -580,12 +580,14 @@ static inline uint2 sf_select(uint2 a, uint2 b, bool c) { return c ? b : a; }
     /// <summary>
     /// Translates the restricted WGSL of this class to Metal Shading Language: function signatures, untyped locals
     /// (<c>auto</c>), the integer vector types and conversions, <c>select</c> and <c>countLeadingZeros</c>. Statements
-    /// and expressions are otherwise the same text in both languages.
+    /// and expressions are otherwise the same text in both languages. WGSL resolves a function wherever it is declared
+    /// and Metal only after its declaration, so every function is declared ahead of the definitions.
     /// </summary>
     internal static string ToMetal(string wgsl)
     {
         if (wgsl is null) throw new ArgumentNullException(nameof(wgsl));
         var metal = new StringBuilder(wgsl.Length + wgsl.Length / 8);
+        var prototypes = new StringBuilder();
         foreach (string raw in wgsl.Replace("\r\n", "\n").Split('\n'))
         {
             string line = raw;
@@ -602,8 +604,9 @@ static inline uint2 sf_select(uint2 a, uint2 b, bool c) { return c ? b : a; }
                     parameters.Append(MetalType(parameter.Substring(colon + 1))).Append(' ').Append(parameter.Substring(0, colon).Trim());
                 }
 
-                line = "static inline " + MetalType(function.Groups[3].Value) + " " + function.Groups[1].Value + "(" + parameters + ") {"
-                    + line.Substring(function.Length);
+                string signature = "static inline " + MetalType(function.Groups[3].Value) + " " + function.Groups[1].Value + "(" + parameters + ")";
+                prototypes.Append(signature).Append(';').Append('\n');
+                line = signature + " {" + line.Substring(function.Length);
             }
 
             line = Local.Replace(line, "auto $1 =");
@@ -613,6 +616,6 @@ static inline uint2 sf_select(uint2 a, uint2 b, bool c) { return c ? b : a; }
             metal.Append(line).Append('\n');
         }
 
-        return metal.ToString();
+        return prototypes.Append(metal).ToString();
     }
 }

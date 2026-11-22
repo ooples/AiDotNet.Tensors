@@ -313,6 +313,12 @@ public class GpuElementTypeTests
         }
         Assert.Throws<ArgumentOutOfRangeException>(() => backend.SupportsOperation((GpuOperationFamily)99, GpuElementType.Float32));
         Assert.Equal("Reduction<Float64>: CPU", new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, false).ToString());
+        // Emulation qualifies a route the device has; a row the device cannot run is never "emulated".
+        var emulated = new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, true, isEmulated: true);
+        Assert.True(emulated.IsEmulated);
+        Assert.Equal("Reduction<Float64>: emulated (on request)", emulated.ToString());
+        Assert.NotEqual(emulated, new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, true));
+        Assert.False(new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, false, isEmulated: true).IsEmulated);
     }
 #endif
 
