@@ -173,6 +173,31 @@ internal static class GpuFloatLayout
     }
 }
 
+/// <summary>The unit a device-to-device copy counts in.</summary>
+internal static class GpuCopyLayout
+{
+    /// <summary>
+    /// Bytes per element of a copy from <paramref name="source"/> to <paramref name="destination"/>: the copy's
+    /// offsets and length count elements of the buffers' type, so a <see cref="GpuElementType.Float64"/> copy moves
+    /// eight bytes an element (it moved four, half the data). Raw bytes (<see cref="GpuElementType.Unspecified"/>) keep
+    /// the 4-byte unit their callers have always counted in. Buffers whose elements differ in width are refused: the
+    /// count would mean different things on each side.
+    /// </summary>
+    public static int ElementBytes(IGpuBuffer source, IGpuBuffer destination, string operation)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        int from = Width(source.ElementType), to = Width(destination.ElementType);
+        if (from != to)
+            throw new InvalidOperationException(
+                $"{operation} cannot copy {source.ElementType} elements ({from} bytes) into a {destination.ElementType} buffer ({to} bytes).");
+        return from;
+    }
+
+    private static int Width(GpuElementType type)
+        => type == GpuElementType.Unspecified ? sizeof(float) : GpuElementTypes.SizeInBytes(type);
+}
+
 /// <summary>A byte allocation that can be declared a buffer of typed elements.</summary>
 internal interface IElementTypedByteBuffer
 {

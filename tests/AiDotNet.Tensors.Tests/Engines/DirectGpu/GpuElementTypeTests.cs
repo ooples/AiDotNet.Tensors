@@ -258,6 +258,43 @@ public class GpuElementTypeTests
         Assert.Equal(new[] { 7, -8, 9 }, words);
     }
 
+    // A device copy counts elements of the buffers' type: of doubles it moves eight bytes each, at element offsets.
+    [SkippableFact]
+    public void DeviceCopy_OfATypedBuffer_MovesWholeElements()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.IfNot(backend.SupportsElementType(GpuElementType.Float64), "The backend holds no Float64 buffers.");
+        var values = new[] { 1.5, -2.25, 1e300, double.Epsilon, 5.0, -6.0 };
+        using var source = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(source, values);
+
+        using var whole = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.Copy(source, whole, values.Length);
+        var read = new double[values.Length];
+        backend.DownloadBuffer<double>(whole, read);
+        Assert.Equal(values, read);
+
+        using var buffered = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.CopyBuffer(source, buffered, values.Length);
+        backend.DownloadBuffer<double>(buffered, read);
+        Assert.Equal(values, read);
+
+        using var part = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(part, new double[values.Length]);
+        backend.Copy(source, 2, part, 1, 3);
+        backend.DownloadBuffer<double>(part, read);
+        Assert.Equal(new[] { 0.0, 1e300, double.Epsilon, 5.0, 0.0, 0.0 }, read);
+
+        // Elements of different widths: the count would mean different things on each side.
+        using var floats = backend.AllocateBuffer(values.Length, GpuElementType.Float32);
+        Assert.Throws<InvalidOperationException>(() => backend.Copy(source, floats, values.Length));
+        Assert.Throws<InvalidOperationException>(() => backend.Copy(floats, 0, source, 0, 1));
+        Assert.Throws<InvalidOperationException>(() => backend.CopyBuffer(source, floats, values.Length));
+    }
+
     private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged
     {
         if (!backend.SupportsElementType(type))
