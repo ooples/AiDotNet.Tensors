@@ -154,6 +154,69 @@ public class DecodeStepReplayTests
     public void A_gpu_plan_follows_a_cache_and_state_reset_between_sequences_and_keeps_replaying(bool capture)
         => RunGpu(capture, sequences: 3);
 
+    // Steady-state replay with nothing reading the cache, position, state or counter on the host: the pre-replay check
+    // must neither download a written target to compare it nor re-upload one. A host read then costs one compare (and
+    // no upload, the data being unchanged); a reset costs uploads.
+    [SkippableFact]
+    public void A_steady_state_replay_with_no_host_reads_downloads_and_compares_nothing()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Inference graph capture is CUDA-only.");
+            var prior = CompiledInferencePlan<float>.InferenceCudaGraphOverride;
+            CompiledInferencePlan<float>.InferenceCudaGraphOverride = true;
+            try
+            {
+                var plan = new Decoder();
+                var x = new Tensor<float>([1, Width]);
+                var q = new Tensor<float>([Rows, Width]);
+                CompiledInferencePlan<float> compiled;
+                using (new EngineScope(gpu))
+                using (var scope = GraphMode.EnableInference())
+                {
+                    var (y, next) = plan.Step(gpu, x, q);
+                    compiled = scope.CompileInference(y, new[] { x, q, plan.Cache }, new[] { (plan.Counter, next) });
+                }
+                var exec = typeof(CompiledInferencePlan<float>).GetField("_graphExec", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                using (compiled)
+                {
+                    void Step(int t)
+                    {
+                        compiled.SetInputs(new[] { X(t), Q(t), plan.Cache });
+                        compiled.Execute();
+                    }
+                    // Warm-up and capture (3 calls), then steady replays.
+                    for (int t = 0; t < 3; t++) Step(t);
+                    Assert.True(exec.GetValue(compiled) is IntPtr h && h != IntPtr.Zero, "the plan is not replaying a captured graph");
+                    long compares = compiled.WrittenTargetCompares, uploads = compiled.WrittenTargetUploads;
+                    Step(3);
+                    Assert.Equal(compares, compiled.WrittenTargetCompares);
+                    Assert.Equal(uploads, compiled.WrittenTargetUploads);
+                    Assert.Equal(4f, plan.Position.ToArray()[0]);
+                    // One host read of the position: the next replay compares that one target and uploads nothing.
+                    plan.Reset(gpu);
+                    long resetUploads = compiled.WrittenTargetUploads;
+                    Step(4);
+                    Assert.True(compiled.WrittenTargetUploads > resetUploads, "a reset was not uploaded");
+                    compares = compiled.WrittenTargetCompares; uploads = compiled.WrittenTargetUploads;
+                    for (int t = 5; t < 7; t++) Step(t);
+                    Assert.Equal(compares, compiled.WrittenTargetCompares);
+                    Assert.Equal(uploads, compiled.WrittenTargetUploads);
+                    Assert.Equal(3f, plan.Position.ToArray()[0]);
+                    Step(7);
+                    Assert.Equal(compares + 1, compiled.WrittenTargetCompares);
+                    Assert.Equal(uploads, compiled.WrittenTargetUploads);
+                    Assert.True(exec.GetValue(compiled) is IntPtr h2 && h2 != IntPtr.Zero, "the plan stopped replaying");
+                }
+            }
+            finally { CompiledInferencePlan<float>.InferenceCudaGraphOverride = prior; }
+        }
+    }
+
     private static void RunGpu(bool capture, int sequences)
     {
         DirectGpuTensorEngine? gpu = null;

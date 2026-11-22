@@ -62,6 +62,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
 
     /// <summary>Captured-graph input uploads skipped because the input was unchanged (for tests).</summary>
     internal long InputUploadsSkipped => Interlocked.Read(ref _inputUploadsSkipped);
+    private long _writtenTargetCompares;
+    private long _writtenTargetUploads;
+    /// <summary>Pre-replay host/device compares of written targets (each one device download), for tests.</summary>
+    internal long WrittenTargetCompares => Interlocked.Read(ref _writtenTargetCompares);
+    /// <summary>Pre-replay uploads of written targets the caller changed, for tests.</summary>
+    internal long WrittenTargetUploads => Interlocked.Read(ref _writtenTargetUploads);
     // The stable buffers the pre-residency pass and the capture draw each step's outputs and temporaries from, keyed by
     // step (see Engines.StepScratchPool): a capture may not allocate, so an op needing scratch (a two-sided broadcast,
     // say) otherwise declined to the CPU engine and abandoned the capture. Lives as long as the captured graph.
@@ -1263,10 +1269,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             if (!changed && !DirectGpuTensorEngine.HostMayDifferFromDevice(target)) continue;
             if (target.GetReadOnlyDataArray() is not float[] host || host.Length != target.Length || buffer.Size < host.Length)
                 throw new InvalidOperationException("A tensor the captured graph writes cannot be refreshed in place.");
+            if (!changed) Interlocked.Increment(ref _writtenTargetCompares);
             if (!changed && gte.DownloadCapturedBuffer(buffer, host.Length) is { } device
                 && System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(host.AsSpan())
                     .SequenceEqual(System.Runtime.InteropServices.MemoryMarshal.Cast<float, int>(device.AsSpan())))
                 continue;
+            Interlocked.Increment(ref _writtenTargetUploads);
             cb.UploadBufferInPlace(host, buffer);
             gte.RearmStateAfterReplay(target, buffer);
             _writtenTargetVersions[i] = target.GpuCacheVersion;
