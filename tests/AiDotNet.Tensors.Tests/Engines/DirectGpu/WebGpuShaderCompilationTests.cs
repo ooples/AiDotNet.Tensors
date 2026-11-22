@@ -35,6 +35,7 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuMoeKernels.SortBody",
         "WebGpuMoeKernels.CombineBody",
         "WebGpuMoeKernels.DScoresBody",
+        "WebGpuFftKernels.SharedBatchedFftBody",   // SharedBatchedFft prefixes it with its WG and MAX_N constants
     };
 
     private const string Validator = @"
