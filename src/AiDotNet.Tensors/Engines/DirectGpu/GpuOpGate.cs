@@ -109,6 +109,16 @@ internal sealed class GpuOpGate
     // A cross-backend policy rejection raised inside the op running on this thread, until that op ends.
     [ThreadStatic] private static CrossBackendTensorException? t_pendingRejection;
 
+    // Drops the calling thread's op entry when its lease was returned from another thread (its counter shows no
+    // lease held), with any rejection that op left pending.
+    private static void ClearStaleOpEntry()
+    {
+        if (t_opCounter is not { } installed || Volatile.Read(ref installed.Depth) != 0) return;
+        t_opBackend = null;
+        t_opCounter = null;
+        t_pendingRejection = null;
+    }
+
     /// <summary>
     /// Leaves <paramref name="rejection"/> pending on the calling thread when it is inside an engine op, so the
     /// outermost op rethrows it on exit even if an inner catch answered it with a CPU fallback. Outside an op there is
@@ -193,12 +203,7 @@ internal sealed class GpuOpGate
         // BEFORE this lease increments a counter - on the same gate that is the very counter the entry is judged by,
         // and the stale backend would then pass for an enclosing op. The op starting here is the outermost on its
         // thread and starts with nothing pending: a rejection the other op left behind never reached its rethrow.
-        if (t_opCounter is { } installed && Volatile.Read(ref installed.Depth) == 0)
-        {
-            t_opBackend = null;
-            t_opCounter = null;
-            t_pendingRejection = null;
-        }
+        ClearStaleOpEntry();
         // Full fence: the increment is visible before the state is read, the order the drain relies on.
         Interlocked.Increment(ref counter.Depth);
         if (Volatile.Read(ref _state) != Open)

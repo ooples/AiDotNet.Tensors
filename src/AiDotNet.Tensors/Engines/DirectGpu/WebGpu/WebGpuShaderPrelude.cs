@@ -272,18 +272,28 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     // element count. `code` is the comment-masked source.
     private static bool IsEarlyEvaluated(string code, int at)
     {
+        if (BraceDepth(code, at) <= 0) return true;
+        int statement = at;
+        while (statement > 0 && code[statement - 1] != ';' && code[statement - 1] != '{' && code[statement - 1] != '}') statement--;
+        return IsConstantDeclaration(code, statement, at) || InAttributeArguments(code, statement, at)
+               || InArrayElementCount(code, statement, at);
+    }
+
+    private static int BraceDepth(string code, int at)
+    {
         int braces = 0;
         for (int i = 0; i < at; i++)
         {
             if (code[i] == '{') braces++;
             else if (code[i] == '}') braces--;
         }
-        if (braces <= 0) return true;
+        return braces;
+    }
 
-        int start = at;
-        while (start > 0 && code[start - 1] != ';' && code[start - 1] != '{' && code[start - 1] != '}') start--;
-        int statement = start;
-        start = SkipTrivia(code, start);
+    // The statement starting at `statement` is a const or override declaration (after any attributes).
+    private static bool IsConstantDeclaration(string code, int statement, int at)
+    {
+        int start = SkipTrivia(code, statement);
         while (start < at && code[start] == '@')   // an attribute such as @id(0) before override
         {
             var attribute = Identifier.Match(code, start + 1);
@@ -292,43 +302,58 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
             if (start < code.Length && code[start] == '(') start = MatchingParen(code, start) + 1;
             start = SkipTrivia(code, start);
         }
-        if (StartsWord(code, start, "const") || StartsWord(code, start, "override")) return true;
+        return StartsWord(code, start, "const") || StartsWord(code, start, "override");
+    }
 
-        // Inside an attribute's argument list: an unclosed '(' before the call that follows @name.
+    // Inside an attribute's argument list: an unclosed '(' before the call that follows @name.
+    private static bool InAttributeArguments(string code, int statement, int at)
+    {
         int depth = 0;
         for (int i = at - 1; i >= statement; i--)
         {
-            if (code[i] == ')') depth++;
-            else if (code[i] == '(' && depth-- == 0)
-            {
-                int name = i;
-                while (name > statement && char.IsWhiteSpace(code[name - 1])) name--;
-                int word = name;
-                while (word > statement && (char.IsLetterOrDigit(code[word - 1]) || code[word - 1] == '_')) word--;
-                if (word < name && word > statement && code[word - 1] == '@') return true;
-                depth = 0;
-            }
-        }
-
-        // Inside an array type's template list (its element count): an array< not yet closed before the call.
-        int array = code.LastIndexOf("array", at, at - statement, StringComparison.Ordinal);
-        while (array >= statement)
-        {
-            int angle = SkipTrivia(code, array + 5);
-            if (angle < at && code[angle] == '<' && (array == 0 || !(char.IsLetterOrDigit(code[array - 1]) || code[array - 1] == '_')))
-            {
-                int open = 1;
-                for (int i = angle + 1; i < at && open > 0; i++)
-                {
-                    if (code[i] == '<') open++;
-                    else if (code[i] == '>') open--;
-                }
-                if (open > 0) return true;
-            }
-            if (array == statement) break;
-            array = code.LastIndexOf("array", array - 1, array - statement, StringComparison.Ordinal);
+            if (code[i] == ')') { depth++; continue; }
+            if (code[i] != '(') continue;
+            if (depth > 0) { depth--; continue; }
+            if (FollowsAttributeName(code, statement, i)) return true;
         }
         return false;
+    }
+
+    // The '(' at `open` comes straight after "@name".
+    private static bool FollowsAttributeName(string code, int statement, int open)
+    {
+        int name = open;
+        while (name > statement && char.IsWhiteSpace(code[name - 1])) name--;
+        int word = name;
+        while (word > statement && (char.IsLetterOrDigit(code[word - 1]) || code[word - 1] == '_')) word--;
+        return word < name && word > statement && code[word - 1] == '@';
+    }
+
+    // Inside an array type's template list (its element count): an "array<" not yet closed before the call.
+    private static bool InArrayElementCount(string code, int statement, int at)
+    {
+        int array = code.IndexOf("array", statement, at - statement, StringComparison.Ordinal);
+        while (array >= 0)
+        {
+            int angle = SkipTrivia(code, array + 5);
+            bool wholeWord = array == 0 || !(char.IsLetterOrDigit(code[array - 1]) || code[array - 1] == '_');
+            if (wholeWord && angle < at && code[angle] == '<' && !ClosesBefore(code, angle, at)) return true;
+            int next = array + 5;
+            array = next < at ? code.IndexOf("array", next, at - next, StringComparison.Ordinal) : -1;
+        }
+        return false;
+    }
+
+    // The template list opened at `angle` is closed before `at`.
+    private static bool ClosesBefore(string code, int angle, int at)
+    {
+        int open = 1;
+        for (int i = angle + 1; i < at && open > 0; i++)
+        {
+            if (code[i] == '<') open++;
+            else if (code[i] == '>') open--;
+        }
+        return open == 0;
     }
 
     // Whether an argument's VALUE is a vector. Calls with a scalar result (dot, length, a function declared -> f32)
@@ -366,10 +391,11 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     {
         System.Text.StringBuilder? result = null;
         int copied = 0;
-        foreach (Match name in Identifier.Matches(argument))
+        // Names of scalar-valued functions that are not members (x.length is a field, not a call).
+        foreach (Match name in Identifier.Matches(argument).Cast<Match>().Where(name =>
+                     types.ScalarFunctions.Contains(name.Value) && (name.Index == 0 || argument[name.Index - 1] != '.')))
         {
-            if (name.Index < copied || !types.ScalarFunctions.Contains(name.Value)) continue;
-            if (name.Index > 0 && argument[name.Index - 1] == '.') continue;   // a member, not a call
+            if (name.Index < copied) continue;   // inside a call already replaced
             int open = SkipTrivia(argument, name.Index + name.Length);
             if (open >= argument.Length || argument[open] != '(') continue;
             int close = Matching(argument, open, '(', ')');
