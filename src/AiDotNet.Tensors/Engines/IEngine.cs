@@ -4746,9 +4746,19 @@ public partial interface IEngine
     /// <paramref name="silu"/>), and the history shifted IN PLACE (<c>history[m] = history[m - 1]</c>,
     /// <c>history[0] = x</c>). A zero history is the sequence start (the full convolution's zero padding). Forward only.
     /// </summary>
+    /// <remarks>
+    /// <para><b>Kernel orientation: NEWEST-FIRST.</b> <c>weight[:, 0]</c> weights the CURRENT input and
+    /// <c>weight[:, m]</c> the input m positions back. This is the REVERSE of PyTorch <c>nn.Conv1d</c> /
+    /// HuggingFace / Mamba <c>causal_conv1d</c> and of this library's <see cref="DepthwiseConv1D{T}"/>, where the
+    /// current input is weighted by the LAST tap <c>w[:, K - 1]</c>. To use PyTorch/HF or
+    /// <see cref="DepthwiseConv1D{T}"/> weights, reverse the tap axis: <c>weight[c, m] = torchWeight[c, 0, K - 1 - m]</c>.
+    /// With that reversal, stepping a zero history over a sequence equals <see cref="DepthwiseConv1D{T}"/> with
+    /// padding K - 1 truncated to the first seqLen outputs.</para>
+    /// </remarks>
     /// <param name="history">The previous inputs [K - 1, batch, channels], most recent first; written in place.</param>
     /// <param name="input">This position's input, batch x channels values.</param>
-    /// <param name="weight">The taps [channels, K]: column 0 weights this position, column m the input m positions back.</param>
+    /// <param name="weight">The taps [channels, K], newest-first: column 0 weights this position, column m the input m positions
+    /// back (the reverse of PyTorch / <see cref="DepthwiseConv1D{T}"/>; reverse the tap axis to use their weights).</param>
     /// <param name="bias">Per-channel bias [channels], or null.</param>
     /// <param name="silu">Apply SiLU (x sigmoid(x)) to the output.</param>
     /// <returns>The output [batch, channels].</returns>
