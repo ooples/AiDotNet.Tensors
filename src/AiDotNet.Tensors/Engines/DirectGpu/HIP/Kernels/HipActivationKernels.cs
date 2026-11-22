@@ -409,6 +409,18 @@ extern ""C"" __global__ __launch_bounds__(256) void power_scalar(const float* A,
     }
 }
 
+// Double-precision element-wise arithmetic: one IEEE operation per element.
+#define BINARY_F64(name, expression) \
+extern ""C"" __global__ void name(const double* a, const double* b, double* output, int size) \
+{ \
+    int i = blockIdx.x * blockDim.x + threadIdx.x; \
+    if (i < size) { const double x = a[i]; const double y = b[i]; output[i] = (expression); } \
+}
+BINARY_F64(add_f64, x + y)
+BINARY_F64(subtract_f64, x - y)
+BINARY_F64(multiply_f64, x * y)
+BINARY_F64(divide_f64, x / y)
+
 // Double-precision reductions: one partial per block, a shared-memory tree (the block size is a power of two).
 extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_f64(const double* input, double* output, int size)
 {
@@ -1425,7 +1437,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "where_backward", "norm_backward", "logsumexp_backward",
             "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
             "scatter_mean", "scatter_mean_activation_deterministic", "scatter_mean_divide",
-            "reduce_sum", "reduce_sum_f64", "reduce_dot_f64", "reduce_max", "reduce_min", "sum_axis", "sum_axis_rows", "sum_axis_rows_split", "bias_add",
+            "reduce_sum", "reduce_sum_f64", "reduce_dot_f64", "add_f64", "subtract_f64", "multiply_f64", "divide_f64", "reduce_max", "reduce_min", "sum_axis", "sum_axis_rows", "sum_axis_rows_split", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary
             "relu_vec4", "sigmoid_vec4", "tanh_activation_vec4", "gelu_vec4", "swish_vec4",

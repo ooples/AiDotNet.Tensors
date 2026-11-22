@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
-public sealed partial class HipBackend : IGpuFloat64Reductions
+public sealed partial class HipBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise
 {
     private const int Float64ReductionBlock = 256;
 
@@ -26,6 +26,41 @@ public sealed partial class HipBackend : IGpuFloat64Reductions
         CheckFloat64Operand(a, size, nameof(a));
         CheckFloat64Operand(b, size, nameof(b));
         return size == 0 ? 0.0 : ReduceFloat64(a, b, size);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64Elementwise
+        => IsAvailable && _kernelCache.ContainsKey("add_f64") && _kernelCache.ContainsKey("subtract_f64")
+            && _kernelCache.ContainsKey("multiply_f64") && _kernelCache.ContainsKey("divide_f64");
+
+    /// <inheritdoc/>
+    public unsafe void BinaryFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+    {
+        if (!SupportsFloat64Elementwise)
+            throw new GpuCapabilityUnavailableException("Double-precision element-wise kernels are not available on this device.");
+        CheckFloat64Operand(a, size, nameof(a));
+        CheckFloat64Operand(b, size, nameof(b));
+        CheckFloat64Operand(output, size, nameof(output));
+        if (size == 0) return;
+        IntPtr kernel = _kernelCache[operation switch
+        {
+            GpuFloat64BinaryOperation.Add => "add_f64",
+            GpuFloat64BinaryOperation.Subtract => "subtract_f64",
+            GpuFloat64BinaryOperation.Multiply => "multiply_f64",
+            GpuFloat64BinaryOperation.Divide => "divide_f64",
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+        }];
+        // Every element-wise double kernel takes (a, b, output, size).
+        IntPtr aPtr = a.Handle;
+        IntPtr bPtr = b.Handle;
+        IntPtr outputPtr = output.Handle;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &bPtr;
+        args[2] = &outputPtr;
+        args[3] = &n;
+        LaunchKernel(kernel, (uint)((size + Float64ReductionBlock - 1) / Float64ReductionBlock), Float64ReductionBlock, args);
     }
 
     private void CheckFloat64Operand(IGpuBuffer buffer, int size, string name)
@@ -71,9 +106,8 @@ public sealed partial class HipBackend : IGpuFloat64Reductions
             first = false;
         }
 
-        double scalar = BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
-        GpuLaunchProbe.OnReadback(sizeof(double), GpuBackendType.Hip);
-        return scalar;
+        // DownloadByteBuffer counts the readback.
+        return BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
     }
 
     // Each launch fills exactly its kernel's parameters: reduce_sum_f64(input, output, size).

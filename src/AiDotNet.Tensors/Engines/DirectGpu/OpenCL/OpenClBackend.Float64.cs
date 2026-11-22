@@ -5,7 +5,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    public sealed partial class OpenClBackend : IGpuFloat64Reductions
+    public sealed partial class OpenClBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise
     {
         private bool _float64ReductionsReady;
 
@@ -29,10 +29,35 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return ReduceFloat64(left, size, firstPass: right);
         }
 
+        /// <inheritdoc/>
+        public bool SupportsFloat64Elementwise => _float64ReductionsReady;
+
+        /// <inheritdoc/>
+        public void BinaryFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
+        {
+            var left = Float64Operand(a, size, nameof(a));
+            var right = Float64Operand(b, size, nameof(b));
+            var destination = Float64Operand(output, size, nameof(output));
+            if (size == 0) return;
+            var kernel = _kernelCache[operation switch
+            {
+                GpuFloat64BinaryOperation.Add => "add_f64",
+                GpuFloat64BinaryOperation.Subtract => "subtract_f64",
+                GpuFloat64BinaryOperation.Multiply => "multiply_f64",
+                GpuFloat64BinaryOperation.Divide => "divide_f64",
+                _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
+            }];
+            kernel.SetArg(0, left.Buffer.Handle);
+            kernel.SetArg(1, right.Buffer.Handle);
+            kernel.SetArg(2, destination.Buffer.Handle);
+            kernel.SetArg(3, size);
+            kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+        }
+
         private DirectOpenClGpuByteBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
         {
             if (_context == null || !_float64ReductionsReady)
-                throw new GpuCapabilityUnavailableException("Double-precision reductions are not available on this OpenCL device.");
+                throw new GpuCapabilityUnavailableException("Double-precision kernels are not available on this OpenCL device.");
             if (buffer is null) throw new ArgumentNullException(name);
             if (buffer.ElementType != GpuElementType.Float64 || buffer is not DirectOpenClGpuByteBuffer typed)
                 throw new ArgumentException($"Expected a {GpuElementType.Float64} buffer of this backend, got {buffer.ElementType}.", name);
@@ -80,9 +105,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 first = false;
             }
 
-            double scalar = BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
-            GpuLaunchProbe.OnReadback(sizeof(double), GpuBackendType.OpenCl);
-            return scalar;
+            // DownloadByteBuffer counts the readback.
+            return BitConverter.ToDouble(DownloadByteBuffer(current, sizeof(double)), 0);
         }
 
         private int Float64LocalSize(DirectOpenClKernel kernel, int size)

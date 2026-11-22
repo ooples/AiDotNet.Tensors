@@ -690,11 +690,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     // SafeMathFlags: the reductions accumulate in a fixed tree order, which fast-math may reassociate.
                     var float64Program = CompileOrLoadCached(
-                        Kernels.Float64ReductionKernels.GetSource(),
+                        Kernels.Float64Kernels.GetSource(),
                         OpenClBuildOptions.SafeMathFlags,
-                        "Double-precision reduction kernels");
+                        "Double-precision kernels");
                     _programs.Add(float64Program);
-                    foreach (var name in Kernels.Float64ReductionKernels.GetKernelNames())
+                    foreach (var name in Kernels.Float64Kernels.GetKernelNames())
                     {
                         _kernelCache[name] = new DirectOpenClKernel(_context, float64Program, name);
                     }
@@ -703,10 +703,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 catch (InvalidOperationException float64Failure)
                 {
-                    // No fp64, or the device rejected the program: double reductions stay on the CPU.
+                    // No fp64, or the device rejected the program: double tensors stay on the CPU.
                     _float64ReductionsReady = false;
                     System.Diagnostics.Trace.TraceWarning(
-                        "OpenCL double-precision reduction kernels are unavailable: {0}", float64Failure);
+                        "OpenCL double-precision kernels are unavailable: {0}", float64Failure);
                 }
 
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
@@ -1748,8 +1748,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (byteCount < 0)
                 throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
+            if (buffer is DirectOpenClGpuBuffer wordBuffer)
+            {
+                // A float or int buffer: its bytes are its 4-byte elements, read back unconverted (the read is a
+                // memory copy, so an int's bits survive the float array). CUDA and HIP read any buffer by handle.
+                if (byteCount > wordBuffer.SizeInBytes)
+                    throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wordBuffer.SizeInBytes}).", nameof(byteCount));
+                var bytes = new byte[byteCount];
+                if (byteCount > 0) Buffer.BlockCopy(DownloadBuffer(buffer), 0, bytes, 0, byteCount);
+                return bytes;
+            }
+
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
-                throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
+                throw new ArgumentException("Buffer must be an OpenCL buffer of this backend.", nameof(buffer));
             if (byteCount > byteBuffer.SizeInBytes)
                 throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.SizeInBytes}).", nameof(byteCount));
             GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.OpenCl);

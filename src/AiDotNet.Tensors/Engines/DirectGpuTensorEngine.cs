@@ -3412,6 +3412,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void ClearActivationCacheCore()
     {
+        ClearFloat64Residents();
         // Snapshot the (key, entry) pairs this cache owns, then clear.
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -5846,10 +5847,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return Gpu.GpuPrecisionOperation.Elementwise;
     }
 
-    private static Gpu.GpuPrecisionOperation PrecisionOperationForBinary(string operationName)
-        => operationName.IndexOf("add", StringComparison.OrdinalIgnoreCase) >= 0
+    private static Gpu.GpuPrecisionOperation PrecisionOperationForBinary(string operationName) => operationName switch
+    {
+        // The arithmetic ops have typed routes of their own (double on the device); matched by exact name, so an op
+        // that merely contains one of these words is not planned as it.
+        nameof(TensorSubtract) => Gpu.GpuPrecisionOperation.Subtract,
+        nameof(TensorMultiply) => Gpu.GpuPrecisionOperation.Multiply,
+        nameof(TensorDivide) => Gpu.GpuPrecisionOperation.Divide,
+        _ => operationName.IndexOf("add", StringComparison.OrdinalIgnoreCase) >= 0
             ? Gpu.GpuPrecisionOperation.Add
-            : Gpu.GpuPrecisionOperation.Elementwise;
+            : Gpu.GpuPrecisionOperation.Elementwise,
+    };
 
     private static void ExecuteFp16Unary(
         IDirectGpuBackend backend,
@@ -5939,6 +5947,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Gpu.GpuPrecisionOperation precisionOperation,
         Gpu.GpuComputePlan precisionPlan)
     {
+        if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float64)
+        {
+            // The float kernels below would narrow the operands. A double op the device route wanted has already run
+            // (TryBinaryFloat64, through TryBinaryResidentOutOfPlace); reaching here means it declined, or the element
+            // type is not double, and the CPU engine is the exact route.
+            return null;
+        }
+
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
         var bufferC = AllocateFullyWrittenOutputBuffer(backend, left.Length);
@@ -5984,6 +6000,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
             return null;
         }
+        // The chunker slices float buffers; a double plan has no chunked route and takes the CPU engine.
+        if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float64) return null;
         long capBytes = ex.DeviceMaxAllocBytes;
         if (capBytes <= 0) return null;
         int totalElements = left.Length;
@@ -9803,6 +9821,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
+            return (T)(object)doubleSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
@@ -16105,6 +16125,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.UnregisterPersistentTensor(tensor);
+        if (tensor is Tensor<double> unregisteredDoubles) DropFloat64Resident(unregisteredDoubles);
 
         // Cache identity is a read-only concern. GetDataArray() advertises writable access and
         // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
@@ -16151,6 +16172,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.InvalidatePersistentTensor(tensor);
+        if (tensor is Tensor<double> invalidatedDoubles) DropFloat64Resident(invalidatedDoubles);
 
         if (!TryGetBackend(out var backend))
             return;
@@ -23663,9 +23685,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Returns the bound output on success, else null (non-resident inputs / autocast / non-float → caller's
     /// normal path). Records nothing; the caller records the backward exactly as its eager path.</summary>
     private Tensor<T>? TryBinaryResidentOutOfPlace<T>(Tensor<T> a, Tensor<T> b,
-        System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> kernel)
+        System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> kernel,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         using var __gpuOp = EnterGpuOp();
+        // Double operands have their own kernels and their own device buffers; `kernel` is the float one.
+        if (a is Tensor<double> leftDoubles && b is Tensor<double> rightDoubles)
+            return ShapesMatch(a.Shape._dims, b.Shape._dims)
+                ? (Tensor<T>?)(object?)TryBinaryFloat64(leftDoubles, rightDoubles, callerName)
+                : null;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
