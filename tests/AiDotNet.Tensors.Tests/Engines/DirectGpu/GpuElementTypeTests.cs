@@ -232,6 +232,32 @@ public class GpuElementTypeTests
         Assert.True(backend.SupportsElementType(GpuElementType.Float32));
     }
 
+    // The float download moves Size * 4 bytes as 32-bit words: of a double buffer that is half its bytes read as
+    // unrelated floats, of a byte-wide buffer a read past the allocation. Both are refused by name.
+    [SkippableFact]
+    public void FloatDownload_RefusesABufferThatIsNotFourByteWords()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        foreach (var type in new[] { GpuElementType.Float64, GpuElementType.Int64, GpuElementType.Float16, GpuElementType.Int8, GpuElementType.Bool })
+        {
+            if (!backend.SupportsElementType(type)) continue;
+            using var typed = backend.AllocateBuffer(6, type);
+            var refused = Assert.Throws<InvalidOperationException>(() => backend.DownloadBuffer(typed, new float[6]));
+            Assert.Contains(type.ToString(), refused.Message);
+            Assert.Throws<InvalidOperationException>(() => backend.DownloadBuffer(typed));
+        }
+        using var floats = backend.AllocateBuffer(new[] { 1f, 2f, 3f });
+        Assert.Equal(new[] { 1f, 2f, 3f }, backend.DownloadBuffer(floats));
+        using var ints = backend.AllocateBuffer(3, GpuElementType.Int32);
+        backend.UploadBuffer<int>(ints, new[] { 7, -8, 9 });
+        var words = new int[3];
+        backend.DownloadBuffer<int>(ints, words);
+        Assert.Equal(new[] { 7, -8, 9 }, words);
+    }
+
     private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged
     {
         if (!backend.SupportsElementType(type))

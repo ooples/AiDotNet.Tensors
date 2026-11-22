@@ -1727,6 +1727,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var hipBuffer = (HipGpuBuffer)buffer;
         float[] result = new float[hipBuffer.Size];
         DownloadBuffer(buffer, result);
@@ -1737,6 +1738,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var hipBuffer = (HipGpuBuffer)buffer;
         if (hipBuffer.Handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");

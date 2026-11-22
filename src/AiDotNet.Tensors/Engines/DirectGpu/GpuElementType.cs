@@ -152,6 +152,27 @@ internal static class GpuBufferTyping
     }
 }
 
+/// <summary>
+/// The precondition of every float transfer: it moves <c>Size * 4</c> bytes and reads them as 32-bit words.
+/// </summary>
+internal static class GpuFloatLayout
+{
+    /// <summary>
+    /// Refuses a buffer whose elements are not 4-byte words. A float read of a <see cref="GpuElementType.Float64"/>
+    /// buffer would return half of its bytes as unrelated floats, and one of a narrower type (or of raw bytes) would
+    /// read past the allocation; the typed transfers (<see cref="GpuTypedBufferExtensions"/>) are the way to read those.
+    /// </summary>
+    public static void Require(IGpuBuffer buffer, string operation)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        var type = buffer.ElementType;
+        if (type is GpuElementType.Float32 or GpuElementType.Int32) return;
+        throw new InvalidOperationException(type == GpuElementType.Unspecified
+            ? $"{operation} reads 32-bit words, but the buffer holds {buffer.SizeInBytes} raw bytes; read it with DownloadByteBuffer."
+            : $"{operation} reads 32-bit words, but the buffer holds {buffer.Size} {type} elements; read it with the typed DownloadBuffer<T>.");
+    }
+}
+
 /// <summary>A byte allocation that can be declared a buffer of typed elements.</summary>
 internal interface IElementTypedByteBuffer
 {

@@ -2615,6 +2615,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         TraceCapturePathHostRead();
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory

@@ -1725,6 +1725,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
         {
+            GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.OpenCl);
             return openClBuffer.Download();
@@ -1734,6 +1735,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
             if (destination is null) throw new ArgumentNullException(nameof(destination));
+            GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             if (openClBuffer.Handle == IntPtr.Zero)
                 throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");
