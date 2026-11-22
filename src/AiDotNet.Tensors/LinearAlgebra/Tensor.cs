@@ -5222,6 +5222,15 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 return this;
             backend = directGpu.Backend;
         }
+        return PlaceOn(backend);
+    }
+
+    /// <summary>
+    /// Uploads this tensor to <paramref name="backend"/> and binds it there as its resident device copy: the body of
+    /// <see cref="Gpu()"/>, also used to rehome a tensor another backend held (CrossBackendTensors).
+    /// </summary>
+    internal Tensor<T> PlaceOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
@@ -5246,14 +5255,71 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
         _device = backend.DeviceType;   // the backend's typed device, not a match on its name
-        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight.
-        if (Engines.AiDotNetEngine.Current.TryGet<Engines.DirectGpuTensorEngine>(out var owner)
-            && ReferenceEquals(owner.PlacementBackend, backend))
+        // The dispatcher's weight reads now take this buffer; a copy it cached earlier is dead weight. The engine that
+        // owns the backend, not Current: a migration places from inside another engine's op, where reading Current
+        // could run a deferred GPU detection, and that engine is the one whose cache holds the copy.
+        if (Engines.DirectGpuTensorEngine.EngineOwning(backend) is { } owner)
             owner.DropPersistentCopy(this);
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
 
         return this;
+    }
+
+    /// <summary>
+    /// Releases this tensor's binding to the backend that owns its GPU buffer (CrossBackendTensors), so the next
+    /// engine op places it on its own backend. <paramref name="readBack"/> first brings the owner's values home (a
+    /// pending deferred download included). The binding is then detached - a whole-storage tensor's is its storage's,
+    /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
+    /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
+    /// </summary>
+    internal void ReleaseForeignGpuBinding(bool readBack, bool free)
+    {
+        var owner = _gpuBackend;
+        if (readBack)
+        {
+            // The owner's backend is the one whose buffer this reads: nothing inside is foreign to anything.
+            using var ownerWork = Engines.DirectGpu.GpuOpGate.SuspendOpBackend();
+            try
+            {
+                // A pending deferred download (an intermediate whose host copy has not been materialized yet) must land
+                // before the buffer goes: Cpu() alone returns early for a tensor that is not marked GPU-resident.
+                if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
+                Helpers.HostSync.TryMaterialize(DataVector);
+                Cpu();
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                throw new InvalidOperationException(
+                    $"Could not read this tensor back from the {owner?.BackendName ?? "unknown"} backend that owns its GPU "
+                    + "buffer, so it cannot be moved to the running operation's backend.", ex);
+            }
+        }
+        var buffer = _gpuBuffer;
+        bool owned = _ownsGpuBuffer;
+        // Without a read-back the host is authoritative (an external input its caller writes): drop the pending
+        // download so a later host read cannot materialize the abandoned device copy over it.
+        if (!readBack && GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
+        Helpers.ResidentHostMirror.Detach(this);
+        _gpuBuffer = null;
+        _gpuBackend = null;
+        _gpuBufferVersion = -1;
+        _ownsGpuBuffer = false;
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
+        _gpuBufferContainsRawInt64 = false;
+        _device = TensorDevice.CPU;
+        if (free && owned && buffer is IDisposable disposable)
+        {
+            // The tensor has already left the buffer: a backend that cannot free it now (gone, or failing) costs that
+            // allocation until its context goes, never the consumer's op.
+            try { disposable.Dispose(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    $"[AiDotNet] Freeing a migrated tensor's buffer on {owner?.BackendName ?? "its old backend"} failed: {ex.Message}");
+            }
+        }
     }
 
     /// <summary>

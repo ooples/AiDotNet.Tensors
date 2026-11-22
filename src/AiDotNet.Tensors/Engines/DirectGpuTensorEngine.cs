@@ -329,7 +329,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// no GPU, so the op takes its CPU fallback. Dispose the lease when the op is done with the backend.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal GpuOpGate.Lease EnterGpuOp() => _opGate.Enter();
+    // The lease also makes this engine's backend the thread's op backend, which Tensor.TryGetGpuBuffer checks a
+    // tensor's owning backend against (CrossBackendTensors).
+    internal GpuOpGate.Lease EnterGpuOp() => _opGate.Enter(_directGpu?.Backend);
 
     /// <summary>Strict lease checking for this engine only (tests): a backend borrowed without a lease throws.</summary>
     internal bool StrictGpuLeases
@@ -753,10 +755,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // The host is authoritative for an external input (callers write batches through a host span). A device op on
         // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
         // it; materializing that would read back data the host already holds.
+        // A binding on another backend holds what its owner last wrote: bring it home through the cross-backend
+        // policy before the host is treated as authoritative (the branch below would free it unread).
+        CrossBackendTensors.ResolveIfForeign(t, cb, hostAuthoritative: true);
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;
-        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+        // The same backend seen through a wrapper (a deferred scope's recording backend) reuses the binding too.
+        if (t._gpuBuffer is { } existing && t._gpuBackend is { } bound && CrossBackendTensors.SameAddressSpace(bound, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);
@@ -2094,6 +2100,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         ThrowIfReleased(tensor);
+        CrossBackendTensors.ResolveIfForeign(tensor, backend);
         // A device read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
         if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op

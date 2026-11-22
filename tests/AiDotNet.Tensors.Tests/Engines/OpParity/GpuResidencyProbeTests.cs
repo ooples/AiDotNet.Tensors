@@ -387,6 +387,27 @@ public sealed class GpuResidencyProbeTests
         var axes = new[] { 0, 2 };
         var inputShape = new[] { 2, 3, 4 };
 
+        bool capture = GpuLaunchProbe.CaptureReadbackSites;
+        GpuLaunchProbe.CaptureReadbackSites = true;
+        try
+        {
+            AssertTensorIndexReduceMax(gpu, cpu, input, gradOutput, axes, inputShape);
+        }
+        finally
+        {
+            GpuLaunchProbe.CaptureReadbackSites = capture;
+        }
+    }
+
+    private static void AssertNoReadbacks(string what)
+    {
+        long readbacks = GpuLaunchProbe.Readbacks;
+        Assert.True(readbacks == 0, $"{what}: {readbacks} device-to-host reads: {string.Join("; ", GpuLaunchProbe.ReadbackSites)}");
+    }
+
+    private static void AssertTensorIndexReduceMax(DirectGpuTensorEngine gpu, CpuEngine cpu, Tensor<float> input,
+        Tensor<float> gradOutput, int[] axes, int[] inputShape)
+    {
         GpuLaunchProbe.Reset();
         using var gpuOutput = gpu.ReduceMaxWithTensorIndices(
             input, axes, keepDims: false, out var gpuIndices);
@@ -396,7 +417,7 @@ public sealed class GpuResidencyProbeTests
         Assert.True(gpuIndices.IsGpuResident);
         Assert.True(gpuGradient.IsGpuResident);
         Assert.True(GpuLaunchProbe.Count > 0);
-        Assert.Equal(0, GpuLaunchProbe.Readbacks);
+        AssertNoReadbacks("ReduceMaxWithTensorIndices + backward");
 
         using var cpuOutput = cpu.ReduceMaxWithTensorIndices(
             input, axes, keepDims: false, out var cpuIndices);
@@ -419,7 +440,7 @@ public sealed class GpuResidencyProbeTests
         using (gpuTapeGradient)
         {
             Assert.True(gpuTapeGradient.IsGpuResident);
-            Assert.Equal(0, GpuLaunchProbe.Readbacks);
+            AssertNoReadbacks("taped ReduceMax gradient");
 
             Tensor<float> cpuTapeGradient;
             using (var tape = new GradientTape<float>())

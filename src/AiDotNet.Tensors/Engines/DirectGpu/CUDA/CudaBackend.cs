@@ -6855,7 +6855,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private void StartCublasWarmup()
     {
-        if (!AiDotNetEngine.Current.Is<DirectGpuTensorEngine>()) return;
+        // Peek, not Current: reading Current would complete a deferred GPU detection - a device probe with its own
+        // readback - inside the first GEMM. Until something resolves it the warmup waits (this runs per GEMM until
+        // it starts).
+        if (!AiDotNetEngine.PeekCurrent().Is<DirectGpuTensorEngine>()) return;
         lock (_cublasWarmLock)
         {
             if (_cublasWarmClosing || _disposed) return;

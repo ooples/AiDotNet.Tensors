@@ -40,8 +40,28 @@ internal sealed class GpuOpGate
     internal readonly struct Lease : IDisposable
     {
         private readonly Counter? _counter;
+        // The op backend this lease made current on its thread, and the pair it displaced (restored on Dispose).
+        private readonly IDirectGpuBackend? _backend;
+        private readonly IDirectGpuBackend? _previousBackend;
+        private readonly Counter? _previousCounter;
+        private readonly int _threadId;
 
-        internal Lease(Counter counter) => _counter = counter;
+        internal Lease(Counter counter, IDirectGpuBackend? backend)
+        {
+            _counter = counter;
+            _backend = backend;
+            _previousBackend = null;
+            _previousCounter = null;
+            _threadId = 0;
+            if (backend is not null)
+            {
+                _previousBackend = t_opBackend;
+                _previousCounter = t_opCounter;
+                _threadId = Environment.CurrentManagedThreadId;
+                t_opBackend = backend;
+                t_opCounter = counter;
+            }
+        }
 
         /// <summary>True when the lease was granted; false when the gate was closed and the op must not use the GPU.</summary>
         public bool Held => _counter is not null;
@@ -49,7 +69,62 @@ internal sealed class GpuOpGate
         // Interlocked, not a plain write: an async op can return its lease from another thread.
         public void Dispose()
         {
-            if (_counter is not null) Interlocked.Decrement(ref _counter.Depth);
+            if (_counter is null) return;
+            // Only the thread that installed the op backend restores it: an async op returning its lease from another
+            // thread cannot reach that thread's [ThreadStatic] at all. That thread's entry then goes stale, which
+            // CurrentOpBackend detects through the counter (its depth drops to zero below).
+            if (_backend is not null && _threadId == Environment.CurrentManagedThreadId
+                && ReferenceEquals(t_opBackend, _backend))
+            {
+                t_opBackend = _previousBackend;
+                t_opCounter = _previousCounter;
+            }
+            Interlocked.Decrement(ref _counter.Depth);
+        }
+    }
+
+    // The backend of the innermost engine op running on this thread (null outside every op), with the lease counter
+    // that holds it. Tensor.TryGetGpuBuffer compares a tensor's owning backend against it, so a buffer another backend
+    // placed is never handed to this op's kernels as a raw device address (see CrossBackendTensors).
+    //
+    // Thread-static rather than AsyncLocal on purpose: an engine op is synchronous from EnterGpuOp to its lease's
+    // Dispose (no DirectGpuTensorEngine method awaits; a backend's asynchronous work completes inside the backend call,
+    // after its buffers were resolved), so the op never resumes on another thread with buffers still to resolve, and
+    // the hot path pays a field read instead of an ExecutionContext lookup and copy-on-write per op. An engine op that
+    // ever awaits mid-op must resolve its tensors before the await, or against an explicit backend
+    // (CrossBackendTensors.ResolveIfForeign).
+    [ThreadStatic] private static IDirectGpuBackend? t_opBackend;
+    [ThreadStatic] private static Counter? t_opCounter;
+
+    /// <summary>
+    /// The backend of the engine op running on the calling thread, or null outside one. An entry whose lease was
+    /// returned from another thread (an async op) no longer counts: its counter shows no lease held.
+    /// </summary>
+    internal static IDirectGpuBackend? CurrentOpBackend
+        => t_opBackend is { } backend && t_opCounter is { } counter && Volatile.Read(ref counter.Depth) > 0
+            ? backend : null;
+
+    /// <summary>Clears the calling thread's op backend until disposed: work done on a tensor's OWNING backend from
+    /// inside another backend's op (the cross-backend readback) must not be judged foreign itself.</summary>
+    internal static OpBackendSuspension SuspendOpBackend() => new(t_opBackend, t_opCounter);
+
+    internal readonly struct OpBackendSuspension : IDisposable
+    {
+        private readonly IDirectGpuBackend? _savedBackend;
+        private readonly Counter? _savedCounter;
+
+        internal OpBackendSuspension(IDirectGpuBackend? savedBackend, Counter? savedCounter)
+        {
+            _savedBackend = savedBackend;
+            _savedCounter = savedCounter;
+            t_opBackend = null;
+            t_opCounter = null;
+        }
+
+        public void Dispose()
+        {
+            t_opBackend = _savedBackend;
+            t_opCounter = _savedCounter;
         }
     }
 
@@ -81,7 +156,14 @@ internal sealed class GpuOpGate
     /// <see cref="Lease.Held"/> or the engine's availability, which reads the same state).
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public Lease Enter()
+    public Lease Enter() => Enter(null);
+
+    /// <summary>
+    /// <see cref="Enter()"/> that also makes <paramref name="backend"/> the calling thread's op backend
+    /// (<see cref="CurrentOpBackend"/>) until the lease is disposed.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Lease Enter(IDirectGpuBackend? backend)
     {
         var counter = ReferenceEquals(t_lastGate, this) ? t_lastCounter! : CounterForThisThread(this);
         // Full fence: the increment is visible before the state is read, the order the drain relies on.
@@ -91,7 +173,7 @@ internal sealed class GpuOpGate
             Interlocked.Decrement(ref counter.Depth);
             return default;
         }
-        return new Lease(counter);
+        return new Lease(counter, backend);
     }
 
     // Static: it fills the thread's one-entry cache, which is per thread rather than per gate.

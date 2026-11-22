@@ -20,7 +20,7 @@ internal static class ChannelBiasResidualGeometry
             || residual.Size < total || residual.SizeInBytes < (long)total * sizeof(float)) return false;
         var residualRoot = GpuBufferViewRoot.Of(residual);
         var outputRoot = GpuBufferViewRoot.Of(output);
-        if (residualRoot.Handle == IntPtr.Zero || SameRoot(residualRoot, outputRoot)) return false;
+        if (!GpuBufferViewRoot.IsLive(residualRoot) || SameRoot(residualRoot, outputRoot)) return false;
         if (writeActivation)
         {
             if (!ChannelBiasLeakyGeometry.TryCount(input, bias, activated, batch, channels, spatial, alpha, out _)) return false;
@@ -31,6 +31,5 @@ internal static class ChannelBiasResidualGeometry
         return true;
     }
 
-    private static bool SameRoot(IGpuBuffer left, IGpuBuffer right)
-        => ReferenceEquals(left, right) || left.Handle == right.Handle;
+    private static bool SameRoot(IGpuBuffer left, IGpuBuffer right) => GpuBufferViewRoot.Same(left, right);
 }
