@@ -17705,7 +17705,6 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
@@ -17776,9 +17775,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colAll, 0, batchColW, false,
                         gradOutAllT, 0, outChannels, false,
                         gradKernelT, 0, outChannels);
-                    TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
-
-                    return RentFloatResult<T>(kernelShape, gradKernelF);
+                    // Every element is written by the transpose, so the result is rented uninitialized: a fresh array
+                    // per call (up to 8 MB for a DCGAN layer) was most of a CPU training step's remaining allocation.
+                    var gradKernelResult = TensorAllocator.RentUninitialized<float>(kernelShape);
+                    TransposeFloatRowMajor(gradKernelT, gradKernelResult.GetDataArrayUnmarked(), colH, outChannels);
+                    return (Tensor<T>)(object)gradKernelResult;
                 }
                 finally
                 {
@@ -17790,6 +17791,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Parallel across batches — each batch accumulates into a local gradKernel,
             // merged after. This avoids lock contention on the shared accumulator.
+            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
             var perBatchGrads = new float[batch][];
             var kPool = System.Buffers.ArrayPool<float>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>

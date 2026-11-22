@@ -45,6 +45,36 @@ public sealed class CompiledCpuLeakyReluGradientTests : IDisposable
         }
     }
 
+    // Past one pool chunk (65536) and not a multiple of it or of the vector width: every chunk, the vector body and
+    // the tail must match the scalar canonical path bit for bit, written and accumulated.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FloatLargeChunkedMatchesCanonicalBitForBit(bool accumulate)
+    {
+        const int length = 3 * 65536 + 13;
+        var rng = new Random(5);
+        var inputValues = new float[length];
+        var upstreamValues = new float[length];
+        var seed = new float[length];
+        for (int i = 0; i < length; i++)
+        {
+            inputValues[i] = (i % 97) switch { 0 => 0f, 1 => -0f, 2 => float.NaN, _ => (float)(rng.NextDouble() * 2 - 1) };
+            upstreamValues[i] = (float)(rng.NextDouble() * 4 - 2);
+            seed[i] = (float)(rng.NextDouble() - .5);
+        }
+        var input = new Tensor<float>(inputValues, new[] { length });
+        var upstream = new Tensor<float>(upstreamValues, new[] { length });
+        var derivative = new CpuEngine().LeakyReluBackward(upstream, input, .2).ToArray();
+        var output = new Tensor<float>((float[])seed.Clone(), new[] { length });
+        Replay(input, upstream, output, .2, shared: accumulate)(new CpuEngine());
+        for (int i = 0; i < length; i++)
+        {
+            float expected = accumulate ? seed[i] + derivative[i] : derivative[i];
+            Assert.Equal(MathCompat.SingleToInt32Bits(expected), MathCompat.SingleToInt32Bits(output[i]));
+        }
+    }
+
     [Theory]
     [InlineData(.1)]
     [InlineData(.01)]
