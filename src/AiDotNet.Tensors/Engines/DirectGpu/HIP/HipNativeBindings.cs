@@ -328,8 +328,17 @@ internal static class HipNativeBindings
 
     private static void LogDiagnostic(string message)
     {
-        if (EnableDiagnostics)
+        if (!EnableDiagnostics) return;
+        // Best-effort: this runs inside the availability probe, whose lazy result would cache an exception from a
+        // closed or failing console and rethrow it from every later IsAvailable.
+        try
+        {
             Console.WriteLine(message);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
+        {
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.TraceWarningBestEffort("HIP diagnostic output failed: {0}", ex);
+        }
     }
 
     /// <summary>
