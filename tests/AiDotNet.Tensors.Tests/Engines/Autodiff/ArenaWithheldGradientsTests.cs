@@ -131,7 +131,7 @@ public class ArenaWithheldGradientsTests
         Exception? failure = null;
         var thread = new Thread(() =>
         {
-            try { counts = RunSteps(callerArenaPerStep, steps: 6); }
+            try { counts = RunSteps(callerArenaPerStep, steps: 10); }
             catch (Exception e) { failure = e; }
         });
         thread.Start();
@@ -143,16 +143,19 @@ public class ArenaWithheldGradientsTests
         // itself issued are withheld, and whether it issues one depends on process-wide pool state that tests running
         // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
         // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
-        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth
-        // (the steady count from the second step on), which must not grow.
-        int gradientsPerStep = callerArenaPerStep ? 2 : (counts is { Length: > 1 } ? counts[1] : 0);
+        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth,
+        // which must not grow. How many of them the arena pooled (and so keeps) depends on the same process-wide pool
+        // state, so the first steps can keep fewer while the pool warms (measured [5, 6, 7, 7, 7, 7] in CI): the bound
+        // is the count once warm (step 3), and the leak would still add to it every step after.
+        const int warmSteps = 3;
         Assert.NotNull(counts);
         if (counts is null) return;
+        int gradientsPerStep = callerArenaPerStep ? 2 : counts[warmSteps];
         // Not vacuous: a run that never withheld anything would pass the bound without testing it. The steady state
         // withholds the step's arena-issued gradients, so some step must hold at least one.
         Assert.True(Array.Exists(counts, count => count > 0),
             $"Withheld arrays per step: [{string.Join(", ", counts)}]; no step withheld a gradient, so the bound was not exercised.");
-        for (int step = 0; step < counts.Length; step++)
+        for (int step = callerArenaPerStep ? 0 : warmSteps; step < counts.Length; step++)
             Assert.True(counts[step] <= gradientsPerStep,
                 $"Withheld arrays per step: [{string.Join(", ", counts)}]; step {step} holds {counts[step]}, more than the {gradientsPerStep} of one step.");
     }
