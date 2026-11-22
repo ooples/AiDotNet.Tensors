@@ -14,14 +14,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// <c>log</c> and <c>log2</c> calls are routed to <c>wgsl_tanh</c> / <c>wgsl_log</c> / <c>wgsl_log2</c>, which hold
 /// a few ULP relative everywhere as
 /// the other backends' libm does: the hand-written kernels, the codegen emitter's and the CUDA-dialect translator's
-/// alike. A module that enables f16 keeps the builtins (the helpers are f32-only).</para>
+/// alike. The helpers are scalar f32, and WGSL has no overloading, so three kinds of call keep the builtin: every call in a
+/// module that enables f16, a call whose argument is a vector (a vector constructor, a name or function declared as a
+/// vector, a multi-component swizzle), and a call inside a const or override declaration (a constant expression may not
+/// call a user function).</para>
 /// </summary>
 internal static class WebGpuShaderPrelude
 {
     private const string F32Bits = "fn wgsl_f32_bits(bits: u32) -> f32 { return bitcast<f32>(bits); }\n";
     private const string IsNan = "fn wgsl_is_nan(x: f32) -> bool { return (bitcast<u32>(x) & 0x7FFFFFFFu) > 0x7F800000u; }\n";
 
-    // tanh: below 0.55 its odd Taylor series to x^15 (the first omitted term is under 2e-8 of the answer there);
+    // tanh: below 0.55 its odd Taylor series to x^15 (the first omitted term is under 5e-8 of the answer there);
     // above, 1 - 2 / (exp(2|x|) + 1), whose cancellation is at most a factor of two and whose exp overflow gives 1.
     private const string Tanh = @"fn wgsl_tanh(x: f32) -> f32 {
     let a = abs(x);
@@ -73,16 +76,27 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
     private static readonly Regex BuiltinLog2 = new(@"(?<![\w.])log2\s*\(", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
     private static readonly Regex BuiltinLog = new(@"(?<![\w.])log\s*\(", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
 
+    // Names the source declares as vectors: parameters, fields and typed declarations (name: vecN / name: vecNf),
+    // declarations initialized from a constructor (let name = vecN...), and functions returning one (fn name(...) -> vecN).
+    private static readonly Regex VectorNames = new(
+        @"(\w+)\s*:\s*vec[234]|(?:let|var)\s+(\w+)\s*=\s*vec[234]|fn\s+(\w+)\s*\([^)]*\)\s*->\s*vec[234]",
+        RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    private static readonly Regex Identifier = new(@"[A-Za-z_]\w*", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    private static readonly Regex VectorSyntax = new(@"\bvec[234]|\.[xyzwrgba]{2,4}\b", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+    private static readonly Regex SingleComponent = new(@"\G\.[xyzwrgba]\b", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(5));
+
     public static string Prepare(string source)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
         // Rewritten before the helpers are added, so the helpers' own builtin calls stay builtin; a source that already
         // carries a helper (prepared once) is not rewritten again, or wgsl_log2's builtin fallback would call itself.
-        if (!source.Contains("enable f16"))
+        DirectivesEnd(source, out bool enablesF16);
+        if (!enablesF16)
         {
-            if (!source.Contains("fn wgsl_tanh(")) source = BuiltinTanh.Replace(source, "wgsl_tanh(");
-            if (!source.Contains("fn wgsl_log2(")) source = BuiltinLog2.Replace(source, "wgsl_log2(");
-            if (!source.Contains("fn wgsl_log(")) source = BuiltinLog.Replace(source, "wgsl_log(");
+            HashSet<string>? vectors = null;
+            if (!source.Contains("fn wgsl_tanh(")) source = Rewrite(source, BuiltinTanh, "wgsl_tanh(", ref vectors);
+            if (!source.Contains("fn wgsl_log2(")) source = Rewrite(source, BuiltinLog2, "wgsl_log2(", ref vectors);
+            if (!source.Contains("fn wgsl_log(")) source = Rewrite(source, BuiltinLog, "wgsl_log(", ref vectors);
         }
         string helpers = "";
         if (source.Contains("wgsl_f32_bits(") && !source.Contains("fn wgsl_f32_bits(")) helpers += F32Bits;
@@ -95,19 +109,128 @@ fn wgsl_log_split(x: f32) -> vec2<f32> {
         if (log) helpers += Log;
         if (helpers.Length == 0) return source;
         // Directives (enable / requires / diagnostic) must precede every declaration.
-        int insert = 0;
-        while (true)
-        {
-            int lineStart = insert;
-            while (lineStart < source.Length && (source[lineStart] == ' ' || source[lineStart] == '\t' || source[lineStart] == '\r' || source[lineStart] == '\n')) lineStart++;
-            if (!(Starts(source, lineStart, "enable ") || Starts(source, lineStart, "requires ") || Starts(source, lineStart, "diagnostic"))) break;
-            int end = source.IndexOf(';', lineStart);
-            if (end < 0) break;
-            insert = end + 1;
-        }
+        int insert = DirectivesEnd(source, out _);
         return source.Substring(0, insert) + "\n" + helpers + source.Substring(insert);
     }
 
-    private static bool Starts(string s, int at, string token) => string.CompareOrdinal(s, at, token, 0, token.Length) == 0;
+    // The offset just past the leading directives, skipping whitespace and comments between them; and whether an enable
+    // among them lists f16.
+    private static int DirectivesEnd(string source, out bool enablesF16)
+    {
+        enablesF16 = false;
+        int end = 0;
+        while (true)
+        {
+            int at = SkipTrivia(source, end);
+            bool enable = StartsWord(source, at, "enable");
+            if (!(enable || StartsWord(source, at, "requires") || StartsWord(source, at, "diagnostic"))) return end;
+            int semicolon = source.IndexOf(';', at);
+            if (semicolon < 0) return end;
+            if (enable)
+            {
+                foreach (var extension in source.Substring(at + 6, semicolon - at - 6).Split(','))
+                    if (extension.Trim() == "f16") enablesF16 = true;
+            }
+            end = semicolon + 1;
+        }
+    }
+
+    private static int SkipTrivia(string s, int at)
+    {
+        while (at < s.Length)
+        {
+            if (char.IsWhiteSpace(s[at])) at++;
+            else if (Starts(s, at, "//")) { int line = s.IndexOf('\n', at); at = line < 0 ? s.Length : line + 1; }
+            else if (Starts(s, at, "/*"))
+            {
+                int depth = 0;   // WGSL block comments nest
+                do
+                {
+                    if (Starts(s, at, "/*")) { depth++; at += 2; }
+                    else if (Starts(s, at, "*/")) { depth--; at += 2; }
+                    else at++;
+                } while (depth > 0 && at < s.Length);
+            }
+            else break;
+        }
+        return at;
+    }
+
+    private static string Rewrite(string source, Regex builtin, string helper, ref HashSet<string>? vectors)
+    {
+        var calls = builtin.Matches(source);
+        if (calls.Count == 0) return source;
+        if (vectors is null)
+        {
+            vectors = new HashSet<string>(StringComparer.Ordinal);
+            foreach (Match m in VectorNames.Matches(source))
+                for (int g = 1; g <= 3; g++)
+                    if (m.Groups[g].Success) vectors.Add(m.Groups[g].Value);
+        }
+        var result = new System.Text.StringBuilder(source.Length + calls.Count * 5);
+        int copied = 0;
+        foreach (Match call in calls)
+        {
+            int open = call.Index + call.Length - 1;
+            int close = MatchingParen(source, open);
+            if (close < 0 || InConstantDeclaration(source, call.Index)
+                || IsVector(source.Substring(open + 1, close - open - 1), vectors))
+                continue;
+            result.Append(source, copied, call.Index - copied).Append(helper);
+            copied = open + 1;
+        }
+        return copied == 0 ? source : result.Append(source, copied, source.Length - copied).ToString();
+    }
+
+    private static int MatchingParen(string s, int open)
+    {
+        int depth = 0;
+        for (int i = open; i < s.Length; i++)
+        {
+            if (s[i] == '(') depth++;
+            else if (s[i] == ')' && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    // The statement holding the call (back to the previous ';', '{' or '}') is a const or override declaration.
+    private static bool InConstantDeclaration(string s, int at)
+    {
+        int start = at;
+        while (start > 0 && s[start - 1] != ';' && s[start - 1] != '{' && s[start - 1] != '}') start--;
+        start = SkipTrivia(s, start);
+        while (start < at && s[start] == '@')   // an attribute such as @id(0) before override
+        {
+            var attribute = Identifier.Match(s, start + 1);
+            if (!attribute.Success) break;
+            start = attribute.Index + attribute.Length;
+            if (start < s.Length && s[start] == '(') start = MatchingParen(s, start) + 1;
+            start = SkipTrivia(s, start);
+        }
+        return StartsWord(s, start, "const") || StartsWord(s, start, "override");
+    }
+
+    // An argument that is, or is built from, a vector: a constructor, a swizzle of two or more components, or a name
+    // the source declares as a vector, unless that name is indexed or takes a single component (v.x, v[i]).
+    private static bool IsVector(string argument, HashSet<string> vectors)
+    {
+        if (VectorSyntax.IsMatch(argument)) return true;
+        foreach (Match name in Identifier.Matches(argument))
+        {
+            if (!vectors.Contains(name.Value)) continue;
+            int after = SkipTrivia(argument, name.Index + name.Length);
+            bool component = after < argument.Length
+                && (argument[after] == '[' || SingleComponent.IsMatch(argument, after));
+            if (!component) return true;
+        }
+        return false;
+    }
+
+    private static bool StartsWord(string s, int at, string word)
+        => Starts(s, at, word)
+           && (at + word.Length >= s.Length || !(char.IsLetterOrDigit(s[at + word.Length]) || s[at + word.Length] == '_'));
+
+    private static bool Starts(string s, int at, string token)
+        => at >= 0 && at + token.Length <= s.Length && string.CompareOrdinal(s, at, token, 0, token.Length) == 0;
 }
 #endif
