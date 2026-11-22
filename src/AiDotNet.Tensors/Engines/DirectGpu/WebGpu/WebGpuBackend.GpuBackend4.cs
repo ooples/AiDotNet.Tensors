@@ -6,7 +6,7 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
+public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
 {
     /// <summary>
     /// Upper bound on the Mesa head dimension. It is a runtime and storage
@@ -911,13 +911,20 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
     public void GatedDeltaNetScanForward(
         IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        => ((IGatedDeltaRuleForwardBackend)this).GatedDeltaNetScanForward(q, k, v, alpha, beta, output,
+            batch, seqLen, modelDim, numHeads, headDim, GatedDeltaNetBackwardResolver.OriginalKeyScale(headDim), false);
+
+    void IGatedDeltaRuleForwardBackend.GatedDeltaNetScanForward(
+        IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta, IGpuBuffer output,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
         => DispatchRecurrence("gdn", WebGpuRecurrenceKernels.GatedDeltaScan, batch * numHeads * headDim,
-            new[] { q, k, v, alpha, beta, output }, new[] { batch, seqLen, modelDim, numHeads, headDim });
+            new[] { q, k, v, alpha, beta, output }, new[] { batch, seqLen, modelDim, numHeads, headDim,
+                GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1 : 0 });
 
     void IGatedDeltaNetBackwardBackend.GatedDeltaNetScanBackward(
         IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
         IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
-        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
     {
         if (batch <= 0 || seqLen <= 0 || modelDim <= 0 || numHeads <= 0 || headDim <= 0)
             throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions must be positive.");
@@ -940,8 +947,11 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         }
         using var traj = AllocateBuffer((int)trajLenLong);
         var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
+        // The rule kernels (recompute, backward) also take the key scale's bits and the decay-first flag.
+        var rulePc = new[] { batch, seqLen, modelDim, numHeads, headDim,
+            GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1 : 0 };
         DispatchRecurrence("gdn_recompute", WebGpuRecurrenceKernels.GatedDeltaRecompute, total,
-            new[] { k, v, alpha, beta, traj }, pc);
+            new[] { k, v, alpha, beta, traj }, rulePc);
         using var qk = PackPair(q, k, qkCount);
         using var abTraj = AllocateBuffer(checked(2 * gateCount + (int)trajLenLong));
         Copy(alpha, 0, abTraj, 0, gateCount);
@@ -954,7 +964,7 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
             using var partials = AllocateBuffer(checked(2 * qkCount));
             DispatchRecurrence("gdn_dq", WebGpuRecurrenceKernels.GatedDeltaDq, qkCount, new[] { dOut, traj, dQ }, pc);
             DispatchRecurrence("gdn_backward_det", WebGpuRecurrenceKernels.GatedDeltaBackwardDeterministic, total,
-                new[] { dOut, qk, v, abTraj, partials, dV }, pc);
+                new[] { dOut, qk, v, abTraj, partials, dV }, rulePc);
             DispatchRecurrence("gdn_reduce", WebGpuRecurrenceKernels.GatedDeltaReduce, qkCount,
                 new[] { abTraj, partials, dK, dAlpha, dBeta }, pc);
             return;
@@ -962,7 +972,7 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend
         using var dAb = AllocateBuffer(checked(2 * gateCount));
         Fill(dAb, 0f, 2 * gateCount);
         DispatchRecurrence("gdn_backward", WebGpuRecurrenceKernels.GatedDeltaBackward, total,
-            new[] { dOut, qk, v, abTraj, dQ, dK, dV, dAb }, pc);
+            new[] { dOut, qk, v, abTraj, dQ, dK, dV, dAb }, rulePc);
         Copy(dAb, 0, dAlpha, 0, gateCount);
         Copy(dAb, gateCount, dBeta, 0, gateCount);
     }

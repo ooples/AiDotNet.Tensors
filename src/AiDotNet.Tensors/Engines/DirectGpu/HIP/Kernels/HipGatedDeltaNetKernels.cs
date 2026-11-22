@@ -19,7 +19,7 @@ internal static class HipGatedDeltaNetKernels
 extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_forward(
     const float* Q, const float* K, const float* V, const float* A, const float* B,
     float* output,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * numHeads * headDim;
@@ -29,7 +29,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_forward(
     int h  = (gid / headDim) % numHeads;
     int b  = gid / (headDim * numHeads);
     int hOff = h * headDim;
-    float kappa = 1.0f / sqrtf((float)headDim);
+    float kappa = keyScale;
 
     if (headDim < 0 || headDim > GDN_MAX_HEADDIM) return;
     float Srow[GDN_MAX_HEADDIM];
@@ -41,7 +41,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_forward(
         float a = A[gIdx], bet = B[gIdx];
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
-        float bd = bet * (V[baseOff + di] - sK);
+        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
         for (int ki = 0; ki < headDim; ki++)
             Srow[ki] = a * Srow[ki] + bd * (K[baseOff + ki] * kappa);
         float o = 0.0f;
@@ -53,7 +53,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_forward(
 extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_recompute(
     const float* K, const float* V, const float* A, const float* B,
     float* Straj,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * numHeads * headDim;
@@ -64,7 +64,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_recompute(
     int b  = gid / (headDim * numHeads);
     int hOff = h * headDim;
     int hh = headDim * headDim;
-    float kappa = 1.0f / sqrtf((float)headDim);
+    float kappa = keyScale;
 
     if (headDim < 0 || headDim > GDN_MAX_HEADDIM) return;
     float Srow[GDN_MAX_HEADDIM];
@@ -76,7 +76,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_recompute(
         float a = A[gIdx], bet = B[gIdx];
         float sK = 0.0f;
         for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
-        float bd = bet * (V[baseOff + di] - sK);
+        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
         long trajBase = ((long)(b * numHeads + h) * seqLen + t) * hh + (long)di * headDim;
         for (int ki = 0; ki < headDim; ki++) {
             float s = a * Srow[ki] + bd * (K[baseOff + ki] * kappa);
@@ -95,7 +95,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_backward(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
     float* Straj,
     float* dQ, float* dK, float* dV, float* dA, float* dB,
-    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det)
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, int det, float keyScale, int decayFirst)
 {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * numHeads * headDim;
@@ -106,7 +106,7 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_backward(
     int b  = gid / (headDim * numHeads);
     int hOff = h * headDim;
     int hh = headDim * headDim;
-    float kappa = 1.0f / sqrtf((float)headDim);
+    float kappa = keyScale;
 
     if (headDim < 0 || headDim > GDN_MAX_HEADDIM) return;
     float dSrow[GDN_MAX_HEADDIM];
@@ -124,7 +124,9 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_backward(
             float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
             sK += sprev * (K[baseOff + ki] * kappa);
         }
-        float delta = V[baseOff + di] - sK;
+        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
+        float pa = decayFirst ? a : 1.0f;
+        float delta = V[baseOff + di] - pa * sK;
 
         float dOutVal = dOut[baseOff + di];
         for (int ki = 0; ki < headDim; ki++) {
@@ -143,6 +145,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_backward(
             dB_acc += dSt * delta * kScaled;
             dDelta += dSt * bet * kScaled;
         }
+        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
+        if (decayFirst) dA_acc -= dDelta * sK;
         dV[baseOff + di] = dDelta;
         if (det) {
             int n = batch * seqLen * modelDim;
@@ -158,10 +162,10 @@ extern ""C"" __global__ __launch_bounds__(1024) void gated_delta_scan_backward(
             float dSt = dSrow[ki];
             float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
             float kScaled = K[baseOff + ki] * kappa;
-            float dKS_ki = dSt * (bet * delta) + dSk * sprev;
+            float dKS_ki = dSt * (bet * delta) + dSk * pa * sprev;
             if (det) Straj[trajBase + ki] = dKS_ki * kappa;
             else atomicAdd(&dK[baseOff + ki], dKS_ki * kappa);
-            dSrow[ki] = dSt * a + dSk * kScaled;
+            dSrow[ki] = dSt * a + dSk * pa * kScaled;
         }
     }
 }

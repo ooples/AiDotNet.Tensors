@@ -391,6 +391,37 @@ void main() {
 }
 ";
 
+    /// <summary>Top k (k &lt;= 16) of each row in the bitonic row sort's order: NaN first, larger, ties to the lower index.</summary>
+    public static string TopKRowsSmall => @"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Input { float input_[]; };
+layout(set = 0, binding = 1) writeonly buffer Values { float values_[]; };
+layout(set = 0, binding = 2) writeonly buffer Indices { float indices_[]; };
+layout(push_constant) uniform P { int rows; int cols; int k; };
+bool isnan_(float x) { return (floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u; }
+bool before_(float va, float ia, float vb, float ib) {
+    bool na = isnan_(va), nb = isnan_(vb);
+    if (na != nb) return na;
+    if (!na && va != vb) return va > vb;
+    return ia < ib;
+}
+void main() {
+    int r = int(gl_GlobalInvocationID.x); if (r >= rows) return;
+    int base_ = r * cols;
+    float tv[16]; float ti[16]; int n = 0;
+    for (int c = 0; c < cols; c++) {
+        float v = input_[base_ + c]; float ic = float(c); int pos = n;
+        for (int j = 0; j < n; j++) if (before_(v, ic, tv[j], ti[j])) { pos = j; break; }
+        if (pos < k) {
+            int last = n < k ? n : k - 1;
+            for (int m = last; m > pos; m--) { tv[m] = tv[m - 1]; ti[m] = ti[m - 1]; }
+            tv[pos] = v; ti[pos] = ic; if (n < k) n++;
+        }
+    }
+    for (int j = 0; j < k; j++) { values_[r * k + j] = tv[j]; indices_[r * k + j] = ti[j]; }
+}
+";
+
     public static string OneHotInt32 => @"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Indices { int indices[]; };

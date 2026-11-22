@@ -33,6 +33,14 @@ public static class AiDotNetEngine
 {
     private static IEngine _current;
 
+    // _current is a single reference published with release/acquire semantics: every writer stores it with
+    // Volatile.Write (the setter and detection do so under their locks, which keep it consistent with the deferred-
+    // detection and caller-assigned flags), and readers need only the latest published engine, so the hot read path
+    // takes no lock. All accesses go through these two helpers.
+    private static IEngine ReadCurrent() => Volatile.Read(ref _current);
+
+    private static void PublishCurrent(IEngine engine) => Volatile.Write(ref _current, engine);
+
     // The GPU engine AutoDetectAndConfigureGpu created. It is never disposed by a demotion: an op that read Current
     // before the swap still holds the engine (each of its GPU paths borrows the backend through TryGetBackend with no
     // release point), so disposing it under that op frees native handles mid-kernel (a cudnnSetStream access
@@ -170,7 +178,7 @@ public static class AiDotNetEngine
             // the thread-static read off the hot path while no override exists anywhere.
             if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local) return local;
             if (Volatile.Read(ref _deferredDetection) != 0 && !t_completingDeferred) CompleteDeferredGpuDetection();
-            return Volatile.Read(ref _current);
+            return ReadCurrent();
         }
         set
         {
@@ -192,7 +200,7 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             Volatile.Write(ref _deferredDetection, 0);
-            Volatile.Write(ref _current, value);
+            PublishCurrent(value);
             // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
             Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
         }
@@ -360,7 +368,7 @@ public static class AiDotNetEngine
             var parked = _adoptedGpu;
             if (parked is not null && !parked.IsDisposed && parked.SupportsGpu)
             {
-                Volatile.Write(ref _current, parked);
+                PublishCurrent(parked);
                 Volatile.Write(ref _callerAssigned, false);
                 return true;
             }
@@ -380,13 +388,13 @@ public static class AiDotNetEngine
                     if (_adoptedGpu is { IsDisposed: false } winner && winner.SupportsGpu)
                     {
                         gpuEngine.Dispose();
-                        Volatile.Write(ref _current, winner);
+                        PublishCurrent(winner);
                         Volatile.Write(ref _callerAssigned, false);
                         return true;
                     }
 
                     _adoptedGpu = gpuEngine;
-                    Volatile.Write(ref _current, gpuEngine);
+                    PublishCurrent(gpuEngine);
                     Volatile.Write(ref _callerAssigned, false);
                 }
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
@@ -577,11 +585,11 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
-            var observed = Volatile.Read(ref _current);
+            var observed = ReadCurrent();
             // A reset hands the choice back to the library either way, also when it keeps a plain CPU engine.
             Volatile.Write(ref _callerAssigned, false);
             if (observed is not null && observed.Unwrap().GetType() == typeof(CpuEngine)) return;
-            Volatile.Write(ref _current, new CpuEngine());
+            PublishCurrent(new CpuEngine());
             if (observed.TryGet<DirectGpuTensorEngine>(out var gpu) && ReferenceEquals(gpu, _adoptedGpu)) parked = gpu;
         }
 
@@ -628,9 +636,9 @@ public static class AiDotNetEngine
             engine = _adoptedGpu;
             if (engine is null) return false;
             _adoptedGpu = null;
-            if (ReferenceEquals(Volatile.Read(ref _current), engine))
+            if (ReferenceEquals(ReadCurrent(), engine))
             {
-                Volatile.Write(ref _current, new CpuEngine());
+                PublishCurrent(new CpuEngine());
                 Volatile.Write(ref _callerAssigned, false);
             }
         }
@@ -715,7 +723,7 @@ public static class AiDotNetEngine
         {
             lock (_adoptionLock)
             {
-                if (Volatile.Read(ref _current).Is<DirectGpuTensorEngine>())
+                if (ReadCurrent().Is<DirectGpuTensorEngine>())
                 {
                     // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
                     // This runs from inside a CUDA fault handler on an already-corrupted context; calling
@@ -723,7 +731,7 @@ public static class AiDotNetEngine
                     // crashing the very process the breaker is trying to keep alive on CPU. The breaker
                     // trips at most once per process, so leaking this one context until process exit (the
                     // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
-                    Volatile.Write(ref _current, new CpuEngine());
+                    PublishCurrent(new CpuEngine());
                     // The library installed this CPU engine, even when the GPU it replaced was the caller's.
                     Volatile.Write(ref _callerAssigned, false);
                 }

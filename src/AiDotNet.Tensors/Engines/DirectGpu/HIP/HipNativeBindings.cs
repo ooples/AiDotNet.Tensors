@@ -175,8 +175,9 @@ internal static class HipNativeBindings
     private const string HipRtcLibrary = RocmNativeLibraryResolver.RuntimeCompilerImportName;
 #endif
 
-    private static bool _isAvailable;
-    private static bool _availabilityChecked;
+    private static readonly object s_initLock = new();
+    private static readonly Lazy<bool> s_availability = new(ProbeAvailability,
+        System.Threading.LazyThreadSafetyMode.ExecutionAndPublication);
     private static bool _dllPathInitialized;
     internal static string? RocmBinPath { get; private set; }
     public static bool EnableDiagnostics { get; set; }
@@ -199,9 +200,16 @@ internal static class HipNativeBindings
     /// </summary>
     private static void InitializeDllSearchPath()
     {
-        if (_dllPathInitialized) return;
-        _dllPathInitialized = true;
+        lock (s_initLock)
+        {
+            if (_dllPathInitialized) return;
+            InitializeDllSearchPathCore();
+            _dllPathInitialized = true;
+        }
+    }
 
+    private static void InitializeDllSearchPathCore()
+    {
         if (RocmNativeLibraryResolver.CurrentOperatingSystem != RocmOperatingSystem.Windows)
         {
             return;
@@ -327,44 +335,38 @@ internal static class HipNativeBindings
     /// <summary>
     /// Gets whether HIP runtime is available on this system.
     /// </summary>
-    public static bool IsAvailable
+    public static bool IsAvailable => s_availability.Value;
+
+    private static bool ProbeAvailability()
     {
-        get
+        // Initialize DLL search path before any P/Invoke calls
+        InitializeDllSearchPath();
+
+        try
         {
-            if (!_availabilityChecked)
-            {
-                _availabilityChecked = true;
-
-                // Initialize DLL search path before any P/Invoke calls
-                InitializeDllSearchPath();
-
-                try
-                {
-                    int count = 0;
-                    var result = hipGetDeviceCount(ref count);
-                    _isAvailable = result == HipError.Success && count > 0;
-                    LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {_isAvailable}");
-                }
-                catch (DllNotFoundException ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
-                    LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
-                    LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
-                    _isAvailable = false;
-                }
-                catch (EntryPointNotFoundException ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
-                    LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
-                    _isAvailable = false;
-                }
-                catch (Exception ex)
-                {
-                    LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
-                    _isAvailable = false;
-                }
-            }
-            return _isAvailable;
+            int count = 0;
+            var result = hipGetDeviceCount(ref count);
+            bool isAvailable = result == HipError.Success && count > 0;
+            LogDiagnostic($"[HIP Diagnostics] hipGetDeviceCount returned: {result}, device count: {count}, available: {isAvailable}");
+            return isAvailable;
+        }
+        catch (DllNotFoundException ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] DllNotFoundException: {ex.Message}");
+            LogDiagnostic("[HIP Diagnostics] amdhip64.dll not found. AMD HIP SDK is not installed.");
+            LogDiagnostic("[HIP Diagnostics] To use HIP, install AMD ROCm/HIP SDK from https://rocm.docs.amd.com/");
+            return false;
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] EntryPointNotFoundException: {ex.Message}");
+            LogDiagnostic("[HIP Diagnostics] HIP DLL found but missing expected function. SDK version mismatch?");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            LogDiagnostic($"[HIP Diagnostics] Exception during availability check: {ex.GetType().Name}: {ex.Message}");
+            return false;
         }
     }
 

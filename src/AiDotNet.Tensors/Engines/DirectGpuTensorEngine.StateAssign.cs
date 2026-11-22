@@ -41,18 +41,177 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// <see cref="AssignStateInPlace"/> for several states at once: with <see cref="IBatchedCopyBackend"/> (CUDA) the copies are one launch (one graph node
+    /// in a captured plan instead of one memcpy node per state). The states must be distinct tensors.
+    /// </summary>
+    internal void AssignStatesInPlace<T>(IReadOnlyList<Tensor<T>> states, IReadOnlyList<Tensor<T>> nexts)
+    {
+        if (states is null) throw new ArgumentNullException(nameof(states));
+        if (nexts is null) throw new ArgumentNullException(nameof(nexts));
+        if (nexts.Count != states.Count) throw new ArgumentException("One next value per state.", nameof(nexts));
+        if (states.Count < 2 || typeof(T) != typeof(float))
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
+        }
+        using var lease = EnterGpuOp();
+        if (!TryGetBackend(out var backend) || backend is not IBatchedCopyBackend batched)
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
+        }
+        var destinations = new IGpuBuffer[states.Count];
+        var sources = new OwnedBuffer[states.Count];
+        var lengths = new int[states.Count];
+        bool ordered = false;
+        try
+        {
+            for (int i = 0; i < states.Count; i++)
+            {
+                var (state, next) = (states[i], nexts[i]);
+                if (state is null) throw new ArgumentNullException(nameof(states));
+                if (next is null) throw new ArgumentNullException(nameof(nexts));
+                if (next.Length != state.Length)
+                    throw new ArgumentException(
+                        $"A state of {state.Length} elements cannot be assigned a value of {next.Length}.", nameof(nexts));
+                if (!state.IsContiguous || IsPartialView(state))
+                    throw new ArgumentException("A plan state must be a whole contiguous tensor, not a view.", nameof(states));
+                destinations[i] = PersistentBufferFor(backend, state);
+                sources[i] = GetOrAllocateBuffer(backend, next);
+                lengths[i] = state.Length;
+            }
+            var sourceBuffers = sources.Select(s => s.Buffer).ToArray();
+            // One launch runs its copies concurrently, so it is only equivalent to the declared-order writes when no
+            // copy touches another's buffer: two states sharing one backing array, or a next that is a view of another
+            // state. Those take the ordered per-state path below.
+            ordered = StateCopiesOverlap(sourceBuffers, destinations);
+            if (!ordered) batched.CopyMany(sourceBuffers, destinations, lengths);
+        }
+        finally
+        {
+            foreach (var s in sources) s.Dispose();
+        }
+        if (ordered)
+        {
+            for (int i = 0; i < states.Count; i++) AssignStateInPlace(states[i], nexts[i]);
+            return;
+        }
+        for (int i = 0; i < states.Count; i++)
+        {
+            states[i].IncrementVersion();
+            BindResidentBuffer(states[i], destinations[i], backend);
+        }
+    }
+
+    /// <summary>
+    /// Whether a batch of state copies cannot run as one concurrent launch: two destinations are the same device buffer,
+    /// or a source is another copy's destination (it would be read before or after that copy overwrites it).
+    /// </summary>
+    internal static bool StateCopiesOverlap(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations)
+    {
+        static bool Same(IGpuBuffer a, IGpuBuffer b)
+            => ReferenceEquals(a, b) || (a.Handle != IntPtr.Zero && a.Handle == b.Handle);
+        for (int i = 0; i < destinations.Count; i++)
+            for (int j = 0; j < destinations.Count; j++)
+            {
+                if (i == j) continue;
+                if (j > i && Same(destinations[i], destinations[j])) return true;
+                if (Same(sources[i], destinations[j])) return true;
+            }
+        return false;
+    }
+
+    /// <summary>
     /// Gives a captured plan's input slot a persistent device buffer holding its current host value and binds it,
     /// so the capture records reads of that address and every replay refreshes it in place. No-op when bound.
     /// </summary>
-    internal IGpuBuffer? PinInputResident<T>(Tensor<T> input)
+    internal IGpuBuffer? PinInputResident<T>(Tensor<T> input) => PinResident(input, deviceAuthoritative: true);
+
+    /// <summary>
+    /// Gives a leaf a captured plan reads (a constant, a weight) a persistent device buffer, so the capture records a
+    /// read of a stable address instead of a transient upload. The host copy stays authoritative (nothing downloads).
+    /// </summary>
+    internal IGpuBuffer? PinLeafResident<T>(Tensor<T> leaf) => PinResident(leaf, deviceAuthoritative: false);
+
+    private IGpuBuffer? PinResident<T>(Tensor<T> tensor, bool deviceAuthoritative)
     {
-        if (input is null) throw new ArgumentNullException(nameof(input));
-        if (!input.IsContiguous || IsPartialView(input) || !TryGetBackend(out var backend)) return null;
-        if (input._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= input.Length
-            && ReferenceEquals(input._gpuBackend, backend) && input._gpuBufferVersion == input.GpuCacheVersion) return bound;
-        var buffer = PersistentBufferFor(backend, input);
-        BindResidentBuffer(input, buffer, backend);
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (!tensor.IsContiguous || IsPartialView(tensor)) return null;
+        using var __gpuOp = EnterGpuOp();
+        if (!TryGetBackend(out var backend)) return null;
+        if (tensor._gpuBuffer is { } bound && bound.Handle != IntPtr.Zero && bound.Size >= tensor.Length
+            && ReferenceEquals(tensor._gpuBackend, backend) && tensor._gpuBufferVersion == tensor.GpuCacheVersion) return bound;
+        var buffer = PersistentBufferFor(backend, tensor);
+        BindResidentBuffer(tensor, buffer, backend, isDeviceModified: deviceAuthoritative);
         return buffer;
+    }
+
+    /// <summary>
+    /// A device copy of the first <paramref name="length"/> elements of <paramref name="buffer"/> (stream-ordered), so a
+    /// pass that writes the buffer in place can be undone with <see cref="RestoreDeviceSnapshot"/>.
+    /// </summary>
+    internal IGpuBuffer TakeDeviceSnapshot(IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
+        var snapshot = AllocateDeviceBufferUninitialized(backend, length);
+        try
+        {
+            backend.Copy(buffer, snapshot, length);
+        }
+        catch
+        {
+            // The caller never receives the snapshot, so nothing else can release it.
+            snapshot.Dispose();
+            throw;
+        }
+        return snapshot;
+    }
+
+    /// <summary>Writes a <see cref="TakeDeviceSnapshot"/> back into <paramref name="buffer"/> and frees the snapshot.</summary>
+    internal void RestoreDeviceSnapshot(IGpuBuffer snapshot, IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        // Freed on every path, including a failed copy: the caller handed the snapshot over.
+        using var owned = snapshot;
+        if (!TryGetBackend(out var backend)) throw new InvalidOperationException("No GPU backend.");
+        backend.Copy(owned, buffer, length);
+    }
+
+    /// <summary>
+    /// Downloads the first <paramref name="length"/> elements of a buffer a captured graph writes (a replayed plan's
+    /// output), independent of any tensor's binding to it. Null when the buffer is gone.
+    /// </summary>
+    internal float[]? DownloadCapturedBuffer(IGpuBuffer buffer, int length)
+    {
+        using var __gpuOp = EnterGpuOp();
+        if (buffer is null || buffer.Handle == IntPtr.Zero || buffer.Size < length || !TryGetBackend(out var backend)) return null;
+        if (buffer.Size == length) return backend.DownloadBuffer(buffer);
+        using var exact = backend.AllocateBuffer(length);
+        backend.Copy(buffer, 0, exact, 0, length);
+        return backend.DownloadBuffer(exact);
+    }
+
+    /// <summary>
+    /// Undoes <see cref="PinInputResident{T}"/> when a plan goes back to eager execution: SetInputs writes only the host
+    /// copy, and a pinned binding would keep serving the call that pinned it (measured: every eager call after an
+    /// abandoned capture read that call's input).
+    /// </summary>
+    internal void UnpinInput<T>(Tensor<T> input)
+    {
+        if (input is not null && input._gpuBuffer is not null) InvalidateStaleBinding(input);
+    }
+
+    private void InvalidateStaleBinding<T>(Tensor<T> tensor)
+    {
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) InvalidateActivationCacheEntry(array);
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
     }
 
     // The tensor's own device buffer: the bound one, else the cached copy of its host array, else a fresh upload
@@ -82,6 +241,7 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal void RearmStateAfterReplay<T>(Tensor<T> state, IGpuBuffer capturedBuffer)
     {
+        using var __gpuOp = EnterGpuOp();
         if (TryGetBackend(out var backend))
         {
             state.IncrementVersion();

@@ -405,6 +405,9 @@ public partial class DifferentiableOpsGradCheckSweep
                                    SafeTensor([1, 3, 2], r), SafeTensor([2, 3, 2], r), 2, 0.1],
         ["GatedDeltaNetScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                              SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],
+        // The rule overload, under the paper's rule (the ScaledKeys value is the overload above).
+        ["GatedDeltaNetScanForward|T,T,T,T,T,int,GatedDeltaRule"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
+            SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2, GatedDeltaRule.Standard],
         ["LstmCellFromGates"] = r => [SafeTensor([2, 12], r), SafeTensor([2, 3], r), null!],
         ["XLstmScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                      SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), SafeTensor([1, 3, 2], r), 2],

@@ -62,20 +62,32 @@ public sealed partial class CudaBackend : IMultiTensorKernels, IFusedNormClipKer
         {
             using var _ = PushContext();
             var table = GetGradientTable(tensors, sizes);
-            int total = table.TotalChunks;
-            var partials = EnsureNormPartials(total);
             // The ticket starts at zero and the launch's last block resets it.
             var ticket = _normTicket ??= AllocateBuffer(new float[1]);
-            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-            IntPtr partH = partials.Handle, tH = ticket.Handle, recH = record.Handle, scH = scale?.Handle ?? record.Handle;
-            int headroom = Gpu.DeterministicGradientNorm.Headroom(total);
-            uint bits = Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm);
-            uint pol = scale is null ? DeterministicNormKernels.RecordOnly : (uint)policy;
-            void** a = stackalloc void*[12];
-            a[0] = &pH; a[1] = &sH; a[2] = &ctH; a[3] = &csH; a[4] = &total; a[5] = &partH; a[6] = &tH; a[7] = &headroom;
-            a[8] = &recH; a[9] = &bits; a[10] = &pol; a[11] = &scH;
-            LaunchKernel(kernel, (uint)Math.Min(total, FusedNormMaxBlocks), DeterministicNormKernels.GroupSize, a);
+            LaunchNormAndClipScale(kernel, table, EnsureNormPartials(table.TotalChunks), ticket, record, maxNorm, scale,
+                policy);
         }
+    }
+
+    /// <summary>
+    /// The fused norm-and-clip launch over a given table and scratch: the shared ones above, or a captured graph's own
+    /// (CudaGraphStepIo), which another tensor list replacing the shared table cannot free under the graph.
+    /// </summary>
+    private unsafe void LaunchNormAndClipScale(IntPtr kernel, MultiTensorTable table, IGpuBuffer partials,
+        IGpuBuffer ticket, IGpuBuffer record, float maxNorm, IGpuBuffer? scale, Gpu.NonFiniteGradientPolicy policy)
+    {
+        int total = table.TotalChunks;
+        if (partials.Size < Math.Max(1, total) * Gpu.DeterministicGradientNorm.PartialWords)
+            throw new ArgumentException("The norm partials are smaller than the table's chunks need.", nameof(partials));
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr partH = partials.Handle, tH = ticket.Handle, recH = record.Handle, scH = scale?.Handle ?? record.Handle;
+        int headroom = Gpu.DeterministicGradientNorm.Headroom(total);
+        uint bits = Gpu.DeterministicGradientNorm.SingleToUInt32Bits(maxNorm);
+        uint pol = scale is null ? DeterministicNormKernels.RecordOnly : (uint)policy;
+        void** a = stackalloc void*[12];
+        a[0] = &pH; a[1] = &sH; a[2] = &ctH; a[3] = &csH; a[4] = &total; a[5] = &partH; a[6] = &tH; a[7] = &headroom;
+        a[8] = &recH; a[9] = &bits; a[10] = &pol; a[11] = &scH;
+        LaunchKernel(kernel, (uint)Math.Min(total, FusedNormMaxBlocks), DeterministicNormKernels.GroupSize, a);
     }
 
     // Blocks of the fused norm launch (each grid-strides over chunks): enough to fill the device, few enough that the

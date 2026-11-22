@@ -4686,7 +4686,7 @@ public partial class DirectGpuTensorEngine
     }
 
     private OwnedBuffer GetOrAllocateInt32IndexBuffer(
-        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null, int upperBound = 0)
+        IDirectGpuBackend backend, Tensor<int> indices, Tensor<int>? originalIndices = null, int upperBound = 0, bool requireUnique = false)
     {
         if (ResidentStepActive && originalIndices is not null && !HasResidentIndexStorage(originalIndices))
             indices = originalIndices;
@@ -4696,7 +4696,7 @@ public partial class DirectGpuTensorEngine
             // upload per call is a cuMemAlloc and a synchronous copy inside the captured step, which aborts the capture
             // and sent the op to the host path, whose read of its device-resident input aborted it again.
             if (ResidentStepActive)
-                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices, upperBound), ownsBuffer: false);
+                return new OwnedBuffer(GetHostIndexDeviceCopy(backend, indices, upperBound, requireUnique), ownsBuffer: false);
             return new OwnedBuffer(backend.AllocateIntBuffer(indices.GetDataArray()), ownsBuffer: true);
         }
 
@@ -4789,7 +4789,7 @@ public partial class DirectGpuTensorEngine
     /// storage version changed (a constant id table uploads once). A captured step reads it through a stable pointer;
     /// <see cref="RefreshHostIndexDeviceCopiesNow"/> brings every copy up to date before a replay.
     /// </summary>
-    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices, int upperBound = 0)
+    private IGpuBuffer GetHostIndexDeviceCopy(IDirectGpuBackend backend, Tensor<int> indices, int upperBound = 0, bool requireUnique = false)
     {
         HostIndexDeviceCopy copy;
         lock (_hostIndexLock)
@@ -4810,11 +4810,11 @@ public partial class DirectGpuTensorEngine
             }
         }
         RefreshHostIndexDeviceCopy(backend, copy, indices, upperBound);
-        RecordHostIndexBinding(copy, indices, upperBound);
+        RecordHostIndexBinding(copy, indices, upperBound, requireUnique);
         return copy.Buffer!;
     }
 
-    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0)
+    private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0, bool requireUnique = false)
     {
         int n = indices.Length;
         object storage = indices.StorageIdentity;
@@ -4822,11 +4822,13 @@ public partial class DirectGpuTensorEngine
         lock (copy)
         {
             int[]? data = null;
-            if (upperBound > 0)
+            if (upperBound > 0 || requireUnique)
             {
                 data = indices.ToArray();
+                if (requireUnique && new HashSet<int>(data).Count != n)
+                    throw new InvalidOperationException("Captured index writes require distinct destinations.");
                 for (int i = 0; i < n; i++)
-                    if (data[i] < 0 || data[i] >= upperBound)
+                    if (upperBound > 0 && (data[i] < 0 || data[i] >= upperBound))
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Target ID {data[i]} at position {i} is out of bounds for vocabulary size {upperBound}.");
             }
@@ -5063,6 +5065,11 @@ public partial class DirectGpuTensorEngine
     }
 
     private const int TopKChunk = 128;
+    // Above this a row is long enough that one thread scanning it is slower than the sort (or the tournament).
+    private const int SmallTopKMaxColumns = 1024;
+    private int _topKSmallRowsCompleted;
+    /// <summary>Number of TensorTopK calls the one-launch small-row kernel served (tests).</summary>
+    internal int TopKSmallRowsCompleted => Volatile.Read(ref _topKSmallRowsCompleted);
 
     private int _topKTournamentsCompleted;
 
@@ -5166,7 +5173,6 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
         using var __gpuOp = EnterGpuOp();
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         int normalizedAxis = axis < 0 ? axis + tensor.Rank : axis;
@@ -5197,6 +5203,25 @@ public partial class DirectGpuTensorEngine
             int columns = tensor._shape[1];
             int selected = Math.Min(k, columns);
             using var input = GetOrAllocateBuffer(backend, tensor);
+            // Small k over a short row (a router's top-2 of 8): one launch, one thread per row, in the row sort's order.
+            if (columns <= SmallTopKMaxColumns && backend is DirectGpu.ISmallTopKRowsBackend small && selected <= small.MaxSmallTopK)
+            {
+                using var smallValues = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
+                using var smallIndices = AllocateFullyWrittenOutputBuffer(backend, rows * selected);
+                small.TopKRowsSmall(input.Buffer, smallValues.Buffer, smallIndices.Buffer, rows, columns, selected);
+                var smallTop = DeferTensorResult<T>(backend, smallValues.Buffer, rows * selected, new[] { rows, selected });
+                smallValues.RelinquishOwnership();
+                indices = DeferTensorResult<int>(backend, smallIndices.Buffer, rows * selected, new[] { rows, selected });
+                smallIndices.RelinquishOwnership();
+                Interlocked.Increment(ref _topKSmallRowsCompleted);
+                if (Autodiff.DifferentiableOps.IsRecording<T>())
+                {
+                    var savedIndices = SnapshotIndices(backend, indices);
+                    Autodiff.DifferentiableOps.RecordUnary("TopK", smallTop, tensor,
+                        Autodiff.BackwardFunctions<T>.TopKBackward, new object[] { savedIndices, 1 });
+                }
+                return smallTop;
+            }
             // Small k over a long row (LM logits: k = 32 of 49,152): exact chunk tournament instead of sorting the row.
             int sortedStride = columns;
             bool tournament = selected * 2 <= TopKChunk && columns >= 4 * TopKChunk;
@@ -7250,7 +7275,7 @@ public partial class DirectGpuTensorEngine
                 return base.TensorIndexCopy(tensor, axis, indices, source);
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstAxis, requireUnique: true);
             var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
@@ -10032,10 +10057,12 @@ public partial class DirectGpuTensorEngine
             outShape[normalizedAxis] = indices.Length;
             int outputLength = outerSize * indices.Length * innerSize;
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousInput);
+            // Gather only reads: repeated source indices are valid, so only the bounds are checked.
             using var indexBuffer = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices, originalIndices: indices, upperBound: axisSize);
+            // Every output element is gathered (the indices were bounds-checked): no zero fill.
             return DispatchDeferredGpuOp<T>(backend, outputLength, outShape, output =>
                 indexBackend.IndexSelect(sourceBuffer.Buffer, indexBuffer.Buffer, output,
-                    outerSize, axisSize, indices.Length, innerSize));
+                    outerSize, axisSize, indices.Length, innerSize), fullyWritten: true);
         }
         catch
         {
@@ -10175,7 +10202,8 @@ public partial class DirectGpuTensorEngine
             using var destinationBuffer = GetOrAllocateBuffer(backend, cd);
             using var sourceBuffer = GetOrAllocateBuffer(backend, cs);
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
-            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            var floatIndex = RentOpScratch(backend, Math.Max(1, indices.Length), leases);
+            IndexConversion.Resolve(backend).Int32ToFloat(int32Index.Buffer, floatIndex, indices.Length);
             IGpuBuffer Scratch(int size) => RentOpScratch(backend, size, leases);
             var claims = Scratch(n);
             var winners = Scratch(m);
@@ -10188,7 +10216,7 @@ public partial class DirectGpuTensorEngine
 
             result = DispatchDeferredGpuOp<T>(backend, n, (int[])destination._shape.Clone(), output =>
             {
-                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex, positions, claims, winners,
                     outer, srcDim, dstDim, inner);
                 // torch.scatter keeps the last write to a slot. Only the winning writes carry their source value into
                 // a zeroed buffer, so each written slot receives exactly one non-zero term and the atomic sum is exact.
@@ -10282,11 +10310,12 @@ public partial class DirectGpuTensorEngine
         try
         {
             using var int32Index = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
-            using var floatIndex = GetOrAllocateNumericIndexBuffer(backend, ci);
+            var floatIndex = RentOpScratch(backend, Math.Max(1, indices.Length), leases);
+            IndexConversion.Resolve(backend).Int32ToFloat(int32Index.Buffer, floatIndex, indices.Length);
             var claims = RentOpScratch(backend, n, leases);
             var positions = RentOpScratch(backend, m, leases);
             return DispatchDeferredGpuOp<T>(backend, m, (int[])indices._shape.Clone(), winners =>
-                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex.Buffer, positions, claims, winners,
+                ScatterLastWritesOnDevice(backend, int32Index.Buffer, floatIndex, positions, claims, winners,
                     outer, srcDim, dstDim, inner));
         }
         catch (NotSupportedException capabilityGap)

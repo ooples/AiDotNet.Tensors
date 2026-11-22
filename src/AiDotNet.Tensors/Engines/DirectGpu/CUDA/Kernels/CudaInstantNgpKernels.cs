@@ -5,7 +5,7 @@ public static class CudaInstantNgpKernels
     public static string[] GetKernelNames() =>
         ["instant_ngp_hash_encode_level", "instant_ngp_hash_encode_level_backward",
             "frexp_decompose", "unique_consecutive_compact", "unique_consecutive_with_info", "unique_sorted_with_info", "project_gaussians_3d_to_2d", "sample_rays_with_occupancy", "resident_mode", "resident_indices_to_int32", "fused_ce_target_positions", "resident_one_hot_int32", "resident_index_add", "resident_index_select", "resident_scatter_max_argmax_rows", "resident_uniform_mesh_laplacian", "resident_scatter_add_rows", "resident_scatter_mean_rows_counts", "resident_scatter_softmax_rows", "resident_scatter_add_backward_rows", "resident_scatter_mean_backward_rows", "resident_scatter_max_backward_rows", "resident_scatter_softmax_backward_rows", "nonzero_compact", "ctc_loss_forward", "importance_sampling", "resident_nms",
-            "generate_spiral_indices"];
+            "generate_spiral_indices", "resident_topk_rows_small"];
 
     public static string GetSource() => @"
 #ifndef INFINITY
@@ -369,6 +369,33 @@ extern ""C"" __global__ __launch_bounds__(256) void fused_ce_target_positions(
     positionBits[gid] = __int_as_float((gid % chunk) * vocab + id);
     positionBits[rows + gid] = raw == id ? 0.0f : __int_as_float(0x7fc00000);
     positionBits[2 * rows + gid] = raw == id ? 0.0f : 1.0f;
+}
+
+// Top k (k <= 16) of each row, one thread per row: an insertion list in registers, in the bitonic row sort's order
+// (NaN first, then larger values, ties to the lower index). Indices are written as floats, as that sort writes them.
+// NaN is tested on the bits, so a fast-math compile cannot fold it away.
+__device__ __forceinline__ int topk_small_before(float va, float ia, float vb, float ib) {
+    int na = (__float_as_uint(va) & 0x7fffffffu) > 0x7f800000u, nb = (__float_as_uint(vb) & 0x7fffffffu) > 0x7f800000u;
+    if (na != nb) return na;
+    if (!na && va != vb) return va > vb;
+    return ia < ib;
+}
+extern ""C"" __global__ __launch_bounds__(256) void resident_topk_rows_small(
+    const float* __restrict__ input, float* __restrict__ values, float* __restrict__ indices, int rows, int cols, int k)
+{
+    int r = (int)(blockIdx.x * blockDim.x + threadIdx.x); if (r >= rows) return;
+    const float* row = input + (long long)r * cols;
+    float tv[16]; float ti[16]; int n = 0;
+    for (int c = 0; c < cols; c++) {
+        float v = row[c]; float ic = (float)c; int pos = n;
+        for (int j = 0; j < n; j++) if (topk_small_before(v, ic, tv[j], ti[j])) { pos = j; break; }
+        if (pos < k) {
+            int last = n < k ? n : k - 1;
+            for (int m = last; m > pos; m--) { tv[m] = tv[m - 1]; ti[m] = ti[m - 1]; }
+            tv[pos] = v; ti[pos] = ic; if (n < k) n++;
+        }
+    }
+    for (int j = 0; j < k; j++) { values[(long long)r * k + j] = tv[j]; indices[(long long)r * k + j] = ti[j]; }
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void resident_one_hot_int32(

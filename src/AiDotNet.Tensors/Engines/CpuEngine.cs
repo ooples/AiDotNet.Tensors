@@ -42568,8 +42568,15 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorOneHot<T>(Tensor<int> indices, int depth)
     {
         if (indices == null) throw new ArgumentNullException(nameof(indices));
-        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
         if (depth <= 0) throw new ArgumentException("Depth must be positive", nameof(depth));
+        // Indices a recorded node refreshes in place each execution (TopK's): recorded as a node after that producer, in
+        // training and inference traces. Any other index tensor (a frozen one, or another int op's output, such as a
+        // reshape of TopK's indices traced as its own node) still crosses element types.
+        var capturedIndices = indices;
+        if (GraphMode.IsActive && TryRecordCompiledOp("TensorOneHot", Array.Empty<Tensor<T>?>(),
+                e => e.TensorOneHot<T>(capturedIndices, depth), out var recorded, inInferenceTrace: true))
+            return recorded;
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numIndices = indices.Length;
@@ -43405,8 +43412,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
-
+        // Recorded as a compiled op whose replay refreshes the traced indices tensor in place, so its readers (index
+        // selects, gathers) see each execution's indices; inference plans included.
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
@@ -43418,7 +43425,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int capturedAxis = axis;
         if (TryRecordCompiledOp("TensorTopK", new Tensor<T>?[] { tensor },
                 e => (e.TensorTopK(tensor, k, capturedAxis, out var fresh), fresh),
-                RefreshIndices, out var compiledNode, out var compiledIndices))
+                RefreshIndices, out var compiledNode, out var compiledIndices, inInferenceTrace: true))
         {
             indices = compiledIndices;
             return compiledNode;
@@ -43571,7 +43578,6 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (axis < 0) axis = tensor.Rank + axis;
 
@@ -43580,15 +43586,23 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && tensor.Rank >= 1 && axis >= 0 && axis < tensor.Rank)
             {
+                // The indices are a concrete Tensor<int> the replay reads live (a frozen index table, or the indices
+                // a compiled TopK refreshes in place each execution), so an inference plan can record this too.
                 RequireConcreteIndices(indices, "TensorIndexSelect");
                 var captured = tensor;
                 var capIndices = indices;
                 int capAxis = axis;
                 var outShape = (int[])tensor._shape.Clone();
                 outShape[axis] = indices.Length;
-                return scope.RecordUnary(LazyNodeType.Custom, "TensorIndexSelect", tensor, outShape,
+                var operands = new List<Tensor<T>> { tensor };
+                DependOnProducer(scope, indices, operands);
+                return scope.RecordVariadic(LazyNodeType.Custom, "TensorIndexSelect", operands.ToArray(), outShape,
                     (eng, output) => { var r = eng.TensorIndexSelect(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis });
+                    BackwardFunctions<T>.IndexSelectBackward, new object[] { capIndices, capAxis },
+                    // A producer operand only orders the schedule. It is not a gradient edge: IndexSelectBackward writes a
+                    // gradient for the selected tensor alone, and scores that feed only the indices must not become loss
+                    // ancestors (the optimizer would still apply weight decay to them).
+                    differentiableInputIndices: operands.Count > 1 ? new[] { 0 } : null);
             }
         }
 
