@@ -35,6 +35,15 @@ public enum CrossBackendTensorPolicy
 }
 
 /// <summary>
+/// The <see cref="CrossBackendTensorPolicy.Throw"/> rejection. An <see cref="InvalidOperationException"/> to callers;
+/// a type of its own so the engine can tell it from a GPU route failure, which an op answers with its CPU fallback.
+/// </summary>
+internal sealed class CrossBackendTensorException : InvalidOperationException
+{
+    internal CrossBackendTensorException(string message) : base(message) { }
+}
+
+/// <summary>
 /// Resolves a tensor's GPU buffer against the backend of the engine op running on the calling thread
 /// (<see cref="GpuOpGate.CurrentOpBackend"/>) and applies <see cref="AiDotNetEngine.CrossBackendPolicy"/>.
 /// </summary>
@@ -88,12 +97,14 @@ internal static class CrossBackendTensors
     /// whose caller writes through the host and uploads it itself: its device copy is read back only while a device
     /// write is still pending, and it is not re-placed.
     /// </summary>
+    /// <param name="deviceAuthoritative">The owner updates this tensor on the device (an in-place state such as a
+    /// running statistic): its device copy is the current one whatever the version stamps say, and is read back.</param>
     internal static void Resolve<T>(Tensor<T> tensor, IDirectGpuBackend owner, IDirectGpuBackend consumer,
-        bool hostAuthoritative = false)
+        bool hostAuthoritative = false, bool deviceAuthoritative = false)
     {
         var policy = AiDotNetEngine.CrossBackendPolicy;
         if (policy == CrossBackendTensorPolicy.Throw)
-            throw new InvalidOperationException(
+            throw Reject(
                 $"A tensor of shape [{Shape(tensor)}] is on the {Describe(owner)} backend, but the operation runs on "
                 + $"{Describe(consumer)}. Move it to the engine's device first (Tensor.To, or Tensor.Gpu with that engine as "
                 + "AiDotNetEngine.Current), or set AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn.");
@@ -110,7 +121,7 @@ internal static class CrossBackendTensors
         bool pending = (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array && Helpers.HostSync.IsPending(array))
                        || Helpers.HostSync.IsPending(tensor.DataVector);
         bool deviceCurrent = wasResident && tensor._gpuBufferVersion == tensor.GpuCacheVersion;
-        bool readBack = pending || (!hostAuthoritative && deviceCurrent);
+        bool readBack = pending || deviceAuthoritative || (!hostAuthoritative && deviceCurrent);
 
         var ownerEngine = DirectGpuTensorEngine.EngineOwning(Unwrap(owner));
         using (var ownerLease = ownerEngine?.EnterGpuOp() ?? default)
@@ -121,7 +132,7 @@ internal static class CrossBackendTensors
                     $"A tensor of shape [{Shape(tensor)}] is held on the {Describe(owner)} backend by an engine that is being "
                     + $"disposed, so it cannot be read back for the operation on {Describe(consumer)}.");
             // An owner mid-teardown frees its own memory with its context: the buffer is detached, not freed here.
-            tensor.ReleaseForeignGpuBinding(readBack, free: ownerLive);
+            tensor.ReleaseForeignGpuBinding(readBack, free: ownerLive, downloadBound: deviceAuthoritative);
         }
         // Re-place it on the op's backend exactly as Tensor.Gpu() would have (version-tagged, host-mirrored), so a
         // resident parameter stays resident: left host-only, an on-device optimizer would update a buffer the forward
@@ -147,7 +158,23 @@ internal static class CrossBackendTensors
     {
         var owner = tensor._gpuBackend;
         if (tensor._gpuBuffer is null || owner is null || SameAddressSpace(owner, consumer)) return;
-        Resolve(tensor, owner, consumer, hostAuthoritative);
+        // A tensor its owner keeps current on the device is not host-authoritative, whoever asks: its device copy is
+        // read back before the binding goes, or the owner's last in-place update would be lost.
+        bool deviceAuthoritative = DirectGpuTensorEngine.EngineOwning(Unwrap(owner))?.IsBoundDeviceAuthoritative(tensor) == true;
+        Resolve(tensor, owner, consumer, hostAuthoritative && !deviceAuthoritative, deviceAuthoritative);
+    }
+
+    /// <summary>
+    /// The policy rejection for <paramref name="message"/>. Inside an engine op it is also left pending on the thread
+    /// (<see cref="GpuOpGate.NotePolicyRejection"/>): many ops answer any exception from their GPU route with the CPU
+    /// fallback, and a rejection swallowed that way is rethrown when the outermost op on the thread ends, so
+    /// <see cref="CrossBackendTensorPolicy.Throw"/> always reaches the caller.
+    /// </summary>
+    internal static CrossBackendTensorException Reject(string message)
+    {
+        var rejection = new CrossBackendTensorException(message);
+        GpuOpGate.NotePolicyRejection(rejection);
+        return rejection;
     }
 
     private static string Shape<T>(Tensor<T> tensor) => string.Join(", ", tensor.Shape.ToArray());
@@ -161,7 +188,13 @@ internal static class CrossBackendTensors
 
     private static string Describe(IDirectGpuBackend backend)
     {
+        // Called while composing an error or a log line: a backend that cannot name itself (mid-teardown, or a device
+        // query that fails) must not replace that message with its own failure.
         try { return $"{backend.BackendName} ({backend.DeviceName})"; }
-        catch (Exception) { return backend.GetType().Name; }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or NotSupportedException
+                                       or System.Runtime.InteropServices.ExternalException)
+        {
+            return backend.GetType().Name;
+        }
     }
 }

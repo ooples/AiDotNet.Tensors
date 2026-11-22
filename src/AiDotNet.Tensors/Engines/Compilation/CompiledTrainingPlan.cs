@@ -899,6 +899,60 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return keys;
     }
 
+    // The device buffers and backends the configured optimizer updates, per parameter (null entries: host update), and
+    // the process-wide migration count they were last checked against.
+    private Engines.DirectGpu.IGpuBuffer?[]? _optimizerGpuParams;
+    private Engines.DirectGpu.IDirectGpuBackend?[]? _optimizerGpuBackends;
+    private long _migrationEpochSeen;
+
+    /// <summary>
+    /// Brings this plan's optimizer back in step with its parameters after a cross-backend migration. When another
+    /// plan (or op) on a different backend used one of this plan's parameters, the parameter's binding here was read
+    /// back and released, and the buffer this optimizer was configured with is gone: updating it would write freed
+    /// device memory. The parameter is moved back to this plan's backend under the cross-backend policy, the optimizer
+    /// is pointed at its new buffer (its moment buffers never left this backend), and the captured step graph, which
+    /// baked the old address in, is retired. Costs one counter read per step when nothing migrated.
+    /// </summary>
+    private void RebindOptimizerParametersAfterMigration()
+    {
+        long epoch = CrossBackendTensors.MigrationCount;
+        if (epoch == Volatile.Read(ref _migrationEpochSeen)) return;
+        Volatile.Write(ref _migrationEpochSeen, epoch);
+        if (_optimizerGpuParams is not { } gpuParam || _optimizerGpuBackends is not { } gpuBackends) return;
+        if (!_engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return;
+        using var operation = gpuEngine.EnterGpuOp();
+        if (!operation.Held) return;
+        lock (_stepSync)
+        {
+            bool retired = false;
+            for (int p = 0; p < gpuParam.Length && p < _parameters.Length; p++)
+            {
+                if (gpuParam[p] is not { } configured || gpuBackends[p] is not { } backend) continue;
+                var parameter = _parameters[p];
+                if (ReferenceEquals(parameter._gpuBuffer, configured)) continue;
+                // An offload-backed parameter has no binding of its own: its buffer is a view of the offload pointer.
+                if (parameter._gpuBuffer is null && parameter.OffloadDevicePointer != IntPtr.Zero) continue;
+                if (!retired)
+                {
+                    // A captured ping-pong update may legitimately hold the weights in its second buffer set: retiring
+                    // the graph copies them back and restores the binding, so only a real move is left to see.
+                    InvalidateCapturedStepGraph();
+                    retired = true;
+                    if (ReferenceEquals(parameter._gpuBuffer, configured)) continue;
+                }
+                CrossBackendTensors.ResolveIfForeign(parameter, backend);
+                gpuEngine.BindResidentParamBuffer(parameter);
+                var current = parameter.TryGetGpuBuffer();
+                if (current is null || parameter._gpuBackend is not { } now || !CrossBackendTensors.SameAddressSpace(now, backend))
+                    throw new InvalidOperationException(
+                        $"Parameter {p} of this training plan was moved to another GPU backend and could not be bound on "
+                        + $"{backend.BackendName} again, so its optimizer state no longer matches it. Reconfigure the "
+                        + "optimizer, or keep the parameter on one backend.");
+                gpuParam[p] = current;
+            }
+        }
+    }
+
     /// <summary>
     /// Makes any other plan's ping-pong update on this plan's parameters yield before this plan reads their bindings,
     /// and keeps this plan in place from then on. Runs outside this plan's step lock: the owner yields under its own.
@@ -4351,6 +4405,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_fixedActiveDomainMask is { } domain && !domain.SequenceEqual(membership))
             throw new InvalidOperationException("External gradients cannot change a coupled optimizer's fixed active-variable domain.");
         ResolvePingPongClaims(force: false);
+        RebindOptimizerParametersAfterMigration();
         lock (_stepSync)
         {
             ResolveDeferredFiniteness();
@@ -4420,6 +4475,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T> ExecuteStepLocked()
     {
         ResolvePingPongClaims(force: false);
+        RebindOptimizerParametersAfterMigration();
         // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
         // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
@@ -7138,6 +7194,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuMScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+        _optimizerGpuParams = gpuParam;
+        _optimizerGpuBackends = gpuBackends;
+        Volatile.Write(ref _migrationEpochSeen, CrossBackendTensors.MigrationCount);
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
         var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
@@ -8665,6 +8724,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var gpuMScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuVScales = new Engines.DirectGpu.IGpuBuffer?[paramCount];
         var gpuBackends = new Engines.DirectGpu.IDirectGpuBackend?[paramCount];
+        _optimizerGpuParams = gpuParam;
+        _optimizerGpuBackends = gpuBackends;
+        Volatile.Write(ref _migrationEpochSeen, CrossBackendTensors.MigrationCount);
         var gpuMomentStorage = new FusedMomentStorageMode[paramCount];
         var gpuGradUploadScratch = new float[paramCount][];
         var gpuFinitenessScratch = new Engines.DirectGpu.IGpuBuffer?[paramCount];
@@ -10505,10 +10567,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var parameter in parameters) CrossBackendTensors.ResolveIfForeign(parameter, consumer);
         // A graph input that is not a parameter is an external batch its caller writes through the host: its host copy
         // is authoritative and the step's pre-pass uploads it (EnsureResidentInput), so it is only detached here.
-        foreach (var node in scope.Nodes.OfType<LazyNode<T>>())
-            foreach (var input in node.GetInputsArray())
-                if (input is not null && input.LazySource is null && !parameterSet.Contains(input))
-                    CrossBackendTensors.ResolveIfForeign(input, consumer, hostAuthoritative: true);
+        // (An input its owner updates in place on the device - another plan's running statistic - is not: ResolveIfForeign
+        // reads such a device-authoritative binding back before it releases it.)
+        var externalInputs = scope.Nodes.OfType<LazyNode<T>>()
+            .SelectMany(node => node.GetInputsArray())
+            .Where(input => input is not null && input.LazySource is null && !parameterSet.Contains(input));
+        foreach (var input in externalInputs)
+            CrossBackendTensors.ResolveIfForeign(input, consumer, hostAuthoritative: true);
     }
 
     private static CompiledTrainingPlan<T> CompileCore(

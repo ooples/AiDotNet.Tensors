@@ -5273,7 +5273,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// shared by every alias, a partial view's its own - and the buffer freed when this tensor owns it and
     /// <paramref name="free"/> (false while the owner is tearing down: its context reclaims the memory).
     /// </summary>
-    internal void ReleaseForeignGpuBinding(bool readBack, bool free)
+    /// <param name="downloadBound">Download the bound buffer even when the tensor is not marked GPU-resident: a
+    /// host-backed tensor its owner updates in place on the device (a running statistic) holds its current value there
+    /// with no pending download to say so.</param>
+    internal void ReleaseForeignGpuBinding(bool readBack, bool free, bool downloadBound = false)
     {
         var owner = _gpuBackend;
         if (readBack)
@@ -5286,6 +5289,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 // before the buffer goes: Cpu() alone returns early for a tensor that is not marked GPU-resident.
                 if (GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.TryMaterialize(array);
                 Helpers.HostSync.TryMaterialize(DataVector);
+                if (downloadBound && !IsGpuResident) DownloadBoundBufferIntoHost();
                 Cpu();
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -5309,7 +5313,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferContainsRawInt32 = false;
         _gpuBufferContainsRawInt64 = false;
         _device = TensorDevice.CPU;
-        if (free && owned && buffer is IDisposable disposable)
+        if (free && owned && buffer is { } disposable)
         {
             // The tensor has already left the buffer: a backend that cannot free it now (gone, or failing) costs that
             // allocation until its context goes, never the consumer's op.
@@ -5328,6 +5332,39 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     /// <returns>This tensor with CPU data synchronized.</returns>
     [MethodImpl(Hot)]
+    /// <summary>
+    /// Copies the bound device buffer's float values into the host storage. Nothing for a buffer whose words are raw
+    /// int32 / int64: their own materializer decodes them (it ran as the pending download), and reading the words as
+    /// floats would overwrite the decoded integers with numeric conversions of their bit patterns.
+    /// </summary>
+    private void DownloadBoundBufferIntoHost()
+    {
+        if (_gpuBuffer is not { } buffer || _gpuBackend is not { } backend) return;
+        if (_gpuBufferContainsRawInt32 || _gpuBufferContainsRawInt64) return;
+        float[] floatData = backend.DownloadBuffer(buffer);
+        var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
+        // A partial view that borrows its parent's buffer (a view taken of a placed tensor) holds the WHOLE storage in
+        // storage order, not this view's elements: it lands on the whole storage. Copying its first Length values into
+        // the view would put the parent's leading elements where the view's own belong.
+        if (!CoversWholeVector && !_ownsGpuBuffer && converted.Length == _data.Length)
+        {
+            converted.AsSpan().CopyTo(_data.AsWritableSpanUnmarked());
+            return;
+        }
+        if (IsContiguous)
+        {
+            var dst = AsWritableSpan();
+            converted.AsSpan(0, Math.Min(converted.Length, dst.Length)).CopyTo(dst);
+        }
+        else
+        {
+            // Non-contiguous view: fall back to the element-wise setter,
+            // which routes through the storage offset/stride correctly.
+            int n = Math.Min(converted.Length, Length);
+            for (int i = 0; i < n; i++) SetFlatIndexValue(i, converted[i]);
+        }
+    }
+
     public Tensor<T> Cpu()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
@@ -5373,23 +5410,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // the buffer changed, but Cpu()/host reads still saw the pre-step value.
         // AsWritableSpan() hands back the real backing span (offset/length
         // aware), matching the engine's own DownloadIntoTensor helper.
-        if (_gpuBuffer is not null && _gpuBackend is not null && _device != TensorDevice.CPU)
-        {
-            float[] floatData = _gpuBackend.DownloadBuffer(_gpuBuffer);
-            var converted = Engines.DirectGpu.DirectGpuEngine.FromFloatArray<T>(floatData);
-            if (IsContiguous)
-            {
-                var dst = AsWritableSpan();
-                converted.AsSpan(0, Math.Min(converted.Length, dst.Length)).CopyTo(dst);
-            }
-            else
-            {
-                // Non-contiguous view: fall back to the element-wise setter,
-                // which routes through the storage offset/stride correctly.
-                int n = Math.Min(converted.Length, Length);
-                for (int i = 0; i < n; i++) SetFlatIndexValue(i, converted[i]);
-            }
-        }
+        if (_device != TensorDevice.CPU) DownloadBoundBufferIntoHost();
 
         // The host is authoritative again and the buffer above is no longer the source of truth, so
         // the markers that described its encoding must not survive into the next upload.

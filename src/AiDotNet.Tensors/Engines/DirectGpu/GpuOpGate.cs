@@ -55,8 +55,18 @@ internal sealed class GpuOpGate
             _threadId = 0;
             if (backend is not null)
             {
-                _previousBackend = t_opBackend;
-                _previousCounter = t_opCounter;
+                // An entry whose lease was returned from another thread is stale (CurrentOpBackend): this op is then the
+                // outermost on its thread, displaces nothing, and starts with nothing pending - a rejection that op left
+                // behind never reached its rethrow and must not surface in this unrelated one.
+                if (CurrentOpBackend is not null)
+                {
+                    _previousBackend = t_opBackend;
+                    _previousCounter = t_opCounter;
+                }
+                else
+                {
+                    t_pendingRejection = null;
+                }
                 _threadId = Environment.CurrentManagedThreadId;
                 t_opBackend = backend;
                 t_opCounter = counter;
@@ -73,13 +83,23 @@ internal sealed class GpuOpGate
             // Only the thread that installed the op backend restores it: an async op returning its lease from another
             // thread cannot reach that thread's [ThreadStatic] at all. That thread's entry then goes stale, which
             // CurrentOpBackend detects through the counter (its depth drops to zero below).
+            bool outermost = false;
             if (_backend is not null && _threadId == Environment.CurrentManagedThreadId
                 && ReferenceEquals(t_opBackend, _backend))
             {
                 t_opBackend = _previousBackend;
                 t_opCounter = _previousCounter;
+                outermost = _previousBackend is null;
             }
             Interlocked.Decrement(ref _counter.Depth);
+            // A policy rejection raised inside this op and swallowed by an op's "any GPU failure -> CPU fallback" catch
+            // is rethrown here, as the outermost op on the thread ends: the caller sees it instead of a CPU result.
+            // (When it was not swallowed this rethrows the exception already propagating.)
+            if (outermost && t_pendingRejection is { } rejection)
+            {
+                t_pendingRejection = null;
+                throw rejection;
+            }
         }
     }
 
@@ -95,6 +115,18 @@ internal sealed class GpuOpGate
     // (CrossBackendTensors.ResolveIfForeign).
     [ThreadStatic] private static IDirectGpuBackend? t_opBackend;
     [ThreadStatic] private static Counter? t_opCounter;
+    // A cross-backend policy rejection raised inside the op running on this thread, until that op ends.
+    [ThreadStatic] private static CrossBackendTensorException? t_pendingRejection;
+
+    /// <summary>
+    /// Leaves <paramref name="rejection"/> pending on the calling thread when it is inside an engine op, so the
+    /// outermost op rethrows it on exit even if an inner catch answered it with a CPU fallback. Outside an op there is
+    /// no catch between the throw and the caller, and nothing is recorded.
+    /// </summary>
+    internal static void NotePolicyRejection(CrossBackendTensorException rejection)
+    {
+        if (CurrentOpBackend is not null) t_pendingRejection = rejection;
+    }
 
     /// <summary>
     /// The backend of the engine op running on the calling thread, or null outside one. An entry whose lease was

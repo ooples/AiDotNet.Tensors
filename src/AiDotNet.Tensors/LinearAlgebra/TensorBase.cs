@@ -1569,6 +1569,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // until they wire their own non-owning buffer types.
             if (allocator is Engines.DirectGpu.IGpuDevicePointerWrapper wrapper)
             {
+                // The pointer is an address in the allocator's device context. An op on a backend that cannot
+                // dereference it follows the cross-backend policy: refused, or served from the host copy (null here,
+                // so the op uploads it to its own backend; the offload allocation itself stays where it is).
+                if (Engines.DirectGpu.GpuOpGate.CurrentOpBackend is { } consumer
+                    && allocator is Engines.DirectGpu.IGpuOffloadBackendAffinity affinity
+                    && !affinity.PointersUsableBy(Engines.CrossBackendTensors.Unwrap(consumer)))
+                {
+                    if (Engines.AiDotNetEngine.CrossBackendPolicy == Engines.CrossBackendTensorPolicy.Throw)
+                        throw Engines.CrossBackendTensors.Reject(
+                            $"A {Lifetime} tensor's device memory belongs to {allocator.GetType().Name}, which the operation's "
+                            + $"backend ({consumer.BackendName}) cannot address. Run it on the allocator's backend, or set "
+                            + "AiDotNetEngine.CrossBackendPolicy to Migrate or MigrateWarn to serve it from the host copy.");
+                    return null;
+                }
                 UploadHostToOffload();
                 return wrapper.WrapDevicePointerAsBuffer(
                     OffloadDevicePointer, Length, ElementByteSize());

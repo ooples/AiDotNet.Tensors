@@ -726,7 +726,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || t is null) return;
         if (!TryGetBackend(out var cb)) return;
-        if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
+        if (t._gpuBuffer is not { } buf || t._gpuBackend is not { } boundBackend
+            || !CrossBackendTensors.SameAddressSpace(boundBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
         using var dataLease = t.LeaseArray();
         var data = dataLease.Array;
         if (buf.Size < t.Length) return;
@@ -747,7 +748,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Unless a device copy rewrote it in its bound buffer since (a dropout mask redrawn on the device): then the
         // buffer holds the value and the host array only a pending download of it, so dropping that download and
         // uploading the host would put the previous step's value back.
-        if (ReferenceEquals(t._gpuBackend, cb) && ResidentInputHoldsDeviceWrite(t))
+        if (t._gpuBackend is { } writeBackend && CrossBackendTensors.SameAddressSpace(writeBackend, cb)
+            && ResidentInputHoldsDeviceWrite(t))
         {
             t._gpuBufferVersion = t.GpuCacheVersion;
             return;
@@ -792,7 +794,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || t is null) return null;
         if (!TryGetBackend(out var cb)) return null;
         var buf = t._gpuBuffer;
-        if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
+        if (buf is null || t._gpuBackend is not { } boundBackend
+            || !CrossBackendTensors.SameAddressSpace(boundBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
         // A buffer can be larger than the tensor (a pooled or padded allocation: a scalar loss has been seen bound to
         // 256 floats). Read only the tensor's elements, through a device copy into an exactly sized buffer.
         if (buf.Size <= t.Length) return cb.DownloadBuffer(buf);
@@ -1193,7 +1196,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void RegisterAsBackendOwner()
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend) || backend is null) return;
+        // The engine's own backend, never what TryGetBackend answers: constructed inside a recording DeferredScope that
+        // is the scope's wrapper, and constructed under GraphMode it is nothing, while the engine owns its backend's
+        // buffers either way. Unwrapped, because CrossBackendTensors looks an owner up by its unwrapped backend.
+        if (_directGpu?.Backend is not { } own) return;
+        var backend = CrossBackendTensors.Unwrap(own);
         lock (s_engineByBackendLock)
         {
             s_enginesByBackend.GetValue(backend, _ => new System.Collections.Generic.List<WeakReference<DirectGpuTensorEngine>>())
@@ -1315,8 +1322,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var deferredScope = Gpu.DeferredScope.Current;
         if (deferredScope != null && deferredScope.IsRecording)
         {
-            backend = deferredScope.RecordingBackend;
-            return true;
+            // Only a scope recording THIS engine's backend. The op lease made this engine's backend the thread's op
+            // backend, which is what tensors are resolved against: dispatching through another engine's recording
+            // backend would hand that backend's kernels buffers resolved for this one. Such an op is not part of that
+            // scope's graph; it runs on its own backend, below.
+            var recording = deferredScope.RecordingBackend;
+            if (_directGpu?.Backend is not { } own || CrossBackendTensors.SameAddressSpace(recording, own))
+            {
+                backend = recording;
+                return true;
+            }
         }
 
         // No deferred scope - use regular backend
@@ -3509,6 +3524,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer GetWeightBufferPreferResident<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
     {
+        // Against the backend that dispatches the kernel, as GetOrAllocateBuffer does for activations.
+        CrossBackendTensors.ResolveIfForeign(weights, backend);
         var resident = weights.TryGetGpuBuffer();
         if (resident != null)
         {

@@ -212,6 +212,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
+    /// <summary>The CUDA context this backend runs in (zero once disposed).</summary>
+    internal IntPtr ContextHandle => _cudaContext;
     private int _cuDevice;   // the CUdevice whose primary context this backend holds
     private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts, AddContextHolder)
 

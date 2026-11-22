@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>cuMemAllocHost</c> (mapped + portable); Managed-scheme uses
 /// <c>cuMemAllocManaged</c> with <c>CU_MEM_ATTACH_GLOBAL</c>.
 /// </summary>
-public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper
+public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper, IGpuOffloadBackendAffinity
 {
     private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
     private readonly object _lifecycleLock = new();
@@ -36,6 +36,11 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     private readonly bool _ownsContext = true;
     private readonly long _sharedContextGeneration;
     private bool _disposed;
+
+    // A CUDA device pointer is valid in the context that allocated it: this allocator's pointers are a CUDA backend's
+    // to use only when that backend runs in the same context (the shared-context constructor).
+    bool IGpuOffloadBackendAffinity.PointersUsableBy(IDirectGpuBackend backend)
+        => backend is CudaBackend cuda && _context != IntPtr.Zero && cuda.ContextHandle == _context;
 
     /// <summary>Standalone offload allocator — lazily creates and owns its own CUDA context.</summary>
     public CudaOffloadAllocator() { }

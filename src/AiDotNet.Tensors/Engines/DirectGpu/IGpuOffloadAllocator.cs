@@ -34,6 +34,16 @@ public interface IGpuOffloadAllocator : IDisposable
 }
 
 /// <summary>
+/// Implemented by an offload allocator whose device pointers are addresses in one backend's device context, so the
+/// engine never hands them to another backend's kernels (see <see cref="Engines.CrossBackendTensors"/>).
+/// </summary>
+internal interface IGpuOffloadBackendAffinity
+{
+    /// <summary>Whether <paramref name="backend"/>'s kernels can dereference this allocator's device pointers.</summary>
+    bool PointersUsableBy(IDirectGpuBackend backend);
+}
+
+/// <summary>
 /// Issue #336: optional capability — allocators that implement this can
 /// wrap a previously-allocated device pointer as a non-owning
 /// <see cref="IGpuBuffer"/>. Used by

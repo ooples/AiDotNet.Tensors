@@ -36,7 +36,8 @@ public sealed class CrossBackendTensorPolicyTests
         public void Dispose() { Placer.Dispose(); Consumer.Dispose(); }
     }
 
-    // The default engine plus an OpenCL engine on a DIFFERENT backend type; skips when the machine cannot make both.
+    // The default engine plus an OpenCL engine on its own backend instance (its own context, so its buffers are
+    // foreign to the default engine's even when that one is OpenCL too); skips when the machine cannot make both.
     private static EnginePair CreateEngines()
     {
         var consumer = new DirectGpuTensorEngine();
@@ -44,12 +45,12 @@ public sealed class CrossBackendTensorPolicyTests
         DirectGpuTensorEngine? placer = null;
         try { placer = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend())); }
         catch (Exception) { placer = null; }
-        if (placer is null || !placer.IsGpuAvailable
-            || placer.QueryBackend?.GetType() == consumer.QueryBackend?.GetType())
+        if (placer is null || !placer.IsGpuAvailable || placer.QueryBackend is not { } placed
+            || consumer.QueryBackend is not { } consuming || CrossBackendTensors.SameAddressSpace(placed, consuming))
         {
             placer?.Dispose();
             consumer.Dispose();
-            Skip.If(true, "Needs a second, different GPU backend (OpenCL) next to the default one.");
+            Skip.If(true, "Needs a second GPU backend instance (OpenCL) next to the default one.");
         }
         return new EnginePair(consumer, placer!);
     }
@@ -171,7 +172,9 @@ public sealed class CrossBackendTensorPolicyTests
         PlaceOn(engines.Placer, w1, w2);
         using (new PolicyScope(CrossBackendTensorPolicy.Throw))
         {
-            var error = Assert.Throws<InvalidOperationException>(() => Compile(engines.Consumer, input, w1, w2));
+            // The dedicated rejection type (an InvalidOperationException to callers that catch that).
+            InvalidOperationException error =
+                Assert.Throws<CrossBackendTensorException>(() => Compile(engines.Consumer, input, w1, w2));
             Assert.Contains("CrossBackendPolicy", error.Message);
             Assert.Same(engines.Placer.QueryBackend, w1._gpuBackend);   // nothing was moved
         }
@@ -281,6 +284,143 @@ public sealed class CrossBackendTensorPolicyTests
         other.Start();
         other.Join();
         Assert.Null(GpuOpGate.CurrentOpBackend);
+    }
+
+    // BatchMatMul answers any exception from its GPU route with the CPU engine: the policy rejection must not be one.
+    [SkippableFact]
+    public void Throw_reaches_the_caller_through_an_op_that_falls_back_to_the_cpu()
+    {
+        using var engines = CreateEngines();
+        var a = Seeded(4, 4, 1).Reshape(1, 4, 4);
+        var b = Seeded(4, 4, 2).Reshape(1, 4, 4);
+        PlaceOn(engines.Placer, a);
+        using (new PolicyScope(CrossBackendTensorPolicy.Throw))
+        {
+            var error = Assert.Throws<CrossBackendTensorException>(() => engines.Consumer.BatchMatMul(a, b));
+            Assert.Contains("CrossBackendPolicy", error.Message);
+            Assert.Same(engines.Placer.QueryBackend, a._gpuBackend);   // nothing was moved
+        }
+        // The rejection does not outlive its op: the next op on this thread runs.
+        var x = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var y = new Tensor<float>(new[] { 3f, 4f }, new[] { 2 });
+        Assert.Equal(new[] { 4f, 6f }, engines.Consumer.TensorAdd(x, y).ToArray());
+    }
+
+    // A rejection whose op returned its lease from another thread never reached that op's rethrow.
+    [SkippableFact]
+    public void A_rejection_left_pending_by_an_op_that_ended_elsewhere_does_not_surface_in_the_next_op()
+    {
+        using var engines = CreateEngines();
+        var gate = new GpuOpGate();
+        var lease = gate.Enter(engines.Consumer.QueryBackend);
+        _ = CrossBackendTensors.Reject("left pending");
+        var other = new System.Threading.Thread(() => lease.Dispose());
+        other.Start();
+        other.Join();
+        var x = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var y = new Tensor<float>(new[] { 3f, 4f }, new[] { 2 });
+        Assert.Equal(new[] { 4f, 6f }, engines.Consumer.TensorAdd(x, y).ToArray());
+    }
+
+    // A raw int32 buffer's words are integers: read as floats and converted, 7 would come home as 9.8e-45 -> 0.
+    [SkippableFact]
+    public void Raw_integer_tensor_placed_elsewhere_comes_home_with_its_integers()
+    {
+        using var engines = CreateEngines();
+        var placer = engines.Placer.QueryBackend!;
+        var values = new[] { 7, -3, 1_000_000, 42 };
+        Tensor<int> indices;
+        using (engines.Placer.EnterGpuOp())
+            indices = Tensor<int>.FromGpuBuffer(placer, placer.AllocateIntBuffer(values), new[] { 4 },
+                bufferContainsRawInt32: true);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        CrossBackendTensors.ResolveIfForeign(indices, engines.Consumer.QueryBackend!);
+        Assert.NotSame(placer, indices._gpuBackend);
+        Assert.Equal(values, indices.ToArray());
+    }
+
+    // A view taken of a placed tensor borrows the WHOLE storage's buffer: its own elements are not that buffer's first.
+    [SkippableFact]
+    public void View_borrowing_its_parents_buffer_migrates_its_own_elements()
+    {
+        using var engines = CreateEngines();
+        var whole = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f, 7f, 8f }, new[] { 2, 4 });
+        Tensor<float> produced;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Placer;
+        try { produced = engines.Placer.TensorAdd(whole, whole); }   // device result, host copy pending
+        finally { AiDotNetEngine.Current = previous; }
+        var view = produced.Slice(1);
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        var zeros = new Tensor<float>(new float[4], new[] { 4 });
+        Assert.Equal(new[] { 10f, 12f, 14f, 16f }, engines.Consumer.TensorAdd(view, zeros).ToArray());
+        Assert.Equal(new[] { 2f, 4f, 6f, 8f, 10f, 12f, 14f, 16f }, produced.ToArray());
+    }
+
+    [SkippableFact]
+    public void An_engine_is_found_by_its_unwrapped_backend()
+    {
+        using var engines = CreateEngines();
+        var backend = CrossBackendTensors.Unwrap(engines.Placer.QueryBackend!);
+        Assert.Same(engines.Placer, DirectGpuTensorEngine.EngineOwning(backend));
+        Assert.Same(engines.Consumer,
+            DirectGpuTensorEngine.EngineOwning(CrossBackendTensors.Unwrap(engines.Consumer.QueryBackend!)));
+    }
+
+    // An input its owner updates on the device (a running statistic) is asked for as host-authoritative by a plan that
+    // merely reads it: the device value must still come home.
+    [SkippableFact]
+    public void Device_authoritative_input_is_read_back_even_when_asked_for_as_host_authoritative()
+    {
+        using var engines = CreateEngines();
+        var state = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 4 });
+        PlaceOn(engines.Placer, state);
+        var placer = engines.Placer.QueryBackend!;
+        using (engines.Placer.EnterGpuOp())
+        {
+            placer.UploadBufferInPlace(new[] { 9f, 8f, 7f, 6f }, state._gpuBuffer!);   // the owner's in-place update
+            engines.Placer.NoteBoundDeviceAuthoritative(state, state._gpuBuffer!);
+        }
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        CrossBackendTensors.ResolveIfForeign(state, engines.Consumer.QueryBackend!, hostAuthoritative: true);
+        Assert.Equal(new[] { 9f, 8f, 7f, 6f }, state.ToArray());
+    }
+
+    // Another backend's op on a plan's parameter releases the buffer the plan's optimizer was configured with.
+    [SkippableFact]
+    public void Plan_keeps_training_after_another_backend_used_its_parameter()
+    {
+        using var engines = CreateEngines();
+        using var policy = new PolicyScope(CrossBackendTensorPolicy.Migrate);
+        float[] Train(bool interfere)
+        {
+            var input = Seeded(32, 64, 1);
+            var w1 = Seeded(64, 64, 2);
+            var w2 = Seeded(64, 64, 3);
+            using var plan = Compile(engines.Consumer, input, w1, w2);
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-3f);
+            var losses = new List<float>();
+            for (int i = 0; i < 8; i++)
+            {
+                if (interfere && i == 4)
+                {
+                    var zeros = new Tensor<float>(new float[64 * 64], new[] { 64, 64 });
+                    var bound = w1._gpuBuffer;
+                    _ = engines.Placer.TensorAdd(w1, zeros).ToArray();   // the placer's op takes w1 off this backend
+                    Assert.NotSame(bound, w1._gpuBuffer);
+                }
+                losses.Add(plan.Step().GetFlat(0));
+            }
+            Assert.NotSame(engines.Placer.QueryBackend, w1._gpuBackend);
+            return losses.ToArray();
+        }
+
+        float[] undisturbed = Train(interfere: false);
+        float[] disturbed = Train(interfere: true);
+        for (int i = 0; i < undisturbed.Length; i++)
+            Assert.True(Math.Abs(undisturbed[i] - disturbed[i]) <= 1e-4f * Math.Max(1f, Math.Abs(undisturbed[i])),
+                $"step {i}: {disturbed[i]} after the parameter moved, {undisturbed[i]} without.");
+        Assert.True(disturbed[7] < disturbed[0], "training must keep reducing the loss.");
     }
 
     [Fact]
