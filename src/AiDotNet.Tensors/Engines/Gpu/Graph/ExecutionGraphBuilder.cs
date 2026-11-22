@@ -271,8 +271,34 @@ public sealed class ExecutionGraphBuilder : IDisposable
         // The graph marks the writes of the generation it was built from, however it is run (the scope's Execute or a
         // caller's own Execute on the graph Compile returned).
         var writes = _writes;
+        if (!_runsWhileRecording) SetAsideWritesTheGraphDropped(optimizedGraph, writes);
         optimizedGraph.Executed = () => writes.Ran = true;
         return (optimizedGraph, statistics);
+    }
+
+    // The optimizer may drop a recorded node (dead-code elimination removes one nothing in the graph reads, fusion
+    // folds an intermediate away): no surviving node writes that node's output, so running the graph leaves the
+    // buffer unwritten. Those buffers move to a state of their own that never runs, and the graph's completion
+    // certifies only what its nodes write.
+    private void SetAsideWritesTheGraphDropped(ExecutionGraph graph, WriteState writes)
+    {
+        var written = new HashSet<IGpuBuffer>();
+        foreach (var node in graph.TopologicalOrder)
+        {
+            foreach (var output in node.OutputTensors) written.Add(output.Buffer);
+            if (node is TransferNode { DestinationBuffer: { } destination }) written.Add(destination);
+        }
+        var dropped = _lastWriteNode.Keys
+            .Where(buffer => !written.Contains(buffer)
+                             && s_recordedWrites.TryGetValue(buffer, out var state) && ReferenceEquals(state, writes))
+            .ToList();
+        if (dropped.Count == 0) return;
+        var neverRuns = new WriteState();
+        foreach (var buffer in dropped)
+        {
+            s_recordedWrites.Remove(buffer);
+            s_recordedWrites.Add(buffer, neverRuns);
+        }
     }
 
     /// <summary>
