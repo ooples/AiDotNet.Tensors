@@ -337,7 +337,7 @@ internal static class HipNativeBindings
         }
         catch (Exception ex) when (ex is System.IO.IOException or ObjectDisposedException)
         {
-            System.Diagnostics.Trace.TraceWarning("HIP diagnostic output failed: {0}", ex);
+            AiDotNet.Tensors.Engines.DirectGpu.CUDA.NvrtcNativeBindings.TraceWarningBestEffort("HIP diagnostic output failed: {0}", ex);
         }
     }
 

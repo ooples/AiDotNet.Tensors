@@ -62,11 +62,27 @@ internal static class NvrtcNativeBindings
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
                                        or NotSupportedException or System.Security.SecurityException)
         {
-            System.Diagnostics.Trace.TraceWarning(
-                "CUDA library path discovery failed; probing NVRTC on the existing search path. {0}", ex);
+            TraceWarningBestEffort("CUDA library path discovery failed; probing NVRTC on the existing search path. {0}", ex);
         }
 
         return probe();
+    }
+
+    /// <summary>
+    /// Writes a warning to the trace listeners without letting a failing listener escape. The callers run inside lazy
+    /// availability probes, which would cache that exception and rethrow it from every later availability check; when
+    /// the trace sink itself is what failed there is nowhere left to report it.
+    /// </summary>
+    internal static void TraceWarningBestEffort(string format, Exception failure)
+    {
+        try
+        {
+            System.Diagnostics.Trace.TraceWarning(format, failure);
+        }
+        catch (Exception listenerFailure) when (listenerFailure is not OutOfMemoryException)
+        {
+            // Deliberately dropped: see the summary.
+        }
     }
 
     /// <summary>

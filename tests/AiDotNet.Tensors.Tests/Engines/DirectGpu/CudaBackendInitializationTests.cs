@@ -114,4 +114,32 @@ public class CudaBackendInitializationTests
             () => throw new InvalidOperationException("defect"),
             () => null));
     }
+
+    private sealed class ThrowingTraceListener : TraceListener
+    {
+        public override void Write(string? message) => throw new IOException("trace sink failed");
+
+        public override void WriteLine(string? message) => throw new IOException("trace sink failed");
+    }
+
+    // Reporting the discovery failure is best-effort too: a trace listener that throws must not skip the probe.
+    [Fact]
+    public void ApiProbe_StillRuns_WhenDiscoveryThrowsAndTheTraceListenerThrows()
+    {
+        var listener = new ThrowingTraceListener();
+        Trace.Listeners.Add(listener);
+        try
+        {
+            var expected = new object();
+            var result = NvrtcNativeBindings.ProbeAfterBestEffortDiscovery<object?>(
+                () => throw new IOException("discovery failed"),
+                () => expected);
+            Assert.Same(expected, result);
+        }
+        finally
+        {
+            Trace.Listeners.Remove(listener);
+            listener.Dispose();
+        }
+    }
 }
