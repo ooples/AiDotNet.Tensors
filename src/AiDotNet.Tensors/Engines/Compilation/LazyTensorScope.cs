@@ -562,31 +562,67 @@ internal sealed class LazyTensorScope : IDisposable
     // A trace may realize part of its graph while it is still being recorded: an op whose graph-mode path computes its
     // value eagerly (to capture its outputs) reads its input, which runs every node upstream of it, including a
     // state-writing decode op, whose state would then be advanced by the trace itself and once more by every execution.
-    // So each such op's targets are snapshotted when it is recorded (only a target's first write in the trace: that
-    // snapshot is the pre-trace state), and compiling or abandoning the trace writes the snapshot back into any target
-    // the trace advanced. Kept on the root scope, which is the one that compiles.
-    private List<(ILazyNode Node, ISignatureTensor Target, ISignatureTensor Snapshot)>? _traceStateSnapshots;
+    // So each such op's targets are registered when it is recorded (only a target's first write in the trace), and the
+    // op snapshots them just before it runs at trace time (LazyNode.BeforeTraceExecute): the trace has not written them
+    // yet, so that is the pre-trace state. A trace that never realizes the op copies nothing (a KV cache is large).
+    // Compiling or abandoning the trace writes each snapshot back. Kept on the root scope, which is the one that
+    // compiles.
+    private sealed class TraceStateSnapshot
+    {
+        internal TraceStateSnapshot(ISignatureTensor target) => Target = target;
+        internal readonly ISignatureTensor Target;
+        internal ISignatureTensor? Snapshot;
+        // False once the trace has been compiled, abandoned or realized for good: a later run is not the trace's.
+        internal bool Live = true;
+    }
 
-    private void SnapshotTraceStateTargets<T>(ILazyNode node, Tensor<T>[] targets)
+    private List<TraceStateSnapshot>? _traceStateSnapshots;
+
+    private void SnapshotTraceStateTargets<T>(LazyNode<T> node, Tensor<T>[] targets)
     {
         var root = this;
         while (root._parent is not null) root = root._parent;
-        var bank = root;
-        // Evaluated as the loop advances, so a target listed twice is snapshotted once: the second sees the first's entry.
+        List<(TraceStateSnapshot Entry, Tensor<T> Target)>? registered = null;
+        // Evaluated as the loop advances, so a target listed twice is registered once: the second sees the first's entry.
         foreach (var target in targets.Where(t => t.LazySource is null
-            && bank._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, t)) != true))
+            && root._traceStateSnapshots?.Exists(s => ReferenceEquals(s.Target, t)) != true))
         {
-            var snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
-            (root._traceStateSnapshots ??= new()).Add((node, target, snapshot));
+            var entry = new TraceStateSnapshot(target);
+            (root._traceStateSnapshots ??= new()).Add(entry);
+            (registered ??= new()).Add((entry, target));
         }
+        if (registered is null) return;
+        node.BeforeTraceExecute = () =>
+        {
+            foreach (var (entry, target) in registered)
+                if (entry.Live && entry.Snapshot is null)
+                    entry.Snapshot = new Tensor<T>((int[])target._shape.Clone(), new Vector<T>(target.ToArray()));
+        };
     }
 
     private void RestoreTraceStateTargets()
     {
         if (_traceStateSnapshots is not { } snapshots) return;
         _traceStateSnapshots = null;
-        foreach (var (node, target, snapshot) in snapshots)
-            if (node.IsRealized) target.CopyLeafFrom(snapshot);
+        foreach (var entry in snapshots)
+        {
+            entry.Live = false;
+            if (entry.Snapshot is { } snapshot) entry.Target.CopyLeafFrom(snapshot);
+            entry.Snapshot = null;
+        }
+    }
+
+    // A trace realized as an eager computation (a compatibility scope's dispose) advances its states for real: nothing
+    // is restored, and no snapshot is taken from here on.
+    private void DiscardTraceStateTargets()
+    {
+        if (_traceStateSnapshots is not { } snapshots) return;
+        _traceStateSnapshots = null;
+        foreach (var entry in snapshots)
+        {
+            entry.Live = false;
+            entry.Snapshot = null;
+        }
     }
 
     /// <summary>Records a variadic operation as a lazy node.</summary>
@@ -909,6 +945,9 @@ internal sealed class LazyTensorScope : IDisposable
             _nodes[i].RestoreOutputLazySource();
 
         _realized = true;
+        // The trace may have advanced a decode op's state while recording (a trace-time realization); the abandoned
+        // trace must leave it as it found it, as compiling does.
+        RestoreTraceStateTargets();
     }
 
     public void Dispose()
@@ -925,7 +964,10 @@ internal sealed class LazyTensorScope : IDisposable
             if (!_realized)
             {
                 if (_traceKind == GraphTraceKind.Compatibility)
+                {
+                    DiscardTraceStateTargets();
                     Realize();
+                }
                 else
                     Abandon();
             }

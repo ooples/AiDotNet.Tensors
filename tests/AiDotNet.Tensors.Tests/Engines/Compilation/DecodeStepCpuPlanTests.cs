@@ -199,6 +199,61 @@ public class DecodeStepCpuPlanTests
             }
     }
 
+    // A trace that realizes a state-writing decode op (a host read of its output) and then throws is abandoned by its
+    // scope's Dispose: the trace's write must be undone there too, as compiling undoes it, so the cache, position and
+    // state leave the failed trace as it found them.
+    [Fact]
+    public void An_abandoned_trace_restores_the_state_its_decode_ops_wrote()
+    {
+        var cpu = new CpuEngine();
+        var cache = T([1, 3, 2], i => 0.5f * i);
+        var position = T([1], _ => 1f);
+        var state = T([1, 2, 2], i => 0.25f * (i + 1));
+        var cacheBefore = cache.ToArray();
+        var stateBefore = state.ToArray();
+        var x = T([1, 2], i => 9f + i);
+        var q = T([1, 2], i => 0.3f + i); var k = T([1, 2], i => 0.7f - i); var v = T([1, 2], i => 0.1f * i);
+        var a = T([1], _ => 0.9f); var b = T([1], _ => 0.5f);
+        using (new EngineScope(cpu))
+        {
+            Assert.Throws<InvalidOperationException>((Action)(() =>
+            {
+                using var scope = GraphMode.EnableInference();
+                var w = cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+                var o = cpu.GatedDeltaNetStep(state, q, k, v, a, b, GatedDeltaRule.ScaledKeys);
+                // Host reads realize both ops while the trace is still recording.
+                Assert.Equal(3, w.ToArray().Length);
+                Assert.Equal(2, o.ToArray().Length);
+                Assert.Equal(2f, position.ToArray()[0]);
+                throw new InvalidOperationException("the model failed after the decode step");
+            }));
+        }
+        Assert.Equal(1f, position.ToArray()[0]);
+        Assert.Equal(cacheBefore, cache.ToArray());
+        Assert.Equal(stateBefore, state.ToArray());
+    }
+
+    // A trace that never realizes its decode op takes no snapshot of the op's state (a KV cache can be large).
+    [Fact]
+    public void A_trace_that_never_realizes_its_decode_op_copies_no_state()
+    {
+        var cpu = new CpuEngine();
+        var cache = new Tensor<float>([1, 4, 2]);
+        var position = new Tensor<float>([1]);
+        var x = new Tensor<float>([1, 2]);
+        using (new EngineScope(cpu))
+        using (var scope = GraphMode.EnableInference())
+        {
+            cpu.Softmax(cpu.KvCacheAppend(cache, position, x), -1);
+            var field = typeof(LazyTensorScope).GetField("_traceStateSnapshots",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            var entries = ((System.Collections.IEnumerable)field.GetValue(scope)!).Cast<object>().ToArray();
+            Assert.Equal(2, entries.Length);
+            var snapshot = entries[0].GetType().GetField("Snapshot", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+            Assert.All(entries, e => Assert.Null(snapshot.GetValue(e)));
+        }
+    }
+
     [Fact]
     public void Malformed_decode_step_arguments_are_rejected()
     {
