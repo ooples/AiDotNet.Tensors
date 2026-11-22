@@ -1552,13 +1552,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // handle read as a CUDA pointer is a sticky illegal-address fault). Apply the cross-backend policy - the tensor
         // migrates (its foreign binding is dropped and, if it was resident, it is placed on the op's backend) or the op
         // throws - before the handle test below: a WebGPU buffer's native handle is always zero.
-        if (_gpuBuffer is not null && Engines.CrossBackendTensors.IsForeign(_gpuBackend))
+        // Foreign implies both an owner and a running op's backend; the patterns state it for the compiler.
+        if (_gpuBuffer is not null && _gpuBackend is { } owner && Engines.CrossBackendTensors.IsForeign(owner)
+            && Engines.DirectGpu.GpuOpGate.CurrentOpBackend is { } opBackend)
         {
-            var owner = _gpuBackend!;
             if (this is not Tensor<T> tensor)
                 throw new InvalidOperationException(
                     "This tensor's GPU buffer belongs to a different backend than the running operation.");
-            Engines.CrossBackendTensors.Resolve(tensor, owner, Engines.DirectGpu.GpuOpGate.CurrentOpBackend!);
+            Engines.CrossBackendTensors.Resolve(tensor, owner, opBackend);
             if (_gpuBuffer is not null && Engines.CrossBackendTensors.IsForeign(_gpuBackend))
                 throw new InvalidOperationException(
                     "A tensor's GPU buffer is still bound to another backend after the cross-backend migration.");
