@@ -201,9 +201,11 @@ internal static class GpuLaunchProbe
     }
 
     /// <summary>A device-to-host copy of <paramref name="byteCount"/> bytes.</summary>
-    // Transfers the tuned-kernel registry makes while it gathers evidence (snapshotting candidate outputs for the
-    // correctness gate) are the registry's own one-time cost per shape class, not the op's: inside a tuning scope they
-    // count toward TuningReadbacks / TuningUploads instead of the op's Readbacks / Uploads and residency scopes.
+    // Transfers the library makes while it gathers one-time evidence - the tuned-kernel registry snapshotting candidate
+    // outputs for its correctness gate (once per shape class), GPU auto-detection reading back its known-answer probe
+    // (once per process, from whichever op first resolves AiDotNetEngine.Current) - are not the op's: inside a tuning
+    // scope they count toward TuningReadbacks / TuningUploads instead of the op's Readbacks / Uploads and residency
+    // scopes.
     [System.ThreadStatic] private static int _tuningDepth;
     private static long _tuningReadbacks, _tuningUploads;
 
