@@ -45,6 +45,7 @@ public sealed partial class WebGpuBackend
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
         EnsureInitialized();
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var result = DownloadBufferData(buffer);
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
         return result;
@@ -55,6 +56,7 @@ public sealed partial class WebGpuBackend
         EnsureInitialized();
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         if (buffer.Size == 0) return;
@@ -95,6 +97,12 @@ public sealed partial class WebGpuBackend
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
+        if (CopiesDoubles(source, destination, 0, 0, size, nameof(Copy)))
+        {
+            CopyFloat64(source, 0, destination, 0, size);
+            return;
+        }
+
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(size),
@@ -104,8 +112,24 @@ public sealed partial class WebGpuBackend
             source, destination, uniforms, size).GetAwaiter().GetResult();
     }
 
+    // Offsets and length count elements of the buffers' type. The float kernel below moves one 4-byte word an element;
+    // a buffer of doubles (two words each) is copied by the word kernel, after its range is checked in doubles.
+    private static bool CopiesDoubles(IGpuBuffer source, IGpuBuffer destination, int sourceOffset, int destinationOffset, int length,
+        string operation)
+    {
+        if (GpuCopyLayout.ElementBytes(source, destination, operation) == sizeof(float)) return false;
+        GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, operation);
+        return length > 0;
+    }
+
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
+        if (CopiesDoubles(source, destination, sourceOffset, destinationOffset, length, nameof(Copy)))
+        {
+            CopyFloat64(source, sourceOffset, destination, destinationOffset, length);
+            return;
+        }
+
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(length),

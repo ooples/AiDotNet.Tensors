@@ -211,7 +211,7 @@ public partial class DirectGpuTensorEngine
         if (length < Float64ElementwiseMinLength) return null;
         if (ResidentStepActive || !IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend)) return null;
         if (backend is not IGpuFloat64Elementwise { SupportsFloat64Elementwise: true } elementwise) return null;
-        if (!backend.SupportsElementType(GpuElementType.Float64)) return null;
+        if (!backend.SupportsElementType(GpuElementType.Float64) || !GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend)) return null;
         // Only the type-preserving policy takes this route; a speed-first scope narrows to float on its own path.
         if (AutocastScope.IsEnabled
             || GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AccuracyMode != GpuAccuracyMode.PreserveInputType)
@@ -283,7 +283,7 @@ public partial class DirectGpuTensorEngine
         if (a is not Tensor<double> left || b is not Tensor<double> right) return null;
         if (ResidentStepActive || !IsGpuPrecisionSafe(a, b)) return null;
         if (backend is not IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true } multiply) return null;
-        if (!backend.SupportsElementType(GpuElementType.Float64)) return null;
+        if (!backend.SupportsElementType(GpuElementType.Float64) || !GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend)) return null;
         if (m <= 0 || n <= 0 || k <= 0 || left.Length != (long)m * k || right.Length != (long)k * n) return null;
         long work = (long)m * n * k;
         long productLength = (long)m * n;
@@ -385,7 +385,7 @@ public partial class DirectGpuTensorEngine
         int length = tensor.Length;
         if (length == 0 || ResidentStepActive || !IsGpuPrecisionSafe(tensor) || !TryGetBackend(out var backend)) return false;
         if (backend is not IGpuFloat64Reductions { SupportsFloat64Reductions: true } reductions
-            || !backend.SupportsElementType(GpuElementType.Float64))
+            || !backend.SupportsElementType(GpuElementType.Float64) || !GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend))
             return false;
         try
         {

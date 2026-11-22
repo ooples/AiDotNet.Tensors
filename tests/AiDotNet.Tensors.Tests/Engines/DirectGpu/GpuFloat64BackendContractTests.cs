@@ -4,44 +4,42 @@
 
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
-using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// The Vulkan backend's double-precision storage and kernels, driven on the backend itself so they are exercised
-/// wherever a Vulkan device with shaderFloat64 and libshaderc exists, whichever backend the engine picked. A double is
-/// two 4-byte words there; these tests hold the kernels to the host's results (bit for bit where the operation is one
-/// IEEE operation) and the buffer to counting elements, not words.
+/// What every backend's double-precision storage and kernels owe, driven on the backend itself so it is exercised
+/// wherever that backend's device exists, whichever backend the engine picked. The kernels are held to the host's
+/// results (bit for bit where the operation is one IEEE operation) and the buffer to counting doubles, not words.
 /// </summary>
-[Collection("VulkanGlobalState")]
-public sealed class VulkanFloat64Tests
+public abstract class GpuFloat64BackendContractTests
 {
-    private readonly VulkanBackend? _backend;
+    /// <summary>The backend under test, or null when its device (or its double support) is absent on this host.</summary>
+    protected abstract IDirectGpuBackend? Device();
 
-    public VulkanFloat64Tests()
+    /// <summary>Why <see cref="Device"/> returned null.</summary>
+    protected abstract string SkipReason { get; }
+
+    private static IGpuFloat64Elementwise Elementwise(IDirectGpuBackend backend)
+        => backend as IGpuFloat64Elementwise ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double element-wise kernels.");
+
+    private static IGpuFloat64Reductions Reductions(IDirectGpuBackend backend)
+        => backend as IGpuFloat64Reductions ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double reductions.");
+
+    private static IGpuFloat64MatrixMultiply MatrixMultiply(IDirectGpuBackend backend)
+        => backend as IGpuFloat64MatrixMultiply ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double matrix multiply.");
+
+    [SkippableFact]
+    public void The_backend_reports_its_double_capabilities()
     {
-        VulkanBackend? backend = null;
-        try
-        {
-            backend = VulkanBackend.Instance;
-            if (!backend.Initialize() || !backend.SupportsElementType(GpuElementType.Float64)) backend = null;
-        }
-        catch (Exception unavailable) when (unavailable is DllNotFoundException or InvalidOperationException or NotSupportedException)
-        {
-            backend = null;
-        }
-
-        _backend = backend;
-    }
-
-    private VulkanBackend? Ready()
-    {
-        if (_backend is not null) return _backend;
-        if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_VULKAN_FLOAT64_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("Vulkan double tests were required but no Vulkan device with shaderFloat64 and libshaderc is present.");
-        return null;
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        Assert.True(backend.SupportsElementType(GpuElementType.Float64));
+        Assert.True(Elementwise(backend).SupportsFloat64Elementwise);
+        Assert.True(Reductions(backend).SupportsFloat64Reductions);
+        Assert.True(MatrixMultiply(backend).SupportsFloat64MatrixMultiply);
+        Assert.True(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Float64));
     }
 
     // Full 53-bit mantissas, mixed signs and magnitudes: a float round trip, a contracted multiply-add or a
@@ -82,8 +80,8 @@ public sealed class VulkanFloat64Tests
     [SkippableFact]
     public void A_double_buffer_counts_doubles_and_round_trips_them()
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         const int length = 1027;
         var values = Values(length, 1);
         using var buffer = backend.AllocateBuffer(length, GpuElementType.Float64);
@@ -104,8 +102,8 @@ public sealed class VulkanFloat64Tests
     [SkippableFact]
     public void A_device_copy_moves_whole_doubles_and_refuses_a_float_destination()
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         const int length = 300;
         var values = Values(length, 2);
         using var source = backend.AllocateBuffer(length, GpuElementType.Float64);
@@ -134,8 +132,8 @@ public sealed class VulkanFloat64Tests
     [InlineData(GpuFloat64BinaryOperation.Divide)]
     public void Arithmetic_equals_the_host_bit_for_bit_with_a_buffer_or_a_scalar_on_the_right(GpuFloat64BinaryOperation operation)
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         const int length = 4099;
         const double scalar = 1.0 / 3.0 + 1e-9;
         var left = Values(length, 10 + (int)operation);
@@ -163,17 +161,17 @@ public sealed class VulkanFloat64Tests
         backend.UploadBuffer<double>(b, right);
         var actual = new double[length];
 
-        backend.BinaryFloat64(operation, a, b, output, length);
+        Elementwise(backend).BinaryFloat64(operation, a, b, output, length);
         backend.DownloadBuffer<double>(output, actual);
         AssertBitEqual(expected, actual);
 
-        backend.ScalarFloat64(operation, a, scalar, output, length);
+        Elementwise(backend).ScalarFloat64(operation, a, scalar, output, length);
         backend.DownloadBuffer<double>(output, actual);
         AssertBitEqual(expectedScalar, actual);
 
-        Assert.Throws<ArgumentException>(() => backend.BinaryFloat64(operation, a, floats, output, length));
-        Assert.Throws<ArgumentException>(() => backend.ScalarFloat64(operation, floats, scalar, output, length));
-        Assert.Throws<ArgumentOutOfRangeException>(() => backend.BinaryFloat64(operation, a, b, output, length + 1));
+        Assert.Throws<ArgumentException>(() => Elementwise(backend).BinaryFloat64(operation, a, floats, output, length));
+        Assert.Throws<ArgumentException>(() => Elementwise(backend).ScalarFloat64(operation, floats, scalar, output, length));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Elementwise(backend).BinaryFloat64(operation, a, b, output, length + 1));
     }
 
     [SkippableTheory]
@@ -187,8 +185,8 @@ public sealed class VulkanFloat64Tests
     [InlineData(GpuFloat64UnaryOperation.Sigmoid, 16)]
     public void Unary_kernels_match_the_host(GpuFloat64UnaryOperation operation, int ulps)
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         const int length = 2053;
         var input = Values(length, 30 + (int)operation);
         if (operation is GpuFloat64UnaryOperation.Sqrt or GpuFloat64UnaryOperation.Log)
@@ -210,7 +208,7 @@ public sealed class VulkanFloat64Tests
         using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
         using var output = backend.AllocateBuffer(length, GpuElementType.Float64);
         backend.UploadBuffer<double>(a, input);
-        backend.UnaryFloat64(operation, a, output, length);
+        Elementwise(backend).UnaryFloat64(operation, a, output, length);
         var actual = new double[length];
         backend.DownloadBuffer<double>(output, actual);
         for (int i = 0; i < length; i++)
@@ -227,8 +225,8 @@ public sealed class VulkanFloat64Tests
     [InlineData(100003)]
     public void Sum_and_dot_agree_with_the_host_to_rounding(int length)
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         var left = Values(length, 40);
         var right = Values(length, 41);
         double sum = 0.0, dot = 0.0, sumMagnitude = 0.0, dotMagnitude = 0.0;
@@ -247,17 +245,17 @@ public sealed class VulkanFloat64Tests
         // A blocked sum orders the additions differently from the host's left-to-right one: both are within the
         // classic n * eps * sum|x| of the exact value. A float-precision reduction misses this by nine digits.
         double bound = 2.0 * length * 2.220446049250313e-16;
-        Assert.True(Math.Abs(backend.SumFloat64(a, length) - sum) <= bound * sumMagnitude, $"Sum of {length}.");
-        Assert.True(Math.Abs(backend.DotFloat64(a, b, length) - dot) <= bound * dotMagnitude, $"Dot of {length}.");
-        Assert.Equal(0.0, backend.SumFloat64(a, 0));
-        Assert.Equal(0.0, backend.DotFloat64(a, b, 0));
+        Assert.True(Math.Abs(Reductions(backend).SumFloat64(a, length) - sum) <= bound * sumMagnitude, $"Sum of {length}.");
+        Assert.True(Math.Abs(Reductions(backend).DotFloat64(a, b, length) - dot) <= bound * dotMagnitude, $"Dot of {length}.");
+        Assert.Equal(0.0, Reductions(backend).SumFloat64(a, 0));
+        Assert.Equal(0.0, Reductions(backend).DotFloat64(a, b, 0));
     }
 
     [SkippableFact]
     public void Matrix_multiply_matches_the_host_and_refuses_an_aliased_product()
     {
-        var backend = Ready();
-        Skip.If(backend is null, "No Vulkan device with shaderFloat64 and libshaderc.");
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
         const int m = 17, k = 23, n = 9;
         var left = Values(m * k, 50);
         var right = Values(k * n, 51);
@@ -266,7 +264,7 @@ public sealed class VulkanFloat64Tests
         using var c = backend.AllocateBuffer(m * n, GpuElementType.Float64);
         backend.UploadBuffer<double>(a, left);
         backend.UploadBuffer<double>(b, right);
-        backend.MatrixMultiplyFloat64(a, b, c, m, n, k);
+        MatrixMultiply(backend).MatrixMultiplyFloat64(a, b, c, m, n, k);
         var actual = new double[m * n];
         backend.DownloadBuffer<double>(c, actual);
         for (int row = 0; row < m; row++)
@@ -289,9 +287,44 @@ public sealed class VulkanFloat64Tests
 
         using var square = backend.AllocateBuffer(9, GpuElementType.Float64);
         using var other = backend.AllocateBuffer(9, GpuElementType.Float64);
-        Assert.Throws<ArgumentException>(() => backend.MatrixMultiplyFloat64(square, other, square, 3, 3, 3));
-        Assert.Throws<ArgumentOutOfRangeException>(() => backend.MatrixMultiplyFloat64(square, other, c, 0, 3, 3));
+        Assert.Throws<ArgumentException>(() => MatrixMultiply(backend).MatrixMultiplyFloat64(square, other, square, 3, 3, 3));
+        Assert.Throws<ArgumentOutOfRangeException>(() => MatrixMultiply(backend).MatrixMultiplyFloat64(square, other, c, 0, 3, 3));
     }
 }
+
+/// <summary>Vulkan: GLSL double kernels behind shaderFloat64 and the runtime GLSL compiler.</summary>
+[Collection("VulkanGlobalState")]
+public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
+{
+    private readonly IDirectGpuBackend? _backend;
+
+    public VulkanFloat64Tests()
+    {
+        try
+        {
+            var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            if (backend.Initialize() && backend.SupportsElementType(GpuElementType.Float64)) _backend = backend;
+        }
+        catch (Exception unavailable) when (unavailable is DllNotFoundException or InvalidOperationException or NotSupportedException)
+        {
+            _backend = null;
+        }
+    }
+
+    protected override IDirectGpuBackend? Device() => _backend;
+
+    protected override string SkipReason => "No Vulkan device with shaderFloat64 and libshaderc.";
+}
+
+#if NET7_0_OR_GREATER
+/// <summary>WebGPU on Dawn: binary64 computed in integer arithmetic, WGSL having no 64-bit float.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class WebGpuFloat64Tests : GpuFloat64BackendContractTests
+{
+    protected override IDirectGpuBackend? Device() => DawnHostedWebGpu.BackendOrNull();
+
+    protected override string SkipReason => "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).";
+}
+#endif
 
 #endif
