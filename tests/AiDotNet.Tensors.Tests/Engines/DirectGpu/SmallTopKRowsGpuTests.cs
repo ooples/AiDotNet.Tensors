@@ -1,5 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
+using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -41,5 +43,41 @@ public sealed class SmallTopKRowsGpuTests : IClassFixture<DirectGpuTensorEngineT
         Assert.Equal(cpuTop.Shape.ToArray(), gpuTop.Shape.ToArray());
         Assert.Equal(cpuIdx.ToArray(), gpuIdx.ToArray());
         Assert.Equal(cpuTop.ToArray(), gpuTop.ToArray());
+    }
+
+    // NaN and signed zeros: the kernel must order them as the CPU engine does (a NaN's rank, -0 against +0 and ties),
+    // bit for bit in the values and exactly in the indices.
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(8)]
+    public void Small_row_top_k_orders_nan_and_signed_zeros_as_the_cpu_engine(int k)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.ISmallTopKRowsBackend, "Backend has no small-row TopK kernel.");
+        float nan = float.NaN, nz = -0f;
+        float[][] rows =
+        {
+            new[] { 0f, nz, 0f, nz, 1f, -1f, nz, 0f },
+            new[] { nz, nz, 0f, 0f, nz, 0f, nz, 0f },
+            new[] { nan, 1f, nz, 0f, -1f, 2f, nan, -2f },
+            new[] { 1f, nan, nan, 1f, nz, nan, 0f, -1f },
+            new[] { nan, nan, nan, nan, nan, nan, nan, nan },
+            new[] { float.NegativeInfinity, nan, float.PositiveInfinity, nz, 0f, nan, float.NegativeInfinity, 3f },
+        };
+        int cols = rows[0].Length;
+        var x = new Tensor<float>([rows.Length, cols]);
+        for (int r = 0; r < rows.Length; r++)
+            for (int c = 0; c < cols; c++) x[r * cols + c] = rows[r][c];
+
+        var cpuTop = new CpuEngine().TensorTopK(x, k, 1, out Tensor<int> cpuIdx);
+        int before = gpu.TopKSmallRowsCompleted;
+        var gpuTop = ((IEngine)gpu).TensorTopK(x, k, 1, out Tensor<int> gpuIdx);
+        Assert.Equal(before + 1, gpu.TopKSmallRowsCompleted);
+
+        Assert.Equal(cpuIdx.ToArray(), gpuIdx.ToArray());
+        Assert.Equal(cpuTop.ToArray().Select(BitConverter.SingleToInt32Bits).ToArray(),
+            gpuTop.ToArray().Select(BitConverter.SingleToInt32Bits).ToArray());
     }
 }
