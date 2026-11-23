@@ -313,7 +313,9 @@ internal static class CpuTopology
             if (!int.TryParse(name.Substring(3), System.Globalization.NumberStyles.None,
                     System.Globalization.CultureInfo.InvariantCulture, out _))
                 continue;   // cpufreq, cpuidle
-            string siblingsFile = System.IO.Path.Combine(directory, "topology", "thread_siblings_list");
+            // Joined by hand: the parts are fixed relative names under a directory the enumeration returned.
+            string siblingsFile = directory + System.IO.Path.DirectorySeparatorChar + "topology"
+                + System.IO.Path.DirectorySeparatorChar + "thread_siblings_list";
             if (!System.IO.File.Exists(siblingsFile)) continue;   // an offline processor has no topology
             int[] siblings;
             try

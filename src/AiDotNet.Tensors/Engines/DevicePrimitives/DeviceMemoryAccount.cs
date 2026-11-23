@@ -151,9 +151,14 @@ internal sealed class DeviceMemoryAccount
             Interlocked.Add(ref _inFlight, bytes);
         }
 
-        t_admittedOn = this;
-        t_admittedBytes = bytes;
+        HoldAdmission(this, bytes);
         return true;
+    }
+
+    private static void HoldAdmission(DeviceMemoryAccount account, long bytes)
+    {
+        t_admittedOn = account;
+        t_admittedBytes = bytes;
     }
 
     /// <summary>Releases the admission this thread holds, if any: its allocation is now counted as reserved, or was
