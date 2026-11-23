@@ -1038,6 +1038,39 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
+    // Under deterministic mode the chunked backward's one-hot subtraction went through ScatterAdd's stable-sort route,
+    // whose scratch keeps a start slot per destination cell: chunk x vocab int32 (128 MiB at 672 x 49152), held for the
+    // backend's life. One position per row is distinct, so it takes no sort to be deterministic.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_backward_under_determinism_keeps_no_sort_scratch()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var cuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(cuda is null, "CUDA backend only.");
+            bool wasDeterministic = AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode;
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(true);
+            try
+            {
+                static Tensor<float> Op(IEngine e, Tensor<float> t) =>
+                    e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds);
+                var cpuGrad = GradientOf(new CpuEngine(), ChunkHidden, Op);
+                DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+                var first = GradientOf(gpu, ChunkHidden, Op);
+                Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+                var second = GradientOf(gpu, ChunkHidden, Op);
+                Assert.Equal(first, second);   // bit-identical run to run
+                for (int i = 0; i < cpuGrad.Length; i++)
+                    Assert.True(Math.Abs(first[i] - cpuGrad[i]) <= 1e-6, $"gradient[{i}] {first[i]} vs CPU {cpuGrad[i]}");
+                long chunkCells = 672L * ChunkVocab;
+                Assert.True(cuda!.SortedScatterScratchBytes < chunkCells,
+                    $"sort scratch {cuda.SortedScatterScratchBytes} bytes, a start slot per logit of a chunk is {chunkCells * 4}.");
+            }
+            finally { AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(wasDeterministic); }
+        }
+    }
+
     // The forward runs in the same row chunks: a GEMM per chunk, row log-softmax, a gather of the target log-probability
     // and a ones-vector GEMM summing them. It replaced a one-thread-per-row kernel that took 3.68 s at N=4096, V=49152.
     [SkippableFact]

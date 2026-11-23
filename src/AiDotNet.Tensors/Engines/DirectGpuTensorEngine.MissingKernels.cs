@@ -6783,7 +6783,10 @@ public partial class DirectGpuTensorEngine
                     difference = DispatchDeferredGpuOp<T>(backend, total, logitShape, output =>
                     {
                         backend.Copy(probabilityBuffer.Buffer, output, total);
-                        backend.ScatterAdd(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
+                        if (backend is DirectGpu.IUniquePositionAddBackend unique)   // one position per row: distinct
+                            unique.AddAtUniquePositions(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
+                        else
+                            backend.ScatterAdd(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
                     });
                 }
                 else
@@ -6950,7 +6953,11 @@ public partial class DirectGpuTensorEngine
             backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
             backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
             backend.Softmax(work, logits, c, vocab);                             // probabilities
-            backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
+            // - one-hot. Each row has one target position inside its own row, so the positions are distinct.
+            if (backend is DirectGpu.IUniquePositionAddBackend unique)
+                unique.AddAtUniquePositions(minusOnes, chunkPositions, logits, c, cv);
+            else
+                backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);
             backend.Scale(logits, logits, 1f / n, cv);                           // / N
             backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
             if (chunkFlags is not null)
