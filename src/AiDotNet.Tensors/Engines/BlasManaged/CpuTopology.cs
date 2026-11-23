@@ -189,7 +189,7 @@ internal static class CpuTopology
     [MethodImpl(Hot)]
     internal static (ushort Group, byte Number)[] UsableCores()
     {
-        if (RequestedCores is { } requested) return ConfineToRequestedCores(requested);
+        if (RequestedCores is not null) return s_confinement.Value;
         var own = UsableCoresInCurrentGroup();
         // AIDOTNET_CPU_SPAN_GROUPS=0 keeps the pool in the process's own group (the pre-#653 placement).
         if (own.Length == 0 || Environment.GetEnvironmentVariable("AIDOTNET_CPU_SPAN_GROUPS") == "0"
@@ -220,6 +220,23 @@ internal static class CpuTopology
         return string.IsNullOrWhiteSpace(text) ? null : ParseCoreList(text!);
     });
 
+    // Decided once, on the first CPU work of the process (EnsureConfined), whether or not that work uses the pool: a
+    // single requested core runs everything inline and would otherwise never be confined. A failure is kept and
+    // rethrown to every later caller.
+    private static readonly Lazy<(ushort Group, byte Number)[]> s_confinement = new(() =>
+        RequestedCores is { } requested ? ConfineToRequestedCores(requested) : Array.Empty<(ushort, byte)>());
+
+    /// <summary>Confines the process to the cores <c>AIDOTNET_CPU_CORES</c> names, once; nothing when it is not set.
+    /// Throws what the confinement threw.</summary>
+    internal static void EnsureConfined()
+    {
+        if (RequestedCores is not null) _ = s_confinement.Value;
+    }
+
+    /// <summary>The highest core or logical-processor index a list may name. Far past any machine, and it bounds what
+    /// a range expands to.</summary>
+    internal const int MaxCoreIndex = 65535;
+
     /// <summary>Parses a core list (<c>0-15,32,40-47</c>) into distinct indexes in the order given.</summary>
     internal static int[] ParseCoreList(string text)
     {
@@ -236,6 +253,10 @@ internal static class CpuTopology
                 || hi < lo)
                 throw new InvalidOperationException(
                     $"{CoresEnvironmentVariable}={text}: '{part}' is not a core index or an ascending range such as 0-15.");
+            // Checked before the range is expanded: an index near int.MaxValue would overflow the loop below.
+            if (hi > MaxCoreIndex)
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable}={text}: '{part}' names an index above {MaxCoreIndex}.");
             for (int c = lo; c <= hi; c++)
                 if (seen.Add(c)) cores.Add(c);
         }
@@ -245,13 +266,14 @@ internal static class CpuTopology
     // The requested cores as (group, first logical processor), and -- when they all lie in the process's primary group,
     // the only group a process affinity mask can name -- the process confined to their logical processors (SMT siblings
     // included), so the threads that dispatch work stay there too, not only the pool's workers.
-    // On Linux the process is confined the same way and no worker is bound one by one: every thread then stays on the
-    // requested cores. A platform with neither (macOS has no affinity) is told once that only the thread count follows.
+    // On Linux every thread of the process is confined (an affinity call there reaches one thread, so each is set;
+    // threads started afterwards inherit it) and no worker is bound one by one. A platform with neither (macOS has no
+    // affinity) is told once that only the thread count follows.
     private static (ushort Group, byte Number)[] ConfineToRequestedCores(int[] requested)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            SetProcessAffinity(MapLinuxCores(requested, ReadLinuxPhysicalCores("/sys/devices/system/cpu")));
+            ConfineLinuxThreads(MapLinuxCores(requested, ReadLinuxPhysicalCores("/sys/devices/system/cpu")));
             return Array.Empty<(ushort, byte)>();
         }
 
@@ -274,7 +296,6 @@ internal static class CpuTopology
     // Confines the process to the logical processors of `mask`, or throws naming the setting: a process left unconfined
     // while its pool is sized for the requested cores is the collision the setting exists to prevent.
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     private static void SetProcessAffinity(ulong mask)
     {
         // The affinity mask is pointer-sized: a 32-bit process cannot name a logical processor above 31, and a
@@ -297,11 +318,67 @@ internal static class CpuTopology
         }
     }
 
+    [DllImport("libc", SetLastError = true)]
+    private static extern int sched_setaffinity(int pid, IntPtr cpuSetSize, ref ulong mask);
+
+    /// <summary>
+    /// Confines every thread of this process to the logical processors of <paramref name="mask"/> and returns how many
+    /// were set. On Linux an affinity call reaches one thread (a process id names only the main one), so each thread
+    /// under <c>/proc/self/task</c> is set; a thread started later inherits its creator's mask. The list is read again
+    /// until a pass finds no thread it has not set, which covers one started meanwhile by a thread not yet confined.
+    /// </summary>
+    internal static int ConfineLinuxThreads(ulong mask)
+    {
+        const int NoSuchProcess = 3;   // ESRCH: the thread exited between the listing and the call
+        const int Passes = 64;
+        var confined = new HashSet<int>();
+        try
+        {
+            for (int pass = 0; pass < Passes; pass++)
+            {
+                bool found = false;
+                foreach (string task in System.IO.Directory.GetDirectories("/proc/self/task"))
+                {
+                    if (!int.TryParse(System.IO.Path.GetFileName(task), System.Globalization.NumberStyles.None,
+                            System.Globalization.CultureInfo.InvariantCulture, out int thread) || !confined.Add(thread))
+                        continue;
+                    found = true;
+                    ulong requested = mask;
+                    if (sched_setaffinity(thread, new IntPtr(sizeof(ulong)), ref requested) == 0) continue;
+                    int error = Marshal.GetLastWin32Error();
+                    if (error == NoSuchProcess)
+                    {
+                        confined.Remove(thread);
+                        continue;
+                    }
+
+                    throw new InvalidOperationException(
+                        $"{CoresEnvironmentVariable}: the operating system refused to confine thread {thread} to the requested "
+                        + $"cores (affinity mask 0x{mask:X}, errno {error}).");
+                }
+
+                if (!found) return confined.Count;
+            }
+        }
+        catch (Exception unavailable) when (unavailable is DllNotFoundException or EntryPointNotFoundException
+                                                or System.IO.IOException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException(
+                $"{CoresEnvironmentVariable}: this process's threads could not be confined to the requested cores "
+                + $"({unavailable.GetType().Name}). Confine the process with taskset or numactl instead.", unavailable);
+        }
+
+        throw new InvalidOperationException(
+            $"{CoresEnvironmentVariable}: threads kept starting unconfined while the process was being confined to the "
+            + "requested cores. Confine the process with taskset or numactl instead.");
+    }
+
     /// <summary>
     /// The logical processors of each physical core under a Linux sysfs CPU directory
     /// (<c>/sys/devices/system/cpu</c>), cores in order of their first logical processor: each
     /// <c>cpuN/topology/thread_siblings_list</c> names the SMT siblings of one core. Empty when the directory has no
-    /// topology.
+    /// topology. A processor without the file is offline and skipped; a file that cannot be read or parsed throws,
+    /// because leaving its core out would shift every later index onto another core.
     /// </summary>
     internal static int[][] ReadLinuxPhysicalCores(string sysfsCpuDirectory)
     {
@@ -324,11 +401,16 @@ internal static class CpuTopology
             }
             catch (Exception unreadable) when (unreadable is InvalidOperationException or System.IO.IOException or UnauthorizedAccessException)
             {
-                System.Diagnostics.Trace.TraceWarning($"CPU topology: {siblingsFile} could not be read ({unreadable.GetType().Name}).");
-                continue;
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable}: the CPU topology file {siblingsFile} could not be read "
+                    + $"({unreadable.GetType().Name}), so the requested cores cannot be found. Confine the process with "
+                    + "taskset or numactl instead.", unreadable);
             }
 
-            if (siblings.Length == 0) continue;
+            if (siblings.Length == 0)
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable}: the CPU topology file {siblingsFile} names no processor, so the requested "
+                    + "cores cannot be found. Confine the process with taskset or numactl instead.");
             Array.Sort(siblings);
             cores[siblings[0]] = siblings;
         }

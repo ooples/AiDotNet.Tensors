@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -33,7 +34,11 @@ internal static class CudaAccountedMemory
         public object Token { get; }
     }
 
-    private static readonly ConcurrentDictionary<IntPtr, Owner> s_contexts = new();
+    // Every live registration of a context, oldest first: backends on one device share its primary context, and the
+    // last one registered answers for it until it is disposed, when the one before it does again.
+    private static readonly Dictionary<IntPtr, List<Owner>> s_contexts = new();
+    private static readonly object s_contextsLock = new object();
+    private static int s_registrations;
     private static readonly ConcurrentDictionary<IntPtr, (DeviceMemoryAccount Account, long Bytes)> s_live = new();
 
     /// <summary>
@@ -44,26 +49,53 @@ internal static class CudaAccountedMemory
     internal static void Register(IntPtr context, DeviceMemoryAccount account, Action reclaim, object token)
     {
         if (context == IntPtr.Zero) return;
-        s_contexts[context] = new Owner(account, reclaim, token);
+        lock (s_contextsLock)
+        {
+            if (!s_contexts.TryGetValue(context, out var owners))
+            {
+                owners = new List<Owner>(1);
+                s_contexts[context] = owners;
+            }
+
+            owners.Add(new Owner(account, reclaim, token));
+            s_registrations++;
+        }
     }
 
-    /// <summary>Removes the registration <paramref name="token"/> made, unless a later backend on the same context
-    /// replaced it.</summary>
+    /// <summary>Removes the registration <paramref name="token"/> made. Another backend still registered on the
+    /// context keeps answering for it.</summary>
     internal static void Unregister(IntPtr context, object token)
     {
         if (context == IntPtr.Zero) return;
-        if (s_contexts.TryGetValue(context, out var owner) && ReferenceEquals(owner.Token, token))
-            ((ICollection<KeyValuePair<IntPtr, Owner>>)s_contexts).Remove(new KeyValuePair<IntPtr, Owner>(context, owner));
+        lock (s_contextsLock)
+        {
+            if (!s_contexts.TryGetValue(context, out var owners)) return;
+            int removed = owners.RemoveAll(owner => ReferenceEquals(owner.Token, token));
+            s_registrations -= removed;
+            if (owners.Count == 0) s_contexts.Remove(context);
+        }
+    }
+
+    /// <summary>Live registrations of <paramref name="context"/> (tests).</summary>
+    internal static int RegistrationCount(IntPtr context)
+    {
+        lock (s_contextsLock) return s_contexts.TryGetValue(context, out var owners) ? owners.Count : 0;
     }
 
     private static Owner? Current()
     {
-        if (s_contexts.IsEmpty) return null;
-        return CudaNativeBindings.cuCtxGetCurrent(out IntPtr context) == CudaResult.Success
-               && s_contexts.TryGetValue(context, out var owner)
-            ? owner
-            : null;
+        if (Volatile.Read(ref s_registrations) == 0) return null;
+        return CudaNativeBindings.cuCtxGetCurrent(out IntPtr context) == CudaResult.Success ? OwnerOf(context) : null;
     }
+
+    private static Owner? OwnerOf(IntPtr context)
+    {
+        lock (s_contextsLock)
+            return s_contexts.TryGetValue(context, out var owners) && owners.Count > 0 ? owners[owners.Count - 1] : null;
+    }
+
+    /// <summary>The account answering for <paramref name="context"/> now, or null (tests).</summary>
+    internal static DeviceMemoryAccount? AccountOf(IntPtr context) => OwnerOf(context)?.Account;
 
     /// <summary>
     /// <c>cuMemAlloc</c> on the current context, counted on its device and refused with

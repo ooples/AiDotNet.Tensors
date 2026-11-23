@@ -29,6 +29,9 @@ public class CpuCoreSetTests
     [InlineData("   ")]
     [InlineData("99999999999")]
     [InlineData("0-99999999999")]
+    [InlineData("2147483647")]
+    [InlineData("0-2147483647")]
+    [InlineData("65536")]
     public void ParseCoreList_RejectsMalformedLists(string text)
     {
         var ex = Assert.Throws<InvalidOperationException>(() => CpuTopology.ParseCoreList(text));
@@ -127,6 +130,87 @@ public class CpuCoreSetTests
         var beyond = Assert.Throws<InvalidOperationException>(
             () => CpuTopology.MapLinuxCores(new[] { 0 }, new[] { new[] { 3, IntPtr.Size * 8 } }));
         Assert.Contains("taskset", beyond.Message);
+    }
+
+    [Fact]
+    public void ParseCoreList_TakesTheHighestIndexItAllows()
+        => Assert.Equal(new[] { CpuTopology.MaxCoreIndex - 1, CpuTopology.MaxCoreIndex },
+            CpuTopology.ParseCoreList($"{CpuTopology.MaxCoreIndex - 1}-{CpuTopology.MaxCoreIndex}"));
+
+    [Theory]
+    [InlineData("not a list")]
+    [InlineData("")]
+    public void LinuxCores_ATopologyFileThatCannotBeParsed_IsAnError_NotASkippedCore(string contents)
+    {
+        // Skipping cpu0 would make "core 0" mean the machine's second core.
+        string root = Sysfs((1, "1"), (2, "2"));
+        try
+        {
+            string topology = System.IO.Path.Combine(root, "cpu0", "topology");
+            System.IO.Directory.CreateDirectory(topology);
+            System.IO.File.WriteAllText(System.IO.Path.Combine(topology, "thread_siblings_list"), contents);
+            var unreadable = Assert.Throws<InvalidOperationException>(() => CpuTopology.ReadLinuxPhysicalCores(root));
+            Assert.Contains(CpuTopology.CoresEnvironmentVariable, unreadable.Message);
+            Assert.Contains("cpu0", unreadable.Message);
+        }
+        finally
+        {
+            System.IO.Directory.Delete(root, recursive: true);
+        }
+    }
+
+    // The 64 lowest logical processors a thread may run on, from its status file ("Cpus_allowed:\tff,ffffffff").
+    private static ulong? AllowedMask(string statusFile)
+    {
+        foreach (string line in System.IO.File.ReadAllLines(statusFile))
+        {
+            if (!line.StartsWith("Cpus_allowed:", StringComparison.Ordinal)) continue;
+            string hex = line.Substring("Cpus_allowed:".Length).Trim().Replace(",", string.Empty).TrimStart('0');
+            if (hex.Length > 16) return null;   // more than 64 logical processors: outside what a mask names
+            return hex.Length == 0 ? 0UL : Convert.ToUInt64(hex, 16);
+        }
+
+        return null;
+    }
+
+    [SkippableFact]
+    public void LinuxConfinement_ReachesEveryThread_NotOnlyTheMainOne()
+    {
+        Skip.IfNot(System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux),
+            "Linux thread affinity.");
+        ulong? allowed = AllowedMask("/proc/thread-self/status");
+        Skip.If(allowed is null || allowed == 0, "This thread's affinity is not a 64-processor mask.");
+        ulong all = allowed.GetValueOrDefault();
+        // The lowest processor this thread may run on: a narrower mask than any thread has, unless only one is allowed.
+        ulong one = all & (~all + 1);
+        using var started = new System.Threading.ManualResetEventSlim(false);
+        using var finish = new System.Threading.ManualResetEventSlim(false);
+        ulong? seenByOther = null;
+        var other = new System.Threading.Thread(() =>
+        {
+            started.Set();
+            finish.Wait();
+            seenByOther = AllowedMask("/proc/thread-self/status");
+        });
+        other.Start();
+        started.Wait();
+        try
+        {
+            int confined = CpuTopology.ConfineLinuxThreads(one);
+            Assert.True(confined >= 2, $"{confined} threads confined; the process has at least this one and the one it started.");
+            Assert.Equal(one, AllowedMask("/proc/thread-self/status"));
+        }
+        finally
+        {
+            finish.Set();
+            other.Join();
+            // Back to what the test host had, on every thread.
+            CpuTopology.ConfineLinuxThreads(all);
+        }
+
+        // A thread that was already running, and is not the main thread, was confined too.
+        Assert.Equal(one, seenByOther);
+        Assert.Equal(all, AllowedMask("/proc/thread-self/status"));
     }
 }
 #endif

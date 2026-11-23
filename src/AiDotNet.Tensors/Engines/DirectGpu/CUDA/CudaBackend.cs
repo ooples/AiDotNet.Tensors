@@ -394,6 +394,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private static long ReadMemPoolBytes(IntPtr pool, int attribute)
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
+    // For the budget: a query that fails throws, so the account keeps its last reading instead of counting the pool
+    // as empty.
+    private static long RequireMemPoolBytes(IntPtr pool, int attribute)
+    {
+        var status = CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value);
+        if (status != CudaResult.Success)
+            throw new InvalidOperationException($"cuMemPoolGetAttribute({attribute}) failed: {status}.");
+        return (long)value;
+    }
+
     private const int MaxPooledBufferElements = int.MaxValue;
     private const int MaxPooledBuffersPerSize = 4096;
     private const int PooledMemoryDivisor = 6;
@@ -879,7 +889,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     // Stream-ordered buffers are not counted as reserved one by one: freed ones stay in this pool, so
                     // the pool's own counter is the device memory they hold. It captures the handle, not the backend.
                     _memoryAccount.SetDriverReserved(
-                        () => (ReadMemPoolBytes(memPool, 5), ReadMemPoolBytes(memPool, 6)),
+                        () => (RequireMemPoolBytes(memPool, 5), RequireMemPoolBytes(memPool, 6)),
                         () => { ulong zero = 0; CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero); });
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
@@ -2083,6 +2093,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         catch
         {
             CuBlasNative.cuMemFree(devicePtr);
+            DeviceMemoryAccount.SettleAdmission();   // admitted, freed before it was counted
             throw;
         }
 
@@ -2462,7 +2473,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         // Stream-ordered: a synchronous cuMemset runs on the legacy stream, which is illegal while _stream is being
         // captured (CUDA 906) and serializes the device everywhere else.
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async");
+        var fill = CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream);
+        if (fill != CudaResult.Success)
+        {
+            CuBlasNative.cuMemFree(devicePtr);
+            DeviceMemoryAccount.SettleAdmission();   // admitted, freed before it was counted
+            CuBlasNative.CheckCudaResult(fill, "cuMemsetD32Async");
+        }
+
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
     }
 
@@ -10479,6 +10497,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         catch
         {
             CuBlasNative.cuMemFree(devicePtr);
+            DeviceMemoryAccount.SettleAdmission();   // admitted, freed before it was counted
             throw;
         }
 

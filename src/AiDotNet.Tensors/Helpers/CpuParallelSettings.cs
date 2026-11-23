@@ -27,7 +27,50 @@ public static class CpuParallelSettings
     /// detected), as PyTorch and OpenMP default to; the <c>AIDOTNET_CPU_THREADS</c> environment variable overrides it.
     /// Set to 1 to disable parallelism.
     /// </remarks>
-    public static int MaxDegreeOfParallelism { get; set; } = DefaultDegreeOfParallelism();
+    public static int MaxDegreeOfParallelism
+    {
+        get
+        {
+            if (!Volatile.Read(ref s_degreeDecided)) DecideDegreeOfParallelism();
+            return s_maxDegreeOfParallelism;
+        }
+        set
+        {
+            // A caller that sets the count before any CPU work still gets the process confined to its requested cores.
+            EnsureCoreConfinement();
+            lock (s_degreeLock)
+            {
+                s_maxDegreeOfParallelism = value;
+                Volatile.Write(ref s_degreeDecided, true);
+            }
+        }
+    }
+
+    private static int s_maxDegreeOfParallelism;
+    private static bool s_degreeDecided;
+    private static readonly object s_degreeLock = new object();
+
+    // Decided on first use rather than when the type loads: confining the process to AIDOTNET_CPU_CORES can fail, and
+    // the failure must reach the caller as itself (naming the setting), not as a type-initialization error. Every
+    // path that runs CPU work in parallel -- or decides to run it inline -- reads the count first, so the process is
+    // confined before that work runs whether or not the worker pool is ever used.
+    private static void DecideDegreeOfParallelism()
+    {
+        EnsureCoreConfinement();
+        lock (s_degreeLock)
+        {
+            if (s_degreeDecided) return;
+            s_maxDegreeOfParallelism = DefaultDegreeOfParallelism();
+            Volatile.Write(ref s_degreeDecided, true);
+        }
+    }
+
+    private static void EnsureCoreConfinement()
+    {
+#if NET5_0_OR_GREATER
+        Engines.BlasManaged.CpuTopology.EnsureConfined();
+#endif
+    }
 
     // #653: a dispatch as wide as every logical processor cost ~90-120 us before any work on a 16-core / 32-thread 3950X:
     // the 31 workers plus the dispatching thread leave no hardware thread spare, so the pool parks them between

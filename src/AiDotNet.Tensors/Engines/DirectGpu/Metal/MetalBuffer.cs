@@ -220,12 +220,20 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         // Past this process's GpuMemoryBudget, after the release a refused allocation runs: the same error.
         device.MemoryAccount.Admit((long)sizeInBytes, () => ReclaimForRetry(device),
             message => new OutOfMemoryException(message));
-        _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
-        if (_buffer == IntPtr.Zero)
+        try
         {
-            // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
-            ReclaimForRetry(device);
-            _buffer = device.CreateBuffer(sizeInBytes, options);
+            _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
+            if (_buffer == IntPtr.Zero)
+            {
+                // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
+                ReclaimForRetry(device);
+                _buffer = device.CreateBuffer(sizeInBytes, options);
+            }
+        }
+        catch
+        {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created: the retry threw
+            throw;
         }
 
         if (_buffer == IntPtr.Zero)
@@ -381,6 +389,11 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
                 ReclaimForRetry(device);
                 _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
             }
+        }
+        catch
+        {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created: the retry threw
+            throw;
         }
         finally
         {

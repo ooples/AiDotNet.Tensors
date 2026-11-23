@@ -110,11 +110,21 @@ public class GpuMemoryBudgetTests
                 threads[i].Start();
             }
 
-            asked.Wait();
+            long heldTogether;
+            try
+            {
+                asked.Wait();
+                heldTogether = account.InFlightBytes;
+            }
+            finally
+            {
+                // Before any assertion: a failed one must not leave the eight threads waiting.
+                release.Set();
+                foreach (var thread in threads) thread?.Join();
+            }
+
             Assert.Equal(expectedAdmitted, admitted);
-            Assert.Equal((long)expectedAdmitted * bytes, account.InFlightBytes);
-            release.Set();
-            foreach (var thread in threads) thread.Join();
+            Assert.Equal((long)expectedAdmitted * bytes, heldTogether);
             Assert.Equal(0, account.InFlightBytes);
         }
         finally
@@ -146,6 +156,105 @@ public class GpuMemoryBudgetTests
             account.Unreserve(700);
             GpuMemoryBudget.ClearLimit("budgettest:5");
         }
+    }
+
+    [Fact]
+    public void ReservingAnAdmittedAllocation_NeverCountsItTwice_ForAThreadAdmittedAtTheSameMoment()
+    {
+        // 600 of 1,000 held by one thread that keeps admitting and reserving it; 400 always fits beside it. Counted in
+        // both figures for a moment, the 600 would look like 1,200 and the 400 would be refused.
+        var account = DeviceMemoryAccount.For("budgettest", 7);
+        GpuMemoryBudget.SetMemoryLimit(1_000, "budgettest:7");
+        try
+        {
+            using var stop = new System.Threading.ManualResetEventSlim(false);
+            var holder = new System.Threading.Thread(() =>
+            {
+                while (!stop.IsSet)
+                {
+                    if (!account.TryAdmit(600, null, out _)) continue;
+                    account.Reserve(600);
+                    account.Unreserve(600);
+                }
+
+                DeviceMemoryAccount.SettleAdmission();
+            });
+            holder.Start();
+            int refused = 0;
+            try
+            {
+                for (int i = 0; i < 200_000; i++)
+                {
+                    if (!account.TryAdmit(400, null, out _)) refused++;
+                    DeviceMemoryAccount.SettleAdmission();
+                }
+            }
+            finally
+            {
+                stop.Set();
+                holder.Join();
+            }
+
+            Assert.Equal(0, refused);
+        }
+        finally
+        {
+            DeviceMemoryAccount.SettleAdmission();
+            GpuMemoryBudget.ClearLimit("budgettest:7");
+        }
+    }
+
+    [Fact]
+    public void ADriverPoolThatCannotBeRead_KeepsItsLastFigure_NotZero()
+    {
+        var account = DeviceMemoryAccount.For("budgettest", 8);
+        GpuMemoryBudget.SetMemoryLimit(1_000, "budgettest:8");
+        bool fail = false;
+        account.SetDriverReserved(
+            () => fail ? throw new InvalidOperationException("the pool query failed") : (900L, 900L),
+            () => { });
+        try
+        {
+            Assert.False(account.TryAdmit(200, null, out _));   // 900 in the pool
+            fail = true;
+            Assert.Equal(900, account.ReservedBytes);
+            Assert.False(account.TryAdmit(200, null, out _));   // still 900: unreadable is not empty
+            Assert.True(account.TryAdmit(100, null, out _));
+        }
+        finally
+        {
+            DeviceMemoryAccount.SettleAdmission();
+            account.SetDriverReserved(() => (0L, 0L), () => { });
+            GpuMemoryBudget.ClearLimit("budgettest:8");
+        }
+    }
+
+    [Fact]
+    public void BackendsSharingAContext_KeepItAccounted_UntilTheLastOneLeaves()
+    {
+        var context = new IntPtr(0x7000_2000);
+        var first = DeviceMemoryAccount.For("budgettest", 9);
+        var second = DeviceMemoryAccount.For("budgettest", 10);
+        object firstToken = new object(), secondToken = new object();
+        CudaAccountedMemory.Register(context, first, () => { }, firstToken);
+        try
+        {
+            CudaAccountedMemory.Register(context, second, () => { }, secondToken);
+            Assert.Same(second, CudaAccountedMemory.AccountOf(context));
+            CudaAccountedMemory.Unregister(context, secondToken);
+            // The first backend is still alive: its context must not fall back to uncounted allocation.
+            Assert.Same(first, CudaAccountedMemory.AccountOf(context));
+            Assert.Equal(1, CudaAccountedMemory.RegistrationCount(context));
+            CudaAccountedMemory.Unregister(context, secondToken);   // a second dispose removes nothing more
+            Assert.Same(first, CudaAccountedMemory.AccountOf(context));
+        }
+        finally
+        {
+            CudaAccountedMemory.Unregister(context, firstToken);
+        }
+
+        Assert.Null(CudaAccountedMemory.AccountOf(context));
+        Assert.Equal(0, CudaAccountedMemory.RegistrationCount(context));
     }
 
     [Fact]

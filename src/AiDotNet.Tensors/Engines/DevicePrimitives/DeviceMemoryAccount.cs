@@ -92,6 +92,11 @@ internal sealed class DeviceMemoryAccount
     /// <summary>Memory the library holds from the driver now: its own reservations and the driver pool's.</summary>
     internal long ReservedBytes => Interlocked.Read(ref _reserved) + (ReadDriver()?.Current ?? 0);
 
+    // The driver pool's figures as last read. A query that fails keeps them: an unreadable pool is not an empty one,
+    // and counting it as zero would admit allocations past the budget.
+    private long _lastDriverCurrent, _lastDriverPeak;
+    private int _driverWasRead;
+
     /// <summary>
     /// Admits a new driver allocation of <paramref name="bytes"/> under the device's budget. Over it, runs
     /// <paramref name="reclaim"/> (the backend's release of cached and unreachable memory, as for a driver
@@ -187,11 +192,23 @@ internal sealed class DeviceMemoryAccount
     /// <summary>A fresh driver allocation of <paramref name="bytes"/>.</summary>
     internal void Reserve(long bytes)
     {
-        Add(ref _reserved, ref _peakReserved, bytes);
+        if (ReferenceEquals(t_admittedOn, this))
+        {
+            // The allocation this thread was admitted for is counted now. Counted and settled under the admission
+            // lock, so an admission sees the bytes in exactly one of the two figures: never in neither (admitting
+            // past the budget), never in both (refusing a request that fits).
+            lock (_admissionLock)
+            {
+                Add(ref _reserved, ref _peakReserved, bytes);
+                SettleAdmission();
+            }
+        }
+        else
+        {
+            Add(ref _reserved, ref _peakReserved, bytes);
+        }
+
         Interlocked.Increment(ref _allocations);
-        // The allocation this thread was admitted for is counted now; counted before it is settled, so no other
-        // thread sees the bytes in neither figure.
-        if (ReferenceEquals(t_admittedOn, this)) SettleAdmission();
         if (!_isTotal) Total.Reserve(bytes);
     }
 
@@ -268,9 +285,21 @@ internal sealed class DeviceMemoryAccount
     {
         var read = _driverReserved;
         if (read is null) return null;
-        try { return read(); }
-        // A statistics read never fails its caller: whatever the driver query throws reads as "no driver figure".
-        catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
+        try
+        {
+            var figures = read();
+            Interlocked.Exchange(ref _lastDriverCurrent, figures.Current);
+            Interlocked.Exchange(ref _lastDriverPeak, figures.Peak);
+            Volatile.Write(ref _driverWasRead, 1);
+            return figures;
+        }
+        // A statistics read never fails its caller. A query that fails reads as the last figures it returned (none
+        // before the first successful one), not as an empty pool.
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            if (Volatile.Read(ref _driverWasRead) == 0) return null;
+            return (Interlocked.Read(ref _lastDriverCurrent), Interlocked.Read(ref _lastDriverPeak));
+        }
     }
 }
 

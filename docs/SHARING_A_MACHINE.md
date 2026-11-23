@@ -67,12 +67,16 @@ not count.
 - **Thread count.** `AIDOTNET_CPU_THREADS`, when set, still sets the thread count.
 - **Platforms.**
   - Windows: as above.
-  - Linux: the whole process is confined to the listed cores and their SMT siblings (read from sysfs), so every thread
-    stays there. Workers are not bound one by one. A core whose logical processor number is 64 or higher cannot be
-    named this way; use `taskset` or `numactl` for those.
+  - Linux: every thread of the process is confined to the listed cores and their SMT siblings (read from sysfs), and
+    threads started later inherit that. Workers are not bound one by one. A core whose logical processor number is 64
+    or higher cannot be named this way; use `taskset` or `numactl` for those.
   - macOS has no processor affinity. The setting sets the thread count only, and a warning is traced.
 - **Failures.** A core the machine does not have, or a confinement the operating system refuses, throws an error naming
-  `AIDOTNET_CPU_CORES` on first use of the pool. The process is never left sized for cores it is not confined to.
+  `AIDOTNET_CPU_CORES` on the first CPU work of the process, whether or not that work uses the pool (a single listed
+  core runs everything on the calling thread). The process is never left sized for cores it is not confined to.
+- **Library assets.** Core selection is in the `net8.0` and `net10.0` assets. The `net471`, `net462` and
+  `netstandard2.0` assets ignore `AIDOTNET_CPU_CORES`: set `AIDOTNET_CPU_THREADS` there and confine the process from
+  its launcher (`start /affinity`, `taskset`, `numactl`).
 
 ## What is not isolated
 
