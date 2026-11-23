@@ -1030,3 +1030,7 @@ AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.SupportsHgemm.get -> bool
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend.SupportsFp16FusedBackward.get -> bool
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend.SupportsFp16NativeOps.get -> bool
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend.SupportsHgemm.get -> bool
+*REMOVED*AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F = 75 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
+*REMOVED*AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16 = 74 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F = 74 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16 = 75 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType

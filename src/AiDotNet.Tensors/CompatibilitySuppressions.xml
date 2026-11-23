@@ -2743,4 +2743,84 @@
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
   </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F</Target>
+    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F</Target>
+    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F</Target>
+    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F</Target>
+    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F</Target>
+    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16</Target>
+    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16</Target>
+    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16</Target>
+    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16</Target>
+    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
+  <Suppression>
+    <!-- Intentional: the values were swapped against cublas_api.h (74 = FAST_16F, 75 = FAST_16BF). -->
+    <DiagnosticId>CP0011</DiagnosticId>
+    <Target>F:AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16</Target>
+    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
+    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
+    <IsBaselineSuppression>true</IsBaselineSuppression>
+  </Suppression>
 </Suppressions>

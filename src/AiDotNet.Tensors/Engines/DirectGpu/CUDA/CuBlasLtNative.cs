@@ -145,8 +145,9 @@ public enum CublasComputeType
     Float32Pedantic = 69,
     Float32FastTf32 = 77,
     Float32FastTf32Pedantic = 78,
-    Float32FastBF16 = 74,
-    Float32Fast16F = 75,
+    // cublas_api.h: CUBLAS_COMPUTE_32F_FAST_16F = 74, CUBLAS_COMPUTE_32F_FAST_16BF = 75 (these were swapped).
+    Float32Fast16F = 74,
+    Float32FastBF16 = 75,
     Float64 = 70,
     Int32 = 72,
 }

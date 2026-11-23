@@ -81,8 +81,8 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
         int compute = precision switch
         {
             Gpu.PrecisionMode.Float32 => 0,
-            Gpu.PrecisionMode.Float16 => CuBlasNative.CUBLAS_COMPUTE_32F_FAST_16F,
-            Gpu.PrecisionMode.BFloat16 => CuBlasNative.CUBLAS_COMPUTE_32F_FAST_16BF,
+            Gpu.PrecisionMode.Float16 => (int)CublasComputeType.Float32Fast16F,
+            Gpu.PrecisionMode.BFloat16 => (int)CublasComputeType.Float32FastBF16,
             _ => throw new NotSupportedException($"Matmul autocast supports FP16 and BF16, not {precision}."),
         };
         int previous = Interlocked.Exchange(ref _gemmAutocastComputeType, compute);
