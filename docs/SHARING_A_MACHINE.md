@@ -34,7 +34,9 @@ not count.
   (`GpuOutOfMemoryException` on CUDA, OpenCL, Vulkan and WebGPU; `OutOfMemoryException` on Metal; `hipErrorOutOfMemory` on
   HIP). Code that already handles a driver out-of-memory, such as a kernel that falls back to needing no workspace,
   handles a budget refusal the same way.
-- **Reuse is not checked.** Reusing pooled memory is not a new reservation, so the budget never refuses it.
+- **Reuse is not checked.** Reusing pooled memory is not a new reservation, so the budget never refuses it. On CUDA,
+  a stream-ordered request is charged only for what the pool's free memory does not cover. If the pool still grows past
+  the budget (fragmentation), the allocation is returned and retried once after the reclaim, then refused.
 - **Why it matters on Windows.** Without a budget, a process that outgrows the GPU does not fail. The Windows driver backs
   the overflow with system memory, and both processes slow down severalfold instead.
 - **Device names.** Devices are named as `GpuMemoryStats` names them: `cuda:0`, `hip:0`, `opencl:0`, `vulkan:0`,

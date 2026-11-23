@@ -2515,7 +2515,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
         byteSize = AllocationBytesOverrideForTests ?? byteSize;
-        AdmitUnderBudget(byteSize);
+        // Under a GpuMemoryBudget only the pool's growth is new reserved memory: the stream-ordered pool keeps every
+        // freed block (its release threshold is maxed), so a request its free blocks cover reserves nothing. Charging the
+        // whole request would send each step's reuse near the budget through a synchronizing reclaim that trims the very
+        // cache the step reuses. A request the free blocks do not fit (fragmentation) is caught after the allocation.
+        bool budgeted = _memoryAccount.LimitBytes > 0;
+        if (budgeted) AdmitUnderBudget(PoolGrowthBound(byteSize));
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
@@ -2567,8 +2572,38 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (r == CudaResult.OutOfMemory)
             throw CudaAllocationError(r, $"cuMemAllocAsync failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        if (budgeted) p = EnforceBudgetAfterPoolGrowth(p, byteSize);
         GpuMemoryTracker.OnAlloc(p, (long)byteSize);
         return p;
+    }
+
+    // The most a stream-ordered request can add to the pool's reservation: what its free blocks do not cover.
+    private ulong PoolGrowthBound(ulong byteSize)
+    {
+        if (_asyncMemPool == IntPtr.Zero) return byteSize;
+        long free = ReadMemPoolBytes(_asyncMemPool, 5) - ReadMemPoolBytes(_asyncMemPool, 7);   // RESERVED - USED _MEM_CURRENT
+        return free <= 0 ? byteSize : byteSize > (ulong)free ? byteSize - (ulong)free : 0;
+    }
+
+    // After a stream-ordered allocation that took this process past its budget (the pool grew though free blocks
+    // seemed to cover the request): give it back, release what the budget's reclaim releases, and allocate once more;
+    // still over, refuse as a driver out-of-memory. Mid-capture nothing may synchronize, so the allocation stands.
+    private IntPtr EnforceBudgetAfterPoolGrowth(IntPtr p, ulong byteSize)
+    {
+        long limit = _memoryAccount.LimitBytes;
+        if (limit <= 0 || _memoryAccount.ReservedBytes <= limit || IsStreamCapturing()) return p;
+        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemFreeAsync(p, _mainStream), "cuMemFreeAsync (memory budget)");
+        ReclaimForBudget();
+        var r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _mainStream);
+        if (r == CudaResult.Success && _memoryAccount.ReservedBytes <= limit) return p;
+        if (r == CudaResult.Success)
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemFreeAsync(p, _mainStream), "cuMemFreeAsync (memory budget)");
+        else if (r != CudaResult.OutOfMemory)
+            CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync (memory budget retry)");
+        _memoryAccount.CountBudgetRefusal();
+        throw CudaAllocationError(CudaResult.OutOfMemory,
+            $"GPU memory budget of {limit} bytes on {_memoryAccount.Device} exceeded: {byteSize} bytes requested grew the "
+            + $"stream-ordered pool to {_memoryAccount.ReservedBytes} reserved (GpuMemoryBudget).");
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)

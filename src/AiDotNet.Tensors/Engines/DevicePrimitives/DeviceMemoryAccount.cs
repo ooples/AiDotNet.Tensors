@@ -129,6 +129,9 @@ internal sealed class DeviceMemoryAccount
 
     internal long BudgetRefusals => Interlocked.Read(ref _budgetRefusals);
 
+    /// <summary>Counts a refusal an allocator decided after allocating (it grew past the budget).</summary>
+    internal void CountBudgetRefusal() => Interlocked.Increment(ref _budgetRefusals);
+
     /// <summary>A fresh driver allocation of <paramref name="bytes"/>.</summary>
     internal void Reserve(long bytes)
     {

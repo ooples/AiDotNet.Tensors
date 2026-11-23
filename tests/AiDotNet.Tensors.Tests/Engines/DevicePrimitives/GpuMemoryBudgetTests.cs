@@ -96,6 +96,8 @@ public class GpuMemoryBudgetTests
         Assert.True(DeviceMemoryAccount.TryGet(device, out var account));
         const int Elements = 16 * 1024 * 1024 + 7;   // 64 MB, an odd size no pool holds
         long refusalsBefore = account.BudgetRefusals;
+        // Cached memory empty first: a request the pool's free memory covers is no new reservation.
+        (backend as IDeviceMemoryPressure)?.ReleaseCachedBuffers();
         GpuMemoryBudget.SetMemoryLimit(Math.Max(1, account.ReservedBytes) + 1024 * 1024, device);
         try
         {
@@ -118,12 +120,41 @@ public class GpuMemoryBudgetTests
         Skip.If(backend is null, "CUDA is not available on this machine");
         string device = GpuMemoryStats.Snapshot(backend!).Device;
         Assert.True(DeviceMemoryAccount.TryGet(device, out var account));
+        // Cached memory empty first: a request the pool's free memory covers is no new reservation.
+        (backend as IDeviceMemoryPressure)?.ReleaseCachedBuffers();
         GpuMemoryBudget.SetMemoryLimit(Math.Max(1, account.ReservedBytes) + 1024 * 1024, device);
         try
         {
             // Larger than anything the other tests park in the pool: a reuse of pooled memory is no new reservation.
             var ex = Assert.Throws<GpuOutOfMemoryException>(() => backend!.AllocateBuffer(40 * 1024 * 1024 + 11).Dispose());
             Assert.Contains("GpuMemoryBudget", ex.Message);
+        }
+        finally
+        {
+            GpuMemoryBudget.ClearLimit(device);
+        }
+    }
+
+    [SkippableFact]
+    public void Cuda_ReuseOfTheStreamOrderedPoolsFreeMemoryIsAdmittedWithoutReclaim()
+    {
+        using var owned = Create("cuda", out var backend);
+        Skip.If(backend is null, "CUDA is not available on this machine");
+        var cuda = (CudaBackend)backend!;
+        string device = GpuMemoryStats.Snapshot(cuda).Device;
+        Assert.True(DeviceMemoryAccount.TryGet(device, out var account));
+
+        // 96 MB freed into the stream-ordered pool, which keeps it reserved.
+        cuda.AllocateBuffer(24 * 1024 * 1024 + 13).Dispose();
+        cuda.ReturnPooledBuffersToDriverPoolForTests();
+        long reclaimsBefore = account.BudgetReclaims, refusalsBefore = account.BudgetRefusals;
+        GpuMemoryBudget.SetMemoryLimit(account.ReservedBytes + 1024 * 1024, device);
+        try
+        {
+            // 48 MB more than the budget leaves, but the pool's free memory covers it: no new reservation.
+            using var reused = cuda.AllocateBuffer(12 * 1024 * 1024 + 17);
+            Assert.Equal(reclaimsBefore, account.BudgetReclaims);
+            Assert.Equal(refusalsBefore, account.BudgetRefusals);
         }
         finally
         {
