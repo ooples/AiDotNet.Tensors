@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerReductions
 {
     /// <inheritdoc/>
-    public bool SupportsIntegerElementwise(GpuElementType type) => type == GpuElementType.Int32 && IsAvailable;
+    public bool SupportsIntegerElementwise(GpuElementType type) => type == GpuElementType.Int32 && SynchronousRouteAvailable;
 
     /// <inheritdoc/>
     public bool SupportsIntegerReductions(GpuElementType type) => SupportsIntegerElementwise(type);
