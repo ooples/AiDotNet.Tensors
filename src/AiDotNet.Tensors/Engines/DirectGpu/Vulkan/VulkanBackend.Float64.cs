@@ -212,7 +212,7 @@ void main()
             GpuFloat64UnaryOperation.Log => "d_log(x)",
             // sinh / cosh overflow to infinity long after tanh has reached 1 in double (|x| > 19.1).
             GpuFloat64UnaryOperation.Tanh => "(abs(x) > 20.0 ? (x < 0.0 ? -1.0 : 1.0) : d_sinh(x) / d_cosh(x))",
-            GpuFloat64UnaryOperation.Sigmoid => "1.0 / (1.0 + d_exp(-x))",
+            GpuFloat64UnaryOperation.Sigmoid => "x < 0.0 ? d_exp(x) / (1.0 + d_exp(x)) : 1.0 / (1.0 + d_exp(-x))",
             // Math.Max(x, 0): NaN stays NaN, and -0 becomes +0.
             GpuFloat64UnaryOperation.Relu => "(x != x ? x : (x > 0.0 ? x : 0.0))",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown double-precision operation."),
@@ -231,10 +231,15 @@ void main()
     }
 
     // The driver's double sqrt is not required to be correctly rounded. One step from its estimate, with the residual
-    // x - r*r formed exactly (Dekker product, `precise`), corrects an estimate that is an ulp or two off; zero,
-    // infinity, NaN and negative arguments keep the driver's answer.
+    // x - r*r formed exactly (Dekker product, `precise`), brings an estimate that is an ulp or two off to within one ulp.
+    // That step alone still rounds wrong where the root lies just below a power of two (sqrt(16777215.999999998) gave
+    // 4096, not 4095.9999999999995), so Tuckerman's test then decides the last ulp: y is the rounded root exactly when
+    // y * prev(y) < x <= y * next(y), each side's sign taken from an exact residual. The products must neither overflow
+    // nor underflow, so an argument above 2^1000 is taken as 4 * (x / 4) and one below 2^-900 (a subnormal included)
+    // as 2^-1000 * (x * 2^1000); every scaling is exact. Zero, infinity, NaN and negative arguments keep the driver's
+    // answer.
     private const string SqrtSource = @"
-double f64_sqrt(double x)
+double f64_sqrt_corrected(double x)
 {
     double r = sqrt(x);
     if (!(x > 0.0) || r != r || (r - r) != 0.0 || r == 0.0) return r;
@@ -246,6 +251,59 @@ double f64_sqrt(double x)
     precise double residual = (x - p) - e;
     precise double corrected = r + residual / (2.0 * r);
     return corrected;
+}
+
+// The neighbours of a positive finite double, by its bit pattern.
+double f64_next_up(double y)
+{
+    uvec2 b = unpackDouble2x32(y);
+    b.x += 1u;
+    if (b.x == 0u) b.y += 1u;
+    return packDouble2x32(b);
+}
+
+double f64_next_down(double y)
+{
+    uvec2 b = unpackDouble2x32(y);
+    if (b.x == 0u) b.y -= 1u;
+    b.x -= 1u;
+    return packDouble2x32(b);
+}
+
+// x - a * b with its exact sign, for a product within a factor of two of x (so x - p is exact) that neither
+// overflows nor underflows (so the Dekker error term is exact).
+double f64_residual(double x, double a, double b)
+{
+    precise double p = a * b;
+    precise double ta = 134217729.0 * a;
+    precise double ah = ta - (ta - a);
+    precise double al = a - ah;
+    precise double tb = 134217729.0 * b;
+    precise double bh = tb - (tb - b);
+    precise double bl = b - bh;
+    precise double e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    precise double r = (x - p) - e;
+    return r;
+}
+
+// The correctly rounded root of x in [2^-900, 2^1022]. A root is never a rounding midpoint, and x minus either
+// product is a whole multiple of the squared ulp, so the two comparisons decide the rounding with no tie.
+double f64_sqrt_rounded(double x)
+{
+    double y = f64_sqrt_corrected(x);
+    double down = f64_next_down(y);
+    if (f64_residual(x, y, down) <= 0.0) return down;
+    double up = f64_next_up(y);
+    if (f64_residual(x, y, up) > 0.0) return up;
+    return y;
+}
+
+double f64_sqrt(double x)
+{
+    if (!(x > 0.0) || x != x || (x - x) != 0.0) return sqrt(x);
+    if (x > ldexp(1.0, 1000)) return 2.0 * f64_sqrt_rounded(0.25 * x);
+    if (x < ldexp(1.0, -900)) return ldexp(f64_sqrt_rounded(x * ldexp(1.0, 1000)), -500);
+    return f64_sqrt_rounded(x);
 }
 ";
 

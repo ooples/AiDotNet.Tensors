@@ -1,6 +1,8 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
+using System.Collections.Generic;
+using System.Threading;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -9,7 +11,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 //
 // Metal Shading Language has no 64-bit float, so these kernels compute IEEE binary64 in 32-bit integer arithmetic
 // (GpuSoftFloat64, the library the WebGPU backend runs): the four arithmetic operations and the square root equal the
-// host bit for bit, and exp, log, tanh and the logistic function are within a few ulp. A double is two 4-byte words of
+// host bit for bit (a NaN result is always the one quiet NaN, not an operand's payload), and exp, log, tanh and the
+// logistic function are within a few ulp. A double is two 4-byte words of
 // the buffer, low word first.
 //
 // Emulation costs hundreds of integer operations an element. The backend reports the capability as Emulated, and the
@@ -21,15 +24,18 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     private readonly object _float64LibraryLock = new object();
     private IntPtr _float64Library;
     private IntPtr _float64ElementaryLibrary;
+    // A library the Metal compiler rejected: kept so later calls report the gap without compiling it again.
+    private Exception? _float64LibraryFailure;
+    private Exception? _float64ElementaryLibraryFailure;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Reductions => IsAvailable;
+    public bool SupportsFloat64Reductions => IsAvailable && Volatile.Read(ref _float64LibraryFailure) is null;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Elementwise => IsAvailable;
+    public bool SupportsFloat64Elementwise => IsAvailable && Volatile.Read(ref _float64LibraryFailure) is null;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64MatrixMultiply => IsAvailable;
+    public bool SupportsFloat64MatrixMultiply => IsAvailable && Volatile.Read(ref _float64LibraryFailure) is null;
 
     private MetalGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {
@@ -43,37 +49,93 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     }
 
     // The arithmetic library compiles in well under a second; the elementary functions are a larger program, compiled
-    // only when one of them is first used.
+    // only when one of them is first used. A library the compiler rejects is a capability gap, not a fault: the call
+    // throws GpuCapabilityUnavailableException, which the engine answers on the CPU, and the rejection is kept, so a
+    // later call neither compiles it again nor reports the capability. The arithmetic library backs every double
+    // kernel, so its rejection also turns the Supports* properties off.
     private MetalPipelineState Float64Pipeline(string kernel, bool elementary = false)
     {
-        if (elementary)
-        {
-            if (_float64ElementaryLibrary == IntPtr.Zero)
-            {
-                lock (_float64LibraryLock)
-                {
-                    if (_float64ElementaryLibrary == IntPtr.Zero)
-                        _float64ElementaryLibrary = _shaderLibrary.CompileLibrary(Float64ElementaryLibraryName, MetalFloat64Kernels.ElementarySource);
-                }
-            }
+        IntPtr library = elementary
+            ? Float64Library(ref _float64ElementaryLibrary, ref _float64ElementaryLibraryFailure, Float64ElementaryLibraryName,
+                () => _shaderLibrary.CompileLibrary(Float64ElementaryLibraryName, MetalFloat64Kernels.ElementarySource))
+            : Float64Library(ref _float64Library, ref _float64LibraryFailure, Float64LibraryName,
+                () => _shaderLibrary.CompileLibrary(Float64LibraryName, MetalFloat64Kernels.ArithmeticSource));
+        return GetPipeline(elementary ? Float64ElementaryLibraryName : Float64LibraryName, library, kernel);
+    }
 
-            return GetPipeline(Float64ElementaryLibraryName, _float64ElementaryLibrary, kernel);
-        }
-
-        if (_float64Library == IntPtr.Zero)
+    private IntPtr Float64Library(ref IntPtr library, ref Exception? failure, string name, Func<IntPtr> compile)
+    {
+        if (library == IntPtr.Zero)
         {
             lock (_float64LibraryLock)
             {
-                if (_float64Library == IntPtr.Zero)
-                    _float64Library = _shaderLibrary.CompileLibrary(Float64LibraryName, MetalFloat64Kernels.ArithmeticSource);
+                if (library == IntPtr.Zero && failure is null)
+                {
+                    try
+                    {
+                        library = compile();
+                    }
+                    catch (InvalidOperationException rejected)
+                    {
+                        Volatile.Write(ref failure, rejected);
+                    }
+                }
+
+                if (failure is { } rejection)
+                    throw new GpuCapabilityUnavailableException(
+                        $"The Metal compiler rejected the double-precision library '{name}': {rejection.Message}", rejection);
             }
         }
 
-        return GetPipeline(Float64LibraryName, _float64Library, kernel);
+        return library;
     }
 
-    // Buffers bind at 0..n-1 and the 32-bit parameters after them; `work` invocations are launched.
+    // Buffers bind at 0..n-1 and the 32-bit parameters after them; `work` invocations are launched. The last buffer is
+    // the one the kernel writes.
+    //
+    // Buffers passed to separate arguments of one kernel cannot alias in Metal Shading Language, read-only ones
+    // included (Metal Shading Language Specification, "Buffers ... cannot alias"), yet the IGpuFloat64* contracts let a
+    // caller pass one buffer twice: Dot(a, a), Unary(op, a, a), a copy within one buffer. An argument whose storage an
+    // earlier argument already binds therefore binds a copy of it; when that argument is the output, the copy is
+    // copied back after the kernel (it starts as the output's contents, so elements the kernel leaves alone keep
+    // theirs). Each launch completes before it returns, so the copies are released right after.
     private void LaunchFloat64(MetalPipelineState pipeline, int work, MetalGpuBuffer[] buffers, params uint[] parameters)
+    {
+        int last = buffers.Length - 1;
+        MetalGpuBuffer[]? bound = null;
+        List<IGpuBuffer>? copies = null;
+        try
+        {
+            for (int i = 1; i < buffers.Length; i++)
+            {
+                if (!SharesStorageWithAnEarlierArgument(buffers, i)) continue;
+                var copy = AllocateBuffer(buffers[i].Size, GpuElementType.Float64);
+                (copies ??= new List<IGpuBuffer>()).Add(copy);
+                var separate = (MetalGpuBuffer)copy;
+                CopyFloat64(buffers[i], 0, separate, 0, buffers[i].Size);
+                (bound ??= (MetalGpuBuffer[])buffers.Clone())[i] = separate;
+            }
+
+            DispatchFloat64(pipeline, work, bound ?? buffers, parameters);
+            if (bound is not null && !ReferenceEquals(bound[last], buffers[last]))
+                CopyFloat64(bound[last], 0, buffers[last], 0, buffers[last].Size);
+        }
+        finally
+        {
+            if (copies is not null)
+                foreach (var copy in copies) copy.Dispose();
+        }
+    }
+
+    // Views of one allocation share its handle, so equal handles are treated as overlapping storage.
+    private static bool SharesStorageWithAnEarlierArgument(MetalGpuBuffer[] buffers, int index)
+    {
+        for (int j = 0; j < index; j++)
+            if (ReferenceEquals(buffers[j], buffers[index]) || buffers[j].Handle == buffers[index].Handle) return true;
+        return false;
+    }
+
+    private void DispatchFloat64(MetalPipelineState pipeline, int work, MetalGpuBuffer[] buffers, uint[] parameters)
     {
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(work);
         using var encoder = _commandQueue.CreateScopedComputeEncoder();

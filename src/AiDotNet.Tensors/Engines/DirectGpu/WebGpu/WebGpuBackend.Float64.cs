@@ -9,8 +9,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // Double-precision compute over Float64 buffers.
 //
 // WGSL has no 64-bit float, so these kernels compute IEEE binary64 in 32-bit integer arithmetic (GpuSoftFloat64): the
-// four arithmetic operations and the square root equal the host bit for bit, and exp, log, tanh and the logistic
-// function are within a few ulp. A double is two 4-byte words of the buffer, low word first.
+// four arithmetic operations and the square root equal the host bit for bit (a NaN result is always the one quiet NaN,
+// not an operand's payload), and exp, log, tanh and the logistic function are within a few ulp. A double is two 4-byte words of the buffer, low word first.
 //
 // Emulation costs hundreds of integer operations an element. The backend reports the capability as Emulated, and the
 // engine sends doubles here only when a policy asks for device residency; by default they stay on the CPU.

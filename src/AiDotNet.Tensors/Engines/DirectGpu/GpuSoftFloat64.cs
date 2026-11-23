@@ -14,8 +14,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <remarks>
 /// <para>
 /// Add, subtract, multiply, divide and square root are correctly rounded (round to nearest even), including
-/// subnormals, infinities and NaN: they equal the host's results bit for bit. The arithmetic follows Berkeley
-/// SoftFloat 3; division and square root are digit recurrences with a sticky bit. Exp and log follow fdlibm, and tanh
+/// subnormals and infinities: they equal the host's results bit for bit, except that every NaN result is the one
+/// quiet NaN <c>0xFFF8000000000000</c>, whatever NaN operand produced it (an operand's payload and sign are not
+/// carried). The arithmetic follows Berkeley SoftFloat 3; division and square root are digit recurrences with a sticky bit. Exp and log follow fdlibm, and tanh
 /// and the logistic function are built on exp; measured against the host's <c>Math</c> functions over 262,144 arguments
 /// each they are within 1, 0, 4 and 0 ulp.
 /// </para>
@@ -541,7 +542,12 @@ fn f64_tanh_fn(x: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(r.x, r.y | sn);
 }
 
+// exp(x) / (1 + exp(x)) below zero: exp(-x) overflows there from x = -710, while the logistic is still representable.
 fn f64_sigmoid_fn(x: vec2<u32>) -> vec2<u32> {
+    if (f64_sign(x) != 0u) {
+        let e = f64_exp_fn(x);
+        return f64_div(e, f64_add(vec2<u32>(0x00000000u, 0x3ff00000u), e));
+    }
     return f64_div(vec2<u32>(0x00000000u, 0x3ff00000u), f64_add(vec2<u32>(0x00000000u, 0x3ff00000u), f64_exp_fn(f64_neg(x))));
 }
 ";

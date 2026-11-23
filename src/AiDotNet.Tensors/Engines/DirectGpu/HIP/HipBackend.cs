@@ -3284,7 +3284,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        if (size <= 0) return;
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, $"{nameof(CopyBuffer)}: the element count must be non-negative.");
+        if (size == 0) return;
         var result = HipNativeBindings.hipMemcpy(destination.Handle, source.Handle,
             (nuint)((ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(CopyBuffer))), HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy CopyBuffer");

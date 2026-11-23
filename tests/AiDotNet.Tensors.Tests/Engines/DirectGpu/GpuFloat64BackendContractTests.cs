@@ -85,6 +85,8 @@ public abstract class GpuFloat64BackendContractTests
     private static long UlpDistance(double a, double b)
     {
         if (double.IsNaN(a) || double.IsNaN(b)) return double.IsNaN(a) && double.IsNaN(b) ? 0 : long.MaxValue;
+        // Infinity is one ulp from double.MaxValue by bit pattern; an overflow and a saturated result must not pass as close.
+        if (double.IsInfinity(a) || double.IsInfinity(b)) return a == b ? 0 : long.MaxValue;
         long x = BitConverter.DoubleToInt64Bits(a), y = BitConverter.DoubleToInt64Bits(b);
         if ((x < 0) != (y < 0)) return a == b ? 0 : long.MaxValue;
         return Math.Abs(x - y);
@@ -205,18 +207,7 @@ public abstract class GpuFloat64BackendContractTests
         if (operation is GpuFloat64UnaryOperation.Sqrt or GpuFloat64UnaryOperation.Log)
             for (int i = 0; i < length; i++) input[i] = Math.Abs(input[i]);
         var expected = new double[length];
-        for (int i = 0; i < length; i++)
-            expected[i] = operation switch
-            {
-                GpuFloat64UnaryOperation.Negate => -input[i],
-                GpuFloat64UnaryOperation.Abs => Math.Abs(input[i]),
-                GpuFloat64UnaryOperation.Relu => Math.Max(input[i], 0.0),
-                GpuFloat64UnaryOperation.Sqrt => Math.Sqrt(input[i]),
-                GpuFloat64UnaryOperation.Exp => Math.Exp(input[i]),
-                GpuFloat64UnaryOperation.Log => Math.Log(input[i]),
-                GpuFloat64UnaryOperation.Tanh => Math.Tanh(input[i]),
-                _ => 1.0 / (1.0 + Math.Exp(-input[i])),
-            };
+        for (int i = 0; i < length; i++) expected[i] = HostUnary(operation, input[i]);
 
         using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
         using var output = backend.AllocateBuffer(length, GpuElementType.Float64);
@@ -227,6 +218,89 @@ public abstract class GpuFloat64BackendContractTests
         for (int i = 0; i < length; i++)
             Assert.True(UlpDistance(expected[i], actual[i]) <= ulps,
                 $"{operation} element {i} ({input[i]:R}): host {expected[i]:R}, device {actual[i]:R}.");
+    }
+
+    // One buffer passed as several arguments: the contracts allow it, and Metal binds no two kernel arguments to one
+    // allocation, so the backend must give each its own storage and still write the caller's buffer.
+    [SkippableFact]
+    public void A_buffer_passed_as_several_arguments_gives_the_host_result()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        const int length = 257, size = 200;   // elements past `size` must keep their values
+        var values = Values(length, 77);
+        var elementwise = Elementwise(backend);
+
+        double[] Run(Action<IGpuBuffer> operation)
+        {
+            using var buffer = backend.AllocateBuffer(length, GpuElementType.Float64);
+            backend.UploadBuffer<double>(buffer, values);
+            operation(buffer);
+            var result = new double[length];
+            backend.DownloadBuffer<double>(buffer, result);
+            return result;
+        }
+
+        double[] Expected(Func<double, double> f)
+        {
+            var e = (double[])values.Clone();
+            for (int i = 0; i < size; i++) e[i] = f(values[i]);
+            return e;
+        }
+
+        AssertBitEqual(Expected(v => -v), Run(a => elementwise.UnaryFloat64(GpuFloat64UnaryOperation.Negate, a, a, size)));
+        AssertBitEqual(Expected(v => v + v), Run(a => elementwise.BinaryFloat64(GpuFloat64BinaryOperation.Add, a, a, a, size)));
+        AssertBitEqual(Expected(v => v * v), Run(a => elementwise.BinaryFloat64(GpuFloat64BinaryOperation.Multiply, a, a, a, size)));
+        AssertBitEqual(Expected(v => v / 3.0), Run(a => elementwise.ScalarFloat64(GpuFloat64BinaryOperation.Divide, a, 3.0, a, size)));
+
+        using var input = backend.AllocateBuffer(length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(input, values);
+        double dot = Reductions(backend).DotFloat64(input, input, length);
+        double hostDot = 0;
+        foreach (double v in values) hostDot += v * v;
+        Assert.True(Math.Abs(dot - hostDot) <= 1e-12 * Math.Abs(hostDot), $"Dot(a, a): host {hostDot:R}, device {dot:R}.");
+    }
+
+    // The logistic in its overflow-free form: exp(x) / (1 + exp(x)) below zero, where exp(-x) overflows from x = -710
+    // while the result is still representable.
+    private static double HostUnary(GpuFloat64UnaryOperation operation, double x) => operation switch
+    {
+        GpuFloat64UnaryOperation.Negate => -x,
+        GpuFloat64UnaryOperation.Abs => Math.Abs(x),
+        GpuFloat64UnaryOperation.Relu => Math.Max(x, 0.0),
+        GpuFloat64UnaryOperation.Sqrt => Math.Sqrt(x),
+        GpuFloat64UnaryOperation.Exp => Math.Exp(x),
+        GpuFloat64UnaryOperation.Log => Math.Log(x),
+        GpuFloat64UnaryOperation.Tanh => Math.Tanh(x),
+        _ => x < 0.0 ? Math.Exp(x) / (1.0 + Math.Exp(x)) : 1.0 / (1.0 + Math.Exp(-x)),
+    };
+
+    // The ends of the range, where an intermediate overflows or underflows before the result does. The square roots
+    // start with (2 - 2^-52) * 2^k at odd k: the root lies just below a power of two, where a single correction step
+    // rounds up to that power.
+    [SkippableTheory]
+    [InlineData(GpuFloat64UnaryOperation.Sqrt, 0, new[] { double.MaxValue, 4.4942328371557893E+307, 1.4181298336770848E+278, 1.118707184315428E+248, 16777215.999999998, 1.3234889800848441E-23, 5.125332723668738E-144, 1.5657565312570098E-294, 1.7976931348623155E+308, 1.0E+305, 1.0715086071862673E+301, 3.2E+301, 1.0E-310, 4.9E-324, 2.2250738585072014E-308 })]
+    [InlineData(GpuFloat64UnaryOperation.Exp, 16, new[] { 709.0, 709.782712893384, 709.7827128933841, 710.0, 1000.0, -708.0, -744.0, -745.1332191019411, -746.0, -1000.0 })]
+    [InlineData(GpuFloat64UnaryOperation.Log, 16, new[] { double.MaxValue, 4.9E-324, 2.2250738585072014E-308, 1.0E+300, 1.0E-300 })]
+    [InlineData(GpuFloat64UnaryOperation.Sigmoid, 16, new[] { -700.0, -709.0, -710.0, -720.0, -744.0, -746.0, -1000.0, 40.0, 710.0, 1000.0 })]
+    [InlineData(GpuFloat64UnaryOperation.Tanh, 16, new[] { -1000.0, -710.0, -20.0, 20.0, 710.0, 1000.0 })]
+    public void Unary_kernels_match_the_host_at_the_ends_of_the_range(GpuFloat64UnaryOperation operation, int ulps, double[] input)
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        int length = input.Length;
+        using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
+        using var output = backend.AllocateBuffer(length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, input);
+        Elementwise(backend).UnaryFloat64(operation, a, output, length);
+        var actual = new double[length];
+        backend.DownloadBuffer<double>(output, actual);
+        for (int i = 0; i < length; i++)
+        {
+            double expected = HostUnary(operation, input[i]);
+            Assert.True(UlpDistance(expected, actual[i]) <= ulps,
+                $"{operation}({input[i]:R}): host {expected:R}, device {actual[i]:R}.");
+        }
     }
 
     [SkippableTheory]

@@ -30,6 +30,35 @@ Version 2.0, whose full text follows this list.
    Apache-2.0). The schema src/AiDotNet.Tensors.Onnx/Protos/onnx.proto3, and
    the C# classes generated from it in AiDotNet.Tensors.Onnx.
 
+The following part is derived from a third-party work under its own notice,
+reproduced in full below it.
+
+3. fdlibm
+   https://www.netlib.org/fdlibm/, by Sun Microsystems, Inc. The exponential
+   and logarithm algorithms and coefficients of e_exp.c and e_log.c, and the
+   further fdlibm elementary functions, in src/AiDotNet.Tensors/Engines/DirectGpu:
+     GpuSoftFloat64.cs (exp and log, and tanh and the logistic built on them)
+     Vulkan/VulkanTorchParityMath.cs
+
+   e_exp.c:
+   ====================================================
+   Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+
+   Permission to use, copy, modify, and distribute this
+   software is freely granted, provided that this notice
+   is preserved.
+   ====================================================
+
+   e_log.c and the other fdlibm functions:
+   ====================================================
+   Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+
+   Developed at SunSoft, a Sun Microsystems, Inc. business.
+   Permission to use, copy, modify, and distribute this
+   software is freely granted, provided that this notice
+   is preserved.
+   ====================================================
+
 The native AiDotNet.Native.* packages carry their own vendor licence files
 and are not covered by this notice.
 

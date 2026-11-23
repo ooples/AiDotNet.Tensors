@@ -39,7 +39,8 @@ public enum GpuFloat64UnaryOperation
 /// <summary>
 /// Element-wise arithmetic computed in double precision on the device, over <see cref="GpuElementType.Float64"/>
 /// buffers. The arithmetic operations, negation, absolute value, square root and ReLU are single correctly rounded
-/// IEEE operations per element, so their results equal the host's bit for bit; the exponential, logarithm, hyperbolic
+/// IEEE operations per element, so their results equal the host's bit for bit, apart from the payload of a NaN result,
+/// which a backend may canonicalize; the exponential, logarithm, hyperbolic
 /// tangent and sigmoid are the device's double library functions, accurate to a few units in the last place.
 /// <see cref="SupportsFloat64Elementwise"/> says whether this device computes in double.
 /// </summary>
