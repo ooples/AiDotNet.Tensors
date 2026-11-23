@@ -1133,12 +1133,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private void UploadHostWrittenInPlaceState()
     {
         if (typeof(T) != typeof(float) || _forwardSteps is null || !_engine.TryGet<Engines.DirectGpuTensorEngine>(out var de)) return;
+        // This runs before StepCore takes its lease: hold one, so a concurrent Dispose cannot release the backend under
+        // the upload. A closed gate uploads nothing; each skipped state keeps its host version ahead of its binding, so
+        // the re-arm leaves its host value in place.
+        using var lease = de.EnterGpuOp();
+        if (!lease.Held) return;
         foreach (var state in DeviceAuthoritativeInPlaceState(de)
                      .Where(s => s._gpuBufferVersion != s.GpuCacheVersion && s._gpuBuffer!.Size >= s.Length))
         {
+            if (state.ToArray() is not float[] host) continue;
             var buffer = state._gpuBuffer!;
             var backend = state._gpuBackend!;
-            backend.UploadBufferInPlace((float[])(object)state.ToArray(), buffer);
+            backend.UploadBufferInPlace(host, buffer);
             // The buffer now equals the host copy: stamp the binding current without arming a download.
             de.BindResidentBuffer(state, buffer, backend, isDeviceModified: false);
         }

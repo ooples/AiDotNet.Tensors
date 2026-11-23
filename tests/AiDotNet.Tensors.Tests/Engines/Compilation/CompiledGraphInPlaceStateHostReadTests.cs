@@ -23,10 +23,22 @@ public sealed class CompiledGraphInPlaceStateHostReadTests
     // Any GPU backend runs the plan device-resident; only CUDA captures and replays the step as a graph.
     private static DirectGpuTensorEngine RequireGpu()
     {
+        // A lane that names CUDA must run these on CUDA: there they are the captured-replay tests.
+        bool cudaExpected = string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_EXPECT_GPU_BACKEND"), "CUDA",
+            StringComparison.OrdinalIgnoreCase);
         var engine = new DirectGpuTensorEngine();
-        if (engine.SupportsGpu && engine.IsGpuAvailable) return engine;
+        if (engine.SupportsGpu && engine.IsGpuAvailable)
+        {
+            if (cudaExpected && !CapturesGraphs(engine))
+            {
+                string actual = engine.QueryBackend?.GetType().Name ?? "none";
+                engine.Dispose();
+                Assert.Fail($"AIDOTNET_EXPECT_GPU_BACKEND is CUDA, but the engine resolved {actual}.");
+            }
+            return engine;
+        }
         engine.Dispose();
-        Assert.False(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1",
+        Assert.False(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1" || cudaExpected,
             "The validation lane requires a working GPU backend.");
         Skip.If(true, "No DirectGpuTensorEngine available.");
         return null!;
@@ -141,7 +153,6 @@ public sealed class CompiledGraphInPlaceStateHostReadTests
             var state = Filled(new[] { 1, 4 }, 3, 1f);
             var initial = state.ToArray();
             using var plan = BuildPlan(engine, state, out var sign);
-            long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
             const int before = 6, after = 5;
             for (int step = 1; step <= before; step++) plan.Step();
             if (readBeforeWrite) AssertState(state, initial, before, sign, $"step {before}");
@@ -150,6 +161,9 @@ public sealed class CompiledGraphInPlaceStateHostReadTests
             for (int j = 0; j < 4; j++) state[j] = written[j];
             AssertState(state, written, 0, sign, "right after the host write");
 
+            // Counted from the write: eager steps after it compute the same values, so only the count shows that the
+            // write did not retire the captured graph.
+            long replaysAfterWrite = CompiledTrainingPlan<float>.GraphReplayCount;
             for (int step = 1; step <= after; step++)
             {
                 plan.Step();
@@ -157,7 +171,12 @@ public sealed class CompiledGraphInPlaceStateHostReadTests
                     $"step {step} after the write (capture failure: {plan.GraphCaptureFailureReason ?? "none"})");
             }
             if (CapturesGraphs(engine))
-                Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore, plan.GraphCaptureFailureReason);
+            {
+                long replayed = CompiledTrainingPlan<float>.GraphReplayCount - replaysAfterWrite;
+                Assert.True(replayed >= after,
+                    $"{replayed} of the {after} steps after the host write replayed the graph " +
+                    $"(capture failure: {plan.GraphCaptureFailureReason ?? "none"}).");
+            }
         }
         finally
         {
