@@ -1798,7 +1798,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
             // Offsets and size count elements of the buffers' type (a double copy moves eight bytes an element).
-            ulong width = (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+            ulong width = (ulong)GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
             var (srcMemory, srcHandle) = CopyOperand(source, nameof(source));
             var (destMemory, destHandle) = CopyOperand(destination, nameof(destination));
             var srcOffsetBytes = new UIntPtr((ulong)srcOffset * width);
@@ -12913,7 +12913,7 @@ KERNEL VARIANTS (A/B testing):
         public void CopyBuffer(IGpuBuffer src, IGpuBuffer dst, int size)
         {
             if (_context == null) return;
-            ulong width = (ulong)GpuCopyLayout.ElementBytes(src, dst, nameof(CopyBuffer));
+            ulong width = (ulong)GpuCopyLayout.CheckedElementBytes(src, 0, dst, 0, size, nameof(CopyBuffer));
             var (srcBuf, srcHandle) = CopyOperand(src, nameof(src));
             var (dstBuf, dstHandle) = CopyOperand(dst, nameof(dst));
 
@@ -14762,6 +14762,7 @@ KERNEL VARIANTS (A/B testing):
             // throw "Collection was modified" if we enumerated the live view.
             // Snapshotting decouples iteration from any such mutation, then we
             // clear the originals once.
+            ReleaseIntegerKernels();
             var kernels = new DirectOpenClKernel[_kernelCache.Count];
             _kernelCache.Values.CopyTo(kernels, 0);
             foreach (var kernel in kernels)

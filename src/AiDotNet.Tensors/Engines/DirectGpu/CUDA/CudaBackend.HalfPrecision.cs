@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
 /// Issue #337: half-precision GEMM dispatch for the
-/// <see cref="IGpuHalfPrecisionBackend"/> capability interface.
+/// <see cref="IGpuHalfFusedKernels"/> capability interface.
 /// <para>
 /// Two paths:
 /// </para>

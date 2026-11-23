@@ -817,7 +817,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // #1650/#638 hardware-FP16 conv lever: route the resident inference conv through the INDUSTRY path (oneDNN/
     // cuDNN/PyTorch) — im2col → FP16 col[K,N] → GemmFp16In32fOut (FP16 multiply / FP32 accumulate on the matrix
-    // units), backend-agnostic via IGpuHalfPrecisionBackend. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
+    // units), backend-agnostic via IGpuHalfFusedKernels. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
     // VALIDATED before flipping on (PR #671 #2): primitive conv vs FP32 Conv2D relL2=0.028%; one full UNet forward
     // end-to-end relL2=0.67% — at the cuBLAS run-to-run FP32-vs-FP32 noise floor (0.666%), PSNR 60.9 dB — and
     // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no FP16 im2col kernel on the
@@ -930,6 +930,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });
     }
+
+    /// <summary>
+    /// A buffer of <paramref name="count"/> halves: typed <see cref="GpuElementType.Float16"/> where the backend holds
+    /// that type (so a float read of it is refused and its size is in elements), a raw byte buffer otherwise.
+    /// </summary>
+    private static IGpuBuffer AllocateHalfBuffer(IDirectGpuBackend backend, int count)
+        => backend.SupportsElementType(GpuElementType.Float16)
+            ? backend.AllocateBuffer(count, GpuElementType.Float16)
+            : backend.AllocateByteBuffer(checked(count * 2));
+
+    private static IGpuBuffer AllocateHalfBuffer(IFp16ActivationBackend device, int count)
+        => AllocateHalfBuffer((IDirectGpuBackend)device, count);
 
     /// <summary>True when <paramref name="t"/>'s resident buffer currently holds FP16 data (and FP16-act is on).</summary>
     internal bool IsFp16Resident<T>(Tensor<T> t)
@@ -2933,7 +2945,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             IGpuBuffer fp16;
             try
             {
-                fp16 = cuda.AllocateByteBuffer(elementCount * 2);
+                fp16 = AllocateHalfBuffer((IDirectGpuBackend)cuda, elementCount);
                 cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryCompressActivationFp16ByKey", capabilityGap); return false; }
@@ -3463,7 +3475,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void ClearActivationCacheCore()
     {
-        ClearFloat64Residents();
+        ClearTypedResidents();
         // Snapshot the (key, entry) pairs this cache owns, then clear.
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -4009,7 +4021,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         else
         {
-            oBuf = cb.AllocateByteBuffer(n * 2);
+            oBuf = AllocateHalfBuffer(cb, n);
             cb.CopyBufferDtoD(rBuf, oBuf, bytes);
         }
         // Half-aware deferred materializer (DownloadBuffer is FP32-only) so any HOST read of o stays correct:
@@ -4950,7 +4962,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
             return resident;
         using var f = GetOrAllocateBuffer(backend, t);
-        owned = backend.AllocateByteBuffer(elems * 2);
+        owned = AllocateHalfBuffer(backend, elems);
         backend.ConvertToFp16(f.Buffer, owned, elems);
         return owned;
     }
@@ -4963,7 +4975,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
             return resident;
         using var f = GetOrAllocateBuffer(backend, t);
-        owned = cb.AllocateByteBuffer(elems * 2);
+        owned = AllocateHalfBuffer(cb, elems);
         cb.ConvertToFp16Native(f.Buffer, owned, elems);
         return owned;
     }
@@ -5690,6 +5702,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Double operands already on the device stay there, computed in double.
         if (input is Tensor<double> doubles && TryUnaryFloat64(doubles, callerName) is { } doubleResult)
             return DoublesAs<T>(doubleResult);
+        if (TryUnaryIntegerAny(input, callerName) is { } integerResult)
+            return integerResult;
+        if (TryUnaryNarrowFloatAny(input, callerName) is { } narrowResult)
+            return narrowResult;
         if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
             return null;
         var precisionOperation = PrecisionOperationForUnary(callerName);
@@ -5931,20 +5947,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IGpuBuffer output,
         int size)
     {
-        if (backend is not Gpu.IGpuFp16ElementwiseBackend fp16 || !fp16.SupportsFp16NativeOps)
-            throw new NotSupportedException($"{backend.BackendName} advertised typed FP16 element-wise support without a dispatch implementation.");
-
-        switch (operation)
+        GpuNarrowFloatUnaryOperation kernel = operation switch
         {
-            case Gpu.GpuPrecisionOperation.Relu:
-                fp16.Fp16Relu(input, output, size);
-                break;
-            case Gpu.GpuPrecisionOperation.Gelu:
-                fp16.Fp16Gelu(input, output, size);
-                break;
-            default:
-                throw new NotSupportedException($"No typed FP16 unary dispatch exists for {operation}.");
-        }
+            Gpu.GpuPrecisionOperation.Relu => GpuNarrowFloatUnaryOperation.Relu,
+            Gpu.GpuPrecisionOperation.Gelu => GpuNarrowFloatUnaryOperation.Gelu,
+            _ => throw new NotSupportedException($"No typed FP16 unary dispatch exists for {operation}."),
+        };
+        if (backend is not IGpuNarrowFloatElementwise fp16 || !fp16.SupportsNarrowFloatUnary(kernel, GpuElementType.Float16))
+            throw new NotSupportedException($"{backend.BackendName} advertised typed FP16 element-wise support without a dispatch implementation.");
+        fp16.UnaryNarrowFloat(kernel, GpuElementType.Float16, input, output, size);
     }
 
     private static void ExecuteFp16Binary(
@@ -5956,13 +5967,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int size)
     {
         if (operation != Gpu.GpuPrecisionOperation.Add
-            || backend is not Gpu.IGpuFp16ElementwiseBackend fp16
-            || !fp16.SupportsFp16NativeOps)
+            || backend is not IGpuNarrowFloatElementwise fp16
+            || !fp16.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16))
         {
             throw new NotSupportedException($"No typed FP16 binary dispatch exists for {operation} on {backend.BackendName}.");
         }
 
-        fp16.Fp16Add(left, right, output, size);
+        fp16.BinaryNarrowFloat(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16, left, right, output, size);
     }
 
     private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
@@ -8303,7 +8314,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try {
             bool fp16PathRan = false;
             if (typeof(T) == typeof(Half)
-                && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
+                && backend is Engines.Gpu.IGpuHalfFusedKernels halfBackend
                 && halfBackend.SupportsHgemm)
             {
                 // Issue #560: FP16 vendor-library fast path. cublasGemmEx with
@@ -8892,7 +8903,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var batchedConvGemm = b > 1 ? rbk as IFp16ConvBatchedGemmBackend : null;
                 if (b > 1 && batchedConvGemm is null) fp16ConvWorth = false;
                 if (s_fp16Conv && fp16ConvWorth
-                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
+                    && rbk is Engines.Gpu.IGpuHalfFusedKernels hbConvR
                     && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
                 {
                     int K = gemmK, N = gemmN, M = gemmM;
@@ -9933,6 +9944,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool ShouldReduceOnDevice<T>(Tensor<T> tensor)
     {
         if (typeof(T) == typeof(double)) return false;
+        // The reductions behind this gate run in FP32: an integer above 2^24 would come back rounded. Integer tensors
+        // have their own exact sum (TrySumIntegerAny); everything else of theirs reduces on the host.
+        if (typeof(T) == typeof(int) || typeof(T) == typeof(long) || typeof(T) == typeof(short)
+            || typeof(T) == typeof(sbyte) || typeof(T) == typeof(byte)) return false;
+        // A BFloat16 tensor resident on the device is 16-bit words: the FP32 reduction would read two elements as one
+        // float, and past the end of the buffer.
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return false;
         return tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor) || IsFp16Resident(tensor);
     }
 
@@ -9942,6 +9960,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
             return (T)(object)doubleSum;
+        if (TrySumIntegerAny(tensor) is T integerSum)
+            return integerSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
@@ -16285,7 +16305,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.UnregisterPersistentTensor(tensor);
-        if (tensor is Tensor<double> unregisteredDoubles) DropFloat64Resident(unregisteredDoubles);
+        if (tensor is Tensor<double> unregisteredDoubles) DropResident(unregisteredDoubles);
+        DropIntegerResident(tensor);
 
         // Cache identity is a read-only concern. GetDataArray() advertises writable access and
         // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
@@ -16332,7 +16353,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.InvalidatePersistentTensor(tensor);
-        if (tensor is Tensor<double> invalidatedDoubles) DropFloat64Resident(invalidatedDoubles);
+        if (tensor is Tensor<double> invalidatedDoubles) DropResident(invalidatedDoubles);
+        DropIntegerResident(tensor);
 
         if (!TryGetBackend(out var backend))
             return;
@@ -17294,7 +17316,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, output.Length, cbS, backend, out hgOwned);
                         var ho = ResolveToFp16(output, output.Length, cbS, backend, out hoOwned);
-                        hOut = cbS.AllocateByteBuffer(output.Length * 2);
+                        hOut = AllocateHalfBuffer(cbS, output.Length);
                         cbS.Fp16SoftmaxBackward(hg, ho, hOut, outerSize, features);
                         var resultH = FinishGpuOpHalfStore(cbS, hOut, output.Length, output.Shape.ToArray());
                         hOut = null;
@@ -18300,9 +18322,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     invVarBuf = cbL.AllocateBuffer(batchSize);
                     cbL.AddScalar(varianceOwned.Value.Buffer, invVarBuf, (float)epsilon, batchSize);
                     cbL.RsqrtKernel(invVarBuf, invVarBuf, batchSize);
-                    giOut = cbL.AllocateByteBuffer(input.Length * 2);
-                    ggOut = cbL.AllocateByteBuffer(normalizedSize * 2);
-                    gbOut = cbL.AllocateByteBuffer(normalizedSize * 2);
+                    giOut = AllocateHalfBuffer(cbL, input.Length);
+                    ggOut = AllocateHalfBuffer(cbL, normalizedSize);
+                    gbOut = AllocateHalfBuffer(cbL, normalizedSize);
                     cbL.Fp16LayerNormBackward(hg, hi, hgam, meanOwned.Value.Buffer, invVarBuf,
                         giOut, batchSize, normalizedSize);
                     cbL.Fp16LayerNormGradParams(hg, hi, meanOwned.Value.Buffer, invVarBuf,
@@ -23939,6 +23961,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return ShapesMatch(a.Shape._dims, b.Shape._dims)
                 ? TryBinaryFloat64(leftDoubles, rightDoubles, callerName) as Tensor<T>
                 : null;
+        // Integer operands likewise: their own kernels, computed in the element type.
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryIntegerAny(a, b, callerName) is { } integerResult)
+            return integerResult;
+        // BFloat16 operands: computed in FP32 on the device and stored as BFloat16.
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryNarrowFloatAny(a, b, callerName) is { } narrowResult)
+            return narrowResult;
         if (AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
@@ -24437,7 +24465,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var hA = ResolveToFp16(a, a.Length, cbA, bkA, out hAOwned);
                 var hB = ResolveToFp16(b, b.Length, cbA, bkA, out hBOwned);
-                hOut = cbA.AllocateByteBuffer(a.Length * 2);
+                hOut = AllocateHalfBuffer(cbA, a.Length);
                 cbA.Fp16Add(hA, hB, hOut, a.Length);
                 var resultH = FinishGpuOpHalfStore(cbA, hOut, a.Length, a.Shape._dims);
                 hOut = null;
@@ -24806,7 +24834,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbR, backend, out hgOwned);
                         var hi = ResolveToFp16(input, input.Length, cbR, backend, out hiOwned);
-                        hOut = cbR.AllocateByteBuffer(gradOutput.Length * 2);
+                        hOut = AllocateHalfBuffer(cbR, gradOutput.Length);
                         cbR.Fp16ReluBackward(hg, hi, hOut, gradOutput.Length);
                         var resultH = FinishGpuOpHalfStore(cbR, hOut, gradOutput.Length, gradOutput.Shape._dims);
                         hOut = null;
@@ -24928,7 +24956,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbG, backend, out hgOwned);
                         var hi = ResolveToFp16(input, input.Length, cbG, backend, out hiOwned);
-                        hOut = cbG.AllocateByteBuffer(gradOutput.Length * 2);
+                        hOut = AllocateHalfBuffer(cbG, gradOutput.Length);
                         cbG.Fp16GeluBackward(hg, hi, hOut, gradOutput.Length);
                         var resultH = FinishGpuOpHalfStore(cbG, hOut, gradOutput.Length, gradOutput.Shape._dims);
                         hOut = null;
@@ -25434,6 +25462,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { doubleScalar });
             return onDevice;
         }
+        if (scalar is not null
+            && TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Multiply, nameof(TensorMultiplyScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", integerResult, tensor,
+                Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
+            return integerResult;
+        }
         if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
         {
@@ -25730,6 +25765,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
+        // Integer operands: their own kernel, in the element type, the result left on the device.
+        if (!IsTapeActive<T>() && ShapesMatch(a.Shape._dims, b.Shape._dims)
+            && TryBinaryIntegerAny(a, b, nameof(TensorMin)) is { } integerMin)
+            return integerMin;
         if (!IsTapeActive<T>() && typeof(T) == typeof(float)
             && ShapesMatch(a.Shape._dims, b.Shape._dims) && TryGetBackend(out var backend))
         {
@@ -25910,7 +25949,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new NotSupportedException($"No conversion implementation exists for {plan.InputStorage} input storage.");
 
         var reduced = plan.ReducesStorageBytes
-            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            ? AllocateHalfBuffer(backend, elementCount)
             : backend.AllocateBuffer(elementCount);
         try
         {
@@ -25933,7 +25972,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new NotSupportedException($"No reduced output allocation exists for {plan.OutputStorage} storage.");
 
         return plan.ReducesStorageBytes
-            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            ? AllocateHalfBuffer(backend, elementCount)
             : backend.AllocateBuffer(elementCount);
     }
 
@@ -25954,7 +25993,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (plan.InputStorage == Gpu.GpuScalarType.Float16)
             {
-                if (backend is not IGpuHalfPrecisionBackend halfBackend || !halfBackend.SupportsHgemm)
+                if (backend is not IGpuHalfFusedKernels halfBackend || !halfBackend.SupportsHgemm)
                     throw new NotSupportedException($"{backend.BackendName} advertised FP16 GEMM without an executable half GEMM route.");
 
                 using var fp16A = AllocateReducedPrecisionInput(backend, bufferA.Buffer, checked(m * k), plan);
@@ -26241,11 +26280,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
             // the VRAM); read IsFp16-resident inputs DIRECTLY (no re-inflate/re-convert churn), run the
             // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. Runs on ANY
-            // backend that ships a half-output GEMM (IGpuHalfPrecisionBackend.Hgemm / SupportsHgemm) — the
+            // backend that ships a half-output GEMM (IGpuHalfFusedKernels.Hgemm / SupportsHgemm) — the
             // half-resident matmul forward is no longer CUDA-only.
             if (rank2Plan.InputStorage == Gpu.GpuScalarType.Float16
                 && typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpFwd && hpFwd.SupportsHgemm)
+                && backend is IGpuHalfFusedKernels hpFwd && GpuNarrowFloatLayout.HasHalfMatrixMultiply(hpFwd))
             {
                 IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
                 bool storeOk = false;
@@ -26253,8 +26292,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
                     var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
-                    hOut = backend.AllocateByteBuffer(M * N * 2);
-                    hpFwd.Hgemm(hAi, hBi, hOut, M, N, K);
+                    hOut = AllocateHalfBuffer(backend, M * N);
+                    ((IGpuNarrowFloatMatrixMultiply)hpFwd).MatrixMultiplyNarrowFloat(GpuElementType.Float16, hAi, hBi, hOut, M, N, K);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
@@ -26336,7 +26375,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-resident fused FP16 matmul BACKWARD for the heterogeneous (FP16-activation) plan. Computes both
     /// gradients of the forward <c>C[M,N] = A[M,K] · B[K,N]</c> — for the FP16 (<see cref="Tensor{Half}"/>)
     /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the BACKEND-AGNOSTIC
-    /// <see cref="Gpu.IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
+    /// <see cref="Gpu.IGpuHalfFusedKernels.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
     /// GEMMs) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> FP32 dispatches —
     /// the four-FP32-allocation-per-matmul scratch that Fp16ActivationDominated_ReducesGpuPeakBytes measured as the
     /// dominant cost. Any backend implementing the capability fuses here (CUDA cuBLAS / HIP rocBLAS via transpose
@@ -26355,13 +26394,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradB = null;
         if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
         if (!TryGetBackend(out var backend)) return false;
-        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfPrecisionBackend capability so EVERY backend
+        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfFusedKernels capability so EVERY backend
         // that ships the fused FP16 backward (CUDA cuBLAS, HIP rocBLAS, and the OpenCL/Vulkan/Metal/WebGpu kernel
         // backends) fuses BOTH gradients with FP16 inputs + FP32 accumulate and NO FP32 transpose/up-cast scratch
         // (the measured dominant cost of the FP16 hetero path). Backends without the capability return false here
         // and fall back to the GENERIC FP16 backward (MatMulBackward<Half>) — correct, just without the working-set
         // win. (#633: the win is no longer CUDA-only.)
-        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsFp16FusedBackward) return false;
+        if (backend is not IGpuHalfFusedKernels hp || !hp.SupportsFp16FusedBackward) return false;
 
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
@@ -26868,11 +26907,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
-            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
+            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfFusedKernels.SupportsFp16NativeOps):
             // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
             // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
+                && backend is IGpuHalfFusedKernels hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
                 var mBuf = default(OwnedBuffer); var vBuf = default(OwnedBuffer);
@@ -26882,7 +26921,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
                     var hG = ResolveToFp16(gamma, normSize, backend, out hGOwned);
                     var hB = ResolveToFp16(beta, normSize, backend, out hBOwned);
-                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hOut = AllocateHalfBuffer(backend, input.Length);
                     mBuf = AllocateOutputBuffer(backend, outerSize);
                     vBuf = AllocateOutputBuffer(backend, outerSize);
                     hpL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
@@ -27324,18 +27363,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
             // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
-            // Runs on ANY backend with the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps);
+            // Runs on ANY backend with the FP16-native kernels (IGpuHalfFusedKernels.SupportsFp16NativeOps);
             // the store plumbing (ResolveToFp16/FinishGpuOpHalfStore) is backend-agnostic, so this is no longer
             // CUDA-only. Backends without the kernels use the correct FP32 softmax path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpS && hpS.SupportsFp16NativeOps)
+                && backend is IGpuHalfFusedKernels hpS && hpS.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hOut = null;
                 bool okS = false;
                 try
                 {
                     var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
-                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hOut = AllocateHalfBuffer(backend, input.Length);
                     hpS.Fp16Softmax(hIn, hOut, outerSize, features);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
@@ -28542,7 +28581,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var hIn = ResolveToFp16(tensor, tensor.Length, cbR, bkR, out hInOwned);
-                hOut = cbR.AllocateByteBuffer(tensor.Length * 2);
+                hOut = AllocateHalfBuffer(cbR, tensor.Length);
                 cbR.Fp16Relu(hIn, hOut, tensor.Length);
                 var resultH = FinishGpuOpHalfStore(cbR, hOut, tensor.Length, tensor.Shape._dims);
                 hOut = null;
@@ -28588,7 +28627,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var hIn = ResolveToFp16(tensor, tensor.Length, cbG, bkG, out hInOwned);
-                hOut = cbG.AllocateByteBuffer(tensor.Length * 2);
+                hOut = AllocateHalfBuffer(cbG, tensor.Length);
                 cbG.Fp16Gelu(hIn, hOut, tensor.Length);
                 var resultH = FinishGpuOpHalfStore(cbG, hOut, tensor.Length, tensor.Shape._dims);
                 hOut = null;
@@ -29127,6 +29166,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
             return onDevice;
         }
+        if (TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Add, nameof(TensorAddScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+            return integerResult;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -29169,6 +29213,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
             return onDevice;
+        }
+        if (TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Subtract, nameof(TensorSubtractScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+            return integerResult;
         }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision

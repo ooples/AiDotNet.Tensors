@@ -114,6 +114,8 @@ public sealed class MetalShaderCompilationTests
         // integer arithmetic, so fast math has no float operations to reorder.
         yield return ("Float64", () => MetalFloat64Kernels.ArithmeticSource, false);
         yield return ("Float64Elementary", () => MetalFloat64Kernels.ElementarySource, false);
+        // The Int32 kernels (MetalBackend.Integer), compiled by the two-argument overload as well.
+        yield return ("Int32", () => MetalInt32Kernels.Source, false);
     }
 
     internal static string? FindCompiler()

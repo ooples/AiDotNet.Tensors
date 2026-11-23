@@ -16,7 +16,7 @@
 // op uses. After the fix it:
 //   1. Resolves both inputs through GetOrAllocateBuffer (cache hit when the
 //      operand is a prior GPU op's deferred output).
-//   2. Routes Half to IGpuHalfPrecisionBackend.GemmFp16In32fOut (tensor cores).
+//   2. Routes Half to IGpuHalfFusedKernels.GemmFp16In32fOut (tensor cores).
 //   3. Returns a Matrix<T> wrapping a deferred-materializer-registered array,
 //      so the next MatMul that consumes it finds the GPU buffer in cache.
 

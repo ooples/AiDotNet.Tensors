@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// IGpuHalfPrecisionBackend implementation for the Metal backend (issue #560):
+// IGpuHalfFusedKernels implementation for the Metal backend (issue #560):
 // FP16 GEMM on the GPU via an MSL compute kernel, so the backend-agnostic
 // DirectGpuTensorEngine FP16 matmul path runs on Apple-silicon / Metal devices.
 
@@ -10,7 +10,7 @@ using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
 /// <summary>
-/// Half-precision GEMM dispatch for the <see cref="IGpuHalfPrecisionBackend"/>
+/// Half-precision GEMM dispatch for the <see cref="IGpuHalfFusedKernels"/>
 /// capability interface. Mirrors the CUDA backend's row-major contract:
 /// C = A·B with A = M×K, B = K×N, C = M×N.
 /// <para>
@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// mixed-precision matmul (matches <c>cublasGemmEx(CUDA_R_16F, COMPUTE_32F)</c>).
 /// </para>
 /// </summary>
-public sealed partial class MetalBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
+public sealed partial class MetalBackend : IGpuHalfFusedKernels, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     public bool SupportsHgemm => IsAvailable;

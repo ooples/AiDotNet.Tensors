@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// Correctness tests for the Metal IGpuHalfPrecisionBackend implementation
+// Correctness tests for the Metal IGpuHalfFusedKernels implementation
 // (issue #560): FP16 GEMM (C = A·B) on Apple GPUs via an MSL compute kernel.
 
 // System.Half (the FP16 oracle) only exists on .NET 5+, and the FP16 GPU path is
@@ -15,8 +15,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Exercises <see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> and
-/// <see cref="IGpuHalfPrecisionBackend.Hgemm"/> on the Metal backend against a
+/// Exercises <see cref="IGpuHalfFusedKernels.GemmFp16In32fOut"/> and
+/// <see cref="IGpuHalfFusedKernels.Hgemm"/> on the Metal backend against a
 /// CPU reference computed from the SAME FP16-rounded inputs, so the only residual
 /// error is FP32 accumulation order. Honors <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c>
 /// (throws instead of skipping when a GPU is required) per the no-silent-pass
@@ -133,7 +133,7 @@ public sealed class MetalHalfPrecisionGemmTests : IDisposable
         using var cBuf = _backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            ((IGpuHalfFusedKernels)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
             var actual = _backend.DownloadBuffer(cBuf);
             AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
         }
@@ -150,7 +150,7 @@ public sealed class MetalHalfPrecisionGemmTests : IDisposable
         Skip.If(!EnsureReady(), "Metal FP16 GEMM not available on this system.");
 
         using var dummy = _backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)_backend;
+        var half = (IGpuHalfFusedKernels)_backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

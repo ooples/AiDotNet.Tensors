@@ -247,6 +247,9 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
         if (gpu is null) return;
         using (gpu)
         {
+            // Stream capture and graph replay exist only on CUDA; no other backend can replay a step as a graph.
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Captured-graph replay is a CUDA capability.");
             long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
             var run = Train(gpu, onDevice: true, batch: 4, size: 8, activation: 1,
                 AiDotNet.Tensors.Engines.Gpu.PrecisionMode.BFloat16, steps: 12);

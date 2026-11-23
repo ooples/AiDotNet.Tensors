@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -22,7 +23,8 @@ public sealed class GradientAccumulationPhysicalGpuTests
         bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
         if (required) Assert.True(gpu.IsGpuAvailable, "A physical GPU was required, but none initialized.");
         Skip.IfNot(gpu.IsGpuAvailable, "No physical GPU backend initialized.");
-        bool nativeHalf = gpu.TestBackend is IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true };
+        bool nativeHalf = gpu.TestBackend is IGpuNarrowFloatElementwise narrow
+            && narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16);
         if (required) Assert.True(nativeHalf, "Native FP16 elementwise support is required for this precision comparison.");
         Skip.IfNot(nativeHalf, "Native FP16 elementwise support is unavailable.");
 

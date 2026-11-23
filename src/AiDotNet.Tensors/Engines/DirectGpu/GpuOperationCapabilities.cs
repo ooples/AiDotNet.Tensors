@@ -85,6 +85,13 @@ public static class GpuOperationCapabilities
     /// Whether <paramref name="backend"/> runs <paramref name="family"/> natively over <paramref name="elementType"/>
     /// buffers on its current device. A wrapper answers for the backend it wraps (see the type's remarks).
     /// </summary>
+    /// <remarks>
+    /// A family row says the family's basic operation runs (for <see cref="GpuOperationFamily.Elementwise"/>, addition;
+    /// for Bool, the logical operations), not that every operation of the family does. Before choosing a particular
+    /// operation, ask the interface that runs it: <see cref="IGpuNarrowFloatElementwise.SupportsNarrowFloatBinary"/>
+    /// and <see cref="IGpuNarrowFloatElementwise.SupportsNarrowFloatUnary"/> for the 16-bit floats,
+    /// <see cref="IGpuFloat64UnaryAvailability"/> for the double unary operations.
+    /// </remarks>
     public static bool SupportsOperation(this IDirectGpuBackend backend, GpuOperationFamily family, GpuElementType elementType)
     {
         if (backend is null) throw new ArgumentNullException(nameof(backend));
@@ -93,6 +100,9 @@ public static class GpuOperationCapabilities
         var physical = Unwrap(backend);
         if (elementType == GpuElementType.Unspecified || !physical.SupportsElementType(elementType)) return false;
         if (family == GpuOperationFamily.Storage) return true;
+        // The compute families are IDirectGpuBackend's synchronous kernels. A backend that reports itself unavailable
+        // through that interface (WebGPU in a browser, where a synchronous wait cannot finish) runs none of them.
+        if (!physical.IsAvailable) return false;
         return elementType switch
         {
             // The float kernels are the backend contract itself.
@@ -104,7 +114,23 @@ public static class GpuOperationCapabilities
                 GpuOperationFamily.MatrixMultiply => physical is IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true },
                 _ => false,
             },
-            // Half, integer and bool buffers are held and moved, not yet computed on.
+            GpuElementType.Int8 or GpuElementType.UInt8 or GpuElementType.Int16 or GpuElementType.Int32 or GpuElementType.Int64
+                or GpuElementType.Bool => family switch
+            {
+                // In the element type itself; for Bool, the logical operations.
+                GpuOperationFamily.Elementwise => physical is IGpuIntegerElementwise integers && integers.SupportsIntegerElementwise(elementType),
+                GpuOperationFamily.Reduction => physical is IGpuIntegerReductions sums && sums.SupportsIntegerReductions(elementType),
+                _ => false,
+            },
+            // 16-bit floats: computed in FP32 and rounded to the storage type.
+            GpuElementType.Float16 or GpuElementType.BFloat16 => family switch
+            {
+                GpuOperationFamily.Elementwise => physical is IGpuNarrowFloatElementwise narrow
+                    && narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, elementType),
+                GpuOperationFamily.MatrixMultiply => physical is IGpuNarrowFloatMatrixMultiply multiply
+                    && multiply.SupportsNarrowFloatMatrixMultiply(elementType),
+                _ => false,
+            },
             _ => false,
         };
     }

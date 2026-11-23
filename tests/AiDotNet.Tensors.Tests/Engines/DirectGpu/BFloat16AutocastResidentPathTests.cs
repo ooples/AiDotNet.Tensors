@@ -131,7 +131,8 @@ public sealed class BFloat16AutocastResidentPathTests : IClassFixture<DirectGpuT
     {
         Skip.IfNot(_fixture.IsAvailable, "No native GPU backend.");
         var engine = _fixture.Engine!;
-        Skip.IfNot(engine.TestBackend is IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true },
+        Skip.IfNot(engine.TestBackend is IGpuNarrowFloatElementwise halves
+                && halves.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16),
             "Native FP16 elementwise support is unavailable.");
         var (a, b) = Operands(engine);
         int adds = 0;

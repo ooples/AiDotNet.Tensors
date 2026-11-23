@@ -703,15 +703,16 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // element; a buffer of doubles (two words each) is copied by the word kernel, its range checked in doubles.
         // Only 4- and 8-byte elements have a copy here: a narrower element counted as a double would address twice
         // the bytes the range check allowed.
-        int elementBytes = GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        int elementBytes = GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
         if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
             throw new NotSupportedException($"{nameof(Copy)} on Metal copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
         if (elementBytes == sizeof(double))
         {
-            GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
             if (size > 0) CopyFloat64(srcBuffer, srcOffset, destBuffer, destOffset, size);
             return;
         }
+
+        if (size == 0) return;
 
         // Use element-wise copy kernel
         var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "copy_buffer");

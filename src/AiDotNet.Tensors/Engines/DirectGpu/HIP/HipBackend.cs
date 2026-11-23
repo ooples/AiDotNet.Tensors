@@ -89,6 +89,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
     private IntPtr _missingLookupModule;
+    private IntPtr _integerModule;
     private IntPtr _octonionModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
@@ -758,6 +759,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // squash / squash_backward and octonion_linear_forward already come from other modules.
             CompileKernelModule(CUDA.Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup", ref _missingLookupModule,
                 new[] { "copy_2d_strided", "var_axis", "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev" });
+            // Integer and bool element-wise ops and sums, in the buffers' own element type (IGpuIntegerElementwise).
+            CompileKernelModule(GpuIntegerKernelSource.Build(GpuIntegerKernelDialect.Cuda), "integer", ref _integerModule,
+                GpuIntegerKernelSource.KernelNames.ToArray(), useFastMath: false);
             CompileKernelModule(Kernels.HipOctonionKernels.GetSource(), "octonion", ref _octonionModule,
                 Kernels.HipOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
             CompileKernelModule(Kernels.HipDotProductKernels.GetSource(), "dot_product", ref _dotProductModule,
@@ -11980,6 +11984,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             UnloadModule(_fp16Module);
             _fp16Module = IntPtr.Zero;
+        }
+
+        if (_integerModule != IntPtr.Zero)
+        {
+            UnloadModule(_integerModule);
+            _integerModule = IntPtr.Zero;
         }
 
         if (_lstmModule != IntPtr.Zero)
