@@ -256,6 +256,56 @@ public abstract class GpuIntegerBackendContractTests
         Assert.True(ran > 0, "No element type ran.");
     }
 
+    // A device copy counts elements of the buffers' type. An 8- or 16-bit element shares a 4-byte word with its
+    // neighbours on the word-addressed backends, so every offset within a word is tried, in both directions, and the
+    // elements either side of the range must keep what they held.
+    [SkippableFact]
+    public void A_device_copy_moves_exactly_the_requested_elements_of_every_type()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type)) continue;
+            ran++;
+            const int Length = 41;
+            var values = Values(type, Length, 91);
+            long fill = type == GpuElementType.Bool ? 1 : GpuIntegerLayout.Wrap(-7, type);
+            foreach (int from in new[] { 0, 1, 2, 3, 5 })
+            foreach (int to in new[] { 0, 1, 2, 3, 6 })
+            foreach (int count in new[] { 1, 2, 3, 4, 5, 9, 30 })
+            {
+                using var source = Upload(backend, type, values);
+                using var target = Upload(backend, type, Enumerable.Repeat(fill, Length).ToArray());
+                backend.Copy(source, from, target, to, count);
+                var actual = Download(backend, type, target, Length);
+                for (int i = 0; i < Length; i++)
+                {
+                    long expected = i >= to && i < to + count ? values[from + i - to] : fill;
+                    Assert.True(expected == actual[i], $"{type} copy of {count} from {from} to {to}: element {i} is {actual[i]}, not {expected}.");
+                }
+
+                // Within one buffer, the ranges overlapping: the destination gets what the source held before the copy.
+                using var same = Upload(backend, type, values);
+                backend.Copy(same, from, same, to, count);
+                actual = Download(backend, type, same, Length);
+                for (int i = 0; i < Length; i++)
+                {
+                    long expected = i >= to && i < to + count ? values[from + i - to] : values[i];
+                    Assert.True(expected == actual[i], $"{type} copy within a buffer of {count} from {from} to {to}: element {i} is {actual[i]}, not {expected}.");
+                }
+            }
+
+            using var whole = Upload(backend, type, values);
+            using var copy = backend.AllocateBuffer(Length, type);
+            backend.Copy(whole, copy, Length);
+            Assert.Equal(values, Download(backend, type, copy, Length));
+        }
+
+        Assert.True(ran > 0, "The backend holds no integer type.");
+    }
+
     [SkippableFact]
     public void A_kernel_writes_only_the_requested_prefix_and_refuses_bad_operands()
     {

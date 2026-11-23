@@ -462,6 +462,13 @@ public sealed unsafe partial class VulkanBackend
 
         // Offsets and size count elements of the buffers' type (a double is two words).
         ulong width = (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        if (ReferenceEquals(src.Storage, dst.Storage)
+            && GpuCopyLayout.Overlaps((long)srcOffset * (long)width, (long)destOffset * (long)width, (long)size * (long)width))
+        {
+            GpuCopyLayout.ThroughScratch(this, source, srcOffset, destination, destOffset, size);
+            return;
+        }
+
         GpuLaunchProbe.OnLaunch();
         _transfer.CopyDeviceToDevice(
             src.Storage, checked((ulong)srcOffset * width),

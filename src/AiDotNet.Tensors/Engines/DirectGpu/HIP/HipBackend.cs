@@ -10647,6 +10647,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
         IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
         var sizeBytes = (UIntPtr)((ulong)length * (ulong)width);
+        if (GpuCopyLayout.Overlaps((long)srcPtr, (long)dstPtr, length * width))
+        {
+            GpuCopyLayout.ThroughScratch(this, source, sourceOffset, destination, destinationOffset, length);
+            return;
+        }
+
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
         GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work

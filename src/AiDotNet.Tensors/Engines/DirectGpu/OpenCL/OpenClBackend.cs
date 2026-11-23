@@ -1804,6 +1804,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var srcOffsetBytes = new UIntPtr((ulong)srcOffset * width);
             var destOffsetBytes = new UIntPtr((ulong)destOffset * width);
             var sizeBytes = new UIntPtr((ulong)size * width);
+            if (srcHandle == destHandle
+                && GpuCopyLayout.Overlaps((long)srcOffset * (long)width, (long)destOffset * (long)width, (long)size * (long)width))
+            {
+                GpuCopyLayout.ThroughScratch(this, source, srcOffset, destination, destOffset, size);
+                return;
+            }
 
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work (keeps data on device)
             int err = EnqueueTrackedCopy(
