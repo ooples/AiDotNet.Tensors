@@ -67,7 +67,9 @@ public class GpuIntegerResidencyTests
             Assert.True(gpu.IsTypedResident(sum), $"The {type} sum was not left on the device.");
             var product = engine.TensorMultiply(sum, x);
             var difference = engine.TensorSubtract(product, y);
-            var negated = engine.TensorNegate(difference);
+            var capped = engine.TensorMin(engine.TensorMax(difference, x), sum);
+            Assert.True(gpu.IsTypedResident(capped), $"The {type} min/max result was not left on the device.");
+            var negated = engine.TensorNegate(capped);
             var shifted = engine.TensorAddScalar(negated, scalar);
             var scaled = engine.TensorMultiplyScalar(shifted, scalar);
             var lowered = engine.TensorSubtractScalar(scaled, scalar);
@@ -75,7 +77,8 @@ public class GpuIntegerResidencyTests
             T total = engine.TensorSum(lowered);
 
             var expected = cpu.TensorSubtractScalar(cpu.TensorMultiplyScalar(cpu.TensorAddScalar(cpu.TensorNegate(
-                cpu.TensorSubtract(cpu.TensorMultiply(cpu.TensorAdd(hostX, hostY), hostX), hostY)), scalar), scalar), scalar);
+                cpu.TensorMin(cpu.TensorMax(cpu.TensorSubtract(cpu.TensorMultiply(cpu.TensorAdd(hostX, hostY), hostX), hostY), hostX),
+                    cpu.TensorAdd(hostX, hostY))), scalar), scalar), scalar);
             Assert.Equal(cpu.TensorSum(expected), total);
             var actualValues = lowered.GetReadOnlyDataArray();
             var expectedValues = expected.GetReadOnlyDataArray();

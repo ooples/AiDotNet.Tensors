@@ -24,6 +24,8 @@ public partial class DirectGpuTensorEngine
         nameof(TensorAdd) => GpuIntegerBinaryOperation.Add,
         nameof(TensorSubtract) => GpuIntegerBinaryOperation.Subtract,
         nameof(TensorMultiply) => GpuIntegerBinaryOperation.Multiply,
+        nameof(TensorMax) => GpuIntegerBinaryOperation.Max,
+        nameof(TensorMin) => GpuIntegerBinaryOperation.Min,
         _ => null,
     };
 

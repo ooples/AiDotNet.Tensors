@@ -25658,6 +25658,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorMin<T>(Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
+        // Integer operands: their own kernel, in the element type, the result left on the device.
+        if (!IsTapeActive<T>() && ShapesMatch(a.Shape._dims, b.Shape._dims)
+            && TryBinaryIntegerAny(a, b, nameof(TensorMin)) is { } integerMin)
+            return integerMin;
         if (!IsTapeActive<T>() && typeof(T) == typeof(float)
             && ShapesMatch(a.Shape._dims, b.Shape._dims) && TryGetBackend(out var backend))
         {
