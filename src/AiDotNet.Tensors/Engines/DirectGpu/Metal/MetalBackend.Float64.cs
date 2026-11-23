@@ -174,6 +174,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
         }
 
         IntPtr commandBuffer = encoder.CommandBuffer;
+        bool encoding = true;
         try
         {
             encoder.SetPipelineState(pipeline.Handle);
@@ -182,6 +183,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
             foreach (uint parameter in parameters) encoder.SetBytes(parameter, (ulong)index++);
             encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
             MetalCommandQueue.EndEncoding(encoder.Handle);
+            encoding = false;
             MetalCommandQueue.Commit(commandBuffer);
             MetalCommandQueue.WaitUntilCompleted(commandBuffer);
             string? error = MetalCommandQueue.GetError(commandBuffer);
@@ -190,6 +192,8 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
         }
         finally
         {
+            // A command buffer must not be released with an encoder still open on it.
+            if (encoding) MetalCommandQueue.EndEncoding(encoder.Handle);
             _commandQueue.ReturnCommandBuffer(commandBuffer);
         }
     }
