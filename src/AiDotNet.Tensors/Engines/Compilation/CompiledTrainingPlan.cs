@@ -1141,10 +1141,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         foreach (var state in DeviceAuthoritativeInPlaceState(de)
                      .Where(s => s._gpuBufferVersion != s.GpuCacheVersion && s._gpuBuffer!.Size >= s.Length))
         {
-            if (state.ToArray() is not float[] host) continue;
             var buffer = state._gpuBuffer!;
             var backend = state._gpuBackend!;
-            backend.UploadBufferInPlace(host, buffer);
+            // T is float here (checked on entry).
+            backend.UploadBufferInPlace(System.Runtime.CompilerServices.Unsafe.As<float[]>(state.ToArray()), buffer);
             // The buffer now equals the host copy: stamp the binding current without arming a download.
             de.BindResidentBuffer(state, buffer, backend, isDeviceModified: false);
         }
