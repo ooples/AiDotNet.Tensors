@@ -188,7 +188,7 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
             source.Append("IK_KERNEL ").Append(Sum(type))
                 .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR i64t* o, const int count, const int blocks)\n{\n")
                 .Append("    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * ").Append(SumBlock)
-                .Append(";\n    const int last = (first + ").Append(SumBlock).Append(" < count) ? first + ").Append(SumBlock)
+                .Append(";\n    const int last = (count - first > ").Append(SumBlock).Append(") ? first + ").Append(SumBlock)
                 .Append(" : count;\n    u64t s = 0;\n    for (int j = first; j < last; j++) s += (u64t)(i64t)a[j];\n    o[i] = (i64t)s;\n}\n");
         }
 

@@ -101,6 +101,21 @@ internal static class GpuNarrowFloatLayout
     public static bool HasHalfMatrixMultiply(object? backend)
         => backend is IGpuNarrowFloatMatrixMultiply multiply && multiply.SupportsNarrowFloatMatrixMultiply(GpuElementType.Float16);
 
+    /// <summary>
+    /// A matrix multiply reads its operands while it writes: the output may not be one of them, as the same object or
+    /// as another buffer over the same device memory.
+    /// </summary>
+    public static void RequireDistinctOutput(IGpuBuffer output, params IGpuBuffer[] operands)
+    {
+        if (output is null) throw new System.ArgumentNullException(nameof(output));
+        foreach (var operand in operands)
+        {
+            if (operand is null) throw new System.ArgumentNullException(nameof(operands));
+            if (ReferenceEquals(operand, output) || (operand.Handle != System.IntPtr.Zero && operand.Handle == output.Handle))
+                throw new System.ArgumentException("The output of a matrix multiply must not be one of its operands.", nameof(output));
+        }
+    }
+
     /// <summary>The <paramref name="m"/> by <paramref name="n"/> by <paramref name="k"/> element counts of a matrix multiply, checked.</summary>
     public static (int A, int B, int C) MatrixCounts(int m, int n, int k)
     {

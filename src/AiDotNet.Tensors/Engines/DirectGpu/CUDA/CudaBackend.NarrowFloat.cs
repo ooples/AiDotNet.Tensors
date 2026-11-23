@@ -87,8 +87,7 @@ public sealed partial class CudaBackend : IGpuNarrowFloatElementwise, IGpuNarrow
     {
         var (aCount, bCount, cCount) = GpuNarrowFloatLayout.MatrixCounts(m, n, k);
         GpuNarrowFloatLayout.Require(nameof(MatrixMultiplyNarrowFloat), type, cCount, (a, aCount), (b, bCount), (c, cCount));
-        if (ReferenceEquals(c, a) || ReferenceEquals(c, b))
-            throw new ArgumentException("The output of a matrix multiply must not be one of its operands.", nameof(c));
+        GpuNarrowFloatLayout.RequireDistinctOutput(c, a, b);
         if (type == GpuElementType.Float16 && SupportsHgemm)
         {
             Hgemm(a, b, c, m, n, k);
