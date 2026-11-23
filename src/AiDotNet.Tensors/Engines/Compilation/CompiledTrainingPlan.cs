@@ -1103,6 +1103,62 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private Tensor<T>[]? _inPlaceStateTensors;
 
     /// <summary>
+    /// Re-arms the host download of every in-place state tensor whose current value the plan keeps on the device
+    /// (bound device-authoritative in the resident pre-pass), after each step.
+    /// </summary>
+    /// <remarks>
+    /// A graph replay runs no host code, so the device update of such a state (a router's selection bias nudged from
+    /// its loads, a running statistic) never re-armed its host copy. The first host read after the state went
+    /// device-resident downloaded it once; every later read returned that value while the device copy kept moving.
+    /// Measured on a GDN/MLA + MoE language model: a checkpoint written at step 100 after one at step 50 saved every
+    /// router bias at its step-50 value, so a resume from it diverged from the uninterrupted run at the first resumed
+    /// step. Only device-authoritative bindings are re-armed: a state an eager step updates on the host keeps its
+    /// host value.
+    /// </remarks>
+    private void RearmInPlaceStateDownloads()
+    {
+        if (_forwardSteps is null || !_engine.TryGet<Engines.DirectGpuTensorEngine>(out var de)) return;
+        // A host write the step did not take (UploadHostWrittenInPlaceState could not upload it) leaves the host
+        // version ahead of the binding; re-arming would let the stale device copy overwrite it, so host wins.
+        foreach (var state in DeviceAuthoritativeInPlaceState(de).Where(s => s._gpuBufferVersion == s.GpuCacheVersion))
+            de.BindResidentBuffer(state, state._gpuBuffer!, state._gpuBackend!);
+    }
+
+    /// <summary>
+    /// Host wins after a host write, as for parameters (<see cref="UploadHostWrittenParameters"/>): a write to an
+    /// in-place state between steps (a checkpoint restore of a router bias or running statistic) advances its host
+    /// version past its device binding. Upload those values into the SAME buffer before the step, so the step's
+    /// in-place update continues from them and a captured graph's baked pointer stays valid.
+    /// </summary>
+    private void UploadHostWrittenInPlaceState()
+    {
+        if (typeof(T) != typeof(float) || _forwardSteps is null || !_engine.TryGet<Engines.DirectGpuTensorEngine>(out var de)) return;
+        // This runs before StepCore takes its lease: hold one, so a concurrent Dispose cannot release the backend under
+        // the upload. A closed gate uploads nothing; each skipped state keeps its host version ahead of its binding, so
+        // the re-arm leaves its host value in place.
+        using var lease = de.EnterGpuOp();
+        if (!lease.Held) return;
+        foreach (var state in DeviceAuthoritativeInPlaceState(de)
+                     .Where(s => s._gpuBufferVersion != s.GpuCacheVersion && s._gpuBuffer!.Size >= s.Length))
+        {
+            var buffer = state._gpuBuffer!;
+            var backend = state._gpuBackend!;
+            // T is float here (checked on entry).
+            backend.UploadBufferInPlace(System.Runtime.CompilerServices.Unsafe.As<float[]>(state.ToArray()), buffer);
+            // The buffer now equals the host copy: stamp the binding current without arming a download.
+            de.BindResidentBuffer(state, buffer, backend, isDeviceModified: false);
+        }
+    }
+
+    /// <summary>
+    /// The in-place state tensors bound to a device buffer the plan keeps authoritative (bound in the resident
+    /// pre-pass). Parameters are excluded: they have their own host-write upload and post-update re-binding.
+    /// </summary>
+    private IEnumerable<Tensor<T>> DeviceAuthoritativeInPlaceState(Engines.DirectGpuTensorEngine de)
+        => InPlaceStateTensors().Where(state => state._gpuBuffer is not null && state._gpuBackend is not null
+            && !Array.Exists(_parameters, p => ReferenceEquals(p, state)) && de.IsBoundDeviceAuthoritative(state));
+
+    /// <summary>
     /// Writes <see cref="SnapshotInPlaceState"/>'s values back. A state the pre-pass left bound to a device buffer gets
     /// them in that same buffer (the graph about to be captured bakes in its address, and the host copy reads through it);
     /// one left on the host gets them on the host.
@@ -4520,11 +4576,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
             ClearPlanBufferReleaseMarks();
             UploadHostWrittenParameters();
+            UploadHostWrittenInPlaceState();
             var loss = StepCore();
             // Graph replay runs no host code: re-arm declared outputs without downloading any activations.
             if (_retainedOutputs.Count > 0 && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var outputEngine))
                 foreach (var output in _retainedOutputs.Where(output => output._gpuBuffer is not null && output._gpuBackend is not null))
                     outputEngine.BindResidentBuffer(output, output._gpuBuffer!, output._gpuBackend!);
+            RearmInPlaceStateDownloads();
             if (_namedRetainedOutputs.Count > 0 || RetainedOutputCapture<T>.IsActive)
             {
                 // Device-guarded optimizers may return before their skip verdict is read back.
