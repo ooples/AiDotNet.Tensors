@@ -151,6 +151,65 @@ public sealed class GpuPrecisionPolicyTests
         Assert.Contains("Float8E4M3", plan.FallbackReason);
     }
 
+    private static GpuPrecisionCapability EmulatedFp64() => new(
+        GpuScalarType.Float64, GpuScalarType.Float64, GpuScalarType.Float64, GpuScalarType.Float64,
+        GpuPrecisionImplementation.Emulated, false, GpuScalarType.Float64);
+
+    [SkippableFact]
+    public void EmulatedDouble_StaysOnTheCpu_UntilAPolicyAsksForTheDevice()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        var backend = CreateBackend(Fp32(), EmulatedFp64());
+        Assert.True(GpuPrecisionPlanner.EmulatesFloat64(backend));
+        Assert.False(GpuPrecisionPlanner.EmulatesFloat64(CreateBackend(Fp32(), Fp64())));
+
+        // By default (and under an explicit Preserve) the device's integer-emulated doubles are not a route: the CPU
+        // computes the same values faster.
+        var plan = Plan<double>(backend);
+        Assert.Equal(GpuExecutionRoute.Cpu, plan.Route);
+        Assert.Contains("integer emulation", plan.FallbackReason);
+        Assert.False(GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend));
+        using (new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve))
+        {
+            Assert.Equal(GpuExecutionRoute.Cpu, Plan<double>(backend).Route);
+            Assert.False(GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend));
+        }
+
+        // A policy that allows it keeps doubles on the device, and the plan says how they are computed.
+        using (new GpuExecutionPolicyScope(GpuExecutionPolicy.PreserveOnDevice))
+        {
+            var onDevice = Plan<double>(backend);
+            Assert.Equal(GpuExecutionRoute.Gpu, onDevice.Route);
+            Assert.Equal(GpuScalarType.Float64, onDevice.InputStorage);
+            Assert.Equal(GpuPrecisionImplementation.Emulated, onDevice.Implementation);
+            Assert.True(GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend));
+        }
+
+        // An explicit Float64 compute preference without the allowance does not reach the emulated route either, and
+        // never narrows.
+        using (new GpuExecutionPolicyScope(new GpuExecutionPolicy(computePreference: GpuComputePreference.Float64)))
+            Assert.Equal(GpuExecutionRoute.Cpu, Plan<double>(backend).Route);
+        using (new GpuExecutionPolicyScope(new GpuExecutionPolicy(computePreference: GpuComputePreference.Float64).WithEmulatedFloat64()))
+            Assert.Equal(GpuExecutionRoute.Gpu, Plan<double>(backend).Route);
+    }
+
+    [Fact]
+    public void TheEmulationAllowance_ChangesNothingForNativeDoubles_AndCopiesThePolicy()
+    {
+        var backend = CreateBackend(Fp32(), Fp64());
+        Assert.True(GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend));
+        using (new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve))
+            Assert.Equal(GpuExecutionRoute.Gpu, Plan<double>(backend).Route);
+
+        Assert.False(GpuExecutionPolicy.Preserve.AllowEmulatedFloat64);
+        Assert.False(GpuExecutionPolicy.Default.AllowEmulatedFloat64);
+        var allowed = GpuExecutionPolicy.PreserveOnDevice;
+        Assert.True(allowed.AllowEmulatedFloat64);
+        Assert.Equal(GpuAccuracyMode.PreserveInputType, allowed.AccuracyMode);
+        Assert.False(allowed.WithEmulatedFloat64(false).AllowEmulatedFloat64);
+        Assert.True(allowed.AllowEmulatedFloat64);
+    }
+
     [Fact]
     public void ExplicitFp64NeverSilentlyFallsBackToLowerGpuPrecision()
     {

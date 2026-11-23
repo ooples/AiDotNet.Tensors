@@ -1737,6 +1737,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var hipBuffer = (HipGpuBuffer)buffer;
         float[] result = new float[hipBuffer.Size];
         DownloadBuffer(buffer, result);
@@ -1747,6 +1748,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var hipBuffer = (HipGpuBuffer)buffer;
         if (hipBuffer.Handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");
@@ -3292,8 +3294,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void CopyBuffer(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        if (size <= 0) return;
-        var result = HipNativeBindings.hipMemcpy(destination.Handle, source.Handle, (nuint)(size * sizeof(float)), HipMemcpyKind.DeviceToDevice);
+        if (size < 0)
+            throw new ArgumentOutOfRangeException(nameof(size), size, $"{nameof(CopyBuffer)}: the element count must be non-negative.");
+        if (size == 0) return;
+        var result = HipNativeBindings.hipMemcpy(destination.Handle, source.Handle,
+            (nuint)((ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(CopyBuffer))), HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy CopyBuffer");
         GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work
     }
@@ -7101,7 +7106,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
     {
-        var sizeBytes = (UIntPtr)((ulong)size * sizeof(float));
+        var sizeBytes = (UIntPtr)((ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(Copy)));
         var result = HipNativeBindings.hipMemcpy(
             destination.Handle,
             source.Handle,
@@ -10644,9 +10649,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
-        IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
-        var sizeBytes = (UIntPtr)((ulong)length * sizeof(float));
+        long width = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
+        IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
+        IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
+        var sizeBytes = (UIntPtr)((ulong)length * (ulong)width);
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
         GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work

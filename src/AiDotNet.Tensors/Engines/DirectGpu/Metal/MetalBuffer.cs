@@ -29,7 +29,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <item><b>Managed</b>: Metal manages synchronization (macOS only).</item>
 /// </list>
 /// </remarks>
-public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer
+public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferViewSource, IRetypableGpuBuffer,
+    IElementTypedByteBuffer
 {
     private const long MinimumReclaimCharge = 128 * 1024;
 
@@ -85,18 +86,19 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     private long _reclaimEpoch = -1;
 
     /// <inheritdoc/>
-    int IPoolableGpuBuffer.Capacity => Size;
+    int IPoolableGpuBuffer.Capacity => WordCount;
 
     /// <inheritdoc/>
     void IPoolableGpuBuffer.MarkRented(int size)
     {
         // A recycled allocation is a float buffer again until its new owner says otherwise.
         Volatile.Write(ref _elementType, (int)GpuElementType.Float32);
+        Volatile.Write(ref _declaredCount, -1);
         // The pool is exact-size (MetalDevice.BufferPool), so a rent is always for this buffer's whole capacity and nothing
         // about the wrapper changes; anything else would hand out a wrong-sized buffer.
-        if (size != Size)
+        if (size != WordCount)
             throw new InvalidOperationException(
-                $"The exact-size Metal pool rented a {Size}-element buffer for a {size}-element request.");
+                $"The exact-size Metal pool rented a {WordCount}-element buffer for a {size}-element request.");
     }
 
     /// <inheritdoc/>
@@ -126,12 +128,36 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     private int _elementType = (int)GpuElementType.Float32;
     public GpuElementType ElementType => (GpuElementType)Volatile.Read(ref _elementType);
     void IRetypableGpuBuffer.SetElementType(GpuElementType type) => Volatile.Write(ref _elementType, (int)type);
-    public int Size { get; }
+    /// <summary>
+    /// The element count: 4-byte words, or the elements the allocation was declared to hold (a
+    /// <see cref="GpuElementType.Float64"/> buffer of n doubles is 2n words and reports n).
+    /// </summary>
+    public int Size
+    {
+        get
+        {
+            int declared = Volatile.Read(ref _declaredCount);
+            return declared >= 0 ? declared : WordCount;
+        }
+    }
+
+    /// <summary>The allocation's length in 4-byte words, whatever elements it is declared to hold.</summary>
+    internal int WordCount { get; }
+
+    private int _declaredCount = -1;
+
+    void IElementTypedByteBuffer.DeclareElements(GpuElementType type, int count)
+    {
+        if (count < 0 || (long)count * GpuElementTypes.SizeInBytes(type) > SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), $"{count} {type} elements do not fit in {SizeInBytes} bytes.");
+        Volatile.Write(ref _elementType, (int)type);
+        Volatile.Write(ref _declaredCount, count);
+    }
 
     /// <summary>
     /// Gets the total size in bytes.
     /// </summary>
-    public long SizeInBytes => (long)Size * sizeof(float);
+    public long SizeInBytes => (long)WordCount * sizeof(float);
 
     /// <summary>
     /// Gets whether the buffer is disposed.
@@ -185,7 +211,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
             throw new ArgumentOutOfRangeException(nameof(elementCount), "Element count must be positive");
         }
 
-        Size = elementCount;
+        WordCount = elementCount;
         _device = device;
         StorageMode = options;
 
@@ -215,7 +241,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     {
         _device = device;
         _buffer = buffer;
-        Size = elementCount;
+        WordCount = elementCount;
         StorageMode = options;
         _pooled = options == MTLResourceOptions.StorageModeShared;
     }
@@ -333,7 +359,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
             throw new ArgumentException("Data cannot be null or empty", nameof(data));
         }
 
-        Size = data.Length;
+        WordCount = data.Length;
         _device = device;
         StorageMode = options;
 
@@ -377,7 +403,10 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
     internal MetalGpuBuffer(MetalGpuBuffer parent, int elementOffset, int elementCount)
     {
         if (parent is null) throw new ArgumentNullException(nameof(parent));
-        if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > parent.Size)
+        // A view addresses 4-byte words; a parent declared to hold wider elements counts something else.
+        if (Volatile.Read(ref parent._declaredCount) >= 0)
+            throw new NotSupportedException($"A {parent.ElementType} buffer has no word-addressed views.");
+        if (elementOffset < 0 || elementCount <= 0 || (long)elementOffset + elementCount > parent.WordCount)
             throw new ArgumentOutOfRangeException(nameof(elementOffset));
         if (parent.Handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(MetalGpuBuffer));
         _buffer = parent.Handle;
@@ -385,7 +414,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         _viewParent = parent;
         _elementType = (int)parent.ElementType;   // the view is the parent's memory, so it is the parent's elements
         _byteOffset = parent._byteOffset + (long)elementOffset * sizeof(float);
-        Size = elementCount;
+        WordCount = elementCount;
         StorageMode = parent.StorageMode;
         Retain(_buffer);
         System.Threading.Interlocked.Increment(ref Owner._liveViews);
@@ -409,7 +438,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         }
 
         _buffer = handle;
-        Size = elementCount;
+        WordCount = elementCount;
         StorageMode = options;
 
         // Retain the buffer since we're taking ownership
@@ -433,15 +462,15 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (count < 0)
         {
-            count = Size - offset;
+            count = WordCount - offset;
         }
 
-        if (offset < 0 || offset >= Size)
+        if (offset < 0 || offset >= WordCount)
         {
             throw new ArgumentOutOfRangeException(nameof(offset));
         }
 
-        if (count <= 0 || offset + count > Size || count > destination.Length)
+        if (count <= 0 || offset + count > WordCount || count > destination.Length)
         {
             throw new ArgumentOutOfRangeException(nameof(count));
         }
@@ -474,15 +503,15 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (count < 0)
         {
-            count = Math.Min(source.Length, Size - offset);
+            count = Math.Min(source.Length, WordCount - offset);
         }
 
-        if (offset < 0 || offset >= Size)
+        if (offset < 0 || offset >= WordCount)
         {
             throw new ArgumentOutOfRangeException(nameof(offset));
         }
 
-        if (count <= 0 || offset + count > Size || count > source.Length)
+        if (count <= 0 || offset + count > WordCount || count > source.Length)
         {
             throw new ArgumentOutOfRangeException(nameof(count));
         }
@@ -653,7 +682,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
             throw new InvalidOperationException("Buffer contents are not accessible");
         }
 
-        return new Span<float>(contents.ToPointer(), Size);
+        return new Span<float>(contents.ToPointer(), WordCount);
     }
 
     /// <summary>
@@ -670,7 +699,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
             throw new InvalidOperationException("Buffer contents are not accessible");
         }
 
-        return new ReadOnlySpan<float>(contents.ToPointer(), Size);
+        return new ReadOnlySpan<float>(contents.ToPointer(), WordCount);
     }
 
     /// <summary>
@@ -694,7 +723,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         // Notify modification for managed storage
         if ((StorageMode & MTLResourceOptions.StorageModeManaged) == MTLResourceOptions.StorageModeManaged)
         {
-            NotifyModified(0, Size);
+            NotifyModified(0, WordCount);
         }
     }
 
@@ -784,7 +813,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (poolDevice is not null && bufferToPark != IntPtr.Zero)
         {
-            var parked = new MetalGpuBuffer(poolDevice, bufferToPark, Size, StorageMode)
+            var parked = new MetalGpuBuffer(poolDevice, bufferToPark, WordCount, StorageMode)
             {
                 _disposed = true,
                 _memory = memoryLease
@@ -810,7 +839,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
         IntPtr buffer;
         DeviceMemoryHold memoryLease = default;
         MetalDevice? poolDevice = null;
-        int size = Size;
+        int size = WordCount;
         MTLResourceOptions storageMode = StorageMode;
 
         lock (_lock)
@@ -864,6 +893,6 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
     public override string ToString()
     {
-        return $"MetalGpuBuffer[{Size} floats, {SizeInBytes / 1024.0:F1} KB, {StorageMode}]";
+        return $"MetalGpuBuffer[{WordCount} floats, {SizeInBytes / 1024.0:F1} KB, {StorageMode}]";
     }
 }

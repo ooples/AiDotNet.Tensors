@@ -115,7 +115,11 @@ public enum GpuPrecisionImplementation
     Composite,
     /// <summary>Reduced-width packed storage decoded by a shader with wider arithmetic.</summary>
     Packed,
-    /// <summary>Values are quantized but retained in wider physical storage.</summary>
+    /// <summary>
+    /// The format is computed without native instructions for it: values quantized but retained in wider physical
+    /// storage, or (for <see cref="GpuScalarType.Float64"/> on a device whose shading language has no 64-bit float) exact
+    /// arithmetic carried out in integer operations.
+    /// </summary>
     Emulated,
 }
 
@@ -143,6 +147,12 @@ public sealed class GpuExecutionPolicy
         GpuComputePreference.Auto,
         GpuPrecisionFallbackBehavior.UseHigherPrecision);
 
+    /// <summary>
+    /// <see cref="Preserve"/>, and doubles stay on the device even where it computes them by integer emulation
+    /// (see <see cref="AllowEmulatedFloat64"/>).
+    /// </summary>
+    public static GpuExecutionPolicy PreserveOnDevice { get; } = Preserve.WithEmulatedFloat64();
+
     /// <summary>Creates a precision policy.</summary>
     public GpuExecutionPolicy(
         GpuAccuracyMode accuracyMode = GpuAccuracyMode.SpeedFirst,
@@ -162,6 +172,19 @@ public sealed class GpuExecutionPolicy
 
     /// <summary>Gets the unsupported-format behavior.</summary>
     public GpuPrecisionFallbackBehavior FallbackBehavior { get; }
+
+    /// <summary>
+    /// Whether <c>double</c> operations may run on a device that computes them by integer emulation (Metal and WebGPU,
+    /// whose shading languages have no 64-bit float). The results are the host's, bit for bit for arithmetic, but each
+    /// operation costs hundreds of integer operations, so it is slower than the CPU: off by default, where such a
+    /// device's doubles are computed on the CPU. Turn it on to keep double data resident on the device between
+    /// operations. It changes nothing on a device with native doubles.
+    /// </summary>
+    public bool AllowEmulatedFloat64 { get; private set; }
+
+    /// <summary>This policy with <see cref="AllowEmulatedFloat64"/> set to <paramref name="allow"/>.</summary>
+    public GpuExecutionPolicy WithEmulatedFloat64(bool allow = true)
+        => new(AccuracyMode, ComputePreference, FallbackBehavior) { AllowEmulatedFloat64 = allow };
 }
 
 /// <summary>
@@ -408,6 +431,10 @@ public static class GpuPrecisionPlanner
         if (policy.AccuracyMode == GpuAccuracyMode.PreserveInputType)
         {
             var exact = FindPreserving(capabilities, sourceType);
+            if (exact is not null && IsEmulatedFloat64(exact) && !policy.AllowEmulatedFloat64)
+                return CpuPlan(backend, operationName, typeof(T), requested,
+                    $"{backend.BackendName} computes {sourceType} {operation} by integer emulation, slower than the CPU; "
+                    + $"a policy with {nameof(GpuExecutionPolicy.AllowEmulatedFloat64)} keeps it on the device.", operation);
             if (exact is not null)
                 return FromCapability(backend, operationName, typeof(T), requested, exact, null, operation);
 
@@ -419,6 +446,8 @@ public static class GpuPrecisionPlanner
             ? AutomaticTypeFor(sourceType)
             : ScalarTypeFor(requested);
         var selected = Find(capabilities, desired);
+        if (selected is not null && IsEmulatedFloat64(selected) && !policy.AllowEmulatedFloat64)
+            selected = null;
         if (selected is not null)
         {
             string? conversionReason = requested == GpuComputePreference.Auto && sourceType != desired
@@ -444,6 +473,31 @@ public static class GpuPrecisionPlanner
         return CpuPlan(backend, operationName, typeof(T), requested,
             $"{backend.BackendName} exposes no eligible GPU precision for {operation}.", operation);
     }
+
+    private static bool IsEmulatedFloat64(GpuPrecisionCapability capability)
+        => capability.ComputeFormat == GpuScalarType.Float64 && capability.Implementation == GpuPrecisionImplementation.Emulated;
+
+    /// <summary>
+    /// Whether <paramref name="backend"/> computes doubles by integer emulation rather than natively. Such a device
+    /// takes double work only under a policy with <see cref="GpuExecutionPolicy.AllowEmulatedFloat64"/>.
+    /// </summary>
+    internal static bool EmulatesFloat64(IDirectGpuBackend backend)
+    {
+        var capabilities = GetCapabilities(backend, GpuPrecisionOperation.Add);
+        for (int i = 0; i < capabilities.Count; i++)
+        {
+            if (IsEmulatedFloat64(capabilities[i])) return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether double work may go to <paramref name="backend"/>'s device kernels under the policy in effect: always
+    /// where they are native, and only on request where they are emulated.
+    /// </summary>
+    internal static bool Float64DeviceRouteAllowed(IDirectGpuBackend backend)
+        => !EmulatesFloat64(backend) || GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AllowEmulatedFloat64;
 
     internal static IReadOnlyList<GpuPrecisionCapability> GetCapabilities(
         IDirectGpuBackend backend,
@@ -655,7 +709,8 @@ internal static class GpuPrecisionCapabilityCatalog
         GpuPrecisionImplementation fp32Implementation = GpuPrecisionImplementation.Native,
         GpuScalarType fp32MultiplyType = GpuScalarType.Float32,
         bool supportsTensorFloat32 = false,
-        bool supportsFloat64 = false)
+        bool supportsFloat64 = false,
+        GpuPrecisionImplementation float64Implementation = GpuPrecisionImplementation.Native)
     {
         var capabilities = new List<GpuPrecisionCapability>(supportsFp16 && supportsTensorFloat32 ? 3 : 2)
         {
@@ -692,13 +747,14 @@ internal static class GpuPrecisionCapabilityCatalog
         }
         if (supportsFloat64)
         {
-            // Native double kernels over double buffers: nothing is narrowed, so PreserveInputType accepts it.
+            // Double kernels over double buffers, native or exact integer emulation: nothing is narrowed, so
+            // PreserveInputType accepts it (an emulated route only under a policy that allows it).
             capabilities.Add(new GpuPrecisionCapability(
                 GpuScalarType.Float64,
                 GpuScalarType.Float64,
                 GpuScalarType.Float64,
                 GpuScalarType.Float64,
-                GpuPrecisionImplementation.Native,
+                float64Implementation,
                 false,
                 GpuScalarType.Float64));
         }
