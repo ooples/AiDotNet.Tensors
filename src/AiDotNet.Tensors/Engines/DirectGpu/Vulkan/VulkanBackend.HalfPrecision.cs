@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// IGpuHalfPrecisionBackend implementation for the Vulkan backend (issue #560):
+// IGpuHalfFusedKernels implementation for the Vulkan backend (issue #560):
 // FP16 GEMM on the GPU via a GLSL compute shader, built on the new real Vulkan
 // GPU GEMM (the previous Gemm was a CPU download/loop/upload fallback).
 
@@ -9,7 +9,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
 /// <summary>
-/// Half-precision GEMM dispatch for the <see cref="IGpuHalfPrecisionBackend"/>
+/// Half-precision GEMM dispatch for the <see cref="IGpuHalfFusedKernels"/>
 /// capability interface, so the backend-agnostic
 /// <c>DirectGpuTensorEngine.MatrixMultiply</c> FP16 path (issue #560) runs on
 /// Vulkan devices. Mirrors the CUDA backend's row-major contract.
@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// compilation; <see cref="SupportsHgemm"/> reflects that.
 /// </para>
 /// </summary>
-public sealed partial class VulkanBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
+public sealed partial class VulkanBackend : IGpuHalfFusedKernels, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>

@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// OpenCL half-precision (FP16) GEMM kernels for the IGpuHalfPrecisionBackend
+// OpenCL half-precision (FP16) GEMM kernels for the IGpuHalfFusedKernels
 // capability interface (issue #560: route MatrixMultiply<Half> to an FP16
 // kernel instead of the scalar CPU fallback).
 

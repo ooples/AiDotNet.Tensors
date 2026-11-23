@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// Correctness tests for the OpenCL IGpuHalfPrecisionBackend implementation
+// Correctness tests for the OpenCL IGpuHalfFusedKernels implementation
 // (issue #560): FP16 GEMM (C = A·B) on the GPU instead of a scalar CPU fallback.
 
 // System.Half (the FP16 oracle) only exists on .NET 5+, and the FP16 GPU path is
@@ -15,8 +15,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Exercises <see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> and
-/// <see cref="IGpuHalfPrecisionBackend.Hgemm"/> on the OpenCL backend against a
+/// Exercises <see cref="IGpuHalfFusedKernels.GemmFp16In32fOut"/> and
+/// <see cref="IGpuHalfFusedKernels.Hgemm"/> on the OpenCL backend against a
 /// CPU reference computed from the SAME FP16-rounded inputs, so the only
 /// residual error is FP32 accumulation order — proving the GPU FP16 kernel is
 /// numerically correct, not just non-crashing.
@@ -142,7 +142,7 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         using var cBuf = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            ((IGpuHalfFusedKernels)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
             var actual = Backend.DownloadBuffer(cBuf);
             // Inputs already FP16-rounded on both sides; remaining error is just
             // FP32 accumulation order across the tiled K loop.
@@ -171,7 +171,7 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         using var cFp32 = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            ((IGpuHalfFusedKernels)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
             Backend.ConvertToFp32(cFp16, cFp32, m * n);
             var actual = Backend.DownloadBuffer(cFp32);
             // The result itself is rounded to FP16, so the dominant error is the
@@ -191,7 +191,7 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         Skip.If(!EnsureReady(), "OpenCL FP16 GEMM not available on this system.");
 
         using var dummy = Backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)Backend;
+        var half = (IGpuHalfFusedKernels)Backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

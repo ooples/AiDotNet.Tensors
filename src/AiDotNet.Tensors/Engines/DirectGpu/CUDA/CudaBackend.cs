@@ -19,7 +19,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
+public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, IChannelBiasAddOutBackend, IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IBiasActivationBackend, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -7632,7 +7632,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel3D(k, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, a, 0);
     }
 
-    // IGpuHalfPrecisionBackend FP16-conv im2col (backend-agnostic dispatch); delegates to the CUDA impl.
+    // IGpuHalfFusedKernels FP16-conv im2col (backend-agnostic dispatch); delegates to the CUDA impl.
     /// <inheritdoc/>
     public bool Fp16Im2colAvailable => Fp16HwIm2colAvailable;
     /// <inheritdoc/>

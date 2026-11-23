@@ -817,7 +817,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     // #1650/#638 hardware-FP16 conv lever: route the resident inference conv through the INDUSTRY path (oneDNN/
     // cuDNN/PyTorch) — im2col → FP16 col[K,N] → GemmFp16In32fOut (FP16 multiply / FP32 accumulate on the matrix
-    // units), backend-agnostic via IGpuHalfPrecisionBackend. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
+    // units), backend-agnostic via IGpuHalfFusedKernels. DEFAULT ON (set AIDOTNET_FP16_CONV=0 to disable),
     // VALIDATED before flipping on (PR #671 #2): primitive conv vs FP32 Conv2D relL2=0.028%; one full UNet forward
     // end-to-end relL2=0.67% — at the cuBLAS run-to-run FP32-vs-FP32 noise floor (0.666%), PSNR 60.9 dB — and
     // 1.40x faster end-to-end. Self-gates to FP32 where it can't or shouldn't run: no FP16 im2col kernel on the
@@ -5943,20 +5943,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IGpuBuffer output,
         int size)
     {
-        if (backend is not Gpu.IGpuFp16ElementwiseBackend fp16 || !fp16.SupportsFp16NativeOps)
-            throw new NotSupportedException($"{backend.BackendName} advertised typed FP16 element-wise support without a dispatch implementation.");
-
-        switch (operation)
+        GpuNarrowFloatUnaryOperation kernel = operation switch
         {
-            case Gpu.GpuPrecisionOperation.Relu:
-                fp16.Fp16Relu(input, output, size);
-                break;
-            case Gpu.GpuPrecisionOperation.Gelu:
-                fp16.Fp16Gelu(input, output, size);
-                break;
-            default:
-                throw new NotSupportedException($"No typed FP16 unary dispatch exists for {operation}.");
-        }
+            Gpu.GpuPrecisionOperation.Relu => GpuNarrowFloatUnaryOperation.Relu,
+            Gpu.GpuPrecisionOperation.Gelu => GpuNarrowFloatUnaryOperation.Gelu,
+            _ => throw new NotSupportedException($"No typed FP16 unary dispatch exists for {operation}."),
+        };
+        if (backend is not IGpuNarrowFloatElementwise fp16 || !fp16.SupportsNarrowFloatUnary(kernel, GpuElementType.Float16))
+            throw new NotSupportedException($"{backend.BackendName} advertised typed FP16 element-wise support without a dispatch implementation.");
+        fp16.UnaryNarrowFloat(kernel, GpuElementType.Float16, input, output, size);
     }
 
     private static void ExecuteFp16Binary(
@@ -5968,13 +5963,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int size)
     {
         if (operation != Gpu.GpuPrecisionOperation.Add
-            || backend is not Gpu.IGpuFp16ElementwiseBackend fp16
-            || !fp16.SupportsFp16NativeOps)
+            || backend is not IGpuNarrowFloatElementwise fp16
+            || !fp16.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16))
         {
             throw new NotSupportedException($"No typed FP16 binary dispatch exists for {operation} on {backend.BackendName}.");
         }
 
-        fp16.Fp16Add(left, right, output, size);
+        fp16.BinaryNarrowFloat(GpuNarrowFloatBinaryOperation.Add, GpuElementType.Float16, left, right, output, size);
     }
 
     private T[]? TryRunBinary<T>(Tensor<T> left, Tensor<T> right, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op,
@@ -8291,8 +8286,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try {
             bool fp16PathRan = false;
             if (typeof(T) == typeof(Half)
-                && backend is Engines.Gpu.IGpuHalfPrecisionBackend halfBackend
-                && halfBackend.SupportsHgemm)
+                && backend is Engines.Gpu.IGpuHalfFusedKernels halfBackend
+                && GpuNarrowFloatLayout.HasHalfMatrixMultiply(halfBackend))
             {
                 // Issue #560: FP16 vendor-library fast path. cublasGemmEx with
                 // FP16 inputs and an FP32 accumulator is the standard
@@ -8880,8 +8875,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var batchedConvGemm = b > 1 ? rbk as IFp16ConvBatchedGemmBackend : null;
                 if (b > 1 && batchedConvGemm is null) fp16ConvWorth = false;
                 if (s_fp16Conv && fp16ConvWorth
-                    && rbk is Engines.Gpu.IGpuHalfPrecisionBackend hbConvR
-                    && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
+                    && rbk is Engines.Gpu.IGpuHalfFusedKernels hbConvR
+                    && GpuNarrowFloatLayout.HasHalfMatrixMultiply(hbConvR) && hbConvR.Fp16Im2colAvailable)
                 {
                     int K = gemmK, N = gemmN, M = gemmM;
                     // STABLE cached col scratch (NOT a per-call `using` alloc) — capture-replay-safe (see method doc).
@@ -25898,7 +25893,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (plan.InputStorage == Gpu.GpuScalarType.Float16)
             {
-                if (backend is not IGpuHalfPrecisionBackend halfBackend || !halfBackend.SupportsHgemm)
+                if (backend is not IGpuHalfFusedKernels halfBackend || !GpuNarrowFloatLayout.HasHalfMatrixMultiply(halfBackend))
                     throw new NotSupportedException($"{backend.BackendName} advertised FP16 GEMM without an executable half GEMM route.");
 
                 using var fp16A = AllocateReducedPrecisionInput(backend, bufferA.Buffer, checked(m * k), plan);
@@ -26185,11 +26180,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // to FP32, re-inflating it for the rest of the step). Keep the activation as a HALF GPU buffer (half
             // the VRAM); read IsFp16-resident inputs DIRECTLY (no re-inflate/re-convert churn), run the
             // Half-output GEMM (FP32 accumulate), and cache the Half output as an IsFp16 entry. Runs on ANY
-            // backend that ships a half-output GEMM (IGpuHalfPrecisionBackend.Hgemm / SupportsHgemm) — the
+            // backend that ships a half-output GEMM (IGpuHalfFusedKernels.Hgemm / SupportsHgemm) — the
             // half-resident matmul forward is no longer CUDA-only.
             if (rank2Plan.InputStorage == Gpu.GpuScalarType.Float16
                 && typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpFwd && hpFwd.SupportsHgemm)
+                && backend is IGpuHalfFusedKernels hpFwd && GpuNarrowFloatLayout.HasHalfMatrixMultiply(hpFwd))
             {
                 IGpuBuffer? hAiOwned = null, hBiOwned = null, hOut = null;
                 bool storeOk = false;
@@ -26198,7 +26193,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
                     var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
                     hOut = AllocateHalfBuffer(backend, M * N);
-                    hpFwd.Hgemm(hAi, hBi, hOut, M, N, K);
+                    ((IGpuNarrowFloatMatrixMultiply)hpFwd).MatrixMultiplyNarrowFloat(GpuElementType.Float16, hAi, hBi, hOut, M, N, K);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
                     var outputH = (Tensor<T>)(object)new Tensor<Half>(resultH, new[] { M, N });
@@ -26280,7 +26275,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-resident fused FP16 matmul BACKWARD for the heterogeneous (FP16-activation) plan. Computes both
     /// gradients of the forward <c>C[M,N] = A[M,K] · B[K,N]</c> — for the FP16 (<see cref="Tensor{Half}"/>)
     /// activations of <see cref="Engines.Compilation.MixedPrecisionGraphBackward"/> — through the BACKEND-AGNOSTIC
-    /// <see cref="Gpu.IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
+    /// <see cref="Gpu.IGpuHalfFusedKernels.MatMulBackwardFp16Fused"/> (two transpose-free FP16-in/FP32-accumulate
     /// GEMMs) INSTEAD of the eager backward's two <c>TensorTranspose</c> + two <c>TensorMatMul</c> FP32 dispatches —
     /// the four-FP32-allocation-per-matmul scratch that Fp16ActivationDominated_ReducesGpuPeakBytes measured as the
     /// dominant cost. Any backend implementing the capability fuses here (CUDA cuBLAS / HIP rocBLAS via transpose
@@ -26299,13 +26294,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradB = null;
         if (a.Rank != 2 || b.Rank != 2 || gradC.Rank != 2) return false;
         if (!TryGetBackend(out var backend)) return false;
-        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfPrecisionBackend capability so EVERY backend
+        // BACKEND-AGNOSTIC fused backward: route through the IGpuHalfFusedKernels capability so EVERY backend
         // that ships the fused FP16 backward (CUDA cuBLAS, HIP rocBLAS, and the OpenCL/Vulkan/Metal/WebGpu kernel
         // backends) fuses BOTH gradients with FP16 inputs + FP32 accumulate and NO FP32 transpose/up-cast scratch
         // (the measured dominant cost of the FP16 hetero path). Backends without the capability return false here
         // and fall back to the GENERIC FP16 backward (MatMulBackward<Half>) — correct, just without the working-set
         // win. (#633: the win is no longer CUDA-only.)
-        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsFp16FusedBackward) return false;
+        if (backend is not IGpuHalfFusedKernels hp || !hp.SupportsFp16FusedBackward) return false;
 
         int M = a._shape[0], K = a._shape[1], N = b._shape[1];
         if (b._shape[0] != K || gradC._shape[0] != M || gradC._shape[1] != N) return false;
@@ -26812,11 +26807,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store (keystone-enabled): read IsFp16 input/gamma/beta directly, FP16-native
             // layernorm (Half output + FP32 mean/var), store Half output — keeps the per-layer norm Half.
-            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
+            // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfFusedKernels.SupportsFp16NativeOps):
             // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
             // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
+                && backend is IGpuHalfFusedKernels hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
                 var mBuf = default(OwnedBuffer); var vBuf = default(OwnedBuffer);
@@ -27252,11 +27247,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             // FP16 Half-resident store: read IsFp16 input directly, FP16-native softmax, store Half output — so
             // the attention softmax activations stay Half (works now that the IsFp16 re-inflate is transient).
-            // Runs on ANY backend with the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps);
+            // Runs on ANY backend with the FP16-native kernels (IGpuHalfFusedKernels.SupportsFp16NativeOps);
             // the store plumbing (ResolveToFp16/FinishGpuOpHalfStore) is backend-agnostic, so this is no longer
             // CUDA-only. Backends without the kernels use the correct FP32 softmax path below.
             if (typeof(T) == typeof(Half) && s_fp16FwdStore
-                && backend is IGpuHalfPrecisionBackend hpS && hpS.SupportsFp16NativeOps)
+                && backend is IGpuHalfFusedKernels hpS && hpS.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hOut = null;
                 bool okS = false;

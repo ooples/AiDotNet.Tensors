@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// Correctness tests for the WebGPU IGpuHalfPrecisionBackend implementation
+// Correctness tests for the WebGPU IGpuHalfFusedKernels implementation
 // (issue #560): FP16 GEMM (C = A·B) on the GPU instead of a scalar CPU fallback.
 
 
@@ -14,8 +14,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Exercises <see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> and
-/// <see cref="IGpuHalfPrecisionBackend.Hgemm"/> on the WebGPU backend.
+/// Exercises <see cref="IGpuHalfFusedKernels.GemmFp16In32fOut"/> and
+/// <see cref="IGpuHalfFusedKernels.Hgemm"/> on the WebGPU backend.
 /// <para>
 /// The FP16 buffers are packed binary16, so the oracle widens the exact half
 /// operands the GPU multiplies (ConvertToFp32) and recomputes the
@@ -144,7 +144,7 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         using var cBuf = _backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            ((IGpuHalfFusedKernels)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
             var actual = _backend.DownloadBuffer(cBuf);
             var expected = CpuReference(aTrunc, bTrunc, m, n, k);
             AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
@@ -169,7 +169,7 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         using var cFp16 = _backend.AllocateByteBuffer(m * n * 2);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            ((IGpuHalfFusedKernels)_backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
             var actual = Widen(cFp16, m * n);
             var expected = CpuReference(aTrunc, bTrunc, m, n, k);
             // The result is rounded to FP16 precision, so the dominant error is the
@@ -189,7 +189,7 @@ public sealed class WebGpuHalfPrecisionGemmTests : IDisposable
         Skip.If(!EnsureReady(), "WebGPU FP16 GEMM not available on this system.");
 
         using var dummy = _backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)_backend;
+        var half = (IGpuHalfFusedKernels)_backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

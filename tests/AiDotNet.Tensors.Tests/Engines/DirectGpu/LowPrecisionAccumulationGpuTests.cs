@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// (2048 + 1 rounds to 2048), so 4096 ones must sum to exactly 4096 and a matmul with an inner dimension of 4096 of
 /// ones must give 4096. Every result is also compared bit for bit with the CPU engine: the GPU either reduces the
 /// widened float32 buffers on the device and rounds once, or falls back to the CPU engine's float32 kernels.
-/// <para>The FP16-storage GEMM (<see cref="IGpuHalfPrecisionBackend.Hgemm"/>: FP16 operands and output) is checked on
+/// <para>The FP16-storage GEMM (<see cref="IGpuHalfFusedKernels.Hgemm"/>: FP16 operands and output) is checked on
 /// the backend directly; cublasHgemm and hipblasHgemm compute in FP16 and returned 2048.</para>
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -150,8 +150,8 @@ public sealed class LowPrecisionAccumulationGpuTests
         var maybeBackend = gpu.GetBackend();
         Skip.If(maybeBackend is null, "No GPU backend");
         IDirectGpuBackend backend = maybeBackend;
-        var half = backend as IGpuHalfPrecisionBackend;
-        Skip.If(half is null || !half.SupportsHgemm, "Backend has no FP16 GEMM");
+        var half = backend as IGpuHalfFusedKernels;
+        Skip.If(half is null || !half.HasHgemm(), "Backend has no FP16 GEMM");
 
         const int m = 2, n = 3;
         IGpuBuffer HalfOnes(int count)

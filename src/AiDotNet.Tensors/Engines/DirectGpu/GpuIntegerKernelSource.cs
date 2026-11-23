@@ -110,6 +110,7 @@ internal static class GpuIntegerKernelSource
             if (type != GpuElementType.Bool) names.Add(Sum(type));
         }
 
+        GpuNarrowFloatKernelSource.AddNames(names);
         return names;
     }
 
@@ -194,6 +195,8 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
                 .Append(" : count;\n    u64t s = 0;\n    for (int j = first; j < last; j++) s += (u64t)(i64t)a[j];\n    o[i] = (i64t)s;\n}\n");
         }
 
+        // The 16-bit float kernels ride in the same program: one compile, one module.
+        GpuNarrowFloatKernelSource.Append(source, openCl);
         return source.ToString();
     }
 }
