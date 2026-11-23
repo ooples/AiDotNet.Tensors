@@ -31,38 +31,33 @@ public static class CpuParallelSettings
     {
         get
         {
-            if (!Volatile.Read(ref s_degreeDecided)) DecideDegreeOfParallelism();
-            return s_maxDegreeOfParallelism;
+            int degree = Volatile.Read(ref s_maxDegreeOfParallelism);
+            return degree != UndecidedDegree ? degree : DecideDegreeOfParallelism();
         }
         set
         {
             // A caller that sets the count before any CPU work still gets the process confined to its requested cores.
             EnsureCoreConfinement();
-            lock (s_degreeLock)
-            {
-                s_maxDegreeOfParallelism = value;
-                Volatile.Write(ref s_degreeDecided, true);
-            }
+            // The one value that means "not decided" is stored as its neighbour: both run everything serially.
+            Volatile.Write(ref s_maxDegreeOfParallelism, value == UndecidedDegree ? UndecidedDegree + 1 : value);
         }
     }
 
-    private static int s_maxDegreeOfParallelism;
-    private static bool s_degreeDecided;
-    private static readonly object s_degreeLock = new object();
+    private const int UndecidedDegree = int.MinValue;
+
+    // One word, read and written atomically, so the hot read takes no lock.
+    private static int s_maxDegreeOfParallelism = UndecidedDegree;
 
     // Decided on first use rather than when the type loads: confining the process to AIDOTNET_CPU_CORES can fail, and
     // the failure must reach the caller as itself (naming the setting), not as a type-initialization error. Every
     // path that runs CPU work in parallel -- or decides to run it inline -- reads the count first, so the process is
     // confined before that work runs whether or not the worker pool is ever used.
-    private static void DecideDegreeOfParallelism()
+    private static int DecideDegreeOfParallelism()
     {
         EnsureCoreConfinement();
-        lock (s_degreeLock)
-        {
-            if (s_degreeDecided) return;
-            s_maxDegreeOfParallelism = DefaultDegreeOfParallelism();
-            Volatile.Write(ref s_degreeDecided, true);
-        }
+        // Kept only if no caller set a count meanwhile.
+        Interlocked.CompareExchange(ref s_maxDegreeOfParallelism, DefaultDegreeOfParallelism(), UndecidedDegree);
+        return Volatile.Read(ref s_maxDegreeOfParallelism);
     }
 
     private static void EnsureCoreConfinement()

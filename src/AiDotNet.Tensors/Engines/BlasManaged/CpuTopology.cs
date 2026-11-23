@@ -318,8 +318,15 @@ internal static class CpuTopology
         }
     }
 
+    // .NET sets a thread's affinity only on Windows (ProcessThread.ProcessorAffinity), and a process's affinity on
+    // Linux reaches the main thread alone, so each thread is set through the system call.
     [DllImport("libc", SetLastError = true)]
     private static extern int sched_setaffinity(int pid, IntPtr cpuSetSize, ref ulong mask);
+
+    // The thread id a /proc/self/task entry names, or -1 for anything else.
+    private static int LinuxThreadId(string taskDirectory)
+        => int.TryParse(System.IO.Path.GetFileName(taskDirectory), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out int thread) ? thread : -1;
 
     /// <summary>
     /// Confines every thread of this process to the logical processors of <paramref name="mask"/> and returns how many
@@ -336,13 +343,13 @@ internal static class CpuTopology
         {
             for (int pass = 0; pass < Passes; pass++)
             {
-                bool found = false;
-                foreach (string task in System.IO.Directory.GetDirectories("/proc/self/task"))
+                // The threads this pass has not set yet.
+                var fresh = System.IO.Directory.GetDirectories("/proc/self/task")
+                    .Select(LinuxThreadId)
+                    .Where(thread => thread >= 0 && confined.Add(thread))
+                    .ToList();
+                foreach (int thread in fresh)
                 {
-                    if (!int.TryParse(System.IO.Path.GetFileName(task), System.Globalization.NumberStyles.None,
-                            System.Globalization.CultureInfo.InvariantCulture, out int thread) || !confined.Add(thread))
-                        continue;
-                    found = true;
                     ulong requested = mask;
                     if (sched_setaffinity(thread, new IntPtr(sizeof(ulong)), ref requested) == 0) continue;
                     int error = Marshal.GetLastWin32Error();
@@ -357,7 +364,7 @@ internal static class CpuTopology
                         + $"cores (affinity mask 0x{mask:X}, errno {error}).");
                 }
 
-                if (!found) return confined.Count;
+                if (fresh.Count == 0) return confined.Count;
             }
         }
         catch (Exception unavailable) when (unavailable is DllNotFoundException or EntryPointNotFoundException
