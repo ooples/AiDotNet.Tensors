@@ -37,6 +37,7 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuMoeKernels.CombineBody",
         "WebGpuMoeKernels.DScoresBody",
         "WebGpuFftKernels.SharedBatchedFftBody",   // SharedBatchedFft prefixes it with its WG and MAX_N constants
+        "WebGpuFloat64Kernels.Entry",         // the double kernels' entry-point header, closed by each kernel's body
     };
 
     private const string Validator = @"

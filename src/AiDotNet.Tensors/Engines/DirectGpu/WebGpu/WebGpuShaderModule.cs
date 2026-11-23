@@ -244,8 +244,11 @@ public sealed class WebGpuBindGroup : IDisposable
                 if (buffers[later].BufferId != buffers[i].BufferId || buffers[later].OffsetBytes != buffers[i].OffsetBytes
                     || buffers[later].SizeBytes != buffers[i].SizeBytes) continue;
                 if (ReferenceEquals(buffers, _original ??= buffers)) buffers = (WebGpuBuffer[])buffers.Clone();
-                var snapshot = new WebGpuBuffer(buffers[i].Size);
-                snapshot.CopyFromBuffer(buffers[i], 0, 0, buffers[i].Size);
+                // Sized by the bytes bound, in 4-byte words: Size counts elements of the buffer's type, and a buffer
+                // of doubles holds two words an element.
+                int words = (buffers[i].SizeBytes + sizeof(float) - 1) / sizeof(float);
+                var snapshot = new WebGpuBuffer(words);
+                snapshot.CopyFromBuffer(buffers[i], 0, 0, words);
                 (_snapshots ??= new System.Collections.Generic.List<WebGpuBuffer>()).Add(snapshot);
                 buffers[i] = snapshot;
                 break;

@@ -5,8 +5,12 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+public sealed partial class CudaBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply,
+    IGpuFloat64UnaryAvailability
 {
+    // Every unary kernel is built with the rest of the double kernels here: none can be missing alone.
+    bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation) => SupportsFloat64Elementwise;
+
     private const int Float64ReductionBlock = 256;
 
     /// <inheritdoc/>

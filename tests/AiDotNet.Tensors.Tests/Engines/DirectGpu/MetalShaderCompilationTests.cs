@@ -110,6 +110,10 @@ public sealed class MetalShaderCompilationTests
         // Strict: false, as MetalBackend.ConvWinogradFused compiles it (the two-argument overload).
         yield return ("WinogradFusedForward", () => WinogradF23KernelTemplate.EmitModule(
             new[] { WinogradFusedForwardTemplate.Spec(8, 16) }, WinogradKernelDialect.Metal), false);
+        // Strict: false, as MetalBackend.Float64Pipeline compiles both (the two-argument overload). The emulation is
+        // integer arithmetic, so fast math has no float operations to reorder.
+        yield return ("Float64", () => MetalFloat64Kernels.ArithmeticSource, false);
+        yield return ("Float64Elementary", () => MetalFloat64Kernels.ElementarySource, false);
     }
 
     internal static string? FindCompiler()

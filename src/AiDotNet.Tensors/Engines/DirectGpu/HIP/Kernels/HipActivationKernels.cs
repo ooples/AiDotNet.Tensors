@@ -433,7 +433,7 @@ UNARY_F64(sqrt_f64, sqrt(x))
 UNARY_F64(exp_f64, exp(x))
 UNARY_F64(log_f64, log(x))
 UNARY_F64(tanh_f64, tanh(x))
-UNARY_F64(sigmoid_f64, 1.0 / (1.0 + exp(-x)))
+UNARY_F64(sigmoid_f64, x < 0.0 ? exp(x) / (1.0 + exp(x)) : 1.0 / (1.0 + exp(-x)))
 UNARY_F64(relu_f64, x > 0.0 ? x : (x != x ? x : 0.0))
 
 // The scalar is the right operand.

@@ -24,7 +24,10 @@ internal static class VulkanTorchParityElementwiseKernels
 
     private static readonly ConcurrentDictionary<string, string> Sources = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-    private static string Cached(string key, Func<string> build) => Sources.GetOrAdd(key, _ => build());
+    // A double shader's header depends on the float-controls modes the device grants, which are set when a device
+    // initialises: a source built before that, or for another device, must not be reused under the other modes.
+    private static string Cached(string key, Func<string> build)
+        => Sources.GetOrAdd((PreserveDoubleSpecials ? "s" : "-") + (PreserveDoubleDenormals ? "d" : "-") + ":" + key, _ => build());
 
     /// <summary>Every shader of this kernel set, by name: what a test compiles to prove the sources are valid GLSL.</summary>
     public static System.Collections.Generic.IEnumerable<(string Name, string Source)> All()
@@ -72,22 +75,43 @@ internal static class VulkanTorchParityElementwiseKernels
     // Without it a driver may compile double arithmetic assuming no infinity or NaN ever occurs: on an RTX 3080's Vulkan
     // driver the library's overflow-to-infinity and NaN returns (built from bit patterns) were folded away, so I0(800)
     // came out as its scaled value times 800 and K(0) as 0 (#1411).
-    private const string PreserveDoubleSpecialsMode = "#extension GL_EXT_spirv_intrinsics : require\n"
-        + "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 64);\n";
+    private const string PreserveDoubleSpecialsMode =
+        "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4466], 4461, 64);\n";
 
     /// <summary>Set by <see cref="VulkanDevice"/> from the device's float-controls properties: the double kernels then
     /// request SignedZeroInfNanPreserve for 64-bit floats.</summary>
     internal static bool PreserveDoubleSpecials { get; set; }
 
+    // SPIR-V ExecutionMode DenormPreserve (4459) for 64-bit floats, under the DenormPreserve capability (4464).
+    private const string PreserveDoubleDenormalsMode =
+        "spirv_execution_mode(extensions = [\"SPV_KHR_float_controls\"], capabilities = [4464], 4459, 64);\n";
+
+    private const string SpirvIntrinsicsExtension = "#extension GL_EXT_spirv_intrinsics : require\n";
+
+    /// <summary>Set by <see cref="VulkanDevice"/> from the device's float-controls properties: the double kernels then
+    /// request DenormPreserve for 64-bit floats, so a subnormal result is not flushed to zero.</summary>
+    internal static bool PreserveDoubleDenormals { get; set; }
+
     private static string Head(bool int64, int localSize = LocalSize, bool preserveDoubleSpecials = false)
         => "#version 450\n" + (int64 ? Int64Extension : "")
+            // The extension both execution modes need, declared once ahead of them.
+            + (preserveDoubleSpecials && (PreserveDoubleSpecials || PreserveDoubleDenormals) ? SpirvIntrinsicsExtension : "")
             + (preserveDoubleSpecials && PreserveDoubleSpecials ? PreserveDoubleSpecialsMode : "")
+            + (preserveDoubleSpecials && PreserveDoubleDenormals ? PreserveDoubleDenormalsMode : "")
             + "layout(local_size_x = " + localSize + ") in;\n";
 
     // A kernel that computes in double: header, declarations, the double library, then the body.
     private static string DoubleShader(string declarations, string body, bool special, bool int64 = false)
         => Head(int64, preserveDoubleSpecials: true) + declarations + VulkanTorchParityMath.Tables + VulkanTorchParityMath.ElementaryFunctions
             + Conversions + (special ? VulkanTorchParityMath.SpecialFunctionsSource : "") + VulkanTorchParityMath.Doubles(body);
+
+    /// <summary>A double kernel built from <paramref name="declarations"/> and <paramref name="body"/> with the double
+    /// library in scope, cached under <paramref name="key"/>: for kernel sets declared outside this class.</summary>
+    internal static string DoubleKernel(string key, string declarations, string body)
+        => Cached("f64:" + key, () => DoubleShader(declarations, body, special: false));
+
+    /// <summary>The bounds guard every per-element kernel starts with: <c>i</c> is the element, <c>n</c> the count.</summary>
+    internal const string IndexGuard = Index;
 
     // Buffer values cross between float and double by bit pattern: D widens exactly and F rounds to nearest even,
     // both including the subnormal floats a GPU's own conversions flush to zero (logit of 6e-39 must not be -inf).

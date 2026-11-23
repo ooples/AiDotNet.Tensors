@@ -531,6 +531,13 @@ public static partial class WebGpuNativeBindings
     /// <summary>
     /// Submits all pending GPU commands and waits for completion.
     /// </summary>
+    /// <summary>
+    /// Whether a caller may block on <see cref="SubmitAndWaitAsync"/>. A hosted device (a process on the other end of
+    /// <c>Host</c>) has finished by the time the call returns. In a browser the task is a JavaScript promise that
+    /// settles on the event loop of the thread that would be blocked, so a synchronous wait never ends.
+    /// </summary>
+    internal static bool CompletesSynchronously => Host is not null || !OperatingSystem.IsBrowser();
+
     public static Task SubmitAndWaitAsync()
     {
         if (Host is not { } host) return JsSubmitAndWaitAsync();
