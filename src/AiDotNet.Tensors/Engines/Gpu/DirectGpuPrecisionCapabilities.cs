@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -89,6 +90,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -142,6 +144,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -181,6 +184,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -220,6 +224,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -271,6 +276,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 

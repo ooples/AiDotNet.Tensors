@@ -156,7 +156,9 @@ public partial class DirectGpuTensorEngine
             if (uploads > downloads) return null;
 
             using var a = ResolveResidentOperand(backend, left, GpuElementType.Float64);
-            using var b = ReferenceEquals(left, right) ? new OwnedBuffer(a.Buffer, ownsBuffer: false) : ResolveResidentOperand(backend, right, GpuElementType.Float64);
+            using var b = ReferenceEquals(left, right)
+                ? new OwnedBuffer(a.Buffer, ownsBuffer: false)
+                : ResolveResidentOperand(backend, right, GpuElementType.Float64, left.DataVector);
             var output = RentResidentBuffer(backend, GpuElementType.Float64, length, left.DataVector, right.DataVector);
             try
             {
@@ -373,7 +375,9 @@ public partial class DirectGpuTensorEngine
         Tensor<double> left, Tensor<double> right, int m, int n, int k, int[] shape)
     {
         using var operandA = ResolveResidentOperand(backend, left, GpuElementType.Float64);
-        using var operandB = ReferenceEquals(left, right) ? new OwnedBuffer(operandA.Buffer, ownsBuffer: false) : ResolveResidentOperand(backend, right, GpuElementType.Float64);
+        using var operandB = ReferenceEquals(left, right)
+            ? new OwnedBuffer(operandA.Buffer, ownsBuffer: false)
+            : ResolveResidentOperand(backend, right, GpuElementType.Float64, left.DataVector);
         var output = RentResidentBuffer(backend, GpuElementType.Float64, m * n, left.DataVector, right.DataVector);
         try
         {
@@ -484,7 +488,9 @@ public partial class DirectGpuTensorEngine
     }
 
     // Callers hold _typedLock.
-    private OwnedBuffer ResolveResidentOperand<T>(IDirectGpuBackend backend, Tensor<T> tensor, GpuElementType type)
+    // `alsoKeep` is the storage of an operand already resolved for the same launch: making room for this one must
+    // not evict it, or the launch would read a buffer the eviction disposed.
+    private OwnedBuffer ResolveResidentOperand<T>(IDirectGpuBackend backend, Tensor<T> tensor, GpuElementType type, object? alsoKeep = null)
         where T : unmanaged
     {
         if (FindResident(tensor) is { } resident && ReferenceEquals(resident.Backend, backend))
@@ -495,7 +501,7 @@ public partial class DirectGpuTensorEngine
         var host = contiguous.GetReadOnlyDataArray();
         bool keep = ReferenceEquals(contiguous, tensor) && IsPersistentResident(tensor) && !_typedByVector.TryGetValue(tensor.DataVector, out _);
         var upload = keep
-            ? RentResidentBuffer(backend, type, contiguous.Length, tensor.DataVector, tensor.DataVector)
+            ? RentResidentBuffer(backend, type, contiguous.Length, tensor.DataVector, alsoKeep ?? tensor.DataVector)
             : backend.AllocateBuffer(contiguous.Length, type);
         try
         {
