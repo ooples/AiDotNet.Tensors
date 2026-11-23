@@ -238,6 +238,7 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
             staging = storage is null ? null : VulkanBuffer.CreateStagingBuffer(size);
             if (storage is null || staging is null)
             {
+                DeviceMemoryAccount.SettleAdmission();   // admitted, not created
                 int vk = VulkanBuffer.LastAllocationResult;
                 if (vk == VulkanNativeBindings.VK_ERROR_OUT_OF_DEVICE_MEMORY || vk == VulkanNativeBindings.VK_ERROR_OUT_OF_HOST_MEMORY)
                     throw new GpuOutOfMemoryException($"Failed to allocate Vulkan GPU buffer: {vk}", vk);

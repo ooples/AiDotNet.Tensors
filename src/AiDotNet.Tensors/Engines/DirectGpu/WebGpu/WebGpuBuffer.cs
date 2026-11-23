@@ -57,7 +57,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     // The count is process-wide, so it is kept by a static method rather than written from each constructor.
     private static void CountDriverAllocation() => System.Threading.Interlocked.Increment(ref s_driverAllocations);
 
-    private int _bufferId;
+    // -1 until a buffer exists: a constructor that throws first (a refused budget, a failed creation) leaves an object
+    // whose finalizer must not destroy buffer 0, a valid id another tensor may own.
+    private int _bufferId = -1;
     private readonly int _sizeBytes;
     private readonly int _elementCount;
     private readonly WebGpuBufferUsage _usage;
@@ -237,6 +239,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
 
         if (_bufferId < 0)
         {
+            AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new InvalidOperationException("Failed to create WebGPU buffer");
         }
         if (usage == DefaultStorageUsage) CountDriverAllocation();

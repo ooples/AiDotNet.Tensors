@@ -19,10 +19,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         internal static void EnsureFits(DirectOpenClContext context, long requestedBytes)
         {
-            // Past this process's GpuMemoryBudget: the out-of-memory error clCreateBuffer raises, so the engine's
-            // reclaim-and-retry (and every other caller's handling) applies as to a driver refusal.
-            context.MemoryAccount?.Admit(requestedBytes, null,
-                message => new GpuOutOfMemoryException(message, -4));   // CL_MEM_OBJECT_ALLOCATION_FAILURE
             ulong cap = context.MaxMemAllocSize;
             // MaxMemAllocSize == 0 means the query failed at context init —
             // skip the guard rather than wrongly reject every allocation. The
@@ -34,6 +30,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 deviceName: !string.IsNullOrEmpty(context.DeviceBoardName)
                     ? context.DeviceBoardName
                     : context.DeviceName);
+            // Past this process's GpuMemoryBudget: the out-of-memory error clCreateBuffer raises, so the engine's
+            // reclaim-and-retry (and every other caller's handling) applies as to a driver refusal. After the cap
+            // check: a request over both must raise the cap's error, which the chunked fallback catches, and each
+            // chunk is then admitted on its own.
+            context.MemoryAccount?.Admit(requestedBytes, null,
+                message => new GpuOutOfMemoryException(message, -4));   // CL_MEM_OBJECT_ALLOCATION_FAILURE
         }
     }
 
@@ -67,9 +69,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// reclaim and retry; anything else stays an <see cref="InvalidOperationException"/>.
         /// </summary>
         internal static InvalidOperationException OpenClAllocationError(string what, int err)
-            => err is -4 or -5 or -6
+        {
+            // The buffer the budget admitted was not created: its bytes are no longer on their way to being reserved.
+            AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
+            return err is -4 or -5 or -6
                 ? new GpuOutOfMemoryException($"{what}: {err}", err)
                 : new InvalidOperationException($"{what}: {err}");
+        }
 
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;

@@ -87,7 +87,7 @@ internal sealed class DeviceMemoryAccount
     /// The most this process may hold reserved on the device (<see cref="GpuMemoryBudget"/>), or 0 for no limit: an
     /// explicit byte limit, else a fraction of <see cref="DeviceTotalBytes"/>.
     /// </summary>
-    internal long LimitBytes => GpuMemoryBudget.LimitFor(Device, DeviceTotalBytes);
+    internal long? LimitBytes => GpuMemoryBudget.LimitFor(Device, DeviceTotalBytes);
 
     /// <summary>Memory the library holds from the driver now: its own reservations and the driver pool's.</summary>
     internal long ReservedBytes => Interlocked.Read(ref _reserved) + (ReadDriver()?.Current ?? 0);
@@ -106,21 +106,68 @@ internal sealed class DeviceMemoryAccount
 
     /// <summary>As <see cref="Admit"/>, for an allocator that reports failure by its result: false (with the reason)
     /// where <see cref="Admit"/> would throw.</summary>
+    // Bytes admitted under the budget whose allocation is still being made: admitted, not yet counted as reserved.
+    // Every admission counts them, so threads allocating at the same moment cannot each be admitted against the
+    // same headroom.
+    private long _inFlight;
+
+    // The admission this thread holds. One at a time: the next admission, or the reservation of the admitted
+    // allocation, settles it.
+    [ThreadStatic] private static DeviceMemoryAccount? t_admittedOn;
+    [ThreadStatic] private static long t_admittedBytes;
+
+    /// <summary>
+    /// Whether an allocation of <paramref name="bytes"/> fits the device's budget, after running
+    /// <paramref name="reclaim"/> once when it does not. An admitted request is held against the budget until this
+    /// thread reserves it (<see cref="Reserve"/>), settles it (<see cref="SettleAdmission"/>, for an allocation the
+    /// driver's own pool counts, or one that failed), or asks for its next admission.
+    /// </summary>
     internal bool TryAdmit(long bytes, Action? reclaim, out string? refusal)
     {
         refusal = null;
-        long limit = LimitBytes;
-        if (limit <= 0 || bytes <= 0) return true;
-        if (ReservedBytes + bytes <= limit) return true;
+        SettleAdmission();
+        if (LimitBytes is not long limit || bytes <= 0) return true;
+        if (Claim(bytes, limit)) return true;
         Interlocked.Increment(ref _budgetReclaims);
         reclaim?.Invoke();
-        long reserved = ReservedBytes;
-        if (reserved + bytes <= limit) return true;
+        if (Claim(bytes, limit)) return true;
         Interlocked.Increment(ref _budgetRefusals);
-        refusal = $"GPU memory budget of {limit} bytes on {Device} exceeded: {bytes} bytes requested with {reserved} "
+        refusal = $"GPU memory budget of {limit} bytes on {Device} exceeded: {bytes} bytes requested with {ReservedBytes} "
                   + "reserved (GpuMemoryBudget).";
         return false;
     }
+
+    private readonly object _admissionLock = new object();
+
+    // Checked and counted under one lock (taken only on a device that has a budget): of the threads asking at the
+    // same moment, exactly those that fit together are admitted -- none past the limit, and none refused for a
+    // request that would have fit.
+    private bool Claim(long bytes, long limit)
+    {
+        lock (_admissionLock)
+        {
+            long inFlight = Interlocked.Read(ref _inFlight);
+            if (bytes > limit || ReservedBytes > limit - bytes - inFlight) return false;
+            Interlocked.Add(ref _inFlight, bytes);
+        }
+
+        t_admittedOn = this;
+        t_admittedBytes = bytes;
+        return true;
+    }
+
+    /// <summary>Releases the admission this thread holds, if any: its allocation is now counted as reserved, or was
+    /// not made.</summary>
+    internal static void SettleAdmission()
+    {
+        if (t_admittedOn is not { } account) return;
+        Interlocked.Add(ref account._inFlight, -t_admittedBytes);
+        t_admittedOn = null;
+        t_admittedBytes = 0;
+    }
+
+    /// <summary>Bytes admitted and not yet reserved or settled.</summary>
+    internal long InFlightBytes => Interlocked.Read(ref _inFlight);
 
     private long _budgetReclaims, _budgetRefusals;
 
@@ -137,6 +184,9 @@ internal sealed class DeviceMemoryAccount
     {
         Add(ref _reserved, ref _peakReserved, bytes);
         Interlocked.Increment(ref _allocations);
+        // The allocation this thread was admitted for is counted now; counted before it is settled, so no other
+        // thread sees the bytes in neither figure.
+        if (ReferenceEquals(t_admittedOn, this)) SettleAdmission();
         if (!_isTotal) Total.Reserve(bytes);
     }
 

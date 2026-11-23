@@ -1659,13 +1659,18 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return HipError.ErrorOutOfMemory;
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         if (result == HipError.Success) reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
-        if (result != HipError.ErrorOutOfMemory) return result;
+        if (result != HipError.ErrorOutOfMemory)
+        {
+            if (result != HipError.Success) DeviceMemoryAccount.SettleAdmission();   // admitted, not allocated
+            return result;
+        }
         DeviceMemoryReclaim.CollectUnreachable();
         DrainCollectedBuffers();
         _bufferPool.DrainAll();
         result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         // Charged like a first-try success: its dispose credits the same bytes back.
         if (result == HipError.Success) reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
+        else DeviceMemoryAccount.SettleAdmission();   // admitted, not allocated
         return result;
     }
 

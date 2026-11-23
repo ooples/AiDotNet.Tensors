@@ -230,6 +230,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (_buffer == IntPtr.Zero)
         {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes");
         }
         CountDriverAllocation();
@@ -388,6 +389,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (_buffer == IntPtr.Zero)
         {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes with data");
         }
         CountDriverAllocation();
