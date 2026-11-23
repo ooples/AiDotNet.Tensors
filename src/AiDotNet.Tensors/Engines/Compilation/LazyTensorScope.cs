@@ -776,6 +776,45 @@ internal sealed class LazyTensorScope : IDisposable
     // Process-wide, so record order also holds between nodes of nested or successive traces.
     private static long s_recordOrder;
 
+    /// <summary>Whether this scope records a training trace (GraphMode.EnableTraining).</summary>
+    internal bool IsTrainingTrace => _traceKind == GraphTraceKind.Training;
+
+    // Activation-checkpoint segments (GraphMode.BeginCheckpointSegment): each the record-order range (First, Last] of the
+    // nodes recorded while it was open. Null when the trace has none.
+    private List<(long After, long Last)>? _checkpointSegments;
+    private bool _checkpointSegmentOpen;
+
+    /// <summary>The checkpoint segments recorded in this trace, in order, as record-order ranges (After, Last].</summary>
+    internal IReadOnlyList<(long After, long Last)> CheckpointSegments
+        => (IReadOnlyList<(long After, long Last)>?)_checkpointSegments ?? Array.Empty<(long, long)>();
+
+    internal long OpenCheckpointSegment()
+    {
+        if (_checkpointSegmentOpen)
+            throw new InvalidOperationException("Activation-checkpoint segments do not nest: close the open segment first.");
+        _checkpointSegmentOpen = true;
+        return System.Threading.Interlocked.Read(ref s_recordOrder);
+    }
+
+    internal void CloseCheckpointSegment(long after)
+    {
+        _checkpointSegmentOpen = false;
+        long last = System.Threading.Interlocked.Read(ref s_recordOrder);
+        if (last > after) (_checkpointSegments ??= new()).Add((after, last));
+    }
+
+    /// <summary>
+    /// The checkpoint segment a node recorded at <paramref name="recordOrder"/> belongs to, or -1 (outside every segment,
+    /// or a node no trace recorded, such as one a fusion pass built).
+    /// </summary>
+    internal int CheckpointSegmentOf(long recordOrder)
+    {
+        if (recordOrder <= 0 || _checkpointSegments is not { } segments) return -1;
+        for (int i = 0; i < segments.Count; i++)
+            if (recordOrder > segments[i].After && recordOrder <= segments[i].Last) return i;
+        return -1;
+    }
+
     private void AddNode(ILazyNode node)
     {
         if (node is ISignableLazyNode signable) signable.RecordedInProbe = IsProbe;

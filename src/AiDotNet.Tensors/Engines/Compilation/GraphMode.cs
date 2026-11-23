@@ -270,6 +270,45 @@ internal static class GraphMode
         }
     }
 
+    /// <summary>
+    /// Whether the active scope is a training trace (<see cref="EnableTraining{T}"/>): the trace a compiled training
+    /// plan is built from.
+    /// </summary>
+    internal static bool IsTrainingTrace
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _current?.IsTrainingTrace == true;
+    }
+
+    /// <summary>
+    /// Marks every op recorded until the returned scope is disposed as one activation-checkpoint segment of the training
+    /// trace, the compiled counterpart of running that code under <c>torch.utils.checkpoint</c>. The compiled plan keeps
+    /// only what the segment's ops produce for readers outside the segment; everything else the segment's backward
+    /// needs is released once the segment's forward ends and recomputed, inside the plan, just before that backward
+    /// runs. Segments do not nest. Outside a training trace this does nothing.
+    /// </summary>
+    internal static CheckpointSegmentScope BeginCheckpointSegment()
+    {
+        var scope = _current;
+        if (scope is null || !scope.IsTrainingTrace) return default;
+        return new CheckpointSegmentScope(scope, scope.OpenCheckpointSegment());
+    }
+
+    /// <summary>Closes a checkpoint segment opened by <see cref="BeginCheckpointSegment"/>.</summary>
+    internal readonly struct CheckpointSegmentScope : IDisposable
+    {
+        private readonly LazyTensorScope? _scope;
+        private readonly long _start;
+
+        internal CheckpointSegmentScope(LazyTensorScope scope, long start)
+        {
+            _scope = scope;
+            _start = start;
+        }
+
+        public void Dispose() => _scope?.CloseCheckpointSegment(_start);
+    }
+
     /// <summary>Sets the current scope (used by LazyTensorScope.Dispose).</summary>
     internal static void SetCurrent(LazyTensorScope? scope) => _current = scope;
 }
