@@ -7,12 +7,14 @@ extern "C" __global__ __launch_bounds__(256) void gdn_step(
     const float* __restrict__ alpha, const float* __restrict__ beta, float* __restrict__ o, int rows, int dv, int dk,
     float keyScale, int decayFirst)
 {
-    int w = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (w >= rows * dv) return;
-    int r = w / dv;
-    float* row = S + (long long)w * dk;
-    const float* kr = k + (long long)r * dk;
-    const float* qr = q + (long long)r * dk;
+    // 64-bit: rows * dv * 32 threads can pass int range (the host bounds the grid, not the product).
+    long long w = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (w >= (long long)rows * dv) return;
+    long long r = w / dv;
+    float* row = S + w * dk;
+    const float* kr = k + r * dk;
+    const float* qr = q + r * dk;
     float pred = 0.0f;
     for (int j = lane; j < dk; j += 32) pred = fmaf(row[j], kr[j], pred);
     for (int off = 16; off > 0; off >>= 1) pred += __shfl_xor_sync(0xFFFFFFFF, pred, off);

@@ -21,6 +21,8 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -61,8 +63,57 @@ public class FullParamResidentTrainingReproTests
         // AIDOTNET_GPU_RESIDENT_PARAMS on by default). This is the configuration that used to silently mistrain on
         // GPU: the on-device fused Adam moved the resident weight buffer while the eager forward kept reading a
         // frozen one-shot host download of it, so the loss went completely flat.
-        if (residentParams) { w1.Gpu(); w2.Gpu(); }
+        // Tensor.Gpu() places onto AiDotNetEngine.Current's backend, so the dispatcher must be this engine; leaving
+        // whatever an earlier test installed made the placement (and the test) depend on test order.
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            if (residentParams) { w1.Gpu(); w2.Gpu(); }
+            TrainAndAssertLossDrops(gpu, input, w1, w2, $"residentParams={residentParams}");
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
 
+    // REGRESSION (order-dependent CUDA-700): Tensor.Gpu() places onto AiDotNetEngine.Current's backend. When an
+    // earlier test left an engine on ANOTHER backend installed (an OpenCL engine, in the suite order that failed),
+    // the parameters carried an OpenCL buffer into a CUDA engine's compiled step, whose GEMM dereferenced the
+    // OpenCL handle as a device pointer: sticky CUDA-700 for the rest of the process. A buffer this engine's
+    // backend does not own must never reach its kernels; the step trains from the host copy instead.
+    [SkippableFact]
+    public void Fp32FusedPath_ParamsPlacedOnAnotherBackend_TrainWithoutForeignPointer()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/...).");
+        DirectGpuTensorEngine placer;
+        try { placer = new DirectGpuTensorEngine(new DirectGpuEngine(new OpenClBackend())); }
+        catch (Exception ex) { Skip.If(true, $"OpenCL backend unavailable: {ex.Message}"); return; }
+        using (placer)
+        {
+            Skip.If(!placer.IsGpuAvailable, "OpenCL backend unavailable.");
+            Skip.If(placer.QueryBackend?.GetType() == gpu.QueryBackend?.GetType(),
+                "the default engine is already OpenCL; this needs two different backends.");
+
+            var input = new Tensor<float>(RandData(new[] { 32, 64 }, 1, scale: 0.5f), new[] { 32, 64 });
+            var w1 = new Tensor<float>(RandData(new[] { 64, 64 }, 2, scale: 0.1f), new[] { 64, 64 });
+            var w2 = new Tensor<float>(RandData(new[] { 64, 64 }, 3, scale: 0.1f), new[] { 64, 64 });
+
+            var previous = AiDotNetEngine.Current;
+            try
+            {
+                AiDotNetEngine.Current = placer;
+                w1.Gpu(); w2.Gpu();
+                Assert.True(w1.IsGpuResident && w2.IsGpuResident, "the OpenCL engine must have placed the parameters.");
+                AiDotNetEngine.Current = gpu;
+                TrainAndAssertLossDrops(gpu, input, w1, w2, "placedOnOpenCl");
+            }
+            finally { AiDotNetEngine.Current = previous; }
+        }
+    }
+
+    private void TrainAndAssertLossDrops(DirectGpuTensorEngine gpu, Tensor<float> input, Tensor<float> w1,
+        Tensor<float> w2, string label)
+    {
         CompiledTrainingPlan<float> plan;
         using (var scope = GraphMode.Enable())
         {
@@ -82,7 +133,7 @@ public class FullParamResidentTrainingReproTests
 
             float last = firstLoss;
             for (int i = 0; i < 15; i++) last = plan.Step().GetFlat(0);
-            _out.WriteLine($"[residentParams={residentParams}] loss: first={firstLoss:G6} last={last:G6}");
+            _out.WriteLine($"[{label}] loss: first={firstLoss:G6} last={last:G6}");
 
             // Whether or not the params are GPU-resident, an identical graph must learn identically — the loss
             // must drop meaningfully. A GPU-resident-param regression re-freezes the forward's weights → flat loss.

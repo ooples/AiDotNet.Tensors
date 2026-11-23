@@ -39,6 +39,14 @@ public static class AiDotNetEngine
     // takes no lock. All accesses go through these two helpers.
     private static IEngine ReadCurrent() => Volatile.Read(ref _current);
 
+    /// <summary>
+    /// The engine <see cref="Current"/> would return, without completing a deferred GPU detection: for code that only
+    /// asks what is configured (a backend deciding whether to prewarm a library) and must not run the detection -
+    /// its device probe and readback - from inside an unrelated op.
+    /// </summary>
+    internal static IEngine PeekCurrent()
+        => Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local ? local : ReadCurrent();
+
     private static void PublishCurrent(IEngine engine) => Volatile.Write(ref _current, engine);
 
     // The GPU engine AutoDetectAndConfigureGpu created. It is never disposed by a demotion: an op that read Current
@@ -144,6 +152,25 @@ public static class AiDotNetEngine
             }
         }
     }
+
+    /// <summary>
+    /// What an engine op does with a tensor whose GPU buffer belongs to another backend (placed while a different
+    /// engine was <see cref="Current"/>). Default <see cref="CrossBackendTensorPolicy.MigrateWarn"/>: the tensor moves
+    /// to the op's backend once and one line is logged; <see cref="CrossBackendTensorPolicy.Throw"/> gives PyTorch's
+    /// "Expected all tensors to be on the same device" behaviour.
+    /// </summary>
+    public static CrossBackendTensorPolicy CrossBackendPolicy
+    {
+        get => (CrossBackendTensorPolicy)Volatile.Read(ref _crossBackendPolicy);
+        set
+        {
+            if (value is not (CrossBackendTensorPolicy.MigrateWarn or CrossBackendTensorPolicy.Migrate
+                or CrossBackendTensorPolicy.Throw))
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown cross-backend policy.");
+            Volatile.Write(ref _crossBackendPolicy, (int)value);
+        }
+    }
+    private static int _crossBackendPolicy = (int)CrossBackendTensorPolicy.MigrateWarn;
 
     /// <summary>
     /// Gets or sets the current execution engine.
@@ -439,6 +466,8 @@ public static class AiDotNetEngine
     /// </remarks>
     private static bool GpuPassesCorrectnessProbe(DirectGpuTensorEngine gpuEngine)
     {
+        // Detection runs from whichever op first resolves Current: its transfers are the detection's, not that op's.
+        using var detection = DirectGpu.GpuLaunchProbe.DetectionScope();
         try
         {
             // [[1,2],[3,4]] @ [[5,6],[7,8]] == [[19,22],[43,50]]

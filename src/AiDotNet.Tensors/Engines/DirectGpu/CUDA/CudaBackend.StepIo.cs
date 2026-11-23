@@ -108,6 +108,7 @@ public sealed partial class CudaBackend
         private MultiTensorTable? _gradientTable;   // private to this graph (see PrepareOptimizer)
         // The captured clip's own record, coefficient, reduction partials and ticket (PrepareGlobalNormClip).
         private IGpuBuffer? _clipRecord, _clipScale, _clipPartials, _clipTicket;
+        private bool _clipCaptured;   // a captured graph's clip launch reads these buffers' addresses
         private MultiTensorTable? _adamTable;
         private IGpuBuffer? _acceptedOffsets; // optional private int64 per-parameter offsets; no all-zero allocation
         private long _minimumAcceptedOffset;
@@ -394,6 +395,11 @@ public sealed partial class CudaBackend
             int partialWords = Math.Max(1, table.TotalChunks) * Gpu.DeterministicGradientNorm.PartialWords;
             if (_clipPartials is null || _clipPartials.Size < partialWords)
             {
+                // A graph captured with the clip baked the old buffer's address: freeing it would leave the replay
+                // writing released memory. A larger gradient table needs a new step I/O (and a new capture).
+                if (_clipCaptured)
+                    throw new InvalidOperationException(
+                        "The global-norm clip was already captured with smaller reduction partials; capture the step again with a new step I/O.");
                 _clipPartials?.Dispose();
                 _clipPartials = _backend.AllocateBuffer(partialWords);
             }
@@ -417,6 +423,7 @@ public sealed partial class CudaBackend
                 throw new GpuCapabilityUnavailableException("CUDA kernels not found: dgn_norm_clip / dgn_multi_tensor_scale");
             _backend.LaunchNormAndClipScale(normClip, table, _clipPartials, _clipTicket, _clipRecord, maxNorm, _clipScale,
                 policy);
+            _clipCaptured = true;
             _backend.LaunchMultiTensorClipScale(scale, table, _clipScale,
                 policy == Gpu.NonFiniteGradientPolicy.ZeroNonFinite);
         }

@@ -18,6 +18,23 @@ internal static class GpuBufferViewRoot
         while (buffer is IGpuBufferViewSource { ViewParent: { } parent }) buffer = parent;
         return buffer;
     }
+
+    /// <summary>
+    /// Whether <paramref name="root"/> still holds device memory. A native handle says so on CUDA, HIP, OpenCL,
+    /// Vulkan and Metal; a WebGPU buffer lives on the JavaScript side and its handle is always zero, so its own
+    /// validity is asked instead.
+    /// </summary>
+    public static bool IsLive(IGpuBuffer root)
+    {
+#if NET7_0_OR_GREATER
+        if (root is WebGpu.WebGpuBuffer web) return web.IsValid;
+#endif
+        return root.Handle != System.IntPtr.Zero;
+    }
+
+    /// <summary>Whether two roots are the same device memory: one object, or one non-zero native handle.</summary>
+    public static bool Same(IGpuBuffer left, IGpuBuffer right)
+        => ReferenceEquals(left, right) || (left.Handle != System.IntPtr.Zero && left.Handle == right.Handle);
 }
 
 /// <summary>

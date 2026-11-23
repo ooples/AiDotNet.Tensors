@@ -14,6 +14,8 @@ internal interface ICausalConv1dStepBackend
     /// <summary>
     /// <c>y = x w[:, 0] + sum_m h[m - 1] w[:, m] (+ bias) (then SiLU)</c>, then <c>h[m] = h[m - 1]</c>, <c>h[0] = x</c> in
     /// place; h is [taps, batch, channels], w [channels, taps + 1], x and y [batch, channels]. bias may be null.
+    /// The taps are NEWEST-FIRST (<c>w[:, 0]</c> weights the current input), the reverse of PyTorch/HF conv1d and
+    /// <see cref="IEngine.DepthwiseConv1D{T}"/>; to use their weights, reverse the tap axis.
     /// </summary>
     void CausalConv1dStep(IGpuBuffer history, IGpuBuffer input, IGpuBuffer weight, IGpuBuffer? bias, IGpuBuffer output,
         int taps, int batch, int channels, bool silu);

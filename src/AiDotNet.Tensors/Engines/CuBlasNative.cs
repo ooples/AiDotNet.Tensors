@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -154,13 +155,15 @@ public static class CuBlasNative
         }
 
         // If not found via standard search, try full paths from CUDA_PATH
+        // Name-first, so the newest cuBLAS in any toolkit directory beats an older one in an earlier directory.
         var cudaBinDirs = GetCudaBinDirectories();
-        foreach (var dir in cudaBinDirs)
+        foreach (var candidate in candidates)
         {
-            foreach (var candidate in candidates)
+            foreach (var dir in cudaBinDirs)
             {
-                var ext = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows) ? ".dll" : ".so";
-                var fullPath = System.IO.Path.Combine(dir, candidate + ext);
+                // Windows candidates are bare names; the Linux ones already end in their suffix (libcublas.so.12).
+                bool windows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+                var fullPath = Under(dir, windows ? candidate + ".dll" : candidate);
                 if (NativeLibrary.TryLoad(fullPath, out var handle))
                     return handle;
             }
@@ -173,54 +176,89 @@ public static class CuBlasNative
 
     internal static string[] GetCudaBinDirectories()
     {
-        var dirs = new System.Collections.Generic.List<string>();
-
-        var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
-        if (string.IsNullOrEmpty(cudaPath) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
-            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.User);
-        if (string.IsNullOrEmpty(cudaPath) && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
-            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
-
-        if (string.IsNullOrEmpty(cudaPath))
+        bool windows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+        var roots = new System.Collections.Generic.List<string>();
+        void AddRoot(string? root)
         {
-            // Scan standard install location
-            var basePath = System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-                "NVIDIA GPU Computing Toolkit", "CUDA");
-            if (System.IO.Directory.Exists(basePath))
-            {
-                var versions = System.IO.Directory.GetDirectories(basePath, "v*");
-                Array.Sort(versions);
-                if (versions.Length > 0)
-                    cudaPath = versions[versions.Length - 1];
-            }
+            if (root is null || root.Length == 0) return;
+            foreach (var existing in roots)
+                if (string.Equals(existing, root, windows ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)) return;
+            roots.Add(root);
         }
 
-        if (!string.IsNullOrEmpty(cudaPath))
+        var cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH");
+        if (string.IsNullOrEmpty(cudaPath) && windows)
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.User);
+        if (string.IsNullOrEmpty(cudaPath) && windows)
+            cudaPath = Environment.GetEnvironmentVariable("CUDA_PATH", EnvironmentVariableTarget.Machine);
+        AddRoot(cudaPath);
+
+        if (windows)
         {
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+            if (roots.Count == 0)
             {
-                // Windows: CUDA 13+ uses bin\x64; older versions use bin
-                var binX64 = System.IO.Path.Combine(cudaPath, "bin", "x64");
-                if (System.IO.Directory.Exists(binX64))
-                    dirs.Add(binX64);
-                var bin = System.IO.Path.Combine(cudaPath, "bin");
-                if (System.IO.Directory.Exists(bin))
-                    dirs.Add(bin);
+                // Scan the standard install location for the newest version.
+                var basePath = Under(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    "NVIDIA GPU Computing Toolkit", "CUDA");
+                if (System.IO.Directory.Exists(basePath))
+                    AddRoot(NewestVersionDirectory(System.IO.Directory.GetDirectories(basePath, "v*"), "v"));
             }
-            else
-            {
-                // Linux: lib64 (standard), lib (fallback)
-                var lib64 = System.IO.Path.Combine(cudaPath, "lib64");
-                if (System.IO.Directory.Exists(lib64))
-                    dirs.Add(lib64);
-                var lib = System.IO.Path.Combine(cudaPath, "lib");
-                if (System.IO.Directory.Exists(lib))
-                    dirs.Add(lib);
-            }
+        }
+        else
+        {
+            // Linux: CUDA_HOME is the other conventional root, then the standard symlink and the newest versioned install.
+            AddRoot(Environment.GetEnvironmentVariable("CUDA_HOME"));
+            AddRoot("/usr/local/cuda");
+            if (System.IO.Directory.Exists("/usr/local"))
+                AddRoot(NewestVersionDirectory(System.IO.Directory.GetDirectories("/usr/local", "cuda-*"), "cuda-"));
+        }
+
+        var dirs = new System.Collections.Generic.List<string>();
+        foreach (var root in roots)
+        {
+            // Windows: CUDA 13+ uses bin\x64; older versions use bin. Linux: lib64 (standard), lib (fallback).
+            var subdirs = windows
+                ? new[] { Under(root, "bin", "x64"), Under(root, "bin") }
+                : new[] { Under(root, "lib64"), Under(root, "lib") };
+            dirs.AddRange(subdirs.Where(System.IO.Directory.Exists));
         }
 
         return dirs.ToArray();
+    }
+
+    // root + separator + each part. Not Path.Combine, which discards everything before an argument that is itself
+    // rooted: a directory under a root is always under that root here.
+    private static string Under(string root, params string[] parts)
+    {
+        char separator = System.IO.Path.DirectorySeparatorChar;
+        var path = new System.Text.StringBuilder(root.TrimEnd(separator, System.IO.Path.AltDirectorySeparatorChar));
+        foreach (var part in parts) path.Append(separator).Append(part);
+        return path.ToString();
+    }
+
+    /// <summary>
+    /// The directory whose name (after <paramref name="prefix"/>) is the highest version, compared numerically: an
+    /// ordinal sort ranks "v9.2" above "v13.0". Names that are not a version are ignored; null when none is.
+    /// </summary>
+    internal static string? NewestVersionDirectory(string[] directories, string prefix)
+    {
+        string? best = null;
+        Version? bestVersion = null;
+        foreach (var dir in directories)
+        {
+            var name = System.IO.Path.GetFileName(dir.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar));
+            if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            var text = name.Substring(prefix.Length);
+            if (text.IndexOf('.') < 0) text += ".0";
+            if (!Version.TryParse(text, out var version)) continue;
+            if (bestVersion is null || version > bestVersion)
+            {
+                best = dir;
+                bestVersion = version;
+            }
+        }
+        return best;
     }
 
 #if !NETCOREAPP

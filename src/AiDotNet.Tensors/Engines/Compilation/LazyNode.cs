@@ -99,6 +99,12 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
     /// </summary>
     internal bool ReplaysHostState { get; set; }
 
+    /// <summary>
+    /// Runs once, just before this node executes during its trace (<see cref="Realize"/>), with its inputs showing their
+    /// recorded producers: a state-writing decode op snapshots its pre-trace state here (LazyTensorScope).
+    /// </summary>
+    internal Action? BeforeTraceExecute { get; set; }
+
     // ═══ Input graph edges (inline for 1-3, overflow for 4+) ═══
     public readonly Tensor<T> Input0;
     public readonly Tensor<T>? Input1;
@@ -277,6 +283,11 @@ internal sealed class LazyNode<T> : ILazyNode, IInPlaceReadOrdering, ISignableLa
             var shown = ShowInputsAsRecorded();
             try
             {
+                if (BeforeTraceExecute is { } beforeExecute)
+                {
+                    BeforeTraceExecute = null;
+                    beforeExecute();
+                }
                 Execute(engine, Output);
             }
             finally

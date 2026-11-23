@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// <c>cuMemAllocHost</c> (mapped + portable); Managed-scheme uses
 /// <c>cuMemAllocManaged</c> with <c>CU_MEM_ATTACH_GLOBAL</c>.
 /// </summary>
-public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper, IGpuTypedDevicePointerWrapper
+public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePointerWrapper, IGpuOffloadBackendAffinity, IGpuTypedDevicePointerWrapper
 {
     private readonly ConcurrentDictionary<IntPtr, GpuOffloadHandle> _live = new();
     private readonly object _lifecycleLock = new();
@@ -36,6 +36,19 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     private readonly bool _ownsContext = true;
     private readonly long _sharedContextGeneration;
     private bool _disposed;
+
+    // A CUDA device pointer is valid in the context that allocated it: this allocator's pointers are a CUDA backend's
+    // to use only when that backend runs in the same context (the shared-context constructor).
+    // The handle alone is not identity: the driver reuses a destroyed context's handle, so the context must also be
+    // the live registration this allocator was given (IsContextUsableUnderLifecycleLock). The caller is an op on `backend`'s engine
+    // and holds its op lease, which the engine drains before it destroys the context: a context found live here stays
+    // live until that op has finished with the wrapped buffer.
+    bool IGpuOffloadBackendAffinity.PointersUsableBy(IDirectGpuBackend backend)
+    {
+        if (backend is not CudaBackend cuda || _context == IntPtr.Zero) return false;
+        lock (CudaBackend.ContextLifecycleLock)
+            return IsContextUsableUnderLifecycleLock() && cuda.ContextHandle == _context;
+    }
 
     /// <summary>Standalone offload allocator — lazily creates and owns its own CUDA context.</summary>
     public CudaOffloadAllocator() { }

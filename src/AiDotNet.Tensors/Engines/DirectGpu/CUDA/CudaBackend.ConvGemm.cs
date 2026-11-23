@@ -29,8 +29,17 @@ public sealed partial class CudaBackend
         {
             if (floats > int.MaxValue || IsStreamCapturing())
                 return null;
-            slot?.Dispose();
-            slot = AllocateBuffer((int)floats);
+            // Under the timing lock: a measurement checks the workspace generation, then captures or replays a graph
+            // that bakes these pointers, all inside that lock. Replacing a slot there waits for the replay to end, so
+            // the graph never reads a released buffer; the generation it bumps drops the graph before its next use.
+            // Re-entrant for the measuring thread's own candidate, and the order (slot lock, then this lock) is the
+            // one MeasureTunedKernelMilliseconds documents: nothing takes a slot lock while holding it.
+            lock (_tuneEventLock)
+            {
+                if (slot is not null) NoteTunedWorkspaceReleased();   // a held timing graph may read the old one
+                slot?.Dispose();
+                slot = AllocateBuffer((int)floats);
+            }
         }
         return slot;
     }
@@ -324,6 +333,7 @@ public sealed partial class CudaBackend
         if (_convOnes is null || _convOnesLength < batch)
         {
             if (IsStreamCapturing()) return false;
+            if (_convOnes is not null) NoteTunedWorkspaceReleased();
             _convOnes?.Dispose();
             _convOnes = AllocateBuffer(batch);
             Fill(_convOnes, 1f, batch);

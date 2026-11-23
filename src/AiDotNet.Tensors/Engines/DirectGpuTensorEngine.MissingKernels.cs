@@ -4809,9 +4809,64 @@ public partial class DirectGpuTensorEngine
                 _hostIndexCopyList.Add(new WeakReference<HostIndexDeviceCopy>(copy));
             }
         }
-        RefreshHostIndexDeviceCopy(backend, copy, indices, upperBound);
+        // The same checks every later replay makes (IndexReplay): a pre-capture or capture run that accepted duplicate
+        // destinations would build a graph whose replays then throw.
+        RefreshHostIndexDeviceCopy(backend, copy, indices, upperBound, requireUnique);
         RecordHostIndexBinding(copy, indices, upperBound, requireUnique);
         return copy.Buffer!;
+    }
+
+    /// <summary>
+    /// Whether no id repeats, without a per-call set (this runs before every replay): a pooled bitset over the ids' range,
+    /// or, for a range too sparse for one, a pooled sorted copy.
+    /// </summary>
+    internal static bool AllDistinct(int[] ids)
+    {
+        int n = ids.Length;
+        if (n < 2) return true;
+        int min = ids[0], max = ids[0];
+        for (int i = 1; i < n; i++)
+        {
+            if (ids[i] < min) min = ids[i];
+            else if (ids[i] > max) max = ids[i];
+        }
+        long range = (long)max - min + 1;
+        if (range < n) return false;
+        if (range <= Math.Max(1L << 16, 64L * n))
+        {
+            int words = (int)((range + 63) >> 6);
+            var bits = System.Buffers.ArrayPool<ulong>.Shared.Rent(words);
+            try
+            {
+                Array.Clear(bits, 0, words);
+                for (int i = 0; i < n; i++)
+                {
+                    long offset = (long)ids[i] - min;
+                    ulong mask = 1UL << (int)(offset & 63);
+                    ref ulong word = ref bits[offset >> 6];
+                    if ((word & mask) != 0) return false;
+                    word |= mask;
+                }
+                return true;
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<ulong>.Shared.Return(bits);
+            }
+        }
+        var sorted = System.Buffers.ArrayPool<int>.Shared.Rent(n);
+        try
+        {
+            Array.Copy(ids, sorted, n);
+            Array.Sort(sorted, 0, n);
+            for (int i = 1; i < n; i++)
+                if (sorted[i] == sorted[i - 1]) return false;
+            return true;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<int>.Shared.Return(sorted);
+        }
     }
 
     private static void RefreshHostIndexDeviceCopy(IDirectGpuBackend backend, HostIndexDeviceCopy copy, Tensor<int> indices, int upperBound = 0, bool requireUnique = false)
@@ -4825,7 +4880,7 @@ public partial class DirectGpuTensorEngine
             if (upperBound > 0 || requireUnique)
             {
                 data = indices.ToArray();
-                if (requireUnique && new HashSet<int>(data).Count != n)
+                if (requireUnique && !AllDistinct(data))
                     throw new InvalidOperationException("Captured index writes require distinct destinations.");
                 for (int i = 0; i < n; i++)
                     if (upperBound > 0 && (data[i] < 0 || data[i] >= upperBound))

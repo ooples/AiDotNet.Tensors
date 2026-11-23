@@ -25,8 +25,10 @@ internal interface IDeviceResultStorage
 /// <remarks>
 /// <para>Registration is on the result path of every op, so it touches only the calling thread's shard: an
 /// uncontended lock and one weak GC handle, no shared cache line between threads running ops in parallel. Each shard
-/// compacts (frees the handles of collected results) when it doubles past its live count, so it stays proportional to
-/// the results alive, amortized O(1) per registration.</para>
+/// compacts (frees the handles of collected results) when it doubles past its live count, and already at half that
+/// growth once a garbage collection has run since its last compaction (only a collection can have emptied a slot), so
+/// it stays proportional to the results alive rather than to how many were alive at the last compaction, amortized
+/// O(1) per registration.</para>
 /// <para>The weak handles are freed by <see cref="EvacuateAll"/>, by compaction, or by the shard's finalizer when an
 /// engine is dropped without being disposed.</para>
 /// </remarks>
@@ -40,6 +42,9 @@ internal sealed class DeviceResultRegistry
         internal IDirectGpuBackend?[] Backends = new IDirectGpuBackend?[MinCompactAt];
         internal int Count;
         internal int CompactAt = MinCompactAt;
+        // From this count on, a garbage collection since the last compaction triggers the next one.
+        internal int RecheckAt = MinCompactAt;
+        internal int CollectionsAtCompact = GC.CollectionCount(0);
 
         ~Shard()
         {
@@ -59,7 +64,9 @@ internal sealed class DeviceResultRegistry
         var shard = ReferenceEquals(t_lastRegistry, this) ? t_lastShard! : ShardForThisThread(this);
         lock (shard)
         {
-            if (shard.Count == shard.CompactAt) Compact(shard);
+            if (shard.Count == shard.CompactAt
+                || (shard.Count >= shard.RecheckAt && GC.CollectionCount(0) != shard.CollectionsAtCompact))
+                Compact(shard);
             if (shard.Count == shard.Handles.Length)
             {
                 Array.Resize(ref shard.Handles, shard.Count * 2);
@@ -101,6 +108,8 @@ internal sealed class DeviceResultRegistry
         }
         shard.Count = live;
         shard.CompactAt = Math.Max(MinCompactAt, live * 2);
+        shard.RecheckAt = live + Math.Max(MinCompactAt, live / 2);
+        shard.CollectionsAtCompact = GC.CollectionCount(0);
     }
 
     /// <summary>The live entries across every thread's shard (a diagnostic for tests).</summary>
@@ -158,6 +167,7 @@ internal sealed class DeviceResultRegistry
                 }
                 shard.Count = 0;
                 shard.CompactAt = MinCompactAt;
+                shard.RecheckAt = MinCompactAt;
             }
         }
         return moved;

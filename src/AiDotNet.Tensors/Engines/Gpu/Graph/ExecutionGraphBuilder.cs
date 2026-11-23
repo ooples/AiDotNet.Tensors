@@ -233,7 +233,8 @@ public sealed class ExecutionGraphBuilder : IDisposable
         ValidateGraph();
 
         _isBuilt = true;
-        return new ExecutionGraph(_nodes.ToList());
+        var writes = _writes;
+        return new ExecutionGraph(_nodes.ToList()) { Executed = () => writes.Ran = true };
     }
 
     /// <summary>
@@ -267,7 +268,37 @@ public sealed class ExecutionGraphBuilder : IDisposable
         var (optimizedGraph, statistics) = compiler.CompileWithStatistics(_nodes.ToList(), backend);
 
         _isBuilt = true;
+        // The graph marks the writes of the generation it was built from, however it is run (the scope's Execute or a
+        // caller's own Execute on the graph Compile returned).
+        var writes = _writes;
+        if (!_runsWhileRecording) SetAsideWritesTheGraphDropped(optimizedGraph, writes);
+        optimizedGraph.Executed = () => writes.Ran = true;
         return (optimizedGraph, statistics);
+    }
+
+    // The optimizer may drop a recorded node (dead-code elimination removes one nothing in the graph reads, fusion
+    // folds an intermediate away): no surviving node writes that node's output, so running the graph leaves the
+    // buffer unwritten. Those buffers move to a state of their own that never runs, and the graph's completion
+    // certifies only what its nodes write.
+    private void SetAsideWritesTheGraphDropped(ExecutionGraph graph, WriteState writes)
+    {
+        var written = new HashSet<IGpuBuffer>();
+        foreach (var node in graph.TopologicalOrder)
+        {
+            foreach (var output in node.OutputTensors) written.Add(output.Buffer);
+            if (node is TransferNode { DestinationBuffer: { } destination }) written.Add(destination);
+        }
+        var dropped = _lastWriteNode.Keys
+            .Where(buffer => !written.Contains(buffer)
+                             && s_recordedWrites.TryGetValue(buffer, out var state) && ReferenceEquals(state, writes))
+            .ToList();
+        if (dropped.Count == 0) return;
+        var neverRuns = new WriteState();
+        foreach (var buffer in dropped)
+        {
+            s_recordedWrites.Remove(buffer);
+            s_recordedWrites.Add(buffer, neverRuns);
+        }
     }
 
     /// <summary>
@@ -279,6 +310,9 @@ public sealed class ExecutionGraphBuilder : IDisposable
         _lastWriteNode.Clear();
         _bufferDependents.Clear();
         _isBuilt = false;
+        // A new recording generation: the nodes just discarded will never run, so the buffers they wrote keep the old
+        // state (unexecuted for good) while what is recorded from here on is marked by the next graph alone.
+        _writes = new WriteState { Ran = _runsWhileRecording };
     }
 
     private void TrackBufferDependencies(ExecutionNode node)
@@ -321,6 +355,36 @@ public sealed class ExecutionGraphBuilder : IDisposable
         }
     }
 
+    // Whether this builder's recorded writes have run: set once its scope executed successfully, or from the start
+    // when the recorder also executes each op as it records it. Shared with the per-buffer markers below.
+    private sealed class WriteState
+    {
+        internal volatile bool Ran;
+    }
+
+    private WriteState _writes = new();
+    private bool _runsWhileRecording;
+
+    // Buffers a recorded, not yet executed node writes, for every builder in the process: weak on the buffer, so an
+    // entry lives exactly as long as the buffer whose contents it describes.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IGpuBuffer, WriteState> s_recordedWrites = new();
+
+    /// <summary>The recorder runs each op as it records it (trace by execution): recorded outputs hold real data.</summary>
+    internal void MarkWritesRunWhileRecording()
+    {
+        _runsWhileRecording = true;
+        _writes.Ran = true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="buffer"/> is the output of a node some deferred scope recorded and has not run: its
+    /// contents are not the recorded result. True for any scope, current or enclosing, and it stays true when the
+    /// scope's execution failed or never happened - only a successful execution writes the buffer. An upload does
+    /// not count: the recording backend uploads the data when it allocates the buffer.
+    /// </summary>
+    internal static bool IsUnexecutedWrite(IGpuBuffer buffer)
+        => s_recordedWrites.TryGetValue(buffer, out var state) && !state.Ran;
+
     // RAW: depend on the buffer's last writer; record this node as a reader (for later WAR edges).
     private void AddRawAndRecordReader(ExecutionNode node, IGpuBuffer buffer)
     {
@@ -360,6 +424,9 @@ public sealed class ExecutionGraphBuilder : IDisposable
         }
 
         _lastWriteNode[buffer] = node;
+        if (node is TransferNode { TransferType: TransferDirection.HostToDevice }) return;
+        s_recordedWrites.Remove(buffer);   // a later scope's write supersedes an earlier scope's marker
+        s_recordedWrites.Add(buffer, _writes);
     }
 
     private void ValidateGraph()

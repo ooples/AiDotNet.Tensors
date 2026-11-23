@@ -19,7 +19,10 @@ public enum GatedDeltaRule
     /// <c>S_t = a_t S_{t-1} (I - b_t k_t k_tᵀ) + b_t v_t k_tᵀ</c>, so the prediction reads the decayed state,
     /// <c>S_t = a_t S_{t-1} + b_t (v_t - a_t S_{t-1} k_t) k_tᵀ</c>. The caller normalizes the keys and scales the
     /// queries: the paper L2-normalizes both, and its reference implementation scales the queries by
-    /// <c>1/sqrt(headDim)</c>. With unit keys and <c>0 &lt;= b_t &lt;= 1</c> the transition is a contraction.
+    /// <c>1/sqrt(headDim)</c>. With unit keys, <c>0 &lt;= a_t &lt;= 1</c> and <c>0 &lt;= b_t &lt;= 1</c> the transition
+    /// <c>a_t (I - b_t k_t k_tᵀ)</c> is non-expansive (spectral norm at most 1); it is not a strict contraction in
+    /// general: at <c>a_t = 1</c> it keeps every direction orthogonal to <c>k_t</c>, and at <c>b_t = 1</c> it is the
+    /// orthogonal projection off <c>k_t</c>.
     /// </summary>
     Standard = 1,
 }

@@ -10,7 +10,9 @@ internal interface IBatchedCopyBackend
 {
     /// <summary>
     /// <c>destinations[i][0..lengths[i]) = sources[i][0..lengths[i])</c> for every i, stream-ordered like
-    /// <see cref="IDirectGpuBackend.Copy(IGpuBuffer, IGpuBuffer, int)"/>. The copies must not overlap one another.
+    /// <see cref="IDirectGpuBackend.Copy(IGpuBuffer, IGpuBuffer, int)"/>. The copies run concurrently, so no copy may
+    /// write memory another copy reads or writes; an implementation throws <see cref="System.ArgumentException"/> for
+    /// overlapping copies or a buffer shorter than its copy's length.
     /// </summary>
     void CopyMany(IReadOnlyList<IGpuBuffer> sources, IReadOnlyList<IGpuBuffer> destinations, IReadOnlyList<int> lengths);
 }

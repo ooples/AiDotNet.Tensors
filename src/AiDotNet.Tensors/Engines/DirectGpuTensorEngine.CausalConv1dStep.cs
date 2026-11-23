@@ -8,6 +8,8 @@ namespace AiDotNet.Tensors.Engines;
 public partial class DirectGpuTensorEngine
 {
     /// <inheritdoc />
+    /// <remarks>The kernel is NEWEST-FIRST: <c>weight[:, 0]</c> weights the current input, the reverse of
+    /// PyTorch/HF conv1d and <see cref="IEngine.DepthwiseConv1D{T}"/>; to use their weights, reverse the tap axis.</remarks>
     public override Tensor<T> CausalConv1dStep<T>(Tensor<T> history, Tensor<T> input, Tensor<T> weight, Tensor<T>? bias, bool silu)
     {
         if (GraphMode.IsActive) return base.CausalConv1dStep(history, input, weight, bias, silu);

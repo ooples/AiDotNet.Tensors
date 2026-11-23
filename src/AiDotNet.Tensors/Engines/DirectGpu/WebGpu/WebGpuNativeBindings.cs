@@ -239,6 +239,7 @@ public static partial class WebGpuNativeBindings
     /// </summary>
     public static void CopyBufferToBuffer(int srcBufferId, int srcOffset, int dstBufferId, int dstOffset, int sizeBytes)
     {
+        GpuLaunchProbe.OnLaunch();   // a device-to-device copy is a GPU dispatch (GpuLaunchProbe's contract)
         if (Host is { } host) host.Invoke("copyBufferToBuffer", Args(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes));
         else JsCopyBufferToBuffer(srcBufferId, srcOffset, dstBufferId, dstOffset, sizeBytes);
     }
@@ -401,6 +402,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeAsync(int pipelineId, int bindGroupId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        GpuLaunchProbe.OnLaunch();   // one kernel launch, folded or not, as the other backends count them
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, -1, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeAsync(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchCompute", Args(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ));
@@ -421,6 +423,7 @@ public static partial class WebGpuNativeBindings
     /// <param name="workgroupsZ">Number of workgroups in Z dimension.</param>
     public static Task DispatchComputeWithUniformsAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroupsX, int workgroupsY, int workgroupsZ)
     {
+        GpuLaunchProbe.OnLaunch();
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX);
         if (Host is not { } host) return JsDispatchComputeWithUniformsAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchComputeWithUniforms", Args(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ));
@@ -440,6 +443,8 @@ public static partial class WebGpuNativeBindings
             throw new ArgumentException("Every dispatch needs a pipeline, a bind group, a uniform buffer and a workgroup count.");
         foreach (int x in workgroupsX)
             if (NeedsFold(x, 1, 1)) return DispatchChainOneByOneAsync(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX);
+        // One launch per dispatch in the chain (the one-by-one path above counts each through its own dispatch).
+        for (int i = 0; i < pipelineIds.Length; i++) GpuLaunchProbe.OnLaunch();
         if (Host is not { } host)
             return JsDispatchComputeChainWithUniformsAsync(ToDoubles(pipelineIds), ToDoubles(bindGroupIds), ToDoubles(uniformBufferIds), ToDoubles(workgroupsX));
         host.Invoke("dispatchComputeChainWithUniforms", Args(pipelineIds, bindGroupIds, uniformBufferIds, workgroupsX));

@@ -23,7 +23,16 @@ public partial class DirectGpuTensorEngine
         var positionBuffer = PinInputResident(position) ?? throw new InvalidOperationException("The position could not be made device-resident.");
         using var v = GetOrAllocateBuffer(backend, value);
         var mask = AllocateFullyWrittenOutputBuffer(backend, capacity);   // every slot written
-        append.KvCacheAppend(cacheBuffer, positionBuffer, v.Buffer, mask.Buffer, batch, capacity, width);
+        try
+        {
+            // Throws, with the cache and the position unwritten, on a bad position (a full cache, as the host does).
+            append.KvCacheAppend(cacheBuffer, positionBuffer, v.Buffer, mask.Buffer, batch, capacity, width);
+        }
+        catch
+        {
+            mask.Dispose();
+            throw;
+        }
         cache.IncrementVersion();
         BindResidentBuffer(cache, cacheBuffer, backend);
         position.IncrementVersion();
