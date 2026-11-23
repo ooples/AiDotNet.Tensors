@@ -335,14 +335,25 @@ public class GpuElementTypeTests
             bool held = backend.SupportsElementType(row.ElementType);
             bool expected = row.Family == GpuOperationFamily.Storage ? held
                 : row.ElementType == GpuElementType.Float32 ? held
-                : row.ElementType != GpuElementType.Float64 || !held ? false
+                : !held ? false
+                // Integer and bool rows are what the backend's integer interfaces say for that type.
+                : GpuIntegerLayout.IsIntegerOrBool(row.ElementType)
+                    ? (row.Family == GpuOperationFamily.Elementwise ? backend is IGpuIntegerElementwise integers && integers.SupportsIntegerElementwise(row.ElementType)
+                        : row.Family == GpuOperationFamily.Reduction && backend is IGpuIntegerReductions sums && sums.SupportsIntegerReductions(row.ElementType))
+                : GpuNarrowFloatLayout.IsNarrowFloat(row.ElementType)
+                    ? (row.Family == GpuOperationFamily.Elementwise
+                        ? backend is IGpuNarrowFloatElementwise narrow && narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Add, row.ElementType)
+                        : row.Family == GpuOperationFamily.MatrixMultiply && backend is IGpuNarrowFloatMatrixMultiply multiply
+                            && multiply.SupportsNarrowFloatMatrixMultiply(row.ElementType))
+                : row.ElementType != GpuElementType.Float64 ? false
                 : row.Family == GpuOperationFamily.Elementwise ? backend is IGpuFloat64Elementwise { SupportsFloat64Elementwise: true }
                 : row.Family == GpuOperationFamily.Reduction ? backend is IGpuFloat64Reductions { SupportsFloat64Reductions: true }
                 : backend is IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true };
             Assert.True(expected == row.IsNative, $"{row} disagrees with the backend ({backend.BackendName}).");
         }
         Assert.True(backend.SupportsOperation(GpuOperationFamily.MatrixMultiply, GpuElementType.Float32));
-        Assert.False(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Int8));
+        // No 16-bit float type has a reduction behind this table.
+        Assert.False(backend.SupportsOperation(GpuOperationFamily.Reduction, GpuElementType.BFloat16));
     }
 
     private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged

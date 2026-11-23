@@ -333,7 +333,7 @@ public class GetStreamSchedulerTests
         // We can't easily round-trip fp16 host bytes for a correctness
         // gate without a fp16↔fp32 conversion helper, so this is a
         // doesn't-crash test. Correctness of cublasGemmEx itself is
-        // exercised by the existing IGpuHalfPrecisionBackend.Hgemm tests.
+        // exercised by the existing IGpuHalfFusedKernels.Hgemm tests.
         using var engine = new DirectGpuTensorEngine();
         var asyncBackend = engine.GetAsyncBackend();
         if (asyncBackend is null || !asyncBackend.SupportsMultiStream) return;

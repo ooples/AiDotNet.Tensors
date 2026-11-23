@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// IGpuHalfPrecisionBackend implementation for the HIP/ROCm backend (issue #560):
+// IGpuHalfFusedKernels implementation for the HIP/ROCm backend (issue #560):
 // FP16 GEMM so MatrixMultiply<Half> runs on AMD GPUs instead of dropping to a
 // scalar CPU fallback.
 
@@ -9,7 +9,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
 /// <summary>
-/// Half-precision GEMM dispatch for the <see cref="IGpuHalfPrecisionBackend"/>
+/// Half-precision GEMM dispatch for the <see cref="IGpuHalfFusedKernels"/>
 /// capability interface, so the backend-agnostic
 /// <c>DirectGpuTensorEngine.MatrixMultiply</c> FP16 path (issue #560) runs on
 /// AMD ROCm GPUs. Mirrors the CUDA backend's contract and column-major
@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// proven layout rather than re-deriving it.
 /// </para>
 /// </summary>
-public sealed partial class HipBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
+public sealed partial class HipBackend : IGpuHalfFusedKernels, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>

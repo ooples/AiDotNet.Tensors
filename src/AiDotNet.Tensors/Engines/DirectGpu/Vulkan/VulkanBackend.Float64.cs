@@ -29,11 +29,12 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     /// <inheritdoc/>
     public bool SupportsFloat64MatrixMultiply => SupportsFloat64Compute;
 
-    // The kernels must keep subnormal results (2^-1022 * 0.5 is 2^-1023, not 0). Vulkan promises that under
-    // DenormPreserve. A device that does not offer the mode (an RTX 3080's driver does not) leaves denormal handling to
-    // the implementation, so the compiled kernels are measured once instead: a device whose kernels flush computes
-    // doubles on the CPU and keeps double storage.
-    private bool SupportsFloat64Compute => SupportsFloat64Storage && (_device.DenormPreserveFloat64 || KeepsSubnormals());
+    // The kernels must give the host's bits: subnormal results kept (2^-1022 * 0.5 is 2^-1023, not 0) and every result
+    // rounded to nearest, ties to even. No float-controls bit promises all of that: DenormPreserve does not cover
+    // division, and nothing a device reports fixes the rounding mode of a shader that does not request one. So the
+    // compiled kernels are measured once on every device, whatever it reports: a device whose kernels flush or round
+    // another way computes doubles on the CPU and keeps double storage.
+    private bool SupportsFloat64Compute => SupportsFloat64Storage && KeepsSubnormals();
 
     private readonly object _subnormalProbeLock = new object();
     private bool? _keepsSubnormals;
@@ -59,13 +60,24 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
         }
     }
 
-    // Runs each arithmetic kernel on operands whose exact results are subnormal or come from subnormals, and compares
-    // the bits with the host's. Every double kernel here is built from these operations and the same header.
+    // Runs each arithmetic kernel on operands whose exact results are subnormal or come from subnormals, and on ones
+    // whose results fall between two doubles (where round-to-nearest-even differs from every other mode: 1 + 3 * 2^-53
+    // is a tie that goes up to 1 + 2^-51, 1 + 2^-53 a tie that stays at 1), and compares the bits with the host's.
+    // Every double kernel here is built from these operations and the same header.
     internal bool MeasureSubnormals()
     {
         const double smallestNormal = 2.2250738585072014E-308, smallestSubnormal = double.Epsilon;
-        var left = new[] { smallestNormal, smallestSubnormal, 3 * smallestSubnormal, smallestNormal, 1.0E-300 };
-        var right = new[] { 0.5, smallestSubnormal, smallestSubnormal, 4.0, 1.0E-10 };
+        const double halfUlp = 1.1102230246251565E-16;   // 2^-53
+        var left = new[]
+        {
+            smallestNormal, smallestSubnormal, 3 * smallestSubnormal, smallestNormal, 1.0E-300,
+            1.0, 1.0, 1.0, 0.1, 1.0, 0.7, -1.0, 1.0 + 4 * halfUlp, 2.0,
+        };
+        var right = new[]
+        {
+            0.5, smallestSubnormal, smallestSubnormal, 4.0, 1.0E-10,
+            3 * halfUlp, halfUlp, 1.5 * halfUlp, 0.2, 3.0, 0.1, 3 * halfUlp, 1.0 + 2 * halfUlp, 3.0,
+        };
         int n = left.Length;
         using var a = AllocateBuffer(n, GpuElementType.Float64);
         using var b = AllocateBuffer(n, GpuElementType.Float64);

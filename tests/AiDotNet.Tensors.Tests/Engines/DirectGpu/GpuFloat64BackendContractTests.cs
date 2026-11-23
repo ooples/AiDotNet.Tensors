@@ -24,14 +24,30 @@ public abstract class GpuFloat64BackendContractTests
     /// <summary>Whether this backend computes doubles in integer arithmetic (its shading language has no 64-bit float).</summary>
     protected abstract bool EmulatesDoubles { get; }
 
-    private static IGpuFloat64Elementwise Elementwise(IDirectGpuBackend backend)
-        => backend as IGpuFloat64Elementwise ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double element-wise kernels.");
+    /// <summary>
+    /// Why this device holds doubles but does not compute them, or null when it computes them. Such a device keeps the
+    /// storage tests and skips the compute ones; the backend's own test asserts that the capability it reports is the
+    /// one it measured.
+    /// </summary>
+    protected virtual string? ComputeUnavailableReason(IDirectGpuBackend backend) => null;
 
-    private static IGpuFloat64Reductions Reductions(IDirectGpuBackend backend)
-        => backend as IGpuFloat64Reductions ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double reductions.");
+    private IGpuFloat64Elementwise Elementwise(IDirectGpuBackend backend)
+    {
+        Skip.If(ComputeUnavailableReason(backend) is not null, ComputeUnavailableReason(backend));
+        return backend as IGpuFloat64Elementwise ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double element-wise kernels.");
+    }
 
-    private static IGpuFloat64MatrixMultiply MatrixMultiply(IDirectGpuBackend backend)
-        => backend as IGpuFloat64MatrixMultiply ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double matrix multiply.");
+    private IGpuFloat64Reductions Reductions(IDirectGpuBackend backend)
+    {
+        Skip.If(ComputeUnavailableReason(backend) is not null, ComputeUnavailableReason(backend));
+        return backend as IGpuFloat64Reductions ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double reductions.");
+    }
+
+    private IGpuFloat64MatrixMultiply MatrixMultiply(IDirectGpuBackend backend)
+    {
+        Skip.If(ComputeUnavailableReason(backend) is not null, ComputeUnavailableReason(backend));
+        return backend as IGpuFloat64MatrixMultiply ?? throw new Xunit.Sdk.XunitException($"{backend.BackendName} has no double matrix multiply.");
+    }
 
     [SkippableFact]
     public void The_backend_reports_its_double_capabilities()
@@ -436,15 +452,37 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
 
     protected override bool EmulatesDoubles => false;
 
-    // A device that does not offer DenormPreserve for doubles is measured instead (NVIDIA's driver offers no mode); this
-    // runs that measurement on every device, so it is exercised where the mode is granted too.
+    // A device that holds doubles but whose kernels do not give the host's bits computes them on the CPU: its storage
+    // tests still run, its compute tests skip, and the test below holds it to the capability it measured.
+    protected override string? ComputeUnavailableReason(IDirectGpuBackend backend)
+        => ((IGpuFloat64Elementwise)backend).SupportsFloat64Elementwise
+            ? null
+            : "This Vulkan device's double kernels do not reproduce the host's results (measured); doubles compute on the CPU.";
+
+    // Every device is measured (subnormals kept, round to nearest even), whatever float controls it reports; the
+    // capabilities the backend reports are that measurement and nothing else.
     [SkippableFact]
-    public void The_subnormal_measurement_runs_and_agrees_with_the_kernels()
+    public void The_compute_capability_is_the_measurement()
     {
         Skip.If(_backend is null, SkipReason);
         var vulkan = (AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend)_backend!;
-        Assert.True(vulkan.MeasureSubnormals());
-        Assert.True(((IGpuFloat64Elementwise)vulkan).SupportsFloat64Elementwise);
+        // A kernel that cannot be built or run here measures as "does not compute doubles", which is how the backend's
+        // own gate reads it; anything else thrown is a defect and fails the test.
+        bool measured;
+        try
+        {
+            measured = vulkan.MeasureSubnormals();
+        }
+        catch (Exception unavailable) when (unavailable is InvalidOperationException or NotSupportedException)
+        {
+            measured = false;
+        }
+
+        Assert.Equal(measured, ((IGpuFloat64Elementwise)vulkan).SupportsFloat64Elementwise);
+        Assert.Equal(measured, ((IGpuFloat64Reductions)vulkan).SupportsFloat64Reductions);
+        Assert.Equal(measured, ((IGpuFloat64MatrixMultiply)vulkan).SupportsFloat64MatrixMultiply);
+        Assert.Equal(measured, vulkan.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Float64));
+        Assert.True(vulkan.SupportsOperation(GpuOperationFamily.Storage, GpuElementType.Float64));
     }
 }
 

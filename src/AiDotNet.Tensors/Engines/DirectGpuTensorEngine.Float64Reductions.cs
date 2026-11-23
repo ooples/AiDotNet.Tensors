@@ -37,7 +37,9 @@ public partial class DirectGpuTensorEngine
         }
 
         if (backend is IGpuFloat64Reductions candidate && candidate.SupportsFloat64Reductions
-            && backend.SupportsElementType(GpuElementType.Float64) && GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend))
+            && backend.SupportsElementType(GpuElementType.Float64)
+            // The planner's own answer for a double reduction, so the plan and this dispatch cannot disagree.
+            && GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend, GpuPrecisionOperation.Reduction))
         {
             reductions = candidate;
             return true;

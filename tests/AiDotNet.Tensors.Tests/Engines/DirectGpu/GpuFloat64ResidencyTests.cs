@@ -14,8 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// device until the host reads it.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class GpuFloat64ResidencyTests
+public class GpuFloat64ResidencyTests : IDisposable
 {
+    // The device route for doubles is taken under the default policy only where the kernels are native. Where they
+    // are integer emulation (Metal, WebGPU) it needs the allowance, which changes nothing on a native device.
+    private readonly GpuExecutionPolicyScope _emulationAllowed = new GpuExecutionPolicyScope(GpuExecutionPolicy.PreserveOnDevice);
+
+    public void Dispose() => _emulationAllowed.Dispose();
+
     private const int Large = DirectGpuTensorEngine.Float64ReductionMinLength + 4097;
 
     private static (DirectGpuTensorEngine Engine, IDirectGpuBackend Backend, IGpuFloat64Elementwise Elementwise)? Device()
@@ -141,12 +147,17 @@ public class GpuFloat64ResidencyTests
             Assert.Equal(GpuExecutionRoute.Cpu, matMul.Route);
         }
 
-        // No double kernel exists for these, so the default (preserving) policy must keep them exact on the CPU.
+        // The reductions are their own capability too, and the plan is the answer the engine's sum dispatches on.
+        var reduction = GpuPrecisionPlanner.CreatePlan<double>(backend, GpuPrecisionOperation.Reduction, "probe");
+        Assert.Equal(backend is IGpuFloat64Reductions { SupportsFloat64Reductions: true } ? GpuExecutionRoute.Gpu : GpuExecutionRoute.Cpu,
+            reduction.Route);
+
+        // No double kernel exists for these, so a preserving policy must keep them exact on the CPU.
         foreach (var operation in new[]
                  {
                      GpuPrecisionOperation.Elementwise, GpuPrecisionOperation.Relu, GpuPrecisionOperation.BatchMatMul,
                      GpuPrecisionOperation.MatMulTransposed, GpuPrecisionOperation.Convolution,
-                     GpuPrecisionOperation.Reduction, GpuPrecisionOperation.General,
+                     GpuPrecisionOperation.General,
                  })
             Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionPlanner.CreatePlan<double>(backend, operation, "probe").Route);
 
@@ -191,9 +202,9 @@ public class GpuFloat64ResidencyTests
             var product = gpu.TensorMultiply(sum, x);
             var difference = gpu.TensorSubtract(product, y);
             var quotient = gpu.TensorDivide(difference, x);
-            Assert.True(gpuEngine.IsFloat64Resident(x), "The persistent leaf is not resident on the device.");
-            Assert.True(gpuEngine.IsFloat64Resident(sum), "The sum is not resident on the device.");
-            Assert.True(gpuEngine.IsFloat64Resident(quotient), "The quotient is not resident on the device.");
+            Assert.True(gpuEngine.IsTypedResident(x), "The persistent leaf is not resident on the device.");
+            Assert.True(gpuEngine.IsTypedResident(sum), "The sum is not resident on the device.");
+            Assert.True(gpuEngine.IsTypedResident(quotient), "The quotient is not resident on the device.");
             Assert.Equal(before, GpuLaunchProbe.Readbacks);
 
             // The reduction of a resident tensor reads one scalar back and nothing else.
@@ -228,8 +239,8 @@ public class GpuFloat64ResidencyTests
         long uploadsBefore = GpuLaunchProbe.TuningUploads;
         long readbacksBefore = GpuLaunchProbe.Readbacks;
         var sum = gpu.TensorAdd(x, y);
-        Assert.False(gpuEngine.IsFloat64Resident(sum));
-        Assert.False(gpuEngine.IsFloat64Resident(x));
+        Assert.False(gpuEngine.IsTypedResident(sum));
+        Assert.False(gpuEngine.IsTypedResident(x));
         Assert.Equal(readbacksBefore, GpuLaunchProbe.Readbacks);
         Assert.Equal(uploadsBefore, GpuLaunchProbe.TuningUploads);
         var expected = new double[length];
@@ -249,7 +260,7 @@ public class GpuFloat64ResidencyTests
         try
         {
             var product = gpu.TensorMultiply(x, y);
-            Assert.False(gpuEngine.IsFloat64Resident(product));
+            Assert.False(gpuEngine.IsTypedResident(product));
             Assert.Equal(x[length - 1] * y[length - 1], product[length - 1]);
         }
         finally
@@ -270,12 +281,12 @@ public class GpuFloat64ResidencyTests
         try
         {
             var sum = gpu.TensorAdd(x, y);
-            Assert.True(gpuEngine.IsFloat64Resident(sum));
+            Assert.True(gpuEngine.IsTypedResident(sum));
             double untouched = x[18] + y[18];
 
             // The write brings the device values down, then replaces one; the device copy is now stale.
             sum[17] = 123.5;
-            Assert.False(gpuEngine.IsFloat64Resident(sum));
+            Assert.False(gpuEngine.IsTypedResident(sum));
             var doubled = gpu.TensorAdd(sum, sum);
             Assert.Equal(247.0, doubled[17]);
             Assert.Equal(untouched * 2.0, doubled[18]);
@@ -283,9 +294,9 @@ public class GpuFloat64ResidencyTests
 
             // A persistent leaf written on the host is uploaded again.
             x[5] = 1000.0;
-            Assert.False(gpuEngine.IsFloat64Resident(x));
+            Assert.False(gpuEngine.IsTypedResident(x));
             var again = gpu.TensorAdd(x, y);
-            Assert.True(gpuEngine.IsFloat64Resident(x));
+            Assert.True(gpuEngine.IsTypedResident(x));
             Assert.Equal(1000.0 + y[5], again[5]);
             Assert.Equal(x[6] + y[6], again[6]);
         }
@@ -303,15 +314,15 @@ public class GpuFloat64ResidencyTests
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
-        gpuEngine.ClearFloat64Residents();
+        gpuEngine.ClearTypedResidents();
         var (x, y) = PersistentLeaves(gpu, Large, 30);
         try
         {
             var sum = gpu.TensorAdd(x, y);
-            Assert.True(gpuEngine.IsFloat64Resident(x));
+            Assert.True(gpuEngine.IsTypedResident(x));
             gpu.InvalidatePersistentTensor(x);
-            Assert.False(gpuEngine.IsFloat64Resident(x));
-            Assert.True(gpuEngine.IsFloat64Resident(y));
+            Assert.False(gpuEngine.IsTypedResident(x));
+            Assert.True(gpuEngine.IsTypedResident(y));
             Assert.Equal(x[9] + y[9], sum[9]);
         }
         finally
@@ -320,9 +331,9 @@ public class GpuFloat64ResidencyTests
             gpu.UnregisterPersistentTensor(y);
         }
 
-        Assert.False(gpuEngine.IsFloat64Resident(y));
+        Assert.False(gpuEngine.IsTypedResident(y));
         // No longer persistent: two plain host operands again.
-        Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorAdd(x, y)));
+        Assert.False(gpuEngine.IsTypedResident(gpu.TensorAdd(x, y)));
     }
 
     // The registration is the array: a second tensor over the same array has its own kept upload, and a host write
@@ -334,7 +345,7 @@ public class GpuFloat64ResidencyTests
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
-        gpuEngine.ClearFloat64Residents();
+        gpuEngine.ClearTypedResidents();
         var array = Values(Large, 33);
         var first = new Tensor<double>(array, new[] { Large });
         var second = new Tensor<double>(array, new[] { Large });
@@ -344,12 +355,12 @@ public class GpuFloat64ResidencyTests
         try
         {
             var before = gpu.TensorNegate(second);
-            Assert.True(gpuEngine.IsFloat64Resident(second), "The second tensor's upload was not kept.");
+            Assert.True(gpuEngine.IsTypedResident(second), "The second tensor's upload was not kept.");
             Assert.Equal(-array[5], before[5]);
 
             array[5] = 1234.5;
             gpu.InvalidatePersistentTensor(first);
-            Assert.False(gpuEngine.IsFloat64Resident(second), "The stale upload of the same array survived.");
+            Assert.False(gpuEngine.IsTypedResident(second), "The stale upload of the same array survived.");
             Assert.Equal(-1234.5, gpu.TensorNegate(second)[5]);
         }
         finally
@@ -366,22 +377,22 @@ public class GpuFloat64ResidencyTests
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
-        gpuEngine.ClearFloat64Residents();
+        gpuEngine.ClearTypedResidents();
         var (x, y) = PersistentLeaves(gpu, Large, 34);
         try
         {
             x.Layout = TensorLayout.Nchwc8;
             y.Layout = TensorLayout.Nchwc8;
             var negated = gpu.TensorNegate(x);
-            Assert.True(gpuEngine.IsFloat64Resident(negated));
+            Assert.True(gpuEngine.IsTypedResident(negated));
             Assert.Equal(TensorLayout.Nchwc8, negated.Layout);
             var sum = gpu.TensorAdd(x, y);
-            Assert.True(gpuEngine.IsFloat64Resident(sum));
+            Assert.True(gpuEngine.IsTypedResident(sum));
             Assert.Equal(TensorLayout.Nchwc8, sum.Layout);
 
             // Operands laid out differently do not meet element for element: not this route.
             y.Layout = TensorLayout.Nchw;
-            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorAdd(x, y)));
+            Assert.False(gpuEngine.IsTypedResident(gpu.TensorAdd(x, y)));
         }
         finally
         {
@@ -426,31 +437,31 @@ public class GpuFloat64ResidencyTests
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
-        gpuEngine.ClearFloat64Residents();
-        long? savedBudget = DirectGpuTensorEngine.Float64ResidentBudgetOverride;
+        gpuEngine.ClearTypedResidents();
+        long? savedBudget = DirectGpuTensorEngine.TypedResidentBudgetOverride;
         var (x, y) = PersistentLeaves(gpu, Large, 40);
         try
         {
             long leafBytes = 2L * Large * sizeof(double);
             long readbacksBefore = GpuLaunchProbe.Readbacks;
             RunAndDropIntermediates(gpu, x, y);
-            Assert.True(gpuEngine.Float64ResidentBytes > leafBytes, "The chain left nothing on the device to free.");
+            Assert.True(gpuEngine.TypedResidentBytes > leafBytes, "The chain left nothing on the device to free.");
 
             GC.Collect();
             GC.WaitForPendingFinalizers();
             GC.Collect();
             // Over a budget with room for the leaves and one result, the next op reclaims the dead results: its own
             // result (in a buffer one of them gave up) is the only one left beside the leaves.
-            DirectGpuTensorEngine.Float64ResidentBudgetOverride = 3L * Large * sizeof(double) + 1024;
+            DirectGpuTensorEngine.TypedResidentBudgetOverride = 3L * Large * sizeof(double) + 1024;
             var kept = gpu.TensorAdd(x, y);
-            Assert.Equal(leafBytes + (long)Large * sizeof(double), gpuEngine.Float64ResidentBytes);
-            Assert.True(gpuEngine.Float64PooledBytes > 0, "No dead result's buffer was pooled.");
+            Assert.Equal(leafBytes + (long)Large * sizeof(double), gpuEngine.TypedResidentBytes);
+            Assert.True(gpuEngine.TypedPooledBytes > 0, "No dead result's buffer was pooled.");
             Assert.Equal(readbacksBefore, GpuLaunchProbe.Readbacks);
             Assert.Equal(x[3] + y[3], kept[3]);
         }
         finally
         {
-            DirectGpuTensorEngine.Float64ResidentBudgetOverride = savedBudget;
+            DirectGpuTensorEngine.TypedResidentBudgetOverride = savedBudget;
             gpu.UnregisterPersistentTensor(x);
             gpu.UnregisterPersistentTensor(y);
         }
@@ -471,34 +482,34 @@ public class GpuFloat64ResidencyTests
         Skip.If(device is null, "No device with double-precision kernels on this host.");
         var gpuEngine = device.Value.Engine;
         var gpu = (IEngine)gpuEngine;
-        long? savedBudget = DirectGpuTensorEngine.Float64ResidentBudgetOverride;
-        gpuEngine.ClearFloat64Residents();
+        long? savedBudget = DirectGpuTensorEngine.TypedResidentBudgetOverride;
+        gpuEngine.ClearTypedResidents();
         var (x, y) = PersistentLeaves(gpu, Large, 10);
         try
         {
             // Room for the two leaves and two results; the third result pushes the oldest result out.
-            DirectGpuTensorEngine.Float64ResidentBudgetOverride = 4L * Large * sizeof(double) + 1024;
+            DirectGpuTensorEngine.TypedResidentBudgetOverride = 4L * Large * sizeof(double) + 1024;
             var first = gpu.TensorAdd(x, y);
             var second = gpu.TensorMultiply(x, y);
             var third = gpu.TensorSubtract(x, y);
-            Assert.False(gpuEngine.IsFloat64Resident(first));
-            Assert.True(gpuEngine.IsFloat64Resident(second));
-            Assert.True(gpuEngine.IsFloat64Resident(third));
-            Assert.True(gpuEngine.Float64ResidentBytes <= 4L * Large * sizeof(double) + 1024);
+            Assert.False(gpuEngine.IsTypedResident(first));
+            Assert.True(gpuEngine.IsTypedResident(second));
+            Assert.True(gpuEngine.IsTypedResident(third));
+            Assert.True(gpuEngine.TypedResidentBytes <= 4L * Large * sizeof(double) + 1024);
             Assert.Equal(x[5] + y[5], first[5]);
             Assert.Equal(x[Large - 1] + y[Large - 1], first[Large - 1]);
 
-            gpuEngine.ClearFloat64Residents();
-            Assert.Equal(0L, gpuEngine.Float64ResidentBytes);
+            gpuEngine.ClearTypedResidents();
+            Assert.Equal(0L, gpuEngine.TypedResidentBytes);
             Assert.Equal(x[5] * y[5], second[5]);
             Assert.Equal(x[Large - 1] - y[Large - 1], third[Large - 1]);
         }
         finally
         {
-            DirectGpuTensorEngine.Float64ResidentBudgetOverride = savedBudget;
+            DirectGpuTensorEngine.TypedResidentBudgetOverride = savedBudget;
             gpu.UnregisterPersistentTensor(x);
             gpu.UnregisterPersistentTensor(y);
-            gpuEngine.ClearFloat64Residents();
+            gpuEngine.ClearTypedResidents();
         }
     }
 
@@ -516,16 +527,16 @@ public class GpuFloat64ResidencyTests
         try
         {
             var sum = gpu.TensorAdd(x, x);
-            Assert.True(gpuEngine.IsFloat64Resident(sum));
+            Assert.True(gpuEngine.IsTypedResident(sum));
             var squared = gpu.TensorMultiply(sum, sum);
-            Assert.True(gpuEngine.IsFloat64Resident(squared));
+            Assert.True(gpuEngine.IsTypedResident(squared));
             Assert.Equal(new[] { rows, columns }, squared.Shape.ToArray());
             Assert.Equal((x[3, 4] + x[3, 4]) * (x[3, 4] + x[3, 4]), squared[3, 4]);
 
             // A reshape shares the resident result's vector and layout: still resident.
             var flat = sum.Reshape(new[] { rows * columns });
             var flatDoubled = gpu.TensorAdd(flat, flat);
-            Assert.True(gpuEngine.IsFloat64Resident(flatDoubled));
+            Assert.True(gpuEngine.IsTypedResident(flatDoubled));
             Assert.Equal(4.0 * x[7, 9], flatDoubled[7 * columns + 9]);
 
             // A permuted view shares the vector but not the layout: it must not be read as the resident buffer.
@@ -646,7 +657,7 @@ public class GpuFloat64ResidencyTests
             var b = new Tensor<double>(right, new[] { k, n });
             long readbacksBefore = GpuLaunchProbe.Readbacks;
             var product = gpu.TensorMatMul(a, b);
-            Assert.True(gpuEngine.IsFloat64Resident(product), "The product is not resident on the device.");
+            Assert.True(gpuEngine.IsTypedResident(product), "The product is not resident on the device.");
             Assert.Equal(readbacksBefore, GpuLaunchProbe.Readbacks);
             Assert.Equal(new[] { m, n }, product.Shape.ToArray());
             AssertProductClose(left, right, m, n, k, product.AsSpan());
@@ -655,7 +666,7 @@ public class GpuFloat64ResidencyTests
             var batchedLeft = Values(2 * 3 * k, 62);
             var batched = new Tensor<double>(batchedLeft, new[] { 2, 3, k });
             var batchedProduct = gpu.TensorMatMul(batched, b);
-            Assert.True(gpuEngine.IsFloat64Resident(batchedProduct));
+            Assert.True(gpuEngine.IsTypedResident(batchedProduct));
             Assert.Equal(new[] { 2, 3, n }, batchedProduct.Shape.ToArray());
             AssertProductClose(batchedLeft, right, 6, n, k, batchedProduct.AsSpan());
 
@@ -683,7 +694,7 @@ public class GpuFloat64ResidencyTests
             long measured = gpuEngine.Float64MatMulMeasurements;
             // Below the floor: the CPU engine, no measurement.
             var small = new Tensor<double>(Values(16 * 16, 70), new[] { 16, 16 });
-            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorMatMul(small, small)));
+            Assert.False(gpuEngine.IsTypedResident(gpu.TensorMatMul(small, small)));
             Assert.Equal(measured, gpuEngine.Float64MatMulMeasurements);
 
             // Above it the first call of the size class measures both routes and every later call uses the winner:
@@ -700,12 +711,12 @@ public class GpuFloat64ResidencyTests
             Assert.Equal(measured + 1, gpuEngine.Float64MatMulMeasurements);
             var second = gpu.TensorMatMul(a, b);
             Assert.Equal(measured + 1, gpuEngine.Float64MatMulMeasurements);
-            Assert.Equal(gpuEngine.IsFloat64Resident(first), gpuEngine.IsFloat64Resident(second));
+            Assert.Equal(gpuEngine.IsTypedResident(first), gpuEngine.IsTypedResident(second));
             AssertProductClose(left, right, size, size, size, first.AsSpan());
             AssertProductClose(left, right, size, size, size, second.AsSpan());
 
             DirectGpuTensorEngine.Float64MatMulForceDevice = false;
-            Assert.False(gpuEngine.IsFloat64Resident(gpu.TensorMatMul(a, b)));
+            Assert.False(gpuEngine.IsTypedResident(gpu.TensorMatMul(a, b)));
         }
         finally
         {
@@ -737,7 +748,7 @@ public class GpuFloat64ResidencyTests
                 // The device route under a tape is what this test is about: a CPU fallback would produce the same
                 // gradient and prove nothing.
                 if (ReferenceEquals(engine, gpu))
-                    Assert.True(gpuEngine.IsFloat64Resident(product), "The product under the tape is not on the device.");
+                    Assert.True(gpuEngine.IsTypedResident(product), "The product under the tape is not on the device.");
                 var loss = engine.ReduceSum(product, null);
                 return tape.ComputeGradients(loss, new[] { a })[a];
             }
@@ -916,7 +927,7 @@ public class GpuFloat64ResidencyTests
             var exponential = gpu.TensorExp(exact);
             var logarithm = gpu.TensorLog(shifted);
             foreach (var result in new[] { negated, magnitude, root, shifted, scaled, divided, exact, rectified, squashed, logistic, exponential, logarithm })
-                Assert.True(gpuEngine.IsFloat64Resident(result), "A result is not resident on the device.");
+                Assert.True(gpuEngine.IsTypedResident(result), "A result is not resident on the device.");
             Assert.Equal(before, GpuLaunchProbe.Readbacks);
 
             var xs = x.AsSpan();
@@ -954,8 +965,8 @@ public class GpuFloat64ResidencyTests
         var host = new Tensor<double>(values, new[] { Large });
         var negated = gpu.TensorNegate(host);
         var scaled = gpu.TensorMultiplyScalar(host, 0.1);
-        Assert.False(gpuEngine.IsFloat64Resident(negated));
-        Assert.False(gpuEngine.IsFloat64Resident(scaled));
+        Assert.False(gpuEngine.IsTypedResident(negated));
+        Assert.False(gpuEngine.IsTypedResident(scaled));
         for (int i = 0; i < Large; i += 997)
         {
             Assert.Equal(-values[i], negated.AsSpan()[i]);
@@ -982,7 +993,7 @@ public class GpuFloat64ResidencyTests
                 var squashed = engine.TensorTanh(shifted);
                 var divided = engine.TensorDivideScalar(squashed, 4.0);
                 var negated = engine.TensorNegate(divided);
-                resident = gpuEngine.IsFloat64Resident(negated);
+                resident = gpuEngine.IsTypedResident(negated);
                 var loss = engine.ReduceSum(negated, null);
                 return tape.ComputeGradients(loss, new[] { x })[x];
             }

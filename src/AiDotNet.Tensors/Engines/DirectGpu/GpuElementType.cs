@@ -196,8 +196,8 @@ internal static class GpuCopyLayout
 
     /// <summary>
     /// <see cref="ElementBytes"/>, after checking that <paramref name="count"/> elements from each offset lie inside
-    /// both buffers. For the backends whose copy is a raw device memcpy, which would otherwise read or write past an
-    /// allocation.
+    /// both buffers: inside the elements a typed buffer declares, and inside the allocation of any buffer. A copy is a
+    /// raw device memcpy or an unchecked kernel, which would otherwise read or write past either.
     /// </summary>
     public static int CheckedElementBytes(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset,
         int count, string operation)
@@ -208,6 +208,13 @@ internal static class GpuCopyLayout
             throw new ArgumentOutOfRangeException(nameof(sourceOffset), sourceOffset, $"{operation}: the source offset must be non-negative.");
         if (destinationOffset < 0)
             throw new ArgumentOutOfRangeException(nameof(destinationOffset), destinationOffset, $"{operation}: the destination offset must be non-negative.");
+        // A typed buffer may sit in a larger allocation (a pooled or rounded one): its declared elements are the range.
+        if (source.ElementType != GpuElementType.Unspecified && (long)sourceOffset + count > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements from offset {sourceOffset} run past the source's {source.Size} elements.");
+        if (destination.ElementType != GpuElementType.Unspecified && (long)destinationOffset + count > destination.Size)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements from offset {destinationOffset} run past the destination's {destination.Size} elements.");
         if (((long)sourceOffset + count) * width > source.SizeInBytes)
             throw new ArgumentOutOfRangeException(nameof(count), count,
                 $"{operation}: {count} elements of {width} bytes from offset {sourceOffset} run past the source's {source.SizeInBytes} bytes.");

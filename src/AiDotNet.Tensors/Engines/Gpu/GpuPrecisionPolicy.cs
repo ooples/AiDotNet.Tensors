@@ -430,8 +430,10 @@ public static class GpuPrecisionPlanner
 
         if (policy.AccuracyMode == GpuAccuracyMode.PreserveInputType)
         {
-            var exact = FindPreserving(capabilities, sourceType);
-            if (exact is not null && IsEmulatedFloat64(exact) && !policy.AllowEmulatedFloat64)
+            // Rows the policy does not allow (emulated doubles without the opt-in) are passed over, so a native row
+            // listed after an emulated one is still chosen; the CPU takes it only when every matching row is disallowed.
+            var exact = FindPreserving(capabilities, sourceType, policy.AllowEmulatedFloat64);
+            if (exact is null && FindPreserving(capabilities, sourceType, allowEmulatedFloat64: true) is not null)
                 return CpuPlan(backend, operationName, typeof(T), requested,
                     $"{backend.BackendName} computes {sourceType} {operation} by integer emulation, slower than the CPU; "
                     + $"a policy with {nameof(GpuExecutionPolicy.AllowEmulatedFloat64)} keeps it on the device.", operation);
@@ -445,9 +447,7 @@ public static class GpuPrecisionPlanner
         var desired = requested == GpuComputePreference.Auto
             ? AutomaticTypeFor(sourceType)
             : ScalarTypeFor(requested);
-        var selected = Find(capabilities, desired);
-        if (selected is not null && IsEmulatedFloat64(selected) && !policy.AllowEmulatedFloat64)
-            selected = null;
+        var selected = Find(capabilities, desired, policy.AllowEmulatedFloat64);
         if (selected is not null)
         {
             string? conversionReason = requested == GpuComputePreference.Auto && sourceType != desired
@@ -498,6 +498,15 @@ public static class GpuPrecisionPlanner
     /// </summary>
     internal static bool Float64DeviceRouteAllowed(IDirectGpuBackend backend)
         => !EmulatesFloat64(backend) || GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AllowEmulatedFloat64;
+
+    /// <summary>
+    /// Whether <paramref name="operation"/> on doubles may go to <paramref name="backend"/>'s device kernels under
+    /// the policy in effect, read from the rows the backend advertises for that operation (the ones
+    /// <see cref="CreatePlan{T}"/> chooses from): a native double row always, an emulated one only on request.
+    /// </summary>
+    internal static bool Float64DeviceRouteAllowed(IDirectGpuBackend backend, GpuPrecisionOperation operation)
+        => Find(GetCapabilities(backend, operation), GpuScalarType.Float64,
+            GpuExecutionPolicyScope.EffectivePolicyFor(typeof(double)).AllowEmulatedFloat64) is not null;
 
     internal static IReadOnlyList<GpuPrecisionCapability> GetCapabilities(
         IDirectGpuBackend backend,
@@ -566,11 +575,12 @@ public static class GpuPrecisionPlanner
 
     private static GpuPrecisionCapability? Find(
         IReadOnlyList<GpuPrecisionCapability> capabilities,
-        GpuScalarType computeFormat)
+        GpuScalarType computeFormat,
+        bool allowEmulatedFloat64 = true)
     {
         for (int i = 0; i < capabilities.Count; i++)
         {
-            if (capabilities[i].ComputeFormat == computeFormat)
+            if (capabilities[i].ComputeFormat == computeFormat && (allowEmulatedFloat64 || !IsEmulatedFloat64(capabilities[i])))
                 return capabilities[i];
         }
         return null;
@@ -578,11 +588,13 @@ public static class GpuPrecisionPlanner
 
     private static GpuPrecisionCapability? FindPreserving(
         IReadOnlyList<GpuPrecisionCapability> capabilities,
-        GpuScalarType sourceType)
+        GpuScalarType sourceType,
+        bool allowEmulatedFloat64)
     {
         for (int i = 0; i < capabilities.Count; i++)
         {
             var capability = capabilities[i];
+            if (!allowEmulatedFloat64 && IsEmulatedFloat64(capability)) continue;
             if (capability.ComputeFormat == sourceType
                 && capability.InputStorage == sourceType
                 && DoesNotNarrow(sourceType, capability.MultiplyType)

@@ -32,6 +32,7 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     private WebGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {
         EnsureInitialized();
+        RequireSynchronousRoute();
         if (buffer is null) throw new ArgumentNullException(name);
         if (buffer.ElementType != GpuElementType.Float64 || buffer is not WebGpuBuffer typed)
             throw new ArgumentException($"Expected a {GpuElementType.Float64} buffer of this backend, got {buffer.ElementType}.", name);
@@ -45,8 +46,11 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     // A uniform reaches the device as floats, and a float does not carry every bit pattern through every host (a NaN
     // pattern has no JSON form). A double therefore travels as four 16-bit pieces, each a small integer.
     private static float[] Uniforms(int n, int p0 = 0, int p1 = 0, double scalar = 0.0)
+        => UniformBits(n, p0, p1, BitConverter.DoubleToInt64Bits(scalar));
+
+    // The same block with the 64 scalar bits given directly (an integer scalar occupies the low pieces).
+    private static float[] UniformBits(int n, int p0, int p1, long bits)
     {
-        long bits = BitConverter.DoubleToInt64Bits(scalar);
         return new[]
         {
             Word(n), Word(p0), Word(p1), 0f,
@@ -168,27 +172,26 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
             Uniforms(elements, n, k), elements).GetAwaiter().GetResult();
     }
 
-    // A device copy of doubles moves their words as integers: a float load and store need not keep every bit pattern.
-    // A copy within one buffer would bind it read-only and writable at once, which WebGPU rejects even for disjoint
-    // ranges: it goes through a scratch buffer.
-    private void CopyFloat64(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
+    // A device copy moves 4-byte words as integers. A copy within one buffer would bind it read-only and writable at
+    // once, which WebGPU rejects even for disjoint ranges: it goes through a scratch buffer.
+    private void CopyWordRange(IGpuBuffer source, int sourceWord, IGpuBuffer destination, int destinationWord, int words)
     {
         if (ReferenceEquals(source, destination)
             || (source is WebGpuBuffer from && destination is WebGpuBuffer to && from.BufferId == to.BufferId))
         {
-            using var scratch = AllocateBuffer(length, GpuElementType.Float64);
-            CopyFloat64Words(source, sourceOffset, scratch, 0, length);
-            CopyFloat64Words(scratch, 0, destination, destinationOffset, length);
+            using var scratch = AllocateBufferCore(words, zeroInitialize: false);
+            CopyWords(source, sourceWord, scratch, 0, words);
+            CopyWords(scratch, 0, destination, destinationWord, words);
             return;
         }
 
-        CopyFloat64Words(source, sourceOffset, destination, destinationOffset, length);
+        CopyWords(source, sourceWord, destination, destinationWord, words);
     }
 
-    private void CopyFloat64Words(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
+    private void CopyWords(IGpuBuffer source, int sourceWord, IGpuBuffer destination, int destinationWord, int words)
     {
-        Dispatch2BufferAsync("F64Copy", WebGpuFloat64Kernels.CopyWords, "main", source, destination,
-            Uniforms(2 * length, 2 * sourceOffset, 2 * destinationOffset), 2 * length).GetAwaiter().GetResult();
+        Dispatch2BufferAsync("WordCopy", WebGpuFloat64Kernels.CopyWords, "main", source, destination,
+            Uniforms(words, sourceWord, destinationWord), words).GetAwaiter().GetResult();
     }
 }
 

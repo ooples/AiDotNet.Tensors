@@ -17,10 +17,10 @@ public sealed class HipHalfPrecisionCapabilityContractTests
     public void MatMulBackwardFp16Fused_DirectForwardFallbackWithoutHipBlas_IsRejectedBeforeDispatch()
     {
         var backend = CreateDirectFallbackOnlyBackend();
-        IGpuHalfPrecisionBackend halfPrecision = backend;
+        IGpuHalfFusedKernels halfPrecision = backend;
         using var buffer = new MockGpuBuffer(new float[1]);
 
-        Assert.True(halfPrecision.SupportsHgemm);
+        Assert.True(halfPrecision.HasHgemm());
         Assert.False(halfPrecision.SupportsFp16FusedBackward);
 
         var exception = Assert.Throws<NotSupportedException>(() =>

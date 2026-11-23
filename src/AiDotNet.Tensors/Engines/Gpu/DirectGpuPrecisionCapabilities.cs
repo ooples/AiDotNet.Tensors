@@ -3,7 +3,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA
 {
     /// <summary>Precision capabilities exposed by the CUDA backend.</summary>
-    public sealed partial class CudaBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class CudaBackend : IGpuPrecisionBackend
     {
         /// <inheritdoc/>
         public IReadOnlyList<GpuPrecisionCapability> GetPrecisionCapabilities(GpuPrecisionOperation operation)
@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -67,7 +68,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
 {
     /// <summary>Precision capabilities exposed by the HIP backend.</summary>
-    public sealed partial class HipBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class HipBackend : IGpuPrecisionBackend
     {
         /// <inheritdoc/>
         public IReadOnlyList<GpuPrecisionCapability> GetPrecisionCapabilities(GpuPrecisionOperation operation)
@@ -89,6 +90,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -122,7 +124,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 {
     /// <summary>Precision capabilities exposed by the Metal backend.</summary>
-    public sealed partial class MetalBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class MetalBackend : IGpuPrecisionBackend
     {
         /// <inheritdoc/>
         public IReadOnlyList<GpuPrecisionCapability> GetPrecisionCapabilities(GpuPrecisionOperation operation)
@@ -142,6 +144,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -162,7 +165,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     /// <summary>Precision capabilities exposed by the OpenCL backend.</summary>
-    public sealed partial class OpenClBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class OpenClBackend : IGpuPrecisionBackend
     {
         /// <inheritdoc/>
         public IReadOnlyList<GpuPrecisionCapability> GetPrecisionCapabilities(GpuPrecisionOperation operation)
@@ -181,6 +184,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -201,7 +205,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
 {
     /// <summary>Precision capabilities exposed by the Vulkan backend.</summary>
-    public sealed partial class VulkanBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class VulkanBackend : IGpuPrecisionBackend
     {
         /// <inheritdoc/>
         public IReadOnlyList<GpuPrecisionCapability> GetPrecisionCapabilities(GpuPrecisionOperation operation)
@@ -220,6 +224,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 
@@ -241,7 +246,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
 {
     /// <summary>Precision capabilities exposed by the WebGPU backend.</summary>
 #if NET7_0_OR_GREATER
-    public sealed partial class WebGpuBackend : IGpuPrecisionBackend, IGpuFp16ElementwiseBackend
+    public sealed partial class WebGpuBackend : IGpuPrecisionBackend
 #else
     public sealed partial class WebGpuBackend : IGpuPrecisionBackend
 #endif
@@ -271,6 +276,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
             GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
                 or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
             GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            GpuPrecisionOperation.Reduction => SupportsFloat64Reductions,
             _ => false,
         };
 

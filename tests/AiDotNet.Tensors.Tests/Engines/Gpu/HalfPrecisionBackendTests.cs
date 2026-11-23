@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Gpu;
 using Xunit;
@@ -7,7 +8,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// <summary>
 /// Issue #337: validates the FP16 GEMM capability interface that
 /// AutocastScope / mixed-precision training paths dispatch through.
-/// CudaBackend implements IGpuHalfPrecisionBackend on Maxwell+ hardware.
+/// CudaBackend implements IGpuHalfFusedKernels on Maxwell+ hardware.
 /// </summary>
 // Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
 // cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
@@ -24,12 +25,12 @@ public class HalfPrecisionBackendTests
 
         // The interface is optional — backends that don't ship HGEMM
         // simply don't implement it. CudaBackend should.
-        var hp = backend as IGpuHalfPrecisionBackend;
+        var hp = backend as IGpuHalfFusedKernels;
         if (hp is null)
             return; // backend other than CUDA, no fp16 support
 
         // SupportsHgemm true iff compute capability >= 5.0
-        Assert.True(hp.SupportsHgemm,
+        Assert.True(hp.HasHgemm(),
             "CUDA backend should support HGEMM on any Maxwell+ device " +
             "(every NVIDIA card 2014+). If this fires, the device probe " +
             "is wrong or the host has a pre-Maxwell card.");
@@ -40,7 +41,7 @@ public class HalfPrecisionBackendTests
     {
         using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
-        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsHgemm)
+        if (backend is not IGpuHalfFusedKernels hp || !hp.HasHgemm())
             return;
 
         // Validate the no-null contract — caller errors surface as
@@ -54,7 +55,7 @@ public class HalfPrecisionBackendTests
     {
         using var engine = new DirectGpuTensorEngine();
         var backend = engine.GetBackend();
-        if (backend is not IGpuHalfPrecisionBackend hp || !hp.SupportsHgemm)
+        if (backend is not IGpuHalfFusedKernels hp || !hp.HasHgemm())
             return;
 
         // We need real buffers to reach the m/n/k check; if the backend
