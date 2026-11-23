@@ -38,8 +38,6 @@ internal static class CpuTopology
     private static extern bool GetProcessAffinityMask(IntPtr hProcess, out nuint processMask, out nuint systemMask);
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetProcessAffinityMask(IntPtr hProcess, nuint mask);
     [DllImport("kernel32.dll")]
     private static extern uint GetActiveProcessorCount(ushort groupNumber);
 
@@ -247,14 +245,122 @@ internal static class CpuTopology
     // The requested cores as (group, first logical processor), and -- when they all lie in the process's primary group,
     // the only group a process affinity mask can name -- the process confined to their logical processors (SMT siblings
     // included), so the threads that dispatch work stay there too, not only the pool's workers.
+    // On Linux the process is confined the same way and no worker is bound one by one: every thread then stays on the
+    // requested cores. A platform with neither (macOS has no affinity) is told once that only the thread count follows.
     private static (ushort Group, byte Number)[] ConfineToRequestedCores(int[] requested)
     {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            SetProcessAffinity(MapLinuxCores(requested, ReadLinuxPhysicalCores("/sys/devices/system/cpu")));
+            return Array.Empty<(ushort, byte)>();
+        }
+
         var all = DetectPhysicalCores();
-        if (all.Length == 0) return Array.Empty<(ushort, byte)>();   // no topology (not Windows): nothing to bind
+        if (all.Length == 0)
+        {
+            System.Diagnostics.Trace.TraceWarning(
+                $"{CoresEnvironmentVariable} is set, but this platform has no processor affinity: threads are not bound to "
+                + "the requested cores. Only the thread count follows the setting.");
+            return Array.Empty<(ushort, byte)>();
+        }
+
         var (cores, group, mask) = MapRequestedCores(requested, all);
-        if (group is { } only && GetThreadGroupAffinity(GetCurrentThread(), out var primary) && primary.Group == only)
-            SetProcessAffinityMask(GetCurrentProcess(), (nuint)mask);
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            && group is { } only && GetThreadGroupAffinity(GetCurrentThread(), out var primary) && primary.Group == only)
+            SetProcessAffinity(mask);
         return cores;
+    }
+
+    // Confines the process to the logical processors of `mask`, or throws naming the setting: a process left unconfined
+    // while its pool is sized for the requested cores is the collision the setting exists to prevent.
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    private static void SetProcessAffinity(ulong mask)
+    {
+        // The affinity mask is pointer-sized: a 32-bit process cannot name a logical processor above 31, and a
+        // truncated mask would confine it to other cores than the ones asked for.
+        if (IntPtr.Size == 4 && mask > uint.MaxValue)
+            throw new InvalidOperationException(
+                $"{CoresEnvironmentVariable} names logical processors above 31, which a 32-bit process cannot be confined to.");
+        IntPtr native = IntPtr.Size == 4 ? new IntPtr(unchecked((int)(uint)mask)) : new IntPtr(unchecked((long)mask));
+        try
+        {
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            process.ProcessorAffinity = native;
+        }
+        catch (Exception refused) when (refused is System.ComponentModel.Win32Exception or InvalidOperationException
+                                            or NotSupportedException or PlatformNotSupportedException)
+        {
+            throw new InvalidOperationException(
+                $"{CoresEnvironmentVariable}: the operating system refused to confine the process to the requested cores "
+                + $"(affinity mask 0x{mask:X}).", refused);
+        }
+    }
+
+    /// <summary>
+    /// The logical processors of each physical core under a Linux sysfs CPU directory
+    /// (<c>/sys/devices/system/cpu</c>), cores in order of their first logical processor: each
+    /// <c>cpuN/topology/thread_siblings_list</c> names the SMT siblings of one core. Empty when the directory has no
+    /// topology.
+    /// </summary>
+    internal static int[][] ReadLinuxPhysicalCores(string sysfsCpuDirectory)
+    {
+        var cores = new SortedDictionary<int, int[]>();
+        if (!System.IO.Directory.Exists(sysfsCpuDirectory)) return Array.Empty<int[]>();
+        foreach (string directory in System.IO.Directory.GetDirectories(sysfsCpuDirectory, "cpu*"))
+        {
+            string name = System.IO.Path.GetFileName(directory);
+            if (!int.TryParse(name.Substring(3), System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out _))
+                continue;   // cpufreq, cpuidle
+            string siblingsFile = System.IO.Path.Combine(directory, "topology", "thread_siblings_list");
+            if (!System.IO.File.Exists(siblingsFile)) continue;   // an offline processor has no topology
+            int[] siblings;
+            try
+            {
+                siblings = ParseCoreList(System.IO.File.ReadAllText(siblingsFile).Trim());
+            }
+            catch (Exception unreadable) when (unreadable is InvalidOperationException or System.IO.IOException or UnauthorizedAccessException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"CPU topology: {siblingsFile} could not be read ({unreadable.GetType().Name}).");
+                continue;
+            }
+
+            if (siblings.Length == 0) continue;
+            Array.Sort(siblings);
+            cores[siblings[0]] = siblings;
+        }
+
+        var ordered = new int[cores.Count][];
+        cores.Values.CopyTo(ordered, 0);
+        return ordered;
+    }
+
+    /// <summary>The affinity mask of the requested physical cores of <paramref name="cores"/> (as
+    /// <see cref="ReadLinuxPhysicalCores"/> lists them), SMT siblings included.</summary>
+    internal static ulong MapLinuxCores(int[] requested, int[][] cores)
+    {
+        if (cores.Length == 0)
+            throw new InvalidOperationException(
+                $"{CoresEnvironmentVariable} is set, but this machine's CPU topology could not be read from sysfs, so the "
+                + "requested cores cannot be found. Confine the process with taskset or numactl instead.");
+        ulong mask = 0;
+        foreach (int index in requested)
+        {
+            if (index >= cores.Length)
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable} names core {index}, but this machine has {cores.Length} physical cores (0-{cores.Length - 1}).");
+            foreach (int processor in cores[index])
+            {
+                if (processor >= IntPtr.Size * 8)
+                    throw new InvalidOperationException(
+                        $"{CoresEnvironmentVariable} names core {index}, whose logical processor {processor} is beyond the "
+                        + $"{IntPtr.Size * 8} a process affinity mask can name. Confine the process with taskset or numactl instead.");
+                mask |= 1UL << processor;
+            }
+        }
+
+        return mask;
     }
 
     /// <summary>The requested cores of <paramref name="all"/> as (group, first logical processor); their single group
@@ -264,12 +370,11 @@ internal static class CpuTopology
         var list = new List<(ushort, byte)>(requested.Length);
         ulong mask = 0;
         ushort? group = requested.Length > 0 && requested[0] < all.Length ? all[requested[0]].Group : null;
-        foreach (int index in requested)
+        foreach (int index in requested.Where(index => index >= all.Length))
+            throw new InvalidOperationException(
+                $"{CoresEnvironmentVariable} names core {index}, but this machine has {all.Length} physical cores (0-{all.Length - 1}).");
+        foreach (var core in requested.Select(index => all[index]))
         {
-            if (index >= all.Length)
-                throw new InvalidOperationException(
-                    $"{CoresEnvironmentVariable} names core {index}, but this machine has {all.Length} physical cores (0-{all.Length - 1}).");
-            var core = all[index];
             list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
             if (core.Group != group) group = null;
             else mask |= core.Mask;
