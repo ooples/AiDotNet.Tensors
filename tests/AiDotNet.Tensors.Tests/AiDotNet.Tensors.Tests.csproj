@@ -40,7 +40,7 @@
     <!-- Optional oneDNN native accelerator (dnnl.dll) — present here so tests can
          validate the OneDnnProvider native-dispatch path. The core library does NOT
          reference this; consuming apps opt in via AiDotNet.Native.OneDNN. (#1478) -->
-    <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.151.0" />
+    <PackageReference Include="AiDotNet.Native.OneDNN" Version="0.152.1" />
   </ItemGroup>
 
   <ItemGroup>
