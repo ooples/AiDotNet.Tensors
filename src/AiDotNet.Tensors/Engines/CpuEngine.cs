@@ -2144,12 +2144,25 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Tier 3: general broadcast (genuine size-1 → size-N expansion at
-        // some axis). Fall through to the existing broadcast kernel via a
-        // zero-add. Equivalent cost to the old idiom; callers used to
-        // allocate the zero tensor themselves which made Tier 1 / Tier 2
-        // fast paths unreachable. Now the primitive handles Tier 1/2
-        // correctly and only burns the full kernel when genuinely needed.
-        return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+        // some axis): a tile of the size-1 axes, after a reshape that left-pads
+        // the rank. This was a zero-add against a zero tensor of the whole
+        // target shape, which a compiled plan holds as a constant input and
+        // re-uploads every replay ([8,256,4,64] per call, 24 calls in a
+        // 16-layer Gated DeltaNet LM: 48 MiB on the device, 96 MiB of upload
+        // staging and 48 MiB copied from the host each step), and whose
+        // two-sided device broadcast expanded both operands into full-size
+        // temporaries. The tile's backward sums the copies, as the add's did.
+        var multiples = new int[targetShape.Length];
+        var padded = new int[targetShape.Length];
+        for (int i = 0; i < targetShape.Length; i++)
+        {
+            int inputAxis = i - rankDiff;
+            int srcDim = inputAxis < 0 ? 1 : input._shape[inputAxis];
+            padded[i] = srcDim;
+            multiples[i] = srcDim == targetShape[i] ? 1 : targetShape[i];
+        }
+        var aligned = rankDiff == 0 ? input : Reshape(input, padded);
+        return TensorTile(aligned, multiples);
     }
 
     [MethodImpl(Hot)]

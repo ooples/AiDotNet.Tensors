@@ -5008,6 +5008,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    /// <summary>Elements of the caller-fed inputs a graph replay refreshes from the host (tests).</summary>
+    internal long GraphExternalLeafElementsForTest
+    {
+        get
+        {
+            long total = 0;
+            foreach (var leaf in GraphExternalLeaves()) total += leaf.Length;
+            return total;
+        }
+    }
+
     private Tensor<T>[] GraphExternalLeaves()
     {
         if (_graphExternalLeaves is { } cached) return cached;
