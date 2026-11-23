@@ -41,8 +41,12 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// cross-plan workspace broker does not serve -- one that keeps stable pointers, captured or capturable -- whose
     /// step-persistent buffers <see cref="TryProtectStepPersistentBuffers"/> can see.
     /// </summary>
+    /// <remarks>An eager plan whose graph step was disabled explicitly is the broker's, even when autocast keeps the
+    /// broker from serving it this run: co-owning would bind its tensors to memory another plan writes, which the broker
+    /// prevents by detaching them (DetachCompiledWorkspaceTensor).</remarks>
     private bool CanCoOwnStepScratch(DirectGpuTensorEngine engine) => SharedStepScratch.Enabled
         && typeof(T) == typeof(float) && !_workspaceSharingBodyAllowed
+        && !(_workspaceExplicitGraphDisable && _graphStepDisabled)
         && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
         && !engine.InferenceCaptureActive && Gpu.DeferredScope.Current?.IsRecording != true;

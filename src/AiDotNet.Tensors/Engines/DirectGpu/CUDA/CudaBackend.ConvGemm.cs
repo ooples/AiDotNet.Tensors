@@ -99,6 +99,8 @@ public sealed partial class CudaBackend
         Release(ref _channelsLastScratchC);
         Release(ref _channelsLastScratchD);
         Release(ref _convColScratch);
+        Release(ref _convOnes);
+        _convOnesLength = 0;
         Release(ref _convTransposeXt);
         Release(ref _convTransposeCol);
         Release(ref _convDgradPartials);
@@ -376,11 +378,15 @@ public sealed partial class CudaBackend
         if (_convOnes is null || _convOnesLength < batch)
         {
             if (IsStreamCapturing()) return false;
-            if (_convOnes is not null) NoteTunedWorkspaceReleased();
-            _convOnes?.Dispose();
-            _convOnes = AllocateBuffer(batch);
-            Fill(_convOnes, 1f, batch);
-            _convOnesLength = batch;
+            // As TryConvScratch: a captured step graph or a held timing graph may name the old ones vector, so it is
+            // retired rather than freed, under the timing lock.
+            lock (_tuneEventLock)
+            {
+                if (_convOnes is not null) NoteTunedWorkspaceReleased();
+                ReplaceScratch(ref _convOnes, batch);
+                Fill(_convOnes!, 1f, batch);
+                _convOnesLength = batch;
+            }
         }
 
         LaunchIm2Col(input, col, batch, inChannels, inHeight, inWidth, kernelH, kernelW,
@@ -397,7 +403,7 @@ public sealed partial class CudaBackend
         int n2 = outChannels * P;
         BlasSgemm(
             CublasOperation.None, CublasOperation.None, n2, 1, batch,
-            ref one, partials.Handle, n2, _convOnes.Handle, batch,
+            ref one, partials.Handle, n2, _convOnes!.Handle, batch,
             ref zero, gradKernel.Handle, n2, "cublasSgemm(conv dW batch sum)");
         return true;
     }

@@ -48,6 +48,7 @@ public class SharedStepScratchTrainingTests : IDisposable
         public float[][] Weights = Array.Empty<float[]>();
         public int Takes;
         public int Revocations;
+        public long SixteenBitConvolutions;
     }
 
     private static Run Train(DirectGpuTensorEngine engine, bool share, PrecisionMode? autocast = null)
@@ -93,6 +94,8 @@ public class SharedStepScratchTrainingTests : IDisposable
 
         var shared = engine.SharedStepScratch;
         int takes0 = shared.Takes, revocations0 = shared.Revocations;
+        var convs0 = engine.AutocastConvDispatchCounts;
+        long channelsLast0 = DirectGpuTensorEngine.AutocastChannelsLastLayoutPasses;   // the channels-last 16-bit route
         using (planA)
         using (planB)
         {
@@ -114,6 +117,10 @@ public class SharedStepScratchTrainingTests : IDisposable
             run.Weights = pa.Concat(pb).Select(p => p.ToArray()).ToArray();
             run.Takes = shared.Takes - takes0;
             run.Revocations = shared.Revocations - revocations0;
+            var convs = engine.AutocastConvDispatchCounts;
+            run.SixteenBitConvolutions = convs.Forward + convs.BackwardData + convs.BackwardFilter
+                - (convs0.Forward + convs0.BackwardData + convs0.BackwardFilter)
+                + (DirectGpuTensorEngine.AutocastChannelsLastLayoutPasses - channelsLast0);
             return run;
         }
     }
@@ -144,7 +151,10 @@ public class SharedStepScratchTrainingTests : IDisposable
             Train(gpu, share: false, autocast);   // tunes the kernels both runs below then pick alike
             var isolated = Train(gpu, share: false, autocast);
             var shared = Train(gpu, share: true, autocast);
-            _output.WriteLine($"takes={shared.Takes} revocations={shared.Revocations}");
+            _output.WriteLine($"takes={shared.Takes} revocations={shared.Revocations} sixteenBitConvolutions={shared.SixteenBitConvolutions}");
+            // A mixed-precision case must actually run its convolutions in 16 bits, or it is the FP32 case again.
+            if (autocast is null) Assert.Equal(0, shared.SixteenBitConvolutions);
+            else Assert.True(shared.SixteenBitConvolutions > 0, $"no convolution ran in {autocast} under the autocast scope");
             Assert.Equal(0, isolated.Takes);
             Assert.True(shared.Takes > 0, "the second plan took none of the first plan's step scratch");
             for (int s = 0; s < Steps; s++)
