@@ -65,8 +65,16 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         }
     }
 
-    /// <inheritdoc/>
+    /// <summary>Whether the device is initialized. The asynchronous members need only this.</summary>
     public bool IsAvailable => _initialized && !_disposed;
+
+    // IDirectGpuBackend is the synchronous surface: each of its members waits for the device's submission before it
+    // returns. Where that wait cannot finish (a browser's single thread, see
+    // WebGpuNativeBindings.CompletesSynchronously) the interface reports the backend unavailable, so an engine given
+    // this backend keeps its work on the CPU instead of blocking the page. The asynchronous members stay usable.
+    bool IDirectGpuBackend.IsAvailable => SynchronousRouteAvailable;
+
+    private bool SynchronousRouteAvailable => IsAvailable && WebGpuNativeBindings.CompletesSynchronously;
 
     /// <inheritdoc/>
     public string BackendName => "WebGPU";

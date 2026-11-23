@@ -21,13 +21,13 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation) => SupportsFloat64Elementwise;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Reductions => IsAvailable;
+    public bool SupportsFloat64Reductions => SynchronousRouteAvailable;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Elementwise => IsAvailable;
+    public bool SupportsFloat64Elementwise => SynchronousRouteAvailable;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64MatrixMultiply => IsAvailable;
+    public bool SupportsFloat64MatrixMultiply => SynchronousRouteAvailable;
 
     private WebGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {
