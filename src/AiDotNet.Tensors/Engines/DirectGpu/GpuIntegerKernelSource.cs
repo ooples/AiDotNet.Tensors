@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
@@ -98,15 +99,13 @@ internal static class GpuIntegerKernelSource
         var names = new List<string>();
         foreach (var type in Types)
         {
-            foreach (var operation in BinaryOperations)
+            foreach (var operation in BinaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)))
             {
-                if (!GpuIntegerLayout.Defined(operation, type)) continue;
                 names.Add(Binary(operation, type));
                 names.Add(Scalar(operation, type));
             }
 
-            foreach (var operation in UnaryOperations)
-                if (GpuIntegerLayout.Defined(operation, type)) names.Add(Unary(operation, type));
+            names.AddRange(UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)).Select(operation => Unary(operation, type)));
             if (type != GpuElementType.Bool) names.Add(Sum(type));
         }
 
@@ -160,9 +159,8 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
             };
             // The unsigned type the wrapping operations are computed in.
             string w = type == GpuElementType.Int64 ? "u64t" : "u32t";
-            foreach (var operation in BinaryOperations)
+            foreach (var operation in BinaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)))
             {
-                if (!GpuIntegerLayout.Defined(operation, type)) continue;
                 string expression = Expression(operation, logical).Replace("(W)", "(" + w + ")");
                 source.Append("IK_KERNEL ").Append(Binary(operation, type))
                     .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR const ").Append(t).Append("* b, IK_PTR ").Append(t)
@@ -176,9 +174,8 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
                     .Append(expression).Append("); }\n}\n");
             }
 
-            foreach (var operation in UnaryOperations)
+            foreach (var operation in UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)))
             {
-                if (!GpuIntegerLayout.Defined(operation, type)) continue;
                 string expression = operation == GpuIntegerUnaryOperation.Negate ? "(" + w + ")0 - (" + w + ")x" : logical ? "x == 0" : "~x";
                 source.Append("IK_KERNEL ").Append(Unary(operation, type))
                     .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR ").Append(t)

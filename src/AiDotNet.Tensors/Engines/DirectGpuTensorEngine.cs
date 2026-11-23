@@ -941,7 +941,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             : backend.AllocateByteBuffer(checked(count * 2));
 
     private static IGpuBuffer AllocateHalfBuffer(IFp16ActivationBackend device, int count)
-        => device is IDirectGpuBackend backend ? AllocateHalfBuffer(backend, count) : device.AllocateByteBuffer(checked(count * 2));
+        => AllocateHalfBuffer((IDirectGpuBackend)device, count);
 
     /// <summary>True when <paramref name="t"/>'s resident buffer currently holds FP16 data (and FP16-act is on).</summary>
     internal bool IsFp16Resident<T>(Tensor<T> t)
