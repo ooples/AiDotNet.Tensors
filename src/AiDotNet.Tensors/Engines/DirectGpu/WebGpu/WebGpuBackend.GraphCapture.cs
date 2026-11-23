@@ -35,4 +35,20 @@ public sealed partial class WebGpuBackend : IGpuGraphCapture
     IGraphStepIo? IGpuGraphCapture.CreateStepIo(System.Collections.Generic.IReadOnlyList<IGpuBuffer> inputs,
         System.Collections.Generic.IReadOnlyList<int> lengths) => null;
 }
+// No device graphs on this backend, so no plan holds step memory across its steps: nothing idle is lent, and an owner's
+// reclaim has nothing to take back. Allocations between steps come from the backend's own allocator.
+public sealed partial class WebGpuBackend : IIdleDeviceMemoryLender
+{
+    void IIdleDeviceMemoryLender.LendIdle(object owner, System.Collections.Generic.IReadOnlyCollection<IGpuBuffer> buffers)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+        if (buffers is null) throw new System.ArgumentNullException(nameof(buffers));
+    }
+
+    void IIdleDeviceMemoryLender.ReclaimIdle(object owner)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+    }
+}
+
 #endif

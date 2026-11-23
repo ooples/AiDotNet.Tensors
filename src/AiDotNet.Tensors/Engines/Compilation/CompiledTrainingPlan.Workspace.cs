@@ -40,6 +40,24 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (!_workspaceSharingBodyAllowed || !CanShareTransientWorkspace(engine) || _scratchPool is not { } pool) return;
         pool.WithdrawLent();
         if (pool.HasOutstandingWorkspaceLeases) return;
+        if (!BuildWorkspaceProtection()) return;
+        pool.CollectTransferableForwardSlots(_forwardActions.Length, IsUnprotectedRoot, _workspaceCandidates);
+        if (_workspaceCandidates.Count == 0) return;
+        // Snapshot aliases before detaching one shared vector clears the binding visible through its siblings.
+        foreach (var tensor in _workspaceTensors)
+            if (!_workspaceProtectedStorage.Contains(tensor.StorageIdentity) && tensor._gpuBuffer is { } buffer
+                && _workspaceCandidates.Contains(GpuBufferViewRoot.Of(buffer))) _workspaceDetach.Add(tensor);
+        foreach (var tensor in _workspaceDetach) engine.DetachCompiledWorkspaceTensor(tensor);
+        TransferWorkspace(pool, backend, engine);
+    }
+
+    /// <summary>
+    /// Collects what outlives a step in this plan's buffers: parameters, gradients, the loss and its seed, inputs and
+    /// step inputs not produced by a forward step, retained outputs, in-place state, optimizer buffers and everything a
+    /// forward step saved that it did not produce. False when a saved state is opaque (it may hide native pointers).
+    /// </summary>
+    private bool BuildWorkspaceProtection()
+    {
         _workspaceProtectedRoots.Clear();
         _workspaceProtectedHandles.Clear();
         _workspaceProtectedStorage.Clear();
@@ -112,8 +130,11 @@ internal sealed partial class CompiledTrainingPlan<T>
                 if (!_workspaceProduced.Contains(input)) Protect(input);
             }
             if (step.SavedState is { } saved)
-                foreach (var item in saved) if (!InspectSaved(item)) return;
+                foreach (var item in saved) if (!InspectSaved(item)) return false;
         }
+        // Step-I/O inputs: a replay skips the copy into a buffer that still holds the same input.
+        if (_stepIoLeaves is { } ioLeaves) foreach (var leaf in ioLeaves) Protect(leaf);
+        if (_stepIoBuffers is { } ioBuffers) foreach (var buffer in ioBuffers) ProtectBuffer(buffer);
         // Owning tensor buffers are outside this loan contract even if a pool happens to name them.
         foreach (var tensor in _workspaceTensors)
             if (tensor._gpuBuffer is { } buffer && (tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(buffer)))
@@ -122,19 +143,18 @@ internal sealed partial class CompiledTrainingPlan<T>
         // Storage identity still makes that sibling's native root observable through the view.
         foreach (var tensor in _workspaceTensors)
             if (_workspaceProtectedStorage.Contains(tensor.StorageIdentity)) ProtectBuffer(tensor._gpuBuffer);
-        bool Eligible(IGpuBuffer buffer)
-        {
-            var root = GpuBufferViewRoot.Of(buffer);
-            return ReferenceEquals(root, buffer) && buffer.Handle != IntPtr.Zero
-                && !_workspaceProtectedRoots.Contains(root) && !_workspaceProtectedHandles.Contains(root.Handle);
-        }
-        pool.CollectTransferableForwardSlots(_forwardActions.Length, Eligible, _workspaceCandidates);
-        if (_workspaceCandidates.Count == 0) return;
-        // Snapshot aliases before detaching one shared vector clears the binding visible through its siblings.
-        foreach (var tensor in _workspaceTensors)
-            if (!_workspaceProtectedStorage.Contains(tensor.StorageIdentity) && tensor._gpuBuffer is { } buffer
-                && _workspaceCandidates.Contains(GpuBufferViewRoot.Of(buffer))) _workspaceDetach.Add(tensor);
-        foreach (var tensor in _workspaceDetach) engine.DetachCompiledWorkspaceTensor(tensor);
+        return true;
+    }
+
+    private bool IsUnprotectedRoot(IGpuBuffer buffer)
+    {
+        var root = GpuBufferViewRoot.Of(buffer);
+        return ReferenceEquals(root, buffer) && buffer.Handle != IntPtr.Zero
+            && !_workspaceProtectedRoots.Contains(root) && !_workspaceProtectedHandles.Contains(root.Handle);
+    }
+
+    private void TransferWorkspace(StepScratchPool pool, IDirectGpuBackend backend, DirectGpuTensorEngine engine)
+    {
         var broker = engine.CompiledWorkspaceBroker;
         SharedWorkspaceBytesLastStep = pool.TransferForwardSlots(_workspaceCandidates, backend, broker,
             out int transferred);
@@ -157,4 +177,53 @@ internal sealed partial class CompiledTrainingPlan<T>
             }
         }
     }
+
+    // Idle step memory lent to the backend between captured steps (IIdleDeviceMemoryLender).
+    private IIdleDeviceMemoryLender? _idleLender;
+    private IGpuBuffer[]? _idleBuffers;
+    private (IntPtr Exec, IntPtr Odd, int Assignment, int Count) _idleBuffersFor;
+
+    /// <summary>Bytes this plan lent after its last step (tests and diagnostics).</summary>
+    internal long IdleLentBytesLastStep { get; private set; }
+
+    /// <summary>
+    /// After a captured step: lends the step buffers nothing reads before the next replay writes them to the backend,
+    /// so validation and eager inference between steps allocate from them instead of growing the device footprint.
+    /// They come back (moving whatever still uses them) when the next step begins (<see cref="ReclaimIdleStepMemory"/>).
+    /// </summary>
+    private void LendIdleStepMemory()
+    {
+        IdleLentBytesLastStep = 0;
+        if (!LendIdleStepMemoryEnabled || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
+            || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
+            || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
+            return;
+        var key = (_stepGraphExec, _stepGraphExecOdd, pool.PinnedCount, pool.BufferCount);
+        if (_idleBuffers is null || _idleBuffersFor != key)
+        {
+            _idleBuffers = null;
+            if (!BuildWorkspaceProtection()) return;
+            _workspaceCandidates.Clear();
+            pool.CollectIdleBetweenRuns(_forwardActions.Length, IsUnprotectedRoot, _workspaceCandidates);
+            _idleBuffers = new IGpuBuffer[_workspaceCandidates.Count];
+            _workspaceCandidates.CopyTo(_idleBuffers);
+            _workspaceCandidates.Clear();
+            _idleBuffersFor = key;
+        }
+        if (_idleBuffers.Length == 0) return;
+        lender.LendIdle(this, _idleBuffers);
+        _idleLender = lender;
+        long bytes = 0;
+        foreach (var buffer in _idleBuffers) bytes += buffer.SizeInBytes;
+        IdleLentBytesLastStep = bytes;
+    }
+
+    /// <summary>Takes back the memory <see cref="LendIdleStepMemory"/> lent: before a step, an invalidation or disposal.</summary>
+    private void ReclaimIdleStepMemory()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is { } lender) lender.ReclaimIdle(this);
+    }
+
+    /// <summary>Process switch for tests that need the backend's own allocations between steps.</summary>
+    internal static bool LendIdleStepMemoryEnabled { get; set; } = true;
 }

@@ -110,6 +110,24 @@ internal sealed partial class StepScratchPool
         foreach (var buffer in Transient.Values) result.Remove(buffer);
     }
 
+    /// <summary>
+    /// The buffers idle between two runs of a captured step: forward output slots (as
+    /// <see cref="CollectTransferableForwardSlots"/>), the transient scratch and the free leased buffers. Every one is
+    /// written by the step before the step reads it, so between runs nothing reads it. A buffer held by a lease, a span
+    /// lease or a slot outside that set is left out.
+    /// </summary>
+    internal void CollectIdleBetweenRuns(int forwardActions, Func<IGpuBuffer, bool> eligible, HashSet<IGpuBuffer> result)
+    {
+        CollectTransferableForwardSlots(forwardActions, eligible, result);
+        foreach (var buffer in Transient.Values) if (eligible(buffer)) result.Add(buffer);
+        foreach (var buffer in _free) if (eligible(buffer)) result.Add(buffer);
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) >= forwardActions || _pinned.Contains(slot.Key)) result.Remove(slot.Value);
+        foreach (var (_, buffer) in _leases) result.Remove(buffer);
+        foreach (var buffer in _spanning.Keys) result.Remove(buffer);
+        foreach (var buffer in _lent.Keys) result.Remove(buffer);
+    }
+
     internal long TransferForwardSlots(HashSet<IGpuBuffer> buffers, IDirectGpuBackend backend,
         CompiledTransientWorkspaceBroker broker, out int transferred)
     {

@@ -598,6 +598,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
         // Land captured counters/parameter ages while the old moment storage is still owned.
+        ReclaimIdleStepMemory();
         InvalidateCapturedStepGraph();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
@@ -1750,6 +1751,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
         using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
+        ReclaimIdleStepMemory();   // the graph's buffers may change hands from here on
         // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
         // while the graphs that pin the second buffers still keep them alive.
         ReleasePingPong();
@@ -4581,6 +4583,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             _retainedOutputsAvailable = false;
 
+            // The step's memory is the step's again: whatever borrowed it between steps moves out first.
+            ReclaimIdleStepMemory();
             ClearPlanBufferReleaseMarks();
             UploadHostWrittenParameters();
             UploadHostWrittenInPlaceState();
@@ -4602,6 +4606,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
             }
 
+            LendIdleStepMemory();
             return loss;
         }
     }

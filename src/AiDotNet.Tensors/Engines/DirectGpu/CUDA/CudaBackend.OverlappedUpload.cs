@@ -55,7 +55,8 @@ public sealed partial class CudaBackend : IOverlappedUploadBackend
             if (slot.Pinned == IntPtr.Zero)
             {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAllocHost(out slot.Pinned, bytes), "cuMemAllocHost(upload)");
-                slot.Staging = AllocateBuffer(floats);
+                // Written on the upload stream while the compute stream may be replaying: never a loan of idle step memory.
+                using (NoIdleLoans()) slot.Staging = AllocateBuffer(floats);
                 CuBlasNative.CheckCudaResult(
                     CudaNativeBindings.cuEventCreate(out slot.Uploaded, CudaNativeBindings.CU_EVENT_DISABLE_TIMING), "cuEventCreate(uploaded)");
                 CuBlasNative.CheckCudaResult(

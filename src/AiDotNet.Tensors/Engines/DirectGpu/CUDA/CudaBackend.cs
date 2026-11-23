@@ -2443,6 +2443,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async(arena)");
             return slot;
         }
+        if (TryRentIdleLoan(size) is { } borrowed)
+        {
+            // Idle step memory a compiled plan lent between its steps, zeroed like any fresh allocation.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(borrowed.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(idle loan)");
+            return borrowed;
+        }
         var allocated = AllocateBufferFromPool(size);
         if (arena is not null && allocated is CudaGpuBuffer tracked) arena.Track(tracked);
         return allocated;
@@ -2517,7 +2525,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return AllocateBuffer(size);
         using var _ = PushContext();
         var arena = StepArenaForThisAllocation();
-        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size);
+        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size) ?? TryRentIdleLoan(size);
         if (buffer is null)
         {
             buffer = TryRentAsyncBuffer(size)
@@ -7003,7 +7011,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // buffer to the capture. It keeps cuBLAS's internal allocator, and its capture GEMMs take the
             // per-slice path, as with an older cuBLAS.
             if (IsStreamCapturing()) throw new InvalidOperationException("cuBLAS workspace not allocated during capture");
-            workspace = AllocateBuffer(CublasWorkspaceFloats);
+            // cuBLAS keeps the workspace address: never a loan of idle step memory.
+            using (NoIdleLoans()) workspace = AllocateBuffer(CublasWorkspaceFloats);
             var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
             if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
             {
@@ -21640,6 +21649,53 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         internal bool IsArenaSlot => _arenaBlock is not null;
 
+        // A loan of a compiled plan's idle step memory (CudaBackend.IdleLoans): the memory is the plan's until the loan
+        // is moved, after which _movedTo owns this buffer's memory.
+        private CudaBackend.IdleLoan? _idleLoan;
+        private CudaGpuBuffer? _movedTo;
+
+        internal bool IsIdleLoan => _idleLoan is not null;
+        /// <summary>The loan this buffer still borrows under, or null (not a loan, or moved, or ended).</summary>
+        internal CudaBackend.IdleLoan? IdleLoanState => _idleLoan is { IsLent: true } loan ? loan : null;
+        internal bool HasCapturePins => Volatile.Read(ref _capturePins) is { Length: > 0 };
+
+        internal static CudaGpuBuffer ForIdleLoan(IntPtr context, IntPtr devicePtr, int size) => new(context, devicePtr, size);
+
+        internal void AttachIdleLoan(CudaBackend.IdleLoan loan) => _idleLoan = loan;
+
+        /// <summary>Switches this loan to <paramref name="owned"/>, which already holds a copy of its contents. False when
+        /// the loan ended first.</summary>
+        internal bool MoveIdleLoanTo(CudaGpuBuffer owned)
+        {
+            Volatile.Write(ref _movedTo, owned);
+            if (_idleLoan is { } loan && loan.TryMarkMoved())
+            {
+                Volatile.Write(ref _devicePtr, owned.RawDevicePointer);
+                return true;
+            }
+            Volatile.Write(ref _movedTo, null);
+            return false;
+        }
+
+        // Ends a loan: its range goes back to the lender, or (moved) the memory it now owns is released.
+        private bool TryEndIdleLoan()
+        {
+            if (_idleLoan is not { } loan) return false;
+            if (loan.TryMarkReturned())
+            {
+                Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+                loan.Lender.ReturnIdleLoan(loan);
+            }
+            else
+            {
+                Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+                Interlocked.Exchange(ref _movedTo, null)?.Dispose();
+            }
+            _context = IntPtr.Zero;
+            GC.SuppressFinalize(this);
+            return true;
+        }
+
         internal static CudaGpuBuffer ForArenaSlot(IntPtr context, IntPtr devicePtr, int size, CudaStepArena.Block block, int slot)
         {
             var buffer = new CudaGpuBuffer(context, devicePtr, size);
@@ -21773,7 +21829,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
-            if (TryEndArenaLease()) return;
+            if (TryEndArenaLease() || TryEndIdleLoan()) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -21853,7 +21909,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
-            if (TryEndArenaLease()) return;
+            if (TryEndArenaLease() || TryEndIdleLoan()) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -21885,6 +21941,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 // Only marks the slot dead (safe on the finalizer thread): the arena owns the memory.
                 if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero) CudaStepArena.OnSlotDead(block, _arenaSlot);
+                return;
+            }
+            if (_idleLoan is { } idleLoan)
+            {
+                // Only hands the range back (a lock, no driver call). A moved loan's memory is freed by its own finalizer.
+                if (idleLoan.TryMarkReturned()) idleLoan.Lender.ReturnIdleLoan(idleLoan);
                 return;
             }
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);

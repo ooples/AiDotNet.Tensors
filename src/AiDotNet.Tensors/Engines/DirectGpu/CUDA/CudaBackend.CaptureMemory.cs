@@ -304,6 +304,8 @@ public sealed partial class CudaBackend
     /// </summary>
     private TResult CaptureWithPrivateMemory<TResult>(Func<TResult> body, Func<TResult, IntPtr> graphOf)
     {
+        // Before the pool opens: moved loans get ordinary memory, not graph-private memory.
+        SuspendIdleLoans();
         var pool = new CaptureMemoryPool();
         bool attached = false;
         try
@@ -333,6 +335,7 @@ public sealed partial class CudaBackend
         finally
         {
             if (!attached) pool.Retire();
+            ResumeIdleLoans();
         }
     }
 }
