@@ -258,6 +258,15 @@ uint pk_relu(uint h, uint top) {
 }
 
 float pk_gelu(float v) {
+    // Past 8 in magnitude the tanh argument is beyond its clamp of 20 (0.79788 * (8 + 0.044715 * 512) = 24.6), where
+    // the host's tanh is exactly 1: the result is v, or 0.5 v * 0. Decided before the cube, which overflows binary32
+    // for a large finite v (a BFloat16 of 2^80) and need not then survive to the clamp on every device.
+    if (v >= 8.0f) {
+        return v;
+    }
+    if (v <= -8.0f) {
+        return (0.5f * v) * 0.0f;
+    }
     float z = clamp(0.7978845608028654f * (v + (((0.044715f * v) * v) * v)), -20.0f, 20.0f);
     return (0.5f * v) * (1.0f + tanh(z));
 }

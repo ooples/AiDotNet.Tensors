@@ -258,8 +258,11 @@ void main() {
     if (idx >= size) return;
     float alpha = uintBitsToFloat(alphaBits);
     // x > 0, as the CPU engine and the other backends (and PyTorch) decide it: at exactly zero the gradient is
-    // grad * (y + alpha), which `>=` doubled for alpha = 0.5.
-    d[idx] = a[idx] * (bdata[idx] > 0.0 ? 1.0 : c[idx] + alpha);
+    // grad * (y + alpha), which `>=` doubled for alpha = 0.5. Decided on the bits (sign clear, not zero, not a NaN):
+    // a device that flushes subnormals would compare a positive subnormal as zero.
+    uint xb = floatBitsToUint(bdata[idx]);
+    bool positive = xb != 0u && xb <= 0x7F800000u;
+    d[idx] = a[idx] * (positive ? 1.0 : c[idx] + alpha);
 }";
 
     public static string Fma => Header + FourBufferLayout + @"

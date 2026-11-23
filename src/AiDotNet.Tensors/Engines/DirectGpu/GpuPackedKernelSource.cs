@@ -399,7 +399,9 @@ internal static class GpuPackedKernelSource
     /// <summary>
     /// <c>c = a b</c> on 16-bit floats, buffers (a, b, c): <c>pcount</c> = m n output elements, <c>pa</c> = n columns,
     /// <c>pb</c> = k. One invocation per output word; each element is a row of a against a column of b accumulated in
-    /// a float and rounded once into the type.
+    /// binary32 and rounded once into the type. The accumulator is computed on the bits (pk_fmul, pk_fadd), in the
+    /// order the host adds in: a BFloat16 operand below 2^-126 widens to a binary32 subnormal, which a device may
+    /// flush to zero before a native multiply (0x0001 times 0x7E80 is the normal 0x3C00, not zero).
     /// </summary>
     public static GpuPackedKernel MatrixMultiply(GpuElementType type)
     {
@@ -407,12 +409,12 @@ internal static class GpuPackedKernelSource
         string w = Widen(type);
         return Kernel("pk_nfgemm_" + Suffix(type), 3, FloatLibrary, () =>
             "    uint r = o[gid];\n    for (uint l = 0u; l < 2u; l++) {\n        uint e = (gid * 2u) + l;\n        if (e < pcount) {\n"
-            + "            uint row = e / pa;\n            uint col = e - (row * pa);\n            float s = 0.0f;\n"
+            + "            uint row = e / pa;\n            uint col = e - (row * pa);\n            uint s = 0u;\n"
             + "            for (uint j = 0u; j < pb; j++) {\n                uint ia = (row * pb) + j;\n                uint ib = (j * pa) + col;\n"
             + "                uint ha = (a[ia >> 1u] >> ((ia & 1u) * 16u)) & 0xFFFFu;\n"
             + "                uint hb = (b[ib >> 1u] >> ((ib & 1u) * 16u)) & 0xFFFFu;\n"
-            + "                s = s + (UFLOAT(" + w + "(ha)) * UFLOAT(" + w + "(hb)));\n            }\n"
-            + "            uint v = " + Narrow(type) + "(FBITS(s));\n            uint sh = l * 16u;\n"
+            + "                s = pk_fadd(s, pk_fmul(" + w + "(ha), " + w + "(hb)));\n            }\n"
+            + "            uint v = " + Narrow(type) + "(s);\n            uint sh = l * 16u;\n"
             + "            r = (r & (~(0xFFFFu << sh))) | (v << sh);\n        }\n    }\n    o[gid] = r;\n");
     }
 

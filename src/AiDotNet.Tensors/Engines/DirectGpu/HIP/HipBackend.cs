@@ -10647,6 +10647,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
         IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
         var sizeBytes = (UIntPtr)((ulong)length * (ulong)width);
+        // A range copied onto itself moves nothing.
+        if (srcPtr == dstPtr) return;
         if (GpuCopyLayout.Overlaps((long)srcPtr, (long)dstPtr, length * width))
         {
             GpuCopyLayout.ThroughScratch(this, source, sourceOffset, destination, destinationOffset, length);

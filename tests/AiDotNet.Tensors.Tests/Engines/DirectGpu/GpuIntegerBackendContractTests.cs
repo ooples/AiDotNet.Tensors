@@ -297,6 +297,11 @@ public abstract class GpuIntegerBackendContractTests
                 }
             }
 
+            // A range copied onto itself changes nothing.
+            using var self = Upload(backend, type, values);
+            backend.Copy(self, 3, self, 3, 17);
+            Assert.Equal(values, Download(backend, type, self, Length));
+
             using var whole = Upload(backend, type, values);
             using var copy = backend.AllocateBuffer(Length, type);
             backend.Copy(whole, copy, Length);

@@ -704,11 +704,25 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         // Offsets and size count elements of the buffers' type. The float kernel below moves one 4-byte word an
         // element; a buffer of doubles (two words each) is copied by the word kernel, its range checked in doubles.
         // A 1- or 2-byte element shares its word with its neighbours (and a blit moves multiples of four bytes), so
-        // those ranges are moved by the packed copy kernel, which rewrites only the elements asked for; the launch
-        // separates a copy within one buffer.
+        // those ranges are moved by the packed copy kernel, which rewrites only the elements asked for.
         int elementBytes = GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
+        bool sameStorage = ReferenceEquals(srcBuffer, destBuffer) || srcBuffer.Handle == destBuffer.Handle;
+        // A range copied onto itself moves nothing.
+        if (size == 0 || (sameStorage && srcBuffer.ByteOffset == destBuffer.ByteOffset && srcOffset == destOffset)) return;
         if (elementBytes == sizeof(byte) || elementBytes == sizeof(ushort))
         {
+            if (sameStorage)
+            {
+                // Through a scratch the size of the range, not of the buffer (the launch would otherwise separate the
+                // two arguments by copying the whole destination): the first pass reads the source before an
+                // overlapping write, the second rewrites only the requested elements.
+                int words = (int)(((long)size * elementBytes + sizeof(uint) - 1) / sizeof(uint));
+                using var scratch = AllocateIntBuffer(words);
+                GpuPackedCompute.Copy(LaunchPacked, srcBuffer, srcOffset, scratch, 0, size, elementBytes);
+                GpuPackedCompute.Copy(LaunchPacked, scratch, 0, destBuffer, destOffset, size, elementBytes);
+                return;
+            }
+
             GpuPackedCompute.Copy(LaunchPacked, srcBuffer, srcOffset, destBuffer, destOffset, size, elementBytes);
             return;
         }

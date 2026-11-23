@@ -107,6 +107,10 @@ public sealed partial class WebGpuBackend
         RequireSynchronousRoute();
         int elementBytes = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
         if (length == 0) return;
+        // A range copied onto itself moves nothing.
+        if (sourceOffset == destinationOffset
+            && (ReferenceEquals(source, destination) || AsWebGpu(source).BufferId == AsWebGpu(destination).BufferId))
+            return;
         if (elementBytes == sizeof(byte) || elementBytes == sizeof(ushort))
         {
             CopyNarrowElements(source, sourceOffset, destination, destinationOffset, length, elementBytes);

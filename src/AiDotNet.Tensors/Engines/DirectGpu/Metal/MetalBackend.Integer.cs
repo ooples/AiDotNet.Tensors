@@ -13,12 +13,17 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     private IntPtr _int32Library;
     private const string PackedLibraryName = "Packed";
     private IntPtr _packedLibrary;
+    // Set when the compiler rejected the packed library: kept, so no later call compiles it again, and every
+    // capability the library backs then reports false (the engine computes those types on the CPU).
+    private Exception? _packedLibraryFailure;
+
+    private bool PackedKernelsAvailable => IsAvailable && System.Threading.Volatile.Read(ref _packedLibraryFailure) is null;
 
     private static bool PackedInteger(GpuElementType type) => Array.IndexOf(GpuPackedKernelSource.IntegerTypes, type) >= 0;
 
     /// <inheritdoc/>
     public bool SupportsIntegerElementwise(GpuElementType type)
-        => (type == GpuElementType.Int32 || PackedInteger(type)) && IsAvailable;
+        => type == GpuElementType.Int32 ? IsAvailable : PackedInteger(type) && PackedKernelsAvailable;
 
     /// <inheritdoc/>
     public bool SupportsIntegerReductions(GpuElementType type) => type != GpuElementType.Bool && SupportsIntegerElementwise(type);
@@ -26,16 +31,10 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     private MetalPipelineState PackedPipeline(string kernel)
     {
         ThrowIfDisposed();
-        if (_packedLibrary == IntPtr.Zero)
-        {
-            lock (_float64LibraryLock)
-            {
-                if (_packedLibrary == IntPtr.Zero)
-                    _packedLibrary = _shaderLibrary.CompileLibrary(PackedLibraryName, GpuPackedKernelSource.MetalLibrary);
-            }
-        }
-
-        return GetPipeline(PackedLibraryName, _packedLibrary, kernel);
+        // A rejected library is a capability gap (GpuCapabilityUnavailableException), recorded once.
+        IntPtr library = Float64Library(ref _packedLibrary, ref _packedLibraryFailure, PackedLibraryName,
+            () => _shaderLibrary.CompileLibrary(PackedLibraryName, GpuPackedKernelSource.MetalLibrary));
+        return GetPipeline(PackedLibraryName, library, kernel);
     }
 
     // Runs a packed kernel and waits for it. An output that is also an operand is separated by the launch (Metal

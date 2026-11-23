@@ -1804,6 +1804,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var srcOffsetBytes = new UIntPtr((ulong)srcOffset * width);
             var destOffsetBytes = new UIntPtr((ulong)destOffset * width);
             var sizeBytes = new UIntPtr((ulong)size * width);
+            // A range copied onto itself moves nothing.
+            if (srcHandle == destHandle && srcOffset == destOffset) return;
             if (srcHandle == destHandle
                 && GpuCopyLayout.Overlaps((long)srcOffset * (long)width, (long)destOffset * (long)width, (long)size * (long)width))
             {

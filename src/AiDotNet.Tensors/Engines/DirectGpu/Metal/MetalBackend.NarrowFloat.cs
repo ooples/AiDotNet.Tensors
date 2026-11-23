@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 // host does.
 public sealed partial class MetalBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply
 {
-    private bool HasNarrowFloatKernels(GpuElementType type) => GpuNarrowFloatLayout.IsNarrowFloat(type) && IsAvailable;
+    private bool HasNarrowFloatKernels(GpuElementType type) => GpuNarrowFloatLayout.IsNarrowFloat(type) && PackedKernelsAvailable;
 
     /// <inheritdoc/>
     public bool SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation operation, GpuElementType type) => HasNarrowFloatKernels(type);

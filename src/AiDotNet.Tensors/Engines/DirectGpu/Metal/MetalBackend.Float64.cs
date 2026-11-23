@@ -112,7 +112,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
 
                 if (failure is { } rejection)
                     throw new GpuCapabilityUnavailableException(
-                        $"The Metal compiler rejected the double-precision library '{name}': {rejection.Message}", rejection);
+                        $"The Metal compiler rejected the kernel library '{name}': {rejection.Message}", rejection);
             }
         }
 

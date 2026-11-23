@@ -211,6 +211,37 @@ public abstract class GpuNarrowFloatContractTests
         RequireRan(ran, Types.Length * Sizes.Length, $"{operation} kernel");
     }
 
+    // Past the tanh clamp GELU is the input itself (or a zero): large finite inputs, whose cube overflows binary32
+    // for BFloat16, must come back as the host computes them and not as whatever an overflowed intermediate leaves.
+    [SkippableFact]
+    public void Gelu_of_a_large_finite_input_is_the_input_or_zero()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Gelu, type)) continue;
+            ushort huge = type == GpuElementType.Float16 ? (ushort)0x7BFF : (ushort)0x6780;   // 65504, and 2^80
+            var values = new[] { huge, (ushort)(huge | 0x8000), Narrow(type, 9f), Narrow(type, -9f), Narrow(type, 100f), Narrow(type, -100f) };
+            using var a = Upload(backend, type, values);
+            using var output = backend.AllocateBuffer(values.Length, type);
+            elementwise.UnaryNarrowFloat(GpuNarrowFloatUnaryOperation.Gelu, type, a, output, values.Length);
+            var actual = Download(backend, type, output, values.Length);
+            for (int i = 0; i < values.Length; i++)
+            {
+                float x = Widen(type, values[i]);
+                float got = Widen(type, actual[i]);
+                Assert.True((x > 0f ? x : 0f) == got, $"Gelu<{type}> of {x:R} (0x{values[i]:X4}) gave {got:R} (0x{actual[i]:X4})");
+            }
+
+            ran++;
+        }
+
+        RequireRan(ran, Types.Length, "Gelu kernel");
+    }
+
     [SkippableFact]
     public void Matrix_multiply_accumulates_in_float_and_stores_the_type()
     {
@@ -255,6 +286,20 @@ public abstract class GpuNarrowFloatContractTests
             using var dot = backend.AllocateBuffer(1, type);
             multiply.MatrixMultiplyNarrowFloat(type, rowOfOnes, columnOfOnes, dot, 1, 1, Long);
             Assert.Equal((float)Long, Widen(type, Download(backend, type, dot, 1)[0]));
+
+            // One by one, bit for bit against the host: the smallest pattern of the type (for BFloat16 a binary32
+            // subnormal, which a device may flush before a native multiply) times a large value, and an ordinary pair.
+            foreach (var (x, y) in new[] { ((ushort)0x0001, type == GpuElementType.Float16 ? (ushort)0x7800 : (ushort)0x7E80),
+                         (Narrow(type, 1.5f), Narrow(type, -2.25f)) })
+            {
+                using var one = Upload(backend, type, new[] { x });
+                using var other = Upload(backend, type, new[] { y });
+                using var product = backend.AllocateBuffer(1, type);
+                multiply.MatrixMultiplyNarrowFloat(type, one, other, product, 1, 1, 1);
+                ushort expectedBits = Narrow(type, Widen(type, x) * Widen(type, y));
+                ushort gotBits = Download(backend, type, product, 1)[0];
+                Assert.True(expectedBits == gotBits, $"{type} 0x{x:X4} times 0x{y:X4} gave 0x{gotBits:X4}, host 0x{expectedBits:X4}");
+            }
 
             Assert.Throws<ArgumentException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, a, M, N, K));
             Assert.Throws<ArgumentOutOfRangeException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, c, 0, N, K));
