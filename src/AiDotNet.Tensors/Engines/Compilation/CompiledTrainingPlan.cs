@@ -1761,6 +1761,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
+        // No graph of this plan names a scratch buffer now: transient slots grown while one could are freed.
+        if (_scratchPool is { } graphPool) graphPool.GraphsHoldBuffers = false;
         _scratchPinsAtCapture = -1;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
@@ -4704,6 +4706,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // Trace every device allocation that fires INSIDE the capture (AIDOTNET_GPU_CAPTURE_TRACE=1):
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
+                        // From here a graph may name the pool's buffers: a transient slot that grows keeps its old one.
+                        if (_scratchPool is { } capturePool) capturePool.GraphsHoldBuffers = true;
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 0));
                         StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;

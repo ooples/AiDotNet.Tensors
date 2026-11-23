@@ -6734,7 +6734,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// allocation is unless the caller's next kernel writes all of it (<paramref name="fullyWritten"/>). The size class rounds up to eight steps per power of two (at most 12.5% over), so actions
     /// whose scratch differs slightly in size still share a buffer.
     /// </summary>
-    private IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
+    internal IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
         // The caller gets exactly `length` elements: a slot is a size class larger, and an op that reads its buffer's
         // Size (a download into a host vector: StridedGather, GenerateDropoutMask) would otherwise return the slack.
@@ -6743,6 +6743,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool views = backend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
         long sizeClass = views ? TransientSizeClass(length) : length;
         var pool = CurrentScratchPool!;
+        if (views)
+        {
+            // One slot per local index, grown to the largest request any action makes there, handed out as an
+            // exact-length view. Keyed by size class too, each local index kept a buffer for every distinct operand size
+            // the plan's actions used there: a BF16 DCGAN step held 35 of them for its convolution operands alone
+            // (117 MB), where the largest is all one serial step ever uses at once.
+            var growKey = (pool.TransientLocal++, StepScratchPool.GrowableTransientClass);
+            if (!pool.Transient.TryGetValue(growKey, out var slot) || slot.Handle == System.IntPtr.Zero || slot.Size < length)
+            {
+                var old = slot is not null && slot.Handle != System.IntPtr.Zero ? slot : null;
+                slot = pool.AllocateNew(backend, checked((int)sizeClass), fullyWritten);
+                pool.Transient[growKey] = slot;
+                if (old is not null) pool.RetireTransient(old);
+            }
+            else if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroSlot) zeroSlot.ZeroBuffer(slot, length);
+                else backend.Fill(slot, 0f, length);
+            }
+            return slot.Size != length && backend is IGpuBufferViews exactSlot && exactSlot.TryCreateView(slot, 0, length) is { } slotView
+                ? slotView : slot;
+        }
         var key = (pool.TransientLocal++, sizeClass);
         if (!pool.Transient.TryGetValue(key, out var b) || b.Handle == System.IntPtr.Zero)
         {

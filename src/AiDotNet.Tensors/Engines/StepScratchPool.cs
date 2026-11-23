@@ -41,8 +41,47 @@ internal sealed partial class StepScratchPool
     /// <summary>The (action, local) key of each output slot, so a first-write gradient copy can name its slot.</summary>
     internal Dictionary<IGpuBuffer, long> Keys { get; } = new();
 
-    /// <summary>Transient scratch by (local index within the action, size class), shared by the plan's actions.</summary>
+    /// <summary>
+    /// Transient scratch shared by the plan's actions: by (local index within the action, size class), or, where views
+    /// are free (<see cref="GrowableTransientClass"/>), one slot per local index grown to the largest request.
+    /// </summary>
     internal Dictionary<(int Local, long SizeClass), IGpuBuffer> Transient { get; } = new();
+
+    /// <summary>The size-class key of a local index's single growable transient slot.</summary>
+    internal const long GrowableTransientClass = -1;
+
+    /// <summary>
+    /// Whether a captured graph of this pool's plan may name its buffers: set before each capture begins, cleared once
+    /// the plan's graphs are destroyed. While it is set, a transient slot that grows keeps its old buffer (retired, not
+    /// freed); clearing it frees the retired ones.
+    /// </summary>
+    internal bool GraphsHoldBuffers
+    {
+        get => _graphsHoldBuffers;
+        set
+        {
+            _graphsHoldBuffers = value;
+            if (value) return;
+            foreach (var buffer in _retiredTransient) DisposeReleased(buffer);
+            _retiredTransient.Clear();
+        }
+    }
+
+    private bool _graphsHoldBuffers;
+    private readonly List<IGpuBuffer> _retiredTransient = new();
+
+    /// <summary>Transient buffers replaced by a larger one while a graph could name them (tests, diagnostics).</summary>
+    internal int RetiredTransientCount => _retiredTransient.Count;
+
+    /// <summary>
+    /// A growable transient slot moved to a larger buffer: the old one is freed now (its release is stream-ordered, so the
+    /// kernels already queued on it finish first) unless a captured graph may name it.
+    /// </summary>
+    internal void RetireTransient(IGpuBuffer old)
+    {
+        if (_graphsHoldBuffers) _retiredTransient.Add(old);
+        else DisposeReleased(old);
+    }
 
     /// <summary>The compiled action running now, or -1 outside one (the pre-pass, the optimizer).</summary>
     internal int Action { get; set; } = -1;
@@ -207,6 +246,7 @@ internal sealed partial class StepScratchPool
     {
         foreach (var b in Slots.Values) yield return b;
         foreach (var b in Transient.Values) yield return b;
+        foreach (var b in _retiredTransient) yield return b;
         foreach (var b in _free) yield return b;
         foreach (var (_, b) in _leases) yield return b;
         foreach (var b in _spanning.Keys) yield return b;
@@ -300,7 +340,7 @@ internal sealed partial class StepScratchPool
     internal bool Leases(long key) => (Action >= FirstLeasedAction || _spanKeys.Contains(key)) && !_pinned.Contains(key);
 
     /// <summary>The device buffers the pool holds: kept slots, the transient arena and free leased buffers.</summary>
-    internal int BufferCount => Slots.Count + Transient.Count + _free.Count + _leases.Count + _spanning.Count;
+    internal int BufferCount => Slots.Count + Transient.Count + _retiredTransient.Count + _free.Count + _leases.Count + _spanning.Count;
 
     /// <summary>The bytes of those buffers.</summary>
     internal long BufferBytes
@@ -310,6 +350,7 @@ internal sealed partial class StepScratchPool
             long bytes = 0;
             foreach (var b in Slots.Values) bytes += b.SizeInBytes;
             foreach (var b in Transient.Values) bytes += b.SizeInBytes;
+            foreach (var b in _retiredTransient) bytes += b.SizeInBytes;
             foreach (var b in _free) bytes += b.SizeInBytes;
             foreach (var (_, b) in _leases) bytes += b.SizeInBytes;
             foreach (var b in _spanning.Keys) bytes += b.SizeInBytes;
@@ -553,10 +594,12 @@ internal sealed partial class StepScratchPool
         EndSpanLeases();
         foreach (var buffer in Slots.Values) DisposeReleased(buffer);
         foreach (var buffer in Transient.Values) DisposeReleased(buffer);
+        foreach (var buffer in _retiredTransient) DisposeReleased(buffer);
         foreach (var buffer in _free) DisposeReleased(buffer);
         Slots.Clear();
         Keys.Clear();
         Transient.Clear();
+        _retiredTransient.Clear();
         _free.Clear();
         _leasedThisRun.Clear();
         Begin(-1);
