@@ -250,26 +250,26 @@ public partial class CpuEngine
                 float[] gT = pool.Rent(cw * outChannels);
                 try
                 {
-                    fixed (float* g = gradOutputF, d = gT)
+                    int block = outChannels * colW;
+                    for (int b = 0; b < nb; b++)
                     {
-                        for (int b = 0; b < nb; b++)
-                        {
-                            Im2ColHelper.Im2ColStridedSingle(
-                                new ReadOnlySpan<float>(inputF, (b0 + b) * inputSliceSize, inputSliceSize),
-                                new Span<float>(cols, 0, colH * cw), cw, b * colW,
-                                inChannels, height, width, kernelHeight, kernelWidth,
-                                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
-                            // g_b is [outC, colW]; its rows of gT are [colW, outC].
+                        Im2ColHelper.Im2ColStridedSingle(
+                            new ReadOnlySpan<float>(inputF, (b0 + b) * inputSliceSize, inputSliceSize),
+                            new Span<float>(cols, 0, colH * cw), cw, b * colW,
+                            inChannels, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                        // g_b is [outC, colW]; its rows of gT are [colW, outC]. Each image's block is taken as a span, so
+                        // its first and last element are bounds-checked against the arrays before any pointer is formed.
+                        var source = new ReadOnlySpan<float>(gradOutputF, checked((b0 + b) * block), block);
+                        var target = new Span<float>(gT, checked(b * block), block);
 #if NET5_0_OR_GREATER
-                            Simd.SimdTranspose.TransposeSerial(g + (long)(b0 + b) * outChannels * colW,
-                                d + (long)b * colW * outChannels, outChannels, colW);
+                        fixed (float* src = source, dst = target)
+                            Simd.SimdTranspose.TransposeSerial(src, dst, outChannels, colW);
 #else
-                            float* src = g + (long)(b0 + b) * outChannels * colW, dst = d + (long)b * colW * outChannels;
-                            for (int oc = 0; oc < outChannels; oc++)
-                                for (int n = 0; n < colW; n++)
-                                    dst[(long)n * outChannels + oc] = src[(long)oc * colW + n];
+                        for (int oc = 0; oc < outChannels; oc++)
+                            for (int n = 0; n < colW; n++)
+                                target[n * outChannels + oc] = source[oc * colW + n];
 #endif
-                        }
                     }
                     Simd.SimdGemm.SgemmForAutotune(
                         new ReadOnlySpan<float>(cols, 0, colH * cw),

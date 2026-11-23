@@ -17006,7 +17006,16 @@ public partial class CpuEngine : ITensorLevelEngine
             // A short reduction per input pixel (an RGB stem: 48 = 3 x 4 x 4 taps per output channel) with an image per
             // worker: the per-image transposed-conv route (one sequential GEMM of the weight against dy_b, then the
             // overlap-add gather). The batched col2im route took 84-165 ms for DCGAN's batch-128 stem.
-            if (dilationH == 1 && dilationW == 1 && gradOutput.IsContiguous && kernel.IsContiguous
+            // Not at stride 1 where the small-output kernel takes this gradient as a forward convolution (one to three
+            // input channels over at least 64 multiplies each): that kernel is the route for it at any worker count,
+            // and this gate, which depends on the worker count, must not take the shape from it on a small machine.
+            bool smallOutputKernelTakesIt = false;
+#if NET5_0_OR_GREATER
+            smallOutputKernelTakesIt = strideH == 1 && strideW == 1
+                && Simd.SmallOutConv.Applies(outChannels, inChannels, kernelHeight, kernelWidth, 1, 1, dilationH, dilationW,
+                    kernelHeight - 1 - padH, kernelWidth - 1 - padW);
+#endif
+            if (!smallOutputKernelTakesIt && dilationH == 1 && dilationW == 1 && gradOutput.IsContiguous && kernel.IsContiguous
                 && Helpers.Im2ColHelper.ConvTransposePerImage(batch, outputHeight * outputWidth, inChannels * kernelHeight * kernelWidth))
             {
                 var gArrP = gradOutput.GetCpuBackingForStridedRead(out int gOffP) as float[];
