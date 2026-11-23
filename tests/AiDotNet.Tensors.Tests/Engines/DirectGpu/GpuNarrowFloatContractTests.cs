@@ -232,6 +232,17 @@ public class GpuNarrowFloatContractTests
                 }
             }
 
+            // 512 ones times 512 ones: a sum kept in BFloat16 (8 significand bits) stops growing at 256, where adding
+            // one no longer changes it. Only a float accumulator reaches 512.
+            const int Long = 512;
+            var ones = new ushort[Long];
+            for (int i = 0; i < Long; i++) ones[i] = Narrow(type, 1f);
+            using var rowOfOnes = Upload(backend, type, ones);
+            using var columnOfOnes = Upload(backend, type, ones);
+            using var dot = backend.AllocateBuffer(1, type);
+            multiply.MatrixMultiplyNarrowFloat(type, rowOfOnes, columnOfOnes, dot, 1, 1, Long);
+            Assert.Equal((float)Long, Widen(type, Download(backend, type, dot, 1)[0]));
+
             Assert.Throws<ArgumentException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, a, M, N, K));
             Assert.Throws<ArgumentOutOfRangeException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, c, 0, N, K));
             ran++;

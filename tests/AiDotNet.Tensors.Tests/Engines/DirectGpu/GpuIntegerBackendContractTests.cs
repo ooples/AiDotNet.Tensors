@@ -294,10 +294,9 @@ public abstract class GpuIntegerBackendContractTests
 [Collection("DirectGpuSerial")]
 public sealed class EngineBackendIntegerTests : GpuIntegerBackendContractTests
 {
+    // The backend whatever it implements: one without the integer interface fails the tests, it does not skip them.
     protected override IDirectGpuBackend? Device()
-        => AiDotNetEngine.Current is DirectGpuTensorEngine gpu && gpu.GetBackend() is IGpuIntegerElementwise { } backend
-            ? (IDirectGpuBackend)backend
-            : null;
+        => AiDotNetEngine.Current is DirectGpuTensorEngine gpu ? gpu.GetBackend() : null;
 
     protected override string SkipReason => "No GPU backend on this host.";
 }
@@ -313,7 +312,9 @@ public sealed class VulkanIntegerTests : GpuIntegerBackendContractTests
         try
         {
             var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
-            if (backend.Initialize() && backend.SupportsIntegerElementwise(GpuElementType.Int32)) _backend = backend;
+            // Gated on what the kernels need (a device and the GLSL compiler), not on the capability under test: a
+            // device that has both and reports no Int32 support fails these tests instead of skipping them.
+            if (backend.Initialize() && backend.IsGlslCompilerAvailable) _backend = backend;
         }
         catch (Exception unavailable) when (unavailable is DllNotFoundException or InvalidOperationException or NotSupportedException)
         {

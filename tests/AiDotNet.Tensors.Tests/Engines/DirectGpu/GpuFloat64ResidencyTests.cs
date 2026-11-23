@@ -14,8 +14,14 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// device until the host reads it.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class GpuFloat64ResidencyTests
+public class GpuFloat64ResidencyTests : IDisposable
 {
+    // The device route for doubles is taken under the default policy only where the kernels are native. Where they
+    // are integer emulation (Metal, WebGPU) it needs the allowance, which changes nothing on a native device.
+    private readonly GpuExecutionPolicyScope _emulationAllowed = new GpuExecutionPolicyScope(GpuExecutionPolicy.PreserveOnDevice);
+
+    public void Dispose() => _emulationAllowed.Dispose();
+
     private const int Large = DirectGpuTensorEngine.Float64ReductionMinLength + 4097;
 
     private static (DirectGpuTensorEngine Engine, IDirectGpuBackend Backend, IGpuFloat64Elementwise Elementwise)? Device()
@@ -141,12 +147,17 @@ public class GpuFloat64ResidencyTests
             Assert.Equal(GpuExecutionRoute.Cpu, matMul.Route);
         }
 
-        // No double kernel exists for these, so the default (preserving) policy must keep them exact on the CPU.
+        // The reductions are their own capability too, and the plan is the answer the engine's sum dispatches on.
+        var reduction = GpuPrecisionPlanner.CreatePlan<double>(backend, GpuPrecisionOperation.Reduction, "probe");
+        Assert.Equal(backend is IGpuFloat64Reductions { SupportsFloat64Reductions: true } ? GpuExecutionRoute.Gpu : GpuExecutionRoute.Cpu,
+            reduction.Route);
+
+        // No double kernel exists for these, so a preserving policy must keep them exact on the CPU.
         foreach (var operation in new[]
                  {
                      GpuPrecisionOperation.Elementwise, GpuPrecisionOperation.Relu, GpuPrecisionOperation.BatchMatMul,
                      GpuPrecisionOperation.MatMulTransposed, GpuPrecisionOperation.Convolution,
-                     GpuPrecisionOperation.Reduction, GpuPrecisionOperation.General,
+                     GpuPrecisionOperation.General,
                  })
             Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionPlanner.CreatePlan<double>(backend, operation, "probe").Route);
 
