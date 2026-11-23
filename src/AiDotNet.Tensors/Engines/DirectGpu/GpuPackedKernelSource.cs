@@ -178,8 +178,14 @@ internal static class GpuPackedKernelSource
         body.Append("            uint x = (wa >> sh) & ").Append(mask).Append(";\n");
         if (second) body.Append("            uint y = (wb >> sh) & ").Append(mask).Append(";\n");
         if (scalar) body.Append("            uint y = pb & ").Append(mask).Append(";\n");
+        // The operands with whatever lies above the element still in them, for the operations whose low bits depend
+        // only on the operands' low bits (see the multiply in LaneValue).
+        body.Append("            uint xw = wa >> sh;\n");
+        if (second) body.Append("            uint yw = wb >> sh;\n");
+        if (scalar) body.Append("            uint yw = pb;\n");
         body.Append("            uint v = ").Append(value).Append(";\n");
-        body.Append("            r = r | ((v & ").Append(mask).Append(") << sh);\n");
+        // The element is placed by two shifts, not by a mask: the first drops every bit of `v` above the element.
+        body.Append("            r = r | ((v << ").Append(32 - bits).Append("u) >> (").Append(32 - bits).Append("u - sh));\n");
         body.Append("            keep = keep | (").Append(mask).Append(" << sh);\n");
         body.Append("        }\n    }\n    o[gid] = (r & keep) | (old & (~keep));\n");
         return body.ToString();
@@ -209,7 +215,12 @@ internal static class GpuPackedKernelSource
         {
             GpuIntegerBinaryOperation.Add => "x + y",
             GpuIntegerBinaryOperation.Subtract => "x - y",
-            GpuIntegerBinaryOperation.Multiply => "x * y",
+            // On the unmasked operands. One shader compiler (Dawn on Direct3D 12, AMD) treated the product of two
+            // operands it knew to be below 2^8 or 2^16 as below that too: it dropped the mask or shift that removes
+            // the product's high part, which then spilled into the next element of the word. The low bits of a
+            // product depend only on the operands' low bits, so the unmasked product has the same element in it and
+            // gives the compiler no range to reason from.
+            GpuIntegerBinaryOperation.Multiply => "xw * yw",
             GpuIntegerBinaryOperation.Min => signed ? "uint(min(" + Signed(type, "x") + ", " + Signed(type, "y") + "))" : "min(x, y)",
             GpuIntegerBinaryOperation.Max => signed ? "uint(max(" + Signed(type, "x") + ", " + Signed(type, "y") + "))" : "max(x, y)",
             GpuIntegerBinaryOperation.And => "x & y",
