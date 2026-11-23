@@ -112,7 +112,14 @@ public static class GpuOperationCapabilities
                 GpuOperationFamily.Reduction => physical is IGpuIntegerReductions sums && sums.SupportsIntegerReductions(elementType),
                 _ => false,
             },
-            // Half buffers are held and moved, not yet computed on through this table's interfaces.
+            // Half: the FP16 kernels (FP32 accumulate, half result) take typed Float16 buffers.
+            GpuElementType.Float16 => family switch
+            {
+                GpuOperationFamily.Elementwise => physical is Gpu.IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true },
+                GpuOperationFamily.MatrixMultiply => physical is Gpu.IGpuHalfPrecisionBackend { SupportsHgemm: true },
+                _ => false,
+            },
+            // BFloat16 buffers are held and moved, not computed on.
             _ => false,
         };
     }

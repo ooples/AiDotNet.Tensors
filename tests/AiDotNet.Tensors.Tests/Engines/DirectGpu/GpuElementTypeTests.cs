@@ -340,6 +340,9 @@ public class GpuElementTypeTests
                 : GpuIntegerLayout.IsIntegerOrBool(row.ElementType)
                     ? (row.Family == GpuOperationFamily.Elementwise ? backend is IGpuIntegerElementwise integers && integers.SupportsIntegerElementwise(row.ElementType)
                         : row.Family == GpuOperationFamily.Reduction && backend is IGpuIntegerReductions sums && sums.SupportsIntegerReductions(row.ElementType))
+                : row.ElementType == GpuElementType.Float16
+                    ? (row.Family == GpuOperationFamily.Elementwise ? backend is AiDotNet.Tensors.Engines.Gpu.IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true }
+                        : row.Family == GpuOperationFamily.MatrixMultiply && backend is AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend { SupportsHgemm: true })
                 : row.ElementType != GpuElementType.Float64 ? false
                 : row.Family == GpuOperationFamily.Elementwise ? backend is IGpuFloat64Elementwise { SupportsFloat64Elementwise: true }
                 : row.Family == GpuOperationFamily.Reduction ? backend is IGpuFloat64Reductions { SupportsFloat64Reductions: true }
@@ -347,8 +350,8 @@ public class GpuElementTypeTests
             Assert.True(expected == row.IsNative, $"{row} disagrees with the backend ({backend.BackendName}).");
         }
         Assert.True(backend.SupportsOperation(GpuOperationFamily.MatrixMultiply, GpuElementType.Float32));
-        // Half buffers are held but have no kernels behind this table yet.
-        Assert.False(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Float16));
+        // BFloat16 buffers are held but have no kernels behind this table.
+        Assert.False(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.BFloat16));
     }
 
     private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged
