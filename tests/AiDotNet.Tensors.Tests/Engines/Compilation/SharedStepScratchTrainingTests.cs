@@ -3,6 +3,7 @@ using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -49,8 +50,10 @@ public class SharedStepScratchTrainingTests : IDisposable
         public int Revocations;
     }
 
-    private static Run Train(DirectGpuTensorEngine engine, bool share)
+    private static Run Train(DirectGpuTensorEngine engine, bool share, PrecisionMode? autocast = null)
     {
+        // Mixed precision narrows the convolutions' operands into step scratch of their own: the plans still co-own it.
+        using var mixed = autocast is { } precision ? new AutocastScope(precision) : null;
         SharedStepScratch.Enabled = share;
         AiDotNetEngine.Current = engine;
         const int batch = 16;
@@ -127,17 +130,20 @@ public class SharedStepScratchTrainingTests : IDisposable
         return null;
     }
 
-    [SkippableFact]
-    public void Plans_stepping_in_turn_co_own_scratch_and_train_bit_identically_to_private_scratch()
+    [SkippableTheory]
+    [InlineData(null)]
+    [InlineData(PrecisionMode.BFloat16)]
+    [InlineData(PrecisionMode.Float16)]
+    public void Plans_stepping_in_turn_co_own_scratch_and_train_bit_identically_to_private_scratch(PrecisionMode? autocast)
     {
         var gpu = TryCuda();
         Skip.If(gpu is null, "CUDA backend did not resolve (whole-step capture is CUDA's).");
         if (gpu is null) return;
         using (gpu)
         {
-            Train(gpu, share: false);   // tunes the kernels both runs below then pick alike
-            var isolated = Train(gpu, share: false);
-            var shared = Train(gpu, share: true);
+            Train(gpu, share: false, autocast);   // tunes the kernels both runs below then pick alike
+            var isolated = Train(gpu, share: false, autocast);
+            var shared = Train(gpu, share: true, autocast);
             _output.WriteLine($"takes={shared.Takes} revocations={shared.Revocations}");
             Assert.Equal(0, isolated.Takes);
             Assert.True(shared.Takes > 0, "the second plan took none of the first plan's step scratch");
