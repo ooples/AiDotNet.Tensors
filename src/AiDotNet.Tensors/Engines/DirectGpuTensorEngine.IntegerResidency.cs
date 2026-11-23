@@ -34,19 +34,65 @@ public partial class DirectGpuTensorEngine
         => !AutocastScope.IsEnabled
            && GpuExecutionPolicyScope.EffectivePolicyFor(elementType).AccuracyMode == GpuAccuracyMode.PreserveInputType;
 
-    private bool TryGetIntegerElementwise(GpuElementType type, Type elementType, out IDirectGpuBackend backend, out IGpuIntegerElementwise elementwise)
+    // The backend a typed (integer or 16-bit float) route may use now, or null: not inside a resident step, and only
+    // under the type-preserving policy.
+    private IDirectGpuBackend? TypedRouteBackend(Type elementType)
     {
-        elementwise = null!;
-        if (ResidentStepActive || !IntegerDeviceRouteAllowed(elementType) || !TryGetBackend(out backend))
-        {
-            backend = null!;
-            return false;
-        }
+        if (ResidentStepActive || !IntegerDeviceRouteAllowed(elementType)) return null;
+        return TryGetBackend(out var backend) ? backend : null;
+    }
 
-        if (backend is not IGpuIntegerElementwise candidate || !backend.SupportsElementType(type) || !candidate.SupportsIntegerElementwise(type))
-            return false;
-        elementwise = candidate;
-        return true;
+    private static Action<IGpuBuffer, IGpuBuffer, IGpuBuffer, int>? IntegerBinaryKernel(IDirectGpuBackend backend, GpuElementType type,
+        GpuIntegerBinaryOperation operation)
+    {
+        if (backend is not IGpuIntegerElementwise elementwise || !backend.SupportsElementType(type) || !elementwise.SupportsIntegerElementwise(type))
+            return null;
+        return (a, b, output, size) => elementwise.BinaryInteger(operation, a, b, output, size);
+    }
+
+    private static GpuNarrowFloatBinaryOperation? NarrowFloatBinaryOperationFor(string callerName) => callerName switch
+    {
+        nameof(TensorAdd) => GpuNarrowFloatBinaryOperation.Add,
+        nameof(TensorSubtract) => GpuNarrowFloatBinaryOperation.Subtract,
+        nameof(TensorMultiply) => GpuNarrowFloatBinaryOperation.Multiply,
+        _ => null,
+    };
+
+    private static GpuNarrowFloatUnaryOperation? NarrowFloatUnaryOperationFor(string callerName) => callerName switch
+    {
+        nameof(TensorNegate) => GpuNarrowFloatUnaryOperation.Negate,
+        nameof(TensorReLU) => GpuNarrowFloatUnaryOperation.Relu,
+        nameof(TensorGELU) => GpuNarrowFloatUnaryOperation.Gelu,
+        _ => null,
+    };
+
+    /// <summary>
+    /// <c>left (op) right</c> for BFloat16 operands on the device, computed in FP32 and stored as BFloat16, the result
+    /// left there. Null when the CPU engine takes it. (Half tensors keep the FP16 routes they already have.)
+    /// </summary>
+    private Tensor<T>? TryBinaryNarrowFloatAny<T>(Tensor<T> left, Tensor<T> right, string callerName)
+    {
+        if (left is not Tensor<NumericOperations.BFloat16> leftValues || right is not Tensor<NumericOperations.BFloat16> rightValues) return null;
+        if (NarrowFloatBinaryOperationFor(callerName) is not { } operation) return null;
+        const GpuElementType Type = GpuElementType.BFloat16;
+        return TryBinaryTyped(leftValues, rightValues, Type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(Type)
+            && elementwise.SupportsNarrowFloatBinary(operation, Type)
+                ? (a, b, output, size) => elementwise.BinaryNarrowFloat(operation, Type, a, b, output, size)
+                : null) as Tensor<T>;
+    }
+
+    /// <summary>Negate, ReLU or GELU of a BFloat16 tensor on the device. Null when the CPU engine takes it.</summary>
+    private Tensor<T>? TryUnaryNarrowFloatAny<T>(Tensor<T> input, string callerName)
+    {
+        if (input is not Tensor<NumericOperations.BFloat16> values) return null;
+        if (NarrowFloatUnaryOperationFor(callerName) is not { } operation) return null;
+        const GpuElementType Type = GpuElementType.BFloat16;
+        return TryMapTyped(values, Type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(Type)
+            && elementwise.SupportsNarrowFloatUnary(operation, Type)
+                ? (a, output, size) => elementwise.UnaryNarrowFloat(operation, Type, a, output, size)
+                : null) as Tensor<T>;
     }
 
     /// <summary>
@@ -72,13 +118,20 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryBinaryInteger<T>(Tensor<T> left, Tensor<T> right, GpuElementType type, GpuIntegerBinaryOperation operation,
         string callerName)
         where T : unmanaged
+        => TryBinaryTyped(left, right, type, callerName, backend => IntegerBinaryKernel(backend, type, operation));
+
+    // One element-wise kernel over two typed operands, the result left on the device. `kernelFor` gives the launch for
+    // a backend, or null when that backend has no such kernel.
+    private Tensor<T>? TryBinaryTyped<T>(Tensor<T> left, Tensor<T> right, GpuElementType type, string callerName,
+        Func<IDirectGpuBackend, Action<IGpuBuffer, IGpuBuffer, IGpuBuffer, int>?> kernelFor)
+        where T : unmanaged
     {
         int length = left.Length;
         if (length < IntegerElementwiseMinLength || right.Length != length) return null;
         // Element i of one operand meets element i of the other in storage order: operands laid out differently are the
         // CPU engine's, which reorders them.
         if (left.Layout != right.Layout) return null;
-        if (!TryGetIntegerElementwise(type, typeof(T), out var backend, out var elementwise)) return null;
+        if (TypedRouteBackend(typeof(T)) is not { } backend || kernelFor(backend) is not { } kernel) return null;
 
         lock (_typedLock)
         {
@@ -97,7 +150,7 @@ public partial class DirectGpuTensorEngine
             var output = RentResidentBuffer(backend, type, length, left.DataVector, right.DataVector);
             try
             {
-                elementwise.BinaryInteger(operation, a.Buffer, b.Buffer, output, length);
+                kernel(a.Buffer, b.Buffer, output, length);
                 var result = RegisterResidentResult<T>(backend, output, length, left.Shape.ToArray(), type);
                 result.Layout = left.Layout;
                 return result;
@@ -155,10 +208,19 @@ public partial class DirectGpuTensorEngine
     private Tensor<T>? TryMapInteger<T>(Tensor<T> input, GpuElementType type, string callerName,
         Action<IGpuIntegerElementwise, IGpuBuffer, IGpuBuffer, int> launch)
         where T : unmanaged
+        => TryMapTyped(input, type, callerName, backend =>
+            backend is IGpuIntegerElementwise elementwise && backend.SupportsElementType(type) && elementwise.SupportsIntegerElementwise(type)
+                ? (a, output, size) => launch(elementwise, a, output, size)
+                : null);
+
+    // One element-wise kernel over one typed operand, the result left on the device.
+    private Tensor<T>? TryMapTyped<T>(Tensor<T> input, GpuElementType type, string callerName,
+        Func<IDirectGpuBackend, Action<IGpuBuffer, IGpuBuffer, int>?> kernelFor)
+        where T : unmanaged
     {
         int length = input.Length;
         if (length < IntegerElementwiseMinLength) return null;
-        if (!TryGetIntegerElementwise(type, typeof(T), out var backend, out var elementwise)) return null;
+        if (TypedRouteBackend(typeof(T)) is not { } backend || kernelFor(backend) is not { } kernel) return null;
 
         lock (_typedLock)
         {
@@ -169,7 +231,7 @@ public partial class DirectGpuTensorEngine
             var output = RentResidentBuffer(backend, type, length, input.DataVector, input.DataVector);
             try
             {
-                launch(elementwise, a.Buffer, output, length);
+                kernel(a.Buffer, output, length);
                 var result = RegisterResidentResult<T>(backend, output, length, input.Shape.ToArray(), type);
                 // The kernel maps the elements in storage order, so the result is laid out as its input is.
                 result.Layout = input.Layout;
@@ -191,43 +253,16 @@ public partial class DirectGpuTensorEngine
 
     /// <summary>
     /// The sum of an integer tensor whose values are on the device, computed there in its own type (wrapping as the
-    /// host's unchecked sum does). False when the CPU engine takes it.
+    /// host's unchecked sum does), boxed. Null when the CPU engine takes it.
     /// </summary>
-    private bool TrySumIntegerAny<T>(Tensor<T> tensor, out T sum)
+    private object? TrySumIntegerAny<T>(Tensor<T> tensor)
     {
-        sum = default!;
-        long wide;
-        if (tensor is Tensor<int> ints)
-        {
-            if (!TrySumInteger(ints, GpuElementType.Int32, out wide)) return false;
-            sum = (T)(object)unchecked((int)wide);
-        }
-        else if (tensor is Tensor<long> longs)
-        {
-            if (!TrySumInteger(longs, GpuElementType.Int64, out wide)) return false;
-            sum = (T)(object)wide;
-        }
-        else if (tensor is Tensor<short> shorts)
-        {
-            if (!TrySumInteger(shorts, GpuElementType.Int16, out wide)) return false;
-            sum = (T)(object)unchecked((short)wide);
-        }
-        else if (tensor is Tensor<sbyte> sbytes)
-        {
-            if (!TrySumInteger(sbytes, GpuElementType.Int8, out wide)) return false;
-            sum = (T)(object)unchecked((sbyte)wide);
-        }
-        else if (tensor is Tensor<byte> bytes)
-        {
-            if (!TrySumInteger(bytes, GpuElementType.UInt8, out wide)) return false;
-            sum = (T)(object)unchecked((byte)wide);
-        }
-        else
-        {
-            return false;
-        }
-
-        return true;
+        if (tensor is Tensor<int> ints) return TrySumInteger(ints, GpuElementType.Int32, out long wide) ? unchecked((int)wide) : null;
+        if (tensor is Tensor<long> longs) return TrySumInteger(longs, GpuElementType.Int64, out long wide) ? wide : null;
+        if (tensor is Tensor<short> shorts) return TrySumInteger(shorts, GpuElementType.Int16, out long wide) ? unchecked((short)wide) : null;
+        if (tensor is Tensor<sbyte> sbytes) return TrySumInteger(sbytes, GpuElementType.Int8, out long wide) ? unchecked((sbyte)wide) : null;
+        if (tensor is Tensor<byte> bytes) return TrySumInteger(bytes, GpuElementType.UInt8, out long wide) ? unchecked((byte)wide) : null;
+        return null;
     }
 
     private bool TrySumInteger<T>(Tensor<T> tensor, GpuElementType type, out long sum)
@@ -259,7 +294,8 @@ public partial class DirectGpuTensorEngine
     /// <summary>Frees the device copy of a persistent integer tensor whose host values changed or that was unregistered.</summary>
     private void DropIntegerResident<T>(Tensor<T> tensor)
     {
-        if (tensor is Tensor<int> || tensor is Tensor<long> || tensor is Tensor<short> || tensor is Tensor<sbyte> || tensor is Tensor<byte>)
+        if (tensor is Tensor<int> || tensor is Tensor<long> || tensor is Tensor<short> || tensor is Tensor<sbyte> || tensor is Tensor<byte>
+            || tensor is Tensor<NumericOperations.BFloat16>)
             DropResident(tensor);
     }
 }

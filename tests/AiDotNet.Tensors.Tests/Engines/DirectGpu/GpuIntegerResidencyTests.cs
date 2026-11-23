@@ -5,6 +5,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.NumericOperations;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -149,6 +150,73 @@ public class GpuIntegerResidencyTests
         }
         finally
         {
+            gpu.ClearTypedResidents();
+        }
+    }
+
+    [SkippableFact]
+    public void BFloat16_chain_stays_on_the_device_and_equals_the_cpu_engine()
+    {
+        const GpuElementType Type = GpuElementType.BFloat16;
+        Skip.If(AiDotNetEngine.Current is not DirectGpuTensorEngine, "No GPU engine on this host.");
+        var gpu = (DirectGpuTensorEngine)AiDotNetEngine.Current;
+        Skip.If(gpu.GetBackend() is not IGpuNarrowFloatElementwise narrow || gpu.GetBackend() is not { } held || !held.SupportsElementType(Type)
+            || !narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Multiply, Type)
+            || !narrow.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Gelu, Type), "No device with BFloat16 kernels on this host.");
+        var cpu = (IEngine)new CpuEngine();
+        IEngine engine = gpu;
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve);
+
+        var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(31);
+        var xValues = new BFloat16[Large];
+        var yValues = new BFloat16[Large];
+        for (int i = 0; i < Large; i++)
+        {
+            xValues[i] = BFloat16.FromFloat((float)((random.NextDouble() - 0.5) * 8.0));
+            yValues[i] = BFloat16.FromFloat((float)((random.NextDouble() - 0.5) * 8.0));
+        }
+
+        var x = new Tensor<BFloat16>((BFloat16[])xValues.Clone(), new[] { Large });
+        var y = new Tensor<BFloat16>((BFloat16[])yValues.Clone(), new[] { Large });
+        var hostX = new Tensor<BFloat16>((BFloat16[])xValues.Clone(), new[] { Large });
+        var hostY = new Tensor<BFloat16>((BFloat16[])yValues.Clone(), new[] { Large });
+        gpu.RegisterPersistentTensor(x, PersistentTensorRole.Weights);
+        gpu.RegisterPersistentTensor(y, PersistentTensorRole.Weights);
+        try
+        {
+            var sum = engine.TensorAdd(x, y);
+            Assert.True(gpu.IsTypedResident(sum), "The BFloat16 sum was not left on the device.");
+            var negated = engine.TensorNegate(engine.TensorSubtract(engine.TensorMultiply(sum, x), y));
+            var rectified = engine.TensorReLU(negated);
+            var smooth = engine.TensorGELU(negated);
+            Assert.True(gpu.IsTypedResident(rectified), "The BFloat16 chain's result was not left on the device.");
+            Assert.True(gpu.IsTypedResident(smooth), "The BFloat16 GELU was not left on the device.");
+
+            var hostNegated = cpu.TensorNegate(cpu.TensorSubtract(cpu.TensorMultiply(cpu.TensorAdd(hostX, hostY), hostX), hostY));
+            var exact = negated.GetReadOnlyDataArray();
+            var exactHost = hostNegated.GetReadOnlyDataArray();
+            var relu = rectified.GetReadOnlyDataArray();
+            var reluHost = cpu.TensorReLU(hostNegated).GetReadOnlyDataArray();
+            var gelu = smooth.GetReadOnlyDataArray();
+            for (int i = 0; i < Large; i++)
+            {
+                Assert.True(exactHost[i].RawValue == exact[i].RawValue, $"Arithmetic at {i}: CPU {(float)exactHost[i]:R}, device {(float)exact[i]:R}.");
+                // The value: the zero of a negative input may carry either sign.
+                Assert.True((float)reluHost[i] == (float)relu[i], $"ReLU at {i}: CPU {(float)reluHost[i]:R}, device {(float)relu[i]:R}.");
+                // GELU against its formula evaluated in float and rounded once, which is what the device does. (The CPU
+                // engine rounds every intermediate to BFloat16 and drifts several percent from the true value.)
+                float v = (float)exactHost[i];
+                float z = Math.Min(20f, Math.Max(-20f, 0.7978845608028654f * (v + 0.044715f * v * v * v)));
+                float expected = 0.5f * v * (1f + (float)Math.Tanh(z));
+                // Two units in BFloat16's last place (7 significand bits), plus the cancellation floor near zero.
+                Assert.True(Math.Abs(expected - (float)gelu[i]) <= 1e-4f + Math.Abs(expected) / 64f,
+                    $"GELU at {i} of {(float)exactHost[i]:R}: CPU {expected:R}, device {(float)gelu[i]:R}.");
+            }
+        }
+        finally
+        {
+            gpu.UnregisterPersistentTensor(x);
+            gpu.UnregisterPersistentTensor(y);
             gpu.ClearTypedResidents();
         }
     }

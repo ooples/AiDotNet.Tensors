@@ -5702,6 +5702,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return DoublesAs<T>(doubleResult);
         if (TryUnaryIntegerAny(input, callerName) is { } integerResult)
             return integerResult;
+        if (TryUnaryNarrowFloatAny(input, callerName) is { } narrowResult)
+            return narrowResult;
         if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
             return null;
         var precisionOperation = PrecisionOperationForUnary(callerName);
@@ -9914,7 +9916,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
             return (T)(object)doubleSum;
-        if (TrySumIntegerAny(tensor, out T integerSum))
+        if (TrySumIntegerAny(tensor) is T integerSum)
             return integerSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
@@ -23867,6 +23869,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Integer operands likewise: their own kernels, computed in the element type.
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryIntegerAny(a, b, callerName) is { } integerResult)
             return integerResult;
+        // BFloat16 operands: computed in FP32 on the device and stored as BFloat16.
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryNarrowFloatAny(a, b, callerName) is { } narrowResult)
+            return narrowResult;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
