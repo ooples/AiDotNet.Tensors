@@ -28,15 +28,24 @@ not count.
 ## GPU memory budget
 
 - **What counts.** The budget counts *reserved* memory, as PyTorch's does: tensors in use plus the memory the library's
-  pools keep for reuse, including CUDA's stream-ordered pool.
+  pools keep for reuse, including CUDA's stream-ordered pool. On CUDA it also counts the cuDNN workspace, the training
+  step arena's blocks, and the scratch buffers the library allocates for cuBLASLt algorithm selection, cuRAND, the
+  direct-PTX runtime and NCCL staging.
 - **Over the budget.** A new device allocation that would pass the budget first releases cached and unreachable memory,
   the same release a driver out-of-memory triggers. If it is still over, it fails with the backend's out-of-memory error
   (`GpuOutOfMemoryException` on CUDA, OpenCL, Vulkan and WebGPU; `OutOfMemoryException` on Metal; `hipErrorOutOfMemory` on
   HIP). Code that already handles a driver out-of-memory, such as a kernel that falls back to needing no workspace,
   handles a budget refusal the same way.
 - **Reuse is not checked.** Reusing pooled memory is not a new reservation, so the budget never refuses it. On CUDA,
-  a stream-ordered request is charged only for what the pool's free memory does not cover. If the pool still grows past
-  the budget (fragmentation), the allocation is returned and retried once after the reclaim, then refused.
+  a stream-ordered request is charged only for what the pool's free memory does not cover, and is judged afterwards
+  only by what it added to the pool: a request the pool served without growing always stands, also under a budget set
+  below what the pool already holds. If the pool grew past the budget (fragmentation), the allocation is returned and
+  retried once after the reclaim, then refused. Inside a stream capture nothing can be reclaimed, so such a request is
+  refused at once; the capture is abandoned and the step runs eagerly.
+- **Concurrent allocations.** A request is held against the budget from the moment it is admitted until it is counted
+  as reserved, so threads allocating at the same moment cannot together pass the budget.
+- **A budget of zero.** A fraction smaller than one byte of the device is a budget that admits nothing, not the absence
+  of one.
 - **Why it matters on Windows.** Without a budget, a process that outgrows the GPU does not fail. The Windows driver backs
   the overflow with system memory, and both processes slow down severalfold instead.
 - **Device names.** Devices are named as `GpuMemoryStats` names them: `cuda:0`, `hip:0`, `opencl:0`, `vulkan:0`,
@@ -56,8 +65,14 @@ not count.
     their SMT siblings, so the threads that dispatch work stay there too.
   - Otherwise only the pool's workers are bound. A process's affinity mask can name only its own group.
 - **Thread count.** `AIDOTNET_CPU_THREADS`, when set, still sets the thread count.
-- **Platforms.** Binding is done on Windows. On Linux, confine the process with `taskset` or `numactl`; the pool keeps to the
-  process's affinity.
+- **Platforms.**
+  - Windows: as above.
+  - Linux: the whole process is confined to the listed cores and their SMT siblings (read from sysfs), so every thread
+    stays there. Workers are not bound one by one. A core whose logical processor number is 64 or higher cannot be
+    named this way; use `taskset` or `numactl` for those.
+  - macOS has no processor affinity. The setting sets the thread count only, and a warning is traced.
+- **Failures.** A core the machine does not have, or a confinement the operating system refuses, throws an error naming
+  `AIDOTNET_CPU_CORES` on first use of the pool. The process is never left sized for cores it is not confined to.
 
 ## What is not isolated
 

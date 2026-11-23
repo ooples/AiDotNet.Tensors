@@ -42,8 +42,132 @@ public class GpuMemoryBudgetTests
         }
         finally
         {
+            DeviceMemoryAccount.SettleAdmission();
             GpuMemoryBudget.ClearLimit("budgettest:1");
         }
+    }
+
+    // What AIDOTNET_GPU_MEMORY_FRACTION leaves in force on a device of `total` bytes once its own limit is cleared.
+    private static long? EnvironmentLimit(long total)
+    {
+        string? text = Environment.GetEnvironmentVariable(GpuMemoryBudget.FractionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        double fraction = double.Parse(text, System.Globalization.CultureInfo.InvariantCulture);
+        return (long)Math.Floor(total * fraction);
+    }
+
+    [Fact]
+    public void AFractionSmallerThanOneByte_IsABudgetOfZero_NotTheAbsenceOfOne()
+    {
+        var account = DeviceMemoryAccount.For("budgettest", 3);
+        account.DeviceTotalBytes = 24L * 1024 * 1024 * 1024;
+        GpuMemoryBudget.SetPerProcessMemoryFraction(1e-12, "budgettest:3");
+        try
+        {
+            Assert.Equal(0, GpuMemoryBudget.GetLimitBytes("budgettest:3"));
+            int reclaims = 0;
+            Assert.False(account.TryAdmit(64L * 1024 * 1024, () => reclaims++, out string? refusal));
+            Assert.Equal(1, reclaims);
+            Assert.Contains("budget of 0 bytes", refusal);
+            Assert.False(account.TryAdmit(1, null, out _));
+        }
+        finally
+        {
+            DeviceMemoryAccount.SettleAdmission();
+            GpuMemoryBudget.ClearLimit("budgettest:3");
+        }
+    }
+
+    [Theory]
+    [InlineData(600, 1)]    // two would pass 1000: exactly one of the eight is admitted
+    [InlineData(125, 8)]    // all eight fit exactly
+    [InlineData(300, 3)]    // three fit, a fourth would not
+    public void ThreadsAdmittedAtTheSameMoment_NeverPassTheBudget_AndNoneThatFitsIsRefused(int bytes, int expectedAdmitted)
+    {
+        const int Threads = 8;
+        var account = DeviceMemoryAccount.For("budgettest", 4 + bytes);
+        string device = account.Device;
+        GpuMemoryBudget.SetMemoryLimit(1_000, device);
+        try
+        {
+            using var start = new System.Threading.Barrier(Threads);
+            using var release = new System.Threading.ManualResetEventSlim(false);
+            using var asked = new System.Threading.CountdownEvent(Threads);
+            int admitted = 0;
+            var threads = new System.Threading.Thread[Threads];
+            for (int i = 0; i < Threads; i++)
+            {
+                threads[i] = new System.Threading.Thread(() =>
+                {
+                    start.SignalAndWait();
+                    bool ok = account.TryAdmit(bytes, null, out _);
+                    if (ok) System.Threading.Interlocked.Increment(ref admitted);
+                    asked.Signal();
+                    // Held, as an allocation in progress holds it, until every thread has asked.
+                    release.Wait();
+                    DeviceMemoryAccount.SettleAdmission();
+                });
+                threads[i].Start();
+            }
+
+            asked.Wait();
+            Assert.Equal(expectedAdmitted, admitted);
+            Assert.Equal((long)expectedAdmitted * bytes, account.InFlightBytes);
+            release.Set();
+            foreach (var thread in threads) thread.Join();
+            Assert.Equal(0, account.InFlightBytes);
+        }
+        finally
+        {
+            GpuMemoryBudget.ClearLimit(device);
+        }
+    }
+
+    [Fact]
+    public void AnAdmission_IsHeldUntilItsBytesAreReserved_OrTheThreadAsksAgain()
+    {
+        var account = DeviceMemoryAccount.For("budgettest", 5);
+        GpuMemoryBudget.SetMemoryLimit(1_000, "budgettest:5");
+        try
+        {
+            Assert.True(account.TryAdmit(700, null, out _));
+            Assert.Equal(700, account.InFlightBytes);
+            account.Reserve(700);                       // the allocation is counted: no longer in flight
+            Assert.Equal(0, account.InFlightBytes);
+            Assert.Equal(700, account.ReservedBytes);
+            Assert.False(account.TryAdmit(400, null, out _));
+            Assert.True(account.TryAdmit(300, null, out _));
+            Assert.True(account.TryAdmit(300, null, out _));   // the earlier 300 was never allocated: asking again replaces it
+            Assert.Equal(300, account.InFlightBytes);
+        }
+        finally
+        {
+            DeviceMemoryAccount.SettleAdmission();
+            account.Unreserve(700);
+            GpuMemoryBudget.ClearLimit("budgettest:5");
+        }
+    }
+
+    [Fact]
+    public void TrackedScratchMemory_IsReservedOnItsDevice_UntilItIsFreed()
+    {
+        var account = DeviceMemoryAccount.For("budgettest", 6);
+        var pointer = new IntPtr(0x6000_1000);
+        long before = account.ReservedBytes;
+        CudaAccountedMemory.Track(pointer, account, 4_096);
+        try
+        {
+            Assert.Equal(before + 4_096, account.ReservedBytes);
+            Assert.Equal(before + 4_096, GpuMemoryBudget.GetReservedBytes("budgettest:6"));
+        }
+        finally
+        {
+            CudaAccountedMemory.Untrack(pointer);
+        }
+
+        Assert.Equal(before, account.ReservedBytes);
+        CudaAccountedMemory.Untrack(pointer);   // a pointer it does not hold returns nothing
+        Assert.Equal(before, account.ReservedBytes);
     }
 
     [Fact]
@@ -69,8 +193,11 @@ public class GpuMemoryBudgetTests
         {
             GpuMemoryBudget.ClearLimit("budgettest:2");
         }
-        Assert.Null(GpuMemoryBudget.GetLimitBytes("budgettest:2"));
-        Assert.True(account.TryAdmit(long.MaxValue / 2, null, out _));
+        // Clearing a device's own limit leaves the environment's fraction in force, when one is set.
+        long? fallback = EnvironmentLimit(1_000_000);
+        Assert.Equal(fallback, GpuMemoryBudget.GetLimitBytes("budgettest:2"));
+        Assert.Equal(fallback is null, account.TryAdmit(long.MaxValue / 2, null, out _));
+        DeviceMemoryAccount.SettleAdmission();
     }
 
     [Fact]
@@ -141,6 +268,8 @@ public class GpuMemoryBudgetTests
         using var owned = Create("cuda", out var backend);
         Skip.If(backend is null, "CUDA is not available on this machine");
         var cuda = (CudaBackend)backend!;
+        Skip.IfNot(cuda.UsesStreamOrderedAllocation,
+            "This CUDA backend allocates synchronously (AIDOTNET_CUDA_ASYNC_ALLOC=0, or a driver without the stream-ordered pool).");
         string device = GpuMemoryStats.Snapshot(cuda).Device;
         Assert.True(DeviceMemoryAccount.TryGet(device, out var account));
 
@@ -189,7 +318,10 @@ public class GpuMemoryBudgetTests
             backend = candidate;
             return name == "vulkan" ? null : candidate as IDisposable;
         }
-        catch (Exception ex) when (ex is not Xunit.Sdk.XunitException)
+        // Only what says the backend's runtime or hardware is not on this machine: any other failure to construct a
+        // backend is a defect, and must fail the test rather than skip it.
+        catch (Exception unavailable) when (unavailable is DllNotFoundException or EntryPointNotFoundException
+                                                or PlatformNotSupportedException or BadImageFormatException)
         {
             return null;
         }
