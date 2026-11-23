@@ -616,12 +616,32 @@ internal static partial class DirectConvAvx2
                         for (int i = 0; i < right; i += Block) Avx.Store(tail + i, zero);
                     }
                 }
-                else
-                {
-                    new Span<float>(d, plane).Clear();   // lanes past the last channel stay zero
-                }
                 long channelPlane = (long)height * width;
                 float* s0 = ps + sourceOffset + ((long)b * channels + blk * Block) * channelPlane;
+                if (blockChannels < Block)
+                {
+                    // A partial block (an RGB stem's 3 channels): each interior pixel is written whole, its lanes past
+                    // the last channel zero, in one pass; clearing the plane first and scattering after wrote it twice.
+                    int rowFloats = paddedW * Block, left = padW * Block, right = (paddedW - padW - width) * Block;
+                    new Span<float>(d, padH * rowFloats).Clear();
+                    new Span<float>(d + (long)(padH + height) * rowFloats, (paddedH - padH - height) * rowFloats).Clear();
+                    float* lanes = stackalloc float[Block];
+                    for (int y = 0; y < height; y++)
+                    {
+                        float* row = d + (long)(y + padH) * rowFloats;
+                        new Span<float>(row, left).Clear();
+                        new Span<float>(row + left + width * Block, right).Clear();
+                        float* drow = row + left;
+                        float* srow = s0 + y * width;
+                        for (int x = 0; x < width; x++)
+                        {
+                            for (int c = 0; c < blockChannels; c++) lanes[c] = srow[c * channelPlane + x];
+                            for (int c = blockChannels; c < Block; c++) lanes[c] = 0f;
+                            Avx.Store(drow + x * Block, Avx.LoadVector256(lanes));
+                        }
+                    }
+                    return;
+                }
                 // A full block goes 8 pixels x 8 channels at a time through a register transpose; the strided scalar
                 // scatter it replaces was 7% of a 64-channel forward.
                 int vectorWidth = blockChannels == Block ? width & ~(Block - 1) : 0;
