@@ -1,4 +1,4 @@
-// Copyright (c) CrowdTrainer LLC. All rights reserved.
+﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -2426,6 +2426,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (CaptureMemoryPool.Current?.TryRentFree(size) is { } recycled)
+        {
+            // Memory this capture released earlier (graph-private reuse), zeroed like any fresh allocation.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(recycled.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(capture reuse)");
+            return recycled;
+        }
         var arena = StepArenaForThisAllocation();
         if (arena?.TryRent(size) is { } slot)
         {
@@ -2509,7 +2517,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return AllocateBuffer(size);
         using var _ = PushContext();
         var arena = StepArenaForThisAllocation();
-        var buffer = arena?.TryRent(size);
+        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size);
         if (buffer is null)
         {
             buffer = TryRentAsyncBuffer(size)
@@ -21669,6 +21677,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 capture.Pin(ref _capturePins, this);
                 _capturedAllocation = true;
+                _capturePool = capture;
+                if (s_captureAllocStacks)
+                {
+                    var frames = new System.Diagnostics.StackTrace(1, false).GetFrames()
+                        .Select(f => f.GetMethod()).Where(m => m is not null && m.DeclaringType is { } t
+                            && !t.FullName!.Contains("CudaBackend") && !t.FullName.Contains("CaptureMemory"))
+                        .Take(6).Select(m => m!.DeclaringType!.Name + "." + m.Name);
+                    AiDotNet.Tensors.Engines.AiDotNetEngine.LogDiagnostic(
+                        $"[CAPTURE-ALLOC] bytes={(long)size * sizeof(float)} at {string.Join(" < ", frames)}");
+                }
             }
             InitCudaBufferLifecycle(
                 context, account is not null ? (long)size * sizeof(float) : 0,
@@ -21678,6 +21696,32 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
         // graph still replays it), always freed.
         private readonly bool _capturedAllocation;
+        internal bool AllocatedInCapture => _capturedAllocation;
+        // The capture that allocated this buffer: a release on that capture's thread while it is still open hands the
+        // memory back to that capture for its later allocations (TryReturnToCapture).
+        private readonly CaptureMemoryPool? _capturePool;
+
+        /// <summary>
+        /// PyTorch's graph-private pool: memory a capture allocated and then released, while that capture is still
+        /// open on this thread, is reused by the capture's later allocations instead of held to the graph's end. The
+        /// capture records one stream, so the next user of the memory is ordered after this buffer's last use on every
+        /// replay, exactly as the eager pool's stream-ordered reuse. The memory goes on under a new wrapper (this one
+        /// reads as released), and stays pinned to the capture until the graph is destroyed.
+        /// </summary>
+        private bool TryReturnToCapture()
+        {
+            if (_capturePool is not { } pool || !ReferenceEquals(CaptureMemoryPool.Current, pool)
+                || !IsCapturingOnThisThread || _arenaBlock is not null
+                || AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.IsActive)   // a recorded op graph still reads it
+                return false;
+            if (Volatile.Read(ref _poolState) != 0) return false;   // already pooled or released
+            var lease = DetachForPool();                             // constructed under the capture: pinned to it
+            if (lease is null) return true;
+            CreditReclaim();
+            if (!pool.TryAddFree(lease)) lease.Release();
+            return true;
+        }
+        private static readonly bool s_captureAllocStacks = Environment.GetEnvironmentVariable("AIDOTNET_CAPTURE_ALLOC_STACKS") == "1";
 
         public void MarkRented(int size)
         {
@@ -21712,6 +21756,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Release()
         {
+            if (TryReturnToCapture()) return;
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
@@ -21790,6 +21835,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Dispose()
         {
+            if (TryReturnToCapture()) return;
             // #642: defer the whole dispose (free OR pool-return) until the deferred-execution
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
