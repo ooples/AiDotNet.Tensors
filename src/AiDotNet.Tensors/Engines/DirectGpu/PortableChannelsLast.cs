@@ -17,12 +17,17 @@ internal static class PortableChannelsLast
         owned = channelsLast;
         if (!channelsLast) return source;
         var copy = backend.AllocateBuffer(batch * channels * spatial);
-        if (!PortableChannelEpilogue.TryChangeLayout(launch, source, copy, batch, channels, spatial, toChannelsLast: false))
+        try
+        {
+            if (!PortableChannelEpilogue.TryChangeLayout(launch, source, copy, batch, channels, spatial, toChannelsLast: false))
+                throw new System.InvalidOperationException("The channels-last layout change did not run.");
+            return copy;
+        }
+        catch
         {
             copy.Dispose();
-            throw new System.InvalidOperationException("The channels-last layout change did not run.");
+            throw;
         }
-        return copy;
     }
 
     /// <summary>As <see cref="IChannelsLastBackend.TryConvolutionChannelsLast"/>.</summary>

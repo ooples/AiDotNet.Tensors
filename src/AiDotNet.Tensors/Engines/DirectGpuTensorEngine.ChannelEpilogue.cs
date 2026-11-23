@@ -26,9 +26,19 @@ public partial class DirectGpuTensorEngine
         using var bufScale = scale is null ? default : GetOrAllocateBuffer(backend, scale);
         using var bufShift = shift is null ? default : GetOrAllocateBuffer(backend, shift);
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, z.Length);
-        if (!epilogue.TryChannelEpilogue(bufZ.Buffer, bias is null ? null : bufBias.Buffer,
+        bool ran;
+        try
+        {
+            ran = epilogue.TryChannelEpilogue(bufZ.Buffer, bias is null ? null : bufBias.Buffer,
                 scale is null ? null : bufScale.Buffer, shift is null ? null : bufShift.Buffer, bufOut.Buffer,
-                batch, channels, spatial, activation, slope))
+                batch, channels, spatial, activation, slope);
+        }
+        catch
+        {
+            bufOut.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufOut.Dispose();
             return null;
@@ -53,8 +63,18 @@ public partial class DirectGpuTensorEngine
         using var bufY = GetOrAllocateBuffer(backend, output);
         using var bufScale = scale is null ? default : GetOrAllocateBuffer(backend, scale);
         var bufDz = AllocateFullyWrittenOutputBuffer(backend, output.Length);
-        if (!epilogue.TryChannelEpilogueBackward(bufDy.Buffer, bufY.Buffer, scale is null ? null : bufScale.Buffer,
-                bufDz.Buffer, batch, channels, spatial, activation, slope))
+        bool ran;
+        try
+        {
+            ran = epilogue.TryChannelEpilogueBackward(bufDy.Buffer, bufY.Buffer, scale is null ? null : bufScale.Buffer,
+                bufDz.Buffer, batch, channels, spatial, activation, slope);
+        }
+        catch
+        {
+            bufDz.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufDz.Dispose();
             return null;

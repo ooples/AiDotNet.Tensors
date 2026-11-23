@@ -132,6 +132,7 @@ public sealed partial class CuDnnConvolution
             {
                 plan = BuildChannelsLastPlan(n, channels, h, w, k, filterH, filterW, outputHeight, outputWidth, padH,
                     padW, strideH, strideW, dilationH, dilationW, inputNhwc, outputNhwc, filterNhwc, mathType, dataType);
+                transient = plan;   // released by the finally until it is cached: a search that throws leaks nothing
                 // Inside a capture no search can run: the pass takes the heuristic's choice, for this call only.
                 int algorithm = capturing
                     ? HeuristicChannelsLast(pass, plan.Input.Handle, plan.Output.Handle, plan.Filter.Handle,
@@ -144,15 +145,19 @@ public sealed partial class CuDnnConvolution
                     // other formats are tried at once on later calls.
                     plan.Algorithm = UnsupportedFormats;
                     plan.Dispose();
+                    transient = null;
                     _channelsLastPlans[key] = plan;
                     return false;
                 }
                 plan.Algorithm = algorithm >= 0 ? algorithm
                     : pass == 0 ? (int)CuDnnNative.CudnnConvolutionFwdAlgo.ImplicitPrecompGemm
                     : (int)CuDnnNative.CudnnConvolutionBwdDataAlgo.Algo1;   // Algo1 for both backward passes
-                if (!TryQueryChannelsLastWorkspace(pass, plan)) { plan.Dispose(); return false; }
-                if (capturing) transient = plan;
-                else if (!_channelsLastPlans.TryAdd(key, plan)) { plan.Dispose(); plan = _channelsLastPlans[key]; }
+                if (!TryQueryChannelsLastWorkspace(pass, plan)) return false;   // the finally releases it
+                if (!capturing)
+                {
+                    transient = null;   // cached: the backend's Dispose releases it
+                    if (!_channelsLastPlans.TryAdd(key, plan)) { plan.Dispose(); plan = _channelsLastPlans[key]; }
+                }
             }
             if (plan.Algorithm == UnsupportedFormats) return false;
             return LaunchChannelsLastPlan(pass, plan, a, b, c, capturing);

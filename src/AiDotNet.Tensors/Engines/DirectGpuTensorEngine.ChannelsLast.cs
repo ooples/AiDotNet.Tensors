@@ -43,12 +43,22 @@ public partial class DirectGpuTensorEngine
         var bufC = AllocateFullyWrittenOutputBuffer(backend, (int)length);
         // Under autocast the pass runs in 16 bits, its activations cast in their layout (no transpose for a
         // channels-last one); a pass the 16-bit route declines runs the FP32 channels-last pass below.
-        if (TryAutocastConvolutionChannelsLast(backend, pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g, inputNhwc,
-                outputNhwc))
-            return DeferTensorResult<float>(backend, bufC.Buffer, (int)length, outputShape);
-        if (!channelsLast.TryConvolutionChannelsLast(pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g.Batch, g.Channels,
+        bool ran;
+        try
+        {
+            if (TryAutocastConvolutionChannelsLast(backend, pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g, inputNhwc,
+                    outputNhwc))
+                return DeferTensorResult<float>(backend, bufC.Buffer, (int)length, outputShape);
+            ran = channelsLast.TryConvolutionChannelsLast(pass, bufA.Buffer, bufB.Buffer, bufC.Buffer, g.Batch, g.Channels,
                 g.Height, g.Width, g.OutChannels, g.KernelH, g.KernelW, g.OutHeight, g.OutWidth, g.PadH, g.PadW, g.StrideH,
-                g.StrideW, g.DilationH, g.DilationW, inputNhwc, outputNhwc))
+                g.StrideW, g.DilationH, g.DilationW, inputNhwc, outputNhwc);
+        }
+        catch
+        {
+            bufC.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufC.Dispose();
             return null;
@@ -76,8 +86,18 @@ public partial class DirectGpuTensorEngine
         var bufY = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufM = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufV = AllocateFullyWrittenOutputBuffer(backend, channels);
-        if (!channelsLast.TryBatchNormChannelsLast(bufX.Buffer, bufY.Buffer, bufG.Buffer, bufB.Buffer, bufM.Buffer,
-                bufV.Buffer, rows, channels, (float)epsilon, act, slope))
+        bool ran;
+        try
+        {
+            ran = channelsLast.TryBatchNormChannelsLast(bufX.Buffer, bufY.Buffer, bufG.Buffer, bufB.Buffer, bufM.Buffer,
+                bufV.Buffer, rows, channels, (float)epsilon, act, slope);
+        }
+        catch
+        {
+            bufY.Dispose(); bufM.Dispose(); bufV.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufY.Dispose(); bufM.Dispose(); bufV.Dispose();
             return null;
@@ -111,9 +131,19 @@ public partial class DirectGpuTensorEngine
         var bufDx = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
-        if (!channelsLast.TryBatchNormChannelsLastBackward(bufDy.Buffer, act != 0 ? bufY.Buffer : null, null, bufX.Buffer,
+        bool ran;
+        try
+        {
+            ran = channelsLast.TryBatchNormChannelsLastBackward(bufDy.Buffer, act != 0 ? bufY.Buffer : null, null, bufX.Buffer,
                 bufG.Buffer, bufM.Buffer, bufV.Buffer, bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, rows, channels,
-                (float)epsilon, act != 0 ? 1 : 0, act, slope, accumulate: false))
+                (float)epsilon, act != 0 ? 1 : 0, act, slope, accumulate: false);
+        }
+        catch
+        {
+            bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufDx.Dispose(); bufDg.Dispose(); bufDb.Dispose();
             return null;
@@ -136,7 +166,17 @@ public partial class DirectGpuTensorEngine
         var d = input.Shape._dims;
         using var bufX = GetOrAllocateBuffer(backend, input);
         var bufY = AllocateFullyWrittenOutputBuffer(backend, input.Length);
-        if (!channelsLast.TryChangeLayout(bufX.Buffer, bufY.Buffer, d[0], d[1], d[2] * d[3], toChannelsLast))
+        bool ran;
+        try
+        {
+            ran = channelsLast.TryChangeLayout(bufX.Buffer, bufY.Buffer, d[0], d[1], d[2] * d[3], toChannelsLast);
+        }
+        catch
+        {
+            bufY.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufY.Dispose();
             return null;

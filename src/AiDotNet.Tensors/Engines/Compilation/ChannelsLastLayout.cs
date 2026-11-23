@@ -186,11 +186,9 @@ internal sealed class ChannelsLastLayoutPass : ILazyGraphOptimizationPass
     {
         if (!s_enabled) return nodes;
         var consumers = new Dictionary<Tensor<float>, List<ILazyNode>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
-        var outputs = new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         foreach (var node in nodes)
         {
             if (node is not LazyNode<float> typed) continue;
-            outputs.Add(typed.Output);
             foreach (var input in typed.GetInputsArray())
             {
                 if (!consumers.TryGetValue(input, out var list)) consumers[input] = list = new List<ILazyNode>(2);

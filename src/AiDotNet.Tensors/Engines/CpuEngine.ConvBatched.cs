@@ -235,6 +235,10 @@ public partial class CpuEngine
         int perChunk = Math.Max(1, ChunkedWeightGradPositions / colW);
         int chunks = (batch + perChunk - 1) / perChunk;
         int inputSliceSize = inChannels * height * width;
+        // The transpose below reads gradOutputF through a raw pointer: prove every image's [outC, colW] block is inside it.
+        if ((long)batch * outChannels * colW > gradOutputF.Length || (long)batch * inputSliceSize > inputF.Length
+            || (long)outSize > gradKernelT.Length)
+            throw new ArgumentException("ConvWeightGradientChunked: an operand is shorter than its geometry.");
         var pool = ArrayPool<float>.Shared;
         float[] partials = pool.Rent(chunks * outSize);
         try

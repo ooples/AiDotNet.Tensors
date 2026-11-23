@@ -251,7 +251,7 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
             var run = Train(gpu, onDevice: true, batch: 4, size: 8, activation: 1,
                 AiDotNet.Tensors.Engines.Gpu.PrecisionMode.BFloat16, steps: 12);
             Assert.Equal(2, run.StepNames.Count(n => n == "ConvBiasBatchNorm"));
-            Assert.All(run.Losses, loss => Assert.True(double.IsFinite(loss), $"loss {loss}"));
+            Assert.All(run.Losses, loss => Assert.True(TestHelpers.MathCompat.IsFinite(loss), $"loss {loss}"));
             Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
                 "the BF16 step never replayed as a captured graph (AIDOTNET_GRAPHSTEP_DIAG=1 says why)");
             Assert.Equal(Rand([Channels], 5, 0.5f).ToArray(), run.Biases[0]);

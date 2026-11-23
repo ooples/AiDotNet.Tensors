@@ -159,14 +159,14 @@ public class SharedStepScratchTrainingTests : IDisposable
             Assert.True(shared.Takes > 0, "the second plan took none of the first plan's step scratch");
             for (int s = 0; s < Steps; s++)
             {
-                Assert.True(BitConverter.SingleToInt32Bits(isolated.LossesA[s]) == BitConverter.SingleToInt32Bits(shared.LossesA[s]),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(isolated.LossesA[s]) == TestHelpers.MathCompat.SingleToInt32Bits(shared.LossesA[s]),
                     $"plan A step {s}: loss {shared.LossesA[s]:G9} co-owned vs {isolated.LossesA[s]:G9} private");
-                Assert.True(BitConverter.SingleToInt32Bits(isolated.LossesB[s]) == BitConverter.SingleToInt32Bits(shared.LossesB[s]),
+                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(isolated.LossesB[s]) == TestHelpers.MathCompat.SingleToInt32Bits(shared.LossesB[s]),
                     $"plan B step {s}: loss {shared.LossesB[s]:G9} co-owned vs {isolated.LossesB[s]:G9} private");
             }
             for (int p = 0; p < isolated.Weights.Length; p++)
                 for (int i = 0; i < isolated.Weights[p].Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(isolated.Weights[p][i]) == BitConverter.SingleToInt32Bits(shared.Weights[p][i]),
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(isolated.Weights[p][i]) == TestHelpers.MathCompat.SingleToInt32Bits(shared.Weights[p][i]),
                         $"parameter {p}[{i}]: {shared.Weights[p][i]:G9} co-owned vs {isolated.Weights[p][i]:G9} private");
             // B's loss took A's one-element buffer: the taker's validation must have revoked it (the plan keeps its loss
             // tensor across steps, so the step-persistent contract excludes it from co-ownership).

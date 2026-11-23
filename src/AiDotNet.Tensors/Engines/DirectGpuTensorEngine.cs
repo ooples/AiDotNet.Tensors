@@ -1255,6 +1255,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override bool SupportsGpu => IsGpuAvailable;
 
+    internal override bool IsDeviceEngine => true;
+
     DirectGpuEngine? IEngine.DirectGpu => _directGpu;
 
     /// <summary>
@@ -18803,13 +18805,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufVar = AllocateFullyWrittenOutputBuffer(backend, channels);
-        if (!(leaky
-                ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluTraining(bufIn.Buffer,
-                    bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial,
-                    (float)epsilon, leakySlope)
-                : varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
-                    bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
-                    residual: residual is null ? null : bufResidual.Buffer)))
+        bool ran;
+        try
+        {
+            ran = (leaky
+                    ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluTraining(bufIn.Buffer,
+                        bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial,
+                        (float)epsilon, leakySlope)
+                    : varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
+                        bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
+                        residual: residual is null ? null : bufResidual.Buffer));
+        }
+        catch
+        {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return null;
@@ -27212,9 +27224,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     if (!TryAutocastConvTranspose2DForward(rbkT, bufInR.Buffer, bufKR.Buffer, outBufR, batchR, inChR, inHR,
                             inWR, outChR, outHR, outWR, kHR, kWR, stride[0], stride[1], padding[0], padding[1], out _))
-                    rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
-                        batchR, inChR, inHR, inWR, outChR, outHR, outWR,
-                        kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
+                        rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
+                            batchR, inChR, inHR, inWR, outChR, outHR, outWR,
+                            kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
                     ResidentSyncCheck("ConvTranspose2D");
                     BindResidentBuffer(outTR, outBufR, rbkT);
                     return outTR;

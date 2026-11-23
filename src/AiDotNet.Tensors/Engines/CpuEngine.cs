@@ -64,6 +64,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual bool SupportsGpu => false;
 
+    /// <summary>Whether this engine is a device engine (<see cref="DirectGpuTensorEngine"/>), GPU found or not: its
+    /// tensors may live on the device, so the host-only fused kernels here step aside for the primitive chain.</summary>
+    internal virtual bool IsDeviceEngine => false;
+
     /// <inheritdoc/>
     public DirectGpu.DirectGpuEngine? DirectGpu => null;
 

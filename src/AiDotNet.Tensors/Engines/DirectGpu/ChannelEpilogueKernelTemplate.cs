@@ -37,7 +37,8 @@ internal static class ChannelEpilogueKernelTemplate
         if ((mode & 2) != 0) v = v * scl[c];
         if ((mode & 4) != 0) v = v + shf[c];
         int act = (mode >> 3) & 3;
-        if (act == 1) v = v > 0.0f ? v : (v != v ? v : 0.0f);
+        // NaN tested on its bits: a fast-math compiler (Metal's default) folds v != v to false.
+        if (act == 1) v = v > 0.0f ? v : ((FBITS(v) & 0x7fffffff) > 0x7f800000 ? v : 0.0f);
         else if (act == 2) v = v > 0.0f ? v : IBITS(slopeBits) * v;
         yout[i] = v;
     }

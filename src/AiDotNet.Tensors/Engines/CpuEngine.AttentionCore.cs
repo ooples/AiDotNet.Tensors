@@ -44,7 +44,7 @@ public partial class CpuEngine
 
         // The fused kernels are host float32. GPU engines and other element types run the primitive chain, which
         // every backend already differentiates (and a GPU plan can capture).
-        if (typeof(T) != typeof(float) || this is DirectGpuTensorEngine)
+        if (typeof(T) != typeof(float) || IsDeviceEngine)
             return MultiHeadAttentionCoreDecomposed(query, key, value, shape);
 
         var q = (Tensor<float>)(object)query;
