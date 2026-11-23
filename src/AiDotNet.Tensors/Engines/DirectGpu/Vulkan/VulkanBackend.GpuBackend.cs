@@ -342,7 +342,9 @@ public sealed unsafe partial class VulkanBackend
     // low word first) on a device that computes in double; the narrower types have no storage here yet.
     public bool SupportsElementType(GpuElementType type)
         => type is GpuElementType.Float32 or GpuElementType.Int32
-           || (type == GpuElementType.Float64 && SupportsFloat64Storage);
+           || (type == GpuElementType.Float64 && SupportsFloat64Storage)
+           // Held as bytes in whole words; computed by the packed kernels, which need the run-time GLSL compiler.
+           || (GpuPackedKernelSource.Computes(type) && IsGlslCompilerAvailable);
 
     /// <summary>Whether this device holds and computes doubles: shaderFloat64 and the runtime GLSL compiler.</summary>
     internal bool SupportsFloat64Storage => IsGlslCompilerAvailable && _device.SupportsShaderFloat64;
