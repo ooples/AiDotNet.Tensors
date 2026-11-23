@@ -386,75 +386,6 @@ public sealed class CompiledOptimizerHandoverIsolationTests
     }
 
     [Fact]
-    public void Float_master_weights_feeding_differentiable_fp16_cast_bridges_enroll_in_optimizer()
-    {
-        var engine = new CpuEngine();
-        var activeMaster = new Tensor<float>(new[] { 2.0f, -1.5f }, new[] { 2 });
-        var detachedMaster = new Tensor<float>(new[] { 3.0f, 4.0f }, new[] { 2 });
-        var parameters = new[] { activeMaster, detachedMaster };
-
-        CompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.EnableTraining(parameters))
-        {
-            var activeHalf = scope.RecordCrossTypeWithBackward<float, Half>(
-                LazyNodeType.Custom,
-                "CastToFp16",
-                activeMaster,
-                new[] { 2 },
-                (e, o) => MixedPrecisionCast.CastToFp16(activeMaster).AsSpan().CopyTo(o.AsWritableSpan()),
-                (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
-
-            // Cast bridge recorded inside NoGradScope must not enroll detachedMaster.
-            Tensor<Half> detachedHalf;
-            using (new NoGradScope<float>())
-            {
-                detachedHalf = scope.RecordCrossTypeWithBackward<float, Half>(
-                    LazyNodeType.Custom,
-                    "CastToFp16Detached",
-                    detachedMaster,
-                    new[] { 2 },
-                    (e, o) => MixedPrecisionCast.CastToFp16(detachedMaster).AsSpan().CopyTo(o.AsWritableSpan()),
-                    (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp16Backward(gradOut));
-            }
-
-            var sumHalf = engine.TensorAdd(engine.TensorMultiply(activeHalf, activeHalf), detachedHalf);
-            var lossHalf = engine.ReduceSum(sumHalf, null, false);
-            var lossFloat = scope.RecordCrossTypeWithBackward<Half, float>(
-                LazyNodeType.Custom,
-                "CastToFp32",
-                lossHalf,
-                lossHalf.Shape.ToArray(),
-                (e, o) => MixedPrecisionCast.CastToFp32(lossHalf).AsSpan().CopyTo(o.AsWritableSpan()),
-                (gradOut, inp, o, s, e) => MixedPrecisionCast.CastToFp32Backward(gradOut));
-
-            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, lossFloat));
-        }
-
-        using (plan)
-        {
-            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.1, weightDecay: 0.05);
-            float initial0 = activeMaster[0];
-            float initial1 = activeMaster[1];
-            plan.Step();
-
-            Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
-            // Independent scalar AdamW recurrence: d(sum(master^2))/d(master) = [4, -3].
-            static double Expected(double value, double gradient)
-            {
-                double firstMoment = 0.1 * gradient;
-                double secondMoment = 0.001 * gradient * gradient;
-                double correctedFirst = firstMoment / (1 - 0.9);
-                double correctedSecond = secondMoment / (1 - 0.999);
-                return value * (1 - 0.1 * 0.05)
-                    - 0.1 * correctedFirst / (Math.Sqrt(correctedSecond) + 1e-8);
-            }
-            Assert.InRange(Math.Abs(activeMaster[0] - Expected(initial0, 4)), 0, 2e-6);
-            Assert.InRange(Math.Abs(activeMaster[1] - Expected(initial1, -3)), 0, 2e-6);
-            Assert.Equal(new[] { 3.0f, 4.0f }, detachedMaster.ToArray());
-        }
-    }
-
-    [Fact]
     public void Explicit_leaf_loss_without_a_recorded_producer_is_rejected()
     {
         var engine = new CpuEngine();
@@ -463,37 +394,6 @@ public sealed class CompiledOptimizerHandoverIsolationTests
         _ = engine.TensorMultiply(parameter, parameter);
         var error = Assert.Throws<ArgumentException>(() => scope.CompileTraining(new[] { parameter }, parameter));
         Assert.Contains("produced by an operation recorded", error.Message);
-    }
-
-    [Fact]
-    public void Foreign_type_no_grad_operation_does_not_enroll_its_float_master()
-    {
-        var engine = new CpuEngine();
-        var master = new Tensor<float>(new[] { 2f, -1.5f }, new[] { 2 });
-        CompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.EnableTraining(new[] { master }))
-        {
-            var half = scope.RecordCrossTypeWithBackward<float, Half>(
-                LazyNodeType.Custom, "MasterToHalf", master, new[] { 2 },
-                (e, o) => MixedPrecisionCast.CastToFp16(master).AsSpan().CopyTo(o.AsWritableSpan()),
-                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradient));
-            Tensor<Half> detached;
-            using (new NoGradScope<Half>())
-                detached = engine.TensorMultiply(half, half);
-            var floating = scope.RecordCrossTypeWithBackward<Half, float>(
-                LazyNodeType.Custom, "DetachedToFloat", detached, new[] { 2 },
-                (e, o) => MixedPrecisionCast.CastToFp32(detached).AsSpan().CopyTo(o.AsWritableSpan()),
-                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradient));
-            var loss = engine.ReduceSum(floating, null, false);
-            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(new[] { master }, loss));
-        }
-        using (plan)
-        {
-            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.1, weightDecay: 0.2);
-            plan.Step();
-            Assert.Equal(new[] { 2f, -1.5f }, master.ToArray());
-            Assert.Equal(new long[] { 0 }, plan.ParameterAcceptedUpdates);
-        }
     }
 
     [Fact]
@@ -517,48 +417,6 @@ public sealed class CompiledOptimizerHandoverIsolationTests
             plan.Step();
             Assert.InRange(Math.Abs(weight[0] - 1.7f), 0, 1e-6f);
             Assert.Equal(10f, bias[0]);
-            Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
-        }
-    }
-
-    [Fact]
-    public void Foreign_type_no_grad_in_place_write_preserves_prior_writer_gradient_only()
-    {
-        var engine = new CpuEngine();
-        var master = new Tensor<float>(new[] { 2f, -1.5f }, new[] { 2 });
-        var detached = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
-        var parameters = new[] { master, detached };
-        CompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.EnableTraining(parameters))
-        {
-            Tensor<Half> CastMaster(Tensor<float> value, string name) =>
-                scope.RecordCrossTypeWithBackward<float, Half>(
-                    LazyNodeType.Custom, name, value, new[] { 2 },
-                    (e, o) => MixedPrecisionCast.CastToFp16(value).AsSpan().CopyTo(o.AsWritableSpan()),
-                    (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp16Backward(gradient));
-            var halfMaster = CastMaster(master, "LiveMasterToHalf");
-            var halfDetached = CastMaster(detached, "DetachedOperandToHalf");
-            var live = engine.TensorMultiplyScalar(halfMaster, (Half)3);
-            using (new NoGradScope<Half>())
-                engine.TensorAddInPlace(live, halfDetached);
-            var halfLoss = engine.ReduceSum(live, null, false);
-            var loss = scope.RecordCrossTypeWithBackward<Half, float>(
-                LazyNodeType.Custom, "PriorWriterLossToFloat", halfLoss, halfLoss.Shape.ToArray(),
-                (e, o) => MixedPrecisionCast.CastToFp32(halfLoss).AsSpan().CopyTo(o.AsWritableSpan()),
-                (gradient, input, output, state, e) => MixedPrecisionCast.CastToFp32Backward(gradient));
-            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters, loss));
-        }
-        using (plan)
-        {
-            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.1);
-            // Forward sum: (3 * 2 + 1) + (3 * -1.5 + 2) = 4.5.
-            // NoGrad addition passes the prior writer's identity gradient, not its added operand's.
-            Assert.Equal(4.5f, plan.Step().ToArray()[0]);
-            Assert.Equal(new[] { 3f, 3f }, plan.Gradients[0].ToArray());
-            Assert.Equal(new[] { 0f, 0f }, plan.Gradients[1].ToArray());
-            Assert.InRange(Math.Abs(master[0] - (2f - 0.1f * 3f)), 0, 1e-6f);
-            Assert.InRange(Math.Abs(master[1] - (-1.5f - 0.1f * 3f)), 0, 1e-6f);
-            Assert.Equal(new[] { 1f, 2f }, detached.ToArray());
             Assert.Equal(new long[] { 1, 0 }, plan.ParameterAcceptedUpdates);
         }
     }

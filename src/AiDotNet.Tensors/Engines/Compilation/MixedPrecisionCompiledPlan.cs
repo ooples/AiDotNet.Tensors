@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// <para>This is the forward half. Phase B captures the backward (<see cref="MixedPrecisionGraphBackward"/>)
 /// into a matching replayable pass; C adds the optimizer + loss scaling; D/E take it to GPU + AiDotNet.
-/// Gated behind <c>AIDOTNET_FP16_ACTIVATIONS</c>; the default FP32 fused path is untouched.</para>
+/// Built only by its own <see cref="Trace"/>/<see cref="Compile"/>; the compiled training plan never records Half nodes.</para>
 /// </summary>
 public sealed class MixedPrecisionCompiledPlan : IDisposable
 {
@@ -79,19 +79,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     /// the free-mode backward. Sampled only while <see cref="DirectGpuTensorEngine.TrackOwnedResultBytes"/> is on.</summary>
     internal long PeakBackwardResidentBytesForTest => _peakBackwardResidentBytes;
 
-    // ── Forward Half-resident activation STORAGE (the last structural piece, #633) ─────────────────────
-    // The hetero forward otherwise emits each Half matmul output as an FP32 device buffer (the engine up-casts
-    // Tensor<Half> → FP32 in GetOrAllocateBuffer/FinishGpuOp), so the activations are stored FLOAT on the GPU and
-    // the dtype win is lost. The engine ships a Half-resident store (FinishGpuOpHalfStore, gated by
-    // DirectGpuTensorEngine.Fp16FwdStoreOverride/AIDOTNET_FP16_FWD_STORE) that keeps the matmul output as a HALF
-    // GPU buffer (half the VRAM); the now-all-backend fused Half backward then reads it directly (no re-inflate).
-    // Default-on for the GPU hetero forward (the activations are already Tensor<Half> — Half-resident matches the
-    // captured intent, no new precision loss); opt-out AIDOTNET_FP16_NO_FWD_STORE. An EXPLICIT caller override
-    // (e.g. the A/B peak tests) is always respected.
-    private readonly bool _fwdStoreDefault;
-
-    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging,
-        bool fwdStoreEligible = false)
+    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
     {
         _engine = engine;
         _order = order;
@@ -123,19 +111,6 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             // (AIDOTNET_FP16_NO_SCRATCH_FREE) so it can be disabled without losing the activation free schedule.
             _scratchFree = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE") != "1";
         }
-        // Forward Half-resident store: keeps each Half matmul output a HALF GPU buffer (half the VRAM)
-        // instead of up-casting to FP32. Engaged by default for the FP16 hetero TRAINING forward
-        // (FromCapturedOrder, fwdStoreEligible=true). The training backward reads these Half activations as
-        // weight-gradient operands (h in dW = hᵀ·dY); that read is correct end-to-end now that
-        // DirectGpuTensorEngine.TensorTranspose routes non-float (Half) through the element-size-correct
-        // path instead of the float-typed transpose_2d kernel, and CudaBackend.ConvertToFp32 falls back to
-        // the self-contained native kernel on driver-only GPUs (the two #1624 fixes — previously the Half
-        // weight-gradient transpose read Half-as-float and zeroed dW). NOT for the standalone
-        // Compile()/Trace() inference path (its contract is bit-for-bit eager replay). Opt-out
-        // AIDOTNET_FP16_NO_FWD_STORE; an explicit Fp16FwdStoreOverride wins.
-        _fwdStoreDefault = fwdStoreEligible
-            && engine.Is<DirectGpuTensorEngine>()
-            && Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") != "1";
     }
 
     // Build the free schedule: which intermediate float activations the backward reads (_bwdReadByNode +
@@ -175,16 +150,6 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             if (!_bwdConsumerCount.ContainsKey(kv.Key))
                 _freeAfterFwd[kv.Value].Add(kv.Key);
     }
-
-    /// <summary>
-    /// FP16-IN-CAPTURE (task #30): construct a paged mixed-precision plan from an ALREADY-captured heterogeneous
-    /// node order (e.g. CompiledTrainingPlan's _fp16HeteroOrder) + its loss output, rather than re-tracing.
-    /// Lets CompiledTrainingPlan delegate its hetero forward/backward to this plan's tested activation-paging
-    /// lifecycle (PageOut/PageIn — frees the transient float up-cast copies, holds only the Half activations,
-    /// on-device when AIDOTNET_FP16_GPU_CACHE=1) so the full peak-VRAM reduction is realized.
-    /// </summary>
-    internal static MixedPrecisionCompiledPlan FromCapturedOrder(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
-        => new MixedPrecisionCompiledPlan(engine, order, output, paging, fwdStoreEligible: true);
 
     /// <summary>
     /// Public entry point (Phase E): trace <paramref name="forward"/> under an FP16 autocast scope with
@@ -263,31 +228,19 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         ThrowIfDisposed();
         using var recordingSuspension = GraphMode.SuspendRecording();
         var eng = _engine;
-        // Engage the Half-resident forward store for the GPU hetero forward so each Half matmul output stays a
-        // HALF GPU buffer (half the VRAM) instead of being up-cast to FP32 — but ONLY when the caller hasn't set
-        // an explicit override (the A/B peak tests do), so their measurement intent is preserved.
-        // AIDOTNET_FP16_NO_FWD_STORE is a hard opt-out that takes precedence over all other enable mechanisms.
-        bool hardOptOut = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE") == "1";
-        bool setStore = !hardOptOut && _fwdStoreDefault && DirectGpuTensorEngine.Fp16FwdStoreOverride is null;
-        var prevStore = DirectGpuTensorEngine.Fp16FwdStoreOverride;
-        if (setStore) DirectGpuTensorEngine.Fp16FwdStoreOverride = true;
-        try
+        for (int i = 0; i < _order.Length; i++)
         {
-            for (int i = 0; i < _order.Length; i++)
-            {
-                // Just-in-time: re-give storage to THIS node's output if it was paged/freed last step, right
-                // before its Execute writes into it. Restoring all upfront would re-inflate to full float and
-                // erase the win; per-node keeps resident float = the live working set.
-                if (_paging) RestoreOutputForReplay(_order[i]);
-                RunForward(_order[i], eng);
-                if (_paging)
-                    foreach (var t in _pageOutAt![i]) PageOut(t);
-                else if (_freeEng is not null)
-                    foreach (var t in _freeAfterFwd![i]) _freeEng.FreeFloatActivation(t); // dead after forward
-            }
-            return _output;
+            // Just-in-time: re-give storage to THIS node's output if it was paged/freed last step, right
+            // before its Execute writes into it. Restoring all upfront would re-inflate to full float and
+            // erase the win; per-node keeps resident float = the live working set.
+            if (_paging) RestoreOutputForReplay(_order[i]);
+            RunForward(_order[i], eng);
+            if (_paging)
+                foreach (var t in _pageOutAt![i]) PageOut(t);
+            else if (_freeEng is not null)
+                foreach (var t in _freeAfterFwd![i]) _freeEng.FreeFloatActivation(t); // dead after forward
         }
-        finally { if (setStore) DirectGpuTensorEngine.Fp16FwdStoreOverride = prevStore; }
+        return _output;
     }
 
     // A node's float output may have had its backing freed on the prior step (paged out / backward-freed);

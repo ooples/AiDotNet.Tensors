@@ -27,7 +27,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     private bool CanShareTransientWorkspace(DirectGpuTensorEngine engine) => ShareTransientWorkspaceForTests
         && typeof(T) == typeof(float) && _workspaceExplicitGraphDisable && !_graphPreparationStarted
         && _graphStepDisabled && _graphStepEligible && !HasLiveStepGraph
-        && !_residentStepFailed && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null
+        && !_residentStepFailed && _dataForwardReplay is null && _checkpointing is null
         && _checkpoint is null
         && !_isFrozenWeights && _lastBackwardReads is not null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers

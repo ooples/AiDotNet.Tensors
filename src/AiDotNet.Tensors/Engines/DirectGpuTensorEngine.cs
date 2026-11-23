@@ -4029,7 +4029,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // r is a transient op result that exists only to be landed here. Leaving its Half entry cached held a second
         // copy of every activation for the rest of the step (eviction is suspended mid-step), so the Half store used
         // 2 x 2 bytes per element - exactly the 4 bytes of the FP32 store it replaces. Measured: resident activation
-        // bytes on == off (98308) in Fp16HeteroScratchFreeTests.
+        // bytes on == off (98308).
         // r's Half copy can be cached under its DataVector (a deferred result - what TryGetResidentFp16Buffer checks
         // first) or its backing array; release it under whichever key holds it, or the copy leaks for the step.
         object? rVec = r.DataVector;

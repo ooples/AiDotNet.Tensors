@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
 /// Phase-2c end-to-end gate (Tensors #555, docs/fp16-activation-storage-design.md): a full mixed-
-/// precision TRAINING loop driven through the production engine seam. With AIDOTNET_FP16_ACTIVATIONS on
+/// precision TRAINING loop driven through the production engine seam. With Half-activation recording on
 /// and an FP16 autocast scope, <see cref="CpuEngine.TensorMatMul{T}"/> recorded under GraphMode auto-
 /// emits the down-cast → FP16 matmul → up-cast triple (the matmul activation is a Tensor&lt;Half&gt;),
 /// and <see cref="MixedPrecisionGraphBackward"/> supplies the FP32 parameter gradients for an SGD step.
@@ -65,7 +65,7 @@ public class MixedPrecisionTrainingE2ETests
         const int steps = 60;
 
         var prevOverride = MixedPrecisionEmit.TestOverrideEnabled;
-        MixedPrecisionEmit.TestOverrideEnabled = true; // AIDOTNET_FP16_ACTIVATIONS on
+        MixedPrecisionEmit.TestOverrideEnabled = true; // record Half activations
         try
         {
             for (int step = 0; step < steps; step++)

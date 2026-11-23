@@ -34,13 +34,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Action<IEngine>[] _backwardActions;
     private readonly Tensor<T> _lossOutput;
 
-    // FP16-IN-CAPTURE (task #30): the full heterogeneous (mixed-dtype) topological node order, captured when
-    // the traced graph contains FP16 activation-storage nodes (LazyNode<Half> + MixedPrecisionCast bridges
-    // emitted by MixedPrecisionEmit under an FP16-storage autocast). The single-type float forward steps
-    // (_forwardActions) DROP these Half nodes, so a heterogeneous forward must replay EVERY node's Realize in
-    // topological order to produce the Half activation buffers (the device-resident, capture-pure VRAM win).
-    // Null ⇒ no FP16 activation nodes ⇒ the normal float-only path is used (zero behavior change).
-    private readonly ILazyNode[]? _fp16HeteroOrder;
     private ForwardOnlyHeterogeneousReplay? _dataForwardReplay;
     internal bool HasForwardOnlyHeterogeneousReplay => _dataForwardReplay is not null;
     internal string? StaticScheduleUnsupportedReason => _dataForwardReplay is null ? null : ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason;
@@ -98,11 +91,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
-    // FP16-IN-CAPTURE: the paged mixed-precision plan built once from _fp16HeteroOrder. Its forward/backward
-    // carry the TESTED activation-paging lifecycle (PageOut/PageIn) that frees the transient float up-cast
-    // copies and holds only the Half activations — realizing the peak-VRAM reduction (on-device when
-    // AIDOTNET_FP16_GPU_CACHE=1). Lazily constructed on first hetero forward.
-    private MixedPrecisionCompiledPlan? _fp16PagedPlan;
     private readonly IEngine _engine;
     // Every replay mutates plan-owned forward buffers, gradient buffers, saved-state holders,
     // optimizer moments, and (on CUDA) graph-lifetime state. A compiled plan is therefore one
@@ -195,8 +183,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // plan's lifetime, which is unbounded for long-running training.
     private readonly List<Engines.DirectGpu.IGpuBuffer> _gpuOptimizerBuffers = new();
     private Engines.DirectGpu.IGpuBuffer?[]? _residentGradBuffers;
-    internal static readonly bool ResidentFp16TrainingEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_RESIDENT_TRAIN") != "1";
     private bool _disposed;
 
     // Phase G.4: rebuild state captured at compile time so
@@ -519,7 +505,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         int[]? fusedStepIndices = null,
         Action<IEngine>[]? fusedForwardActions = null,
         bool graphStepEligible = false,
-        ILazyNode[]? fp16HeteroOrder = null,
         int[][]? gradPoolReZeroByStep = null,
         ForwardEmit[]? forwardEmitKinds = null,
         Action<IEngine>?[]? forwardFixedActions = null,
@@ -529,7 +514,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _forwardActions = forwardActions;
         _backwardActions = backwardActions;
         _graphStepEligible = graphStepEligible;
-        _fp16HeteroOrder = fp16HeteroOrder;
         _lossOutput = lossOutput;
         _engine = engine;
         _parameters = parameters;
@@ -636,8 +620,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         DisposeLabelErrorReadback();
 
-        _fp16PagedPlan?.Dispose();
-        _fp16PagedPlan = null;
         _storageLeases?.Dispose();
         _storageLeases = null;
         _weightNormWorkspace?.Dispose();
@@ -2107,7 +2089,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long observation = ++_diagnosticObservations;
         string failure = (GraphCaptureFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
         string residentFailure = (_residentStepFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
-        AiDotNetEngine.LogDiagnostic($"[PLAN-EXEC] plan={_planId} parameters={_parameters.Length} observation={observation} graph_enabled={s_graphStepEnabled} eligible={_graphStepEligible} disabled={_graphStepDisabled} graph_bound={_stepGraphExec != IntPtr.Zero} warmup_calls={_graphStepCalls} plan_replays={_planGraphReplayCount} process_replays={GraphReplayCount} resident_failed={_residentStepFailed} data_forward_replay={_dataForwardReplay is not null} checkpointing={_checkpointing is not null} checkpoint_segments={CheckpointSegmentCount} recomputed_actions={CheckpointRecomputedActionCount} released_actions={CheckpointReleasedActionCount} scratch_bytes={ScratchBufferBytes} half_training={_fp16HeteroOrder is not null} span_candidates={ForwardSpanLeaseCandidates} failure={failure} resident_failure={residentFailure}");
+        AiDotNetEngine.LogDiagnostic($"[PLAN-EXEC] plan={_planId} parameters={_parameters.Length} observation={observation} graph_enabled={s_graphStepEnabled} eligible={_graphStepEligible} disabled={_graphStepDisabled} graph_bound={_stepGraphExec != IntPtr.Zero} warmup_calls={_graphStepCalls} plan_replays={_planGraphReplayCount} process_replays={GraphReplayCount} resident_failed={_residentStepFailed} data_forward_replay={_dataForwardReplay is not null} checkpointing={_checkpointing is not null} checkpoint_segments={CheckpointSegmentCount} recomputed_actions={CheckpointRecomputedActionCount} released_actions={CheckpointReleasedActionCount} scratch_bytes={ScratchBufferBytes} span_candidates={ForwardSpanLeaseCandidates} failure={failure} resident_failure={residentFailure}");
         if (storage && _scratchPool is { } pool)
         {
             var categories = pool.SnapshotStorage(_forwardActions.Length);
@@ -4632,7 +4614,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // capture-PURE hetero backward, FP16 forces the EAGER path (StepEager — already wired + verified to
         // produce the FP16 VRAM win with correct loss/grads). FP16+capture compose in a follow-up increment.
         if (s_graphStepEnabled && !_graphStepDisabled && _graphStepEligible && typeof(T) == typeof(float)
-            && _checkpointing is null && _fp16HeteroOrder is null
+            && _checkpointing is null
             && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb
             && RetireGraphIfEngineShared(gte))
@@ -4878,7 +4860,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (OpenCL, Vulkan, Metal, HIP as well as CUDA). The host-array eager step downloads every device gradient to
         // accumulate it; only the graph capture above is CUDA's.
         if (s_residentStepEnabled && !_residentStepFailed && _graphStepEligible && typeof(T) == typeof(float)
-            && _checkpointing is null && _fp16HeteroOrder is null
+            && _checkpointing is null
             && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is { } cb
             && DeviceParametersLiveOn(cb))
@@ -6179,20 +6161,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Forward: use checkpointing if enabled, otherwise straight-line delegates
         long fwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
-        if (_fp16HeteroOrder is not null)
-        {
-            // Gradient checkpointing replays the float-only forward; the FP16 hetero
-            // path replays a different (mixed-dtype) graph, so the two cannot compose
-            // until heterogeneous checkpoint replay exists. Fail loudly rather than
-            // silently dropping checkpointing for FP16 hetero plans.
-            if (_checkpointing is not null)
-                throw new NotSupportedException(
-                    "Gradient checkpointing is not currently supported for FP16 heterogeneous compiled training plans.");
-            // FP16-IN-CAPTURE: replay the mixed-dtype graph (Half activation nodes + cast bridges) — the
-            // float-only forward steps dropped the Half nodes. Produces device-resident Half activations.
-            RunFp16HeteroForward(engine);
-        }
-        else if (_dataForwardReplay is not null)
+        if (_dataForwardReplay is not null)
         {
             _dataForwardReplay.Execute(engine);
         }
@@ -6350,7 +6319,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // not write keep being zeroed (see RecordEagerFirstWriteCoverage).
         int eagerGradWriteGeneration = 0;
         var eagerCandidates = _eagerFirstWriteCandidates;
-        if (eagerCandidates is not null && !engine.Is<Engines.DirectGpuTensorEngine>() && _fp16HeteroOrder is null)
+        if (eagerCandidates is not null && !engine.Is<Engines.DirectGpuTensorEngine>())
         {
             eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
             bool verified = _eagerFirstWriteVerified;
@@ -6477,14 +6446,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (eagerGradWriteGeneration != 0) Autodiff.DifferentiableOps.GradWriteGeneration = eagerGradWriteGeneration;
         try
         {
-        if (_fp16HeteroOrder is not null)
-        {
-            // FP16-IN-CAPTURE: mixed-dtype reverse pass (float/Half LazyNode backwards + cast-bridge
-            // gradient moves) → parameter grads routed into _gradients, which the clip + fused optimizer
-            // below read exactly as for the float path.
-            RunFp16HeteroBackward(engine);
-        }
-        else if (_profileStepEnabled)
+        if (_profileStepEnabled)
         {
             // Per-delegate timing — accumulates into _profPerStepUs[i] across calls.
             var perStep = _profPerStepUs;
@@ -10563,98 +10525,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return info.GetIncompatibilityReason<T>() is null;
     }
 
-    // FP16-IN-CAPTURE (task #30): true when the traced graph carried FP16 activation-storage nodes, so the
-    // heterogeneous Realize-forward must be used instead of the float-only forward steps.
-    internal bool HasFp16HeteroForward => _fp16HeteroOrder is not null;
-
-    /// <summary>FP16-IN-CAPTURE: the captured heterogeneous node order (test/measurement use — lets a test
-    /// sum the activation buffer bytes that are stored as Half vs the FP32 equivalent).</summary>
-    internal ILazyNode[]? Fp16HeteroOrderForTest => _fp16HeteroOrder;
-
-    /// <summary>
-    /// FP16-IN-CAPTURE heterogeneous forward: replay EVERY node (float + Half + cast bridges) in topological
-    /// order via <see cref="ILazyNode.Realize"/>, producing the device-resident Half activation buffers (the
-    /// capture-pure VRAM win) and writing the scalar loss into <c>_lossOutput</c>. All ops dispatch to the
-    /// supplied engine (FP16-native device kernels on the GPU), so no host transfer — capture stays pure.
-    /// </summary>
-    internal Tensor<T> RunFp16HeteroForward(IEngine engine)
-    {
-        var order = _fp16HeteroOrder ?? throw new InvalidOperationException(
-            "RunFp16HeteroForward called but no FP16 heterogeneous order was captured.");
-        if (typeof(T) != typeof(float))
-            throw new NotSupportedException("FP16-in-capture is float-only.");
-        // Delegate to MixedPrecisionCompiledPlan: it replays each node's Execute over the order (forward) and
-        // runs the TESTED mixed-dtype backward — reusing verified code instead of a hand-rolled replay.
-        // paging:false here — MEASURED (Fp16Paging_ReducesGpuPeakBytes): the existing GPU paging is CACHE-based
-        // (CompressActivationFp16 compresses activation-CACHE entries), but this graph's transient float
-        // up-casts are NODE OUTPUTS, not cache entries, so paging:true does NOT free them and its compress
-        // copies raise peak ~40%. Realizing the device VRAM win needs a node-output-transient free (free each
-        // float up-cast buffer after its forward consumer; re-derive from the held Half in backward) — a
-        // purpose-built mechanism, not the cache pager. Correctness is unaffected (parity verified).
-        // paging:false — MEASURED (forward-paging experiment, 2026-06-16): enabling paging + GPU compress +
-        // draining the deferred frees gave NO peak reduction. Root cause: CompressActivationFp16 is keyed on
-        // Tensor<float> cache entries, but the hetero activations are Tensor<Half> whose GPU buffers the engine
-        // already up-casts to FP32 (GetOrAllocateBuffer:1105 ToFloatArray) — so the compress never matches them.
-        // The real forward-storage win needs the Half matmul FORWARD to emit a Half OUTPUT buffer (not up-cast)
-        // — a residency-machinery change (FinishGpuOp/DownloadBuffer are float-only), not the cache pager.
-        // Resident FP16 training (#633): make every parameter PERSISTENT-resident before the forward reads it —
-        // but ONLY when an on-device fused optimizer is configured (_optimizerUpdate != null). That is the sole
-        // case where the param is updated IN PLACE on the device and the host array goes stale, so the forward
-        // MUST read the device buffer. With no on-device optimizer (e.g. a bare forward+backward, or a host-side
-        // optimizer), the host array stays authoritative: pinning the param would make the device down-cast read a
-        // device buffer instead of the fresh host weights, needlessly diverging the gradients from the FP32
-        // reference. Leaving the param unpinned lets TryCastResidentForwardHalf fall back to the tested host cast.
-        if (ResidentFp16TrainingEnabled && _optimizerUpdate is not null
-            && engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var prde))
-            for (int p = 0; p < _parameters.Length; p++)
-                prde.RegisterResidentParamBuffer(_parameters[p]);
-
-        _fp16PagedPlan ??= MixedPrecisionCompiledPlan.FromCapturedOrder(
-            engine, order, (Tensor<float>)(object)_lossOutput, paging: false);
-        var loss = _fp16PagedPlan.Forward();
-        return (Tensor<T>)(object)loss;
-    }
-
-    /// <summary>
-    /// FP16-IN-CAPTURE heterogeneous backward: reverse-mode gradients over the mixed-dtype order via the
-    /// VERIFIED <see cref="MixedPrecisionGraphBackward.BackwardOverOrder"/> (each LazyNode backprops in its
-    /// own dtype; the float&lt;-&gt;Half CrossTypeLazyNode bridges move the gradient across the dtype
-    /// boundary on-device). The resulting parameter gradients (FP32 map) are routed into the plan's grad
-    /// buffers (<c>_gradients</c> = what the fused optimizer reads). Forward must have replayed first.
-    /// </summary>
-    internal void RunFp16HeteroBackward(IEngine engine)
-    {
-        _ = _fp16HeteroOrder ?? throw new InvalidOperationException(
-            "RunFp16HeteroBackward called but no FP16 heterogeneous order was captured.");
-        if (typeof(T) != typeof(float))
-            throw new NotSupportedException("FP16-in-capture is float-only.");
-        if (_fp16PagedPlan is null)
-            throw new InvalidOperationException("RunFp16HeteroForward must run before RunFp16HeteroBackward.");
-        // The paged plan's backward pages activations in (up-cast) before each node's backward reads them and
-        // frees them after the last read — the tested mixed-dtype reverse pass (MixedPrecisionGraphBackward).
-        var result = _fp16PagedPlan.Backward();
-        var residentEng = ResidentFp16TrainingEnabled ? engine.As<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>() : null;
-        if (residentEng is not null && (_residentGradBuffers is null || _residentGradBuffers.Length != _parameters.Length))
-            _residentGradBuffers = new Engines.DirectGpu.IGpuBuffer?[_parameters.Length];
-        for (int p = 0; p < _parameters.Length; p++)
-        {
-            if (_gradients[p] is null) continue;
-            var paramF = (Tensor<float>)(object)_parameters[p];
-            if (result.Fp32.TryGetValue(paramF, out var g) && g is not null)
-            {
-                var destF = (Tensor<float>)(object)_gradients[p];
-                if (g.Length != destF.Length)
-                    throw new InvalidOperationException(
-                        $"FP16 backward produced gradient length {g.Length} for parameter {p}, " +
-                        $"but the compiled parameter gradient buffer length is {destF.Length}.");
-                using var gKeep1 = new KeepAliveScope(g);
-                using var destFKeep1 = new KeepAliveScope(destF);
-                if (!(residentEng is not null && residentEng.TryRouteGradResident(g, destF, ref _residentGradBuffers![p])))
-                    g.AsSpanUnmarked().CopyTo(destF.AsWritableSpanUnmarked());
-            }
-        }
-    }
-
     // ── Internal accessors for serialization ────────────────────────────
     internal Action<IEngine>[] ForwardActions => _forwardActions;
     internal Action<IEngine>[] BackwardActions => _backwardActions;
@@ -10848,38 +10718,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
-        // FP16-IN-CAPTURE (task #30): if the traced graph contains mixed-dtype activation-storage nodes
-        // (anything that isn't a LazyNode<T> — i.e. LazyNode<Half> + the MixedPrecisionCast bridges emitted by
-        // MixedPrecisionEmit under an FP16-storage autocast), the float-only forwardSteps above DROPPED them, so
-        // capture the FULL heterogeneous topological order. The plan replays every node's Realize to produce the
-        // Half activation buffers. Null when no such nodes exist → the normal float path is byte-identical.
-        ILazyNode[]? fp16HeteroOrder = null;
-        {
-            // Detect the ACTUAL FP16 storage nodes (LazyNode<Half> + the Half cast
-            // bridges), not merely "anything that isn't LazyNode<T>". The FP16-hetero
-            // replay path is float-plan-specific, so only a float plan carrying one of
-            // the known Half node types should route through it — a future non-FP16
-            // heterogeneous graph must not be misrouted here.
-            bool hasFp16Nodes = false;
-            if (typeof(T) == typeof(float) && dataReplay is null)
-            {
-                foreach (var n in optimized)
-                {
-                    if (n is LazyNode<Half>
-                        || n is CrossTypeLazyNode<float, Half>
-                        || n is CrossTypeLazyNode<Half, float>)
-                    {
-                        hasFp16Nodes = true;
-                        break;
-                    }
-                }
-            }
-            if (hasFp16Nodes) fp16HeteroOrder = System.Linq.Enumerable.ToArray(optimized);
-        }
-        if (retainedOutputs.Count > 0 && fp16HeteroOrder is not null)
-            throw new NotSupportedException("RetainOutput is not supported by mixed-precision compiled training plans.");
+        // Half activation nodes (LazyNode<Half> and the float/Half cast bridges) outside a forward-only data replay are
+        // emitted only while MixedPrecisionCompiledPlan traces; its own plan consumes them. The float-only steps above
+        // drop them, so a training plan built over such a graph would silently skip work: refuse it.
+        if (typeof(T) == typeof(float) && dataReplay is null)
+            foreach (var n in optimized)
+                if (n is LazyNode<Half> || n is CrossTypeLazyNode<float, Half> || n is CrossTypeLazyNode<Half, float>)
+                    throw new NotSupportedException(
+                        "The traced graph holds Half activation nodes, which only MixedPrecisionCompiledPlan replays.");
 
-        if (dataReplay is null && fp16HeteroOrder is null && forwardSteps.Count > 0)
+        if (dataReplay is null && forwardSteps.Count > 0)
             ShareWeightNormForwardStorage(forwardSteps, parameters,
                 explicitLoss ?? recordedLastOutput ?? forwardSteps[forwardSteps.Count - 1].OutputBuffer,
                 retainedOutputs, engine, scope);
@@ -10965,7 +10813,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // tenants of one array share one device buffer too (BindPooledGradientsResident): a GPU DenseNet-121 step held
         // 3.7 GB of per-tensor gradient buffers on the device, past the card, so the driver paged to host memory.
         // AIDOTNET_COMPILED_GRAD_VIEWS=0 turns it off.
-        bool useGradViews = !useGradPool && fp16HeteroOrder is null
+        bool useGradViews = !useGradPool
             && (engine.SupportsGpu ? typeof(T) == typeof(float) : typeof(T) == typeof(float) || typeof(T) == typeof(double))
             && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_VIEWS") != "0";
         HashSet<Tensor<T>>? gradPlaceholders = null;
@@ -11182,7 +11030,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // excluded. AIDOTNET_COMPILED_FORWARD_POOL=0 turns it off.
         int pooledForwardOutputs = 0;
         if (dataReplay is null && (typeof(T) == typeof(float) || typeof(T) == typeof(double)) && !useGradPool && !preferGenericForGpu
-            && !engine.SupportsGpu && fp16HeteroOrder is null
+            && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_FORWARD_POOL") != "0")
         {
             var fusedAway = new HashSet<int>(fusedStepIndices);
@@ -11335,13 +11183,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // stream) or for an FP16 heterogeneous graph (its Half nodes are not in forwardSteps, so a path through them
         // would be missed).
         HashSet<Tensor<T>>? gradRequired =
-            parameters.Length > 0 && !useGradPool && fp16HeteroOrder is null ? requiresGradTensors : null;
+            parameters.Length > 0 && !useGradPool ? requiresGradTensors : null;
 
         // ResNet's downsampling pairs (a 3x3 stride-2 convolution and its 1x1 projection shortcut reading the same
         // input): one GPU-dispatched action writes the input's gradient once (CompiledTrainingPlan.ShortcutPair.cs).
         var shortcutPairs = new Dictionary<int, (int Main, int Shortcut)>();
         var consumedByShortcutPair = new HashSet<int>();
-        if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool && fp16HeteroOrder is null
+        if (typeof(T) == typeof(float) && preferGenericForGpu && !useGradPool
             && engine.TryGet<IConvShortcutPairEngine>(out var shortcutEngine)
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_SHORTCUT_FUSION") != "0")
         {
@@ -11621,7 +11469,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // for mixed plans: there the clear also invalidates every buffer's stale device copy, which this host-side
         // accounting does not model. The FP16 heterogeneous backward does not run these actions either.
         int[]? genericGradIndices;
-        if (!useGradPool && (genericBackwardCount == 0 || (!engine.SupportsGpu && fp16HeteroOrder is null)))
+        if (!useGradPool && (genericBackwardCount == 0 || !engine.SupportsGpu))
         {
             // allGrads holds the distinct physical grad buffers (id == index), so a
             // reverse map gives each multi-consumer tensor's grad-buffer index.
@@ -11760,7 +11608,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // Unknown delegates and heterogeneous/custom engines keep the conservative plan.
                     typeof(T) == typeof(float) && preferGenericForGpu
                         && engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
-                        && fp16HeteroOrder is null
                         && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_EXACT_GRAD_WRITES") == "1"
                         ? gradRequired : null);
                 if (aliasedGradViews is not null && t_gradAliasTargets is not null)
@@ -11820,7 +11667,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             outputBuffer.AsWritableSpan();
         }
 
-        var weightNormWorkspace = dataReplay is null && fp16HeteroOrder is null
+        var weightNormWorkspace = dataReplay is null
             ? PrepareWeightNormWorkspace(forwardSteps, forwardActions, backwardActions, forwardEmitKinds,
                 actionCoverage, parameters, lossOutput, retainedOutputs, scope, engine)
             : null;
@@ -11834,9 +11681,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         try
         {
             for (int i = 0; i < forwardSteps.Count; i++) storageLeases.Add(forwardSteps[i]);
-            if (fp16HeteroOrder is not null)
-                for (int i = 0; i < fp16HeteroOrder.Length; i++)
-                    fp16HeteroOrder[i].AddStorageLeases(storageLeases);
             dataReplay?.AcquireStorage(storageLeases);
             storageLeases.Add(lossOutput);
             weightNormWorkspace?.CompleteSnapshot();
@@ -11861,7 +11705,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
                 fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
                 graphStepEligible,
-                fp16HeteroOrder,
                 gradPoolReZeroByStep,
                 forwardEmitKinds,
                 forwardFixedActions,
@@ -11872,9 +11715,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             plan._graphGradientMembership = parameters.Select(gradientMembers.Contains).ToArray();
             plan._optimizerGradientMembership = plan._graphGradientMembership;
             plan._liveGradientMap = gradMap;
-            if (fp16HeteroOrder is null)
-                plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
-                    parameters, lossOutput);
+            plan._lastBackwardReads = PlanLastBackwardReads(plan._backwardActions.Length, actionCoverage, forwardSteps,
+                parameters, lossOutput);
             plan._retainedOutputs = retainedOutputs;
             plan._namedRetainedOutputs = scope.NamedRetainedOutputs.ToDictionary(
                 item => item.Key, item => (Tensor<T>)item.Value, StringComparer.Ordinal);
@@ -11915,7 +11757,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (BuildCheckpointSchedule(forwardSteps, genericActionOfStep, forwardActions.Length, actionCoverage,
                     backwardActions.Count, parameters, lossOutput, retainedOutputs, engine) is { } checkpoint)
             {
-                if (dataReplay is not null || fp16HeteroOrder is not null || pooledForwardOutputs > 0)
+                if (dataReplay is not null || pooledForwardOutputs > 0)
                     throw new NotSupportedException(
                         "Activation checkpointing inside a compiled training plan does not compose with a heterogeneous "
                         + "(mixed-dtype) forward replay or with host forward-output pooling.");
@@ -11928,7 +11770,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (genericActionOfStep[i] >= 0 && checkpoint.SegmentOfForwardAction[genericActionOfStep[i]] >= 0)
                         spanUnsafe.Add(forwardSteps[i].OutputBuffer);
             }
-            if (dataReplay is null && typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
+            if (dataReplay is null && typeof(T) == typeof(float) && engine.SupportsGpu
                 && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, spanUnsafe, backwardReadSteps) is { } spans)
             {
                 plan._spanStepOfAction = spans.StepOfAction;
