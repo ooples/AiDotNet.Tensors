@@ -269,4 +269,58 @@ public class GpuNarrowFloatContractTests
     }
 }
 
+/// <summary>
+/// The host GELU of the 16-bit float types is the FP32 result rounded once, which is what the device kernels store.
+/// Evaluated in the storage type instead, every intermediate is rounded: several percent off in BFloat16, and NaN
+/// for +infinity.
+/// </summary>
+public class NarrowFloatHostGeluTests
+{
+    private static readonly float[] Inputs =
+    {
+        // The two largest lead, so the vector path (the first eight elements) takes them and not only the scalar tail.
+        float.PositiveInfinity, 3.2964854E+38f, -6f, -3f, -1f, -0.5f, -0.0f, 0f, 0.25f, 0.5f, 1f, 2f, 3.5f, 8f, 1e30f, 1.5f, -2f,
+    };
+
+    private static float[] Fp32()
+    {
+        var expected = new float[Inputs.Length];
+        AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().GELU(Inputs, expected);
+        return expected;
+    }
+
+    [Fact]
+    public void BFloat16_gelu_is_the_fp32_result_rounded_once()
+    {
+        var x = Array.ConvertAll(Inputs, BFloat16.FromFloat);
+        var actual = new BFloat16[x.Length];
+        AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<BFloat16>().GELU(x, actual);
+        var expected = new float[x.Length];
+        AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().GELU(Array.ConvertAll(x, v => (float)v), expected);
+        for (int i = 0; i < x.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits((float)BFloat16.FromFloat(expected[i])), BitConverter.SingleToInt32Bits((float)actual[i]));
+        Assert.True(float.IsPositiveInfinity((float)actual[0]), "GELU(+infinity) is +infinity.");
+    }
+
+    [Fact]
+    public void Half_gelu_is_the_fp32_result_rounded_once()
+    {
+        var x = Array.ConvertAll(Inputs, v => (Half)v);
+        var actual = new Half[x.Length];
+        AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<Half>().GELU(x, actual);
+        var expected = new float[x.Length];
+        AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<float>().GELU(Array.ConvertAll(x, v => (float)v), expected);
+        for (int i = 0; i < x.Length; i++)
+            Assert.Equal(BitConverter.SingleToInt32Bits((float)(Half)expected[i]), BitConverter.SingleToInt32Bits((float)actual[i]));
+    }
+
+    [Fact]
+    public void Fp32_gelu_of_a_value_above_half_the_largest_float_is_finite()
+    {
+        var expected = Fp32();
+        Assert.Equal(3.2964854E+38f, expected[1]);
+        Assert.True(float.IsPositiveInfinity(expected[0]));
+    }
+}
+
 #endif

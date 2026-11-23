@@ -3639,7 +3639,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var tanh_arg = Avx.Multiply(vSqrt2OverPi, inner);
                     // tanh(z) = 2*sigmoid(2z) - 1 using FastSigmoid256 (Cephes exp, ~0.01% error)
                     var tanh_val = Avx.Subtract(Avx.Multiply(vTwo, FastSigmoid256(Avx.Multiply(vTwo, tanh_arg))), vOne);
-                    WriteVector256(output, i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanh_val))));
+                    WriteVector256(output, i, Avx.Multiply(Avx.Multiply(vHalf, x), Avx.Add(vOne, tanh_val)));
                 }
             }
 
@@ -5759,7 +5759,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     // tanh(z) = (exp(2z)-1)/(exp(2z)+1)
                     var e2z = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
                     var tanhVal = Avx.Divide(Avx.Subtract(e2z, vOne), Avx.Add(e2z, vOne));
-                    Avx.Store(output + i, Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanhVal))));
+                    Avx.Store(output + i, Avx.Multiply(Avx.Multiply(vHalf, x), Avx.Add(vOne, tanhVal)));
                 }
             }
 #endif
@@ -6283,7 +6283,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                     var e2t = FastExpDouble256(Avx.Multiply(vTwo, tanhArg));
                     var tanhVal = Avx.Divide(Avx.Subtract(e2t, vOne), Avx.Add(e2t, vOne));
                     WriteVector256Double(output, i,
-                        Avx.Multiply(vHalf, Avx.Multiply(x, Avx.Add(vOne, tanhVal))));
+                        Avx.Multiply(Avx.Multiply(vHalf, x), Avx.Add(vOne, tanhVal)));
                 }
             }
 #endif

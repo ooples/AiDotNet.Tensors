@@ -298,8 +298,10 @@ public class BFloat16Operations : INumericOperations<BFloat16>
 
     public void LeakyReLU(ReadOnlySpan<BFloat16> x, BFloat16 alpha, Span<BFloat16> dst)
         => VectorizedOperationsFallback.LeakyReLU(this, x, alpha, dst);
-    public void GELU(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
-        => VectorizedOperationsFallback.GELU(this, x, dst);
+    // Computed in FP32 and rounded once, as every other elementary function here is. Evaluating the formula in
+    // BFloat16 rounds each intermediate to 8 significant bits (an error of several percent) and turns +infinity into NaN.
+    public void GELU(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst) =>
+        Lift1(x, dst, (a, c, n) => Engines.Simd.SimdKernels.GELU(a.AsSpan(0, n), c.AsSpan(0, n)));
     public void Mish(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
         => VectorizedOperationsFallback.Mish(this, x, dst);
     public void Swish(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)

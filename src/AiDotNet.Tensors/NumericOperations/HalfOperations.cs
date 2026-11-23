@@ -823,8 +823,24 @@ public class HalfOperations : INumericOperations<Half>
     public void LeakyReLU(ReadOnlySpan<Half> x, Half alpha, Span<Half> destination)
         => VectorizedOperationsFallback.LeakyReLU(this, x, alpha, destination);
 
+    // Computed in FP32 and rounded once, as Tanh and Exp are: evaluating the formula in Half rounds every intermediate.
     public void GELU(ReadOnlySpan<Half> x, Span<Half> destination)
-        => VectorizedOperationsFallback.GELU(this, x, destination);
+    {
+        int len = x.Length;
+        float[] xf = ArrayPool<float>.Shared.Rent(len);
+        float[] df = ArrayPool<float>.Shared.Rent(len);
+        try
+        {
+            HalfToFloat(x, xf);
+            Engines.Simd.SimdKernels.GELU(xf.AsSpan(0, len), df.AsSpan(0, len));
+            FloatToHalf(df, destination, len);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(xf);
+            ArrayPool<float>.Shared.Return(df);
+        }
+    }
 
     public void Mish(ReadOnlySpan<Half> x, Span<Half> destination)
         => VectorizedOperationsFallback.Mish(this, x, destination);
