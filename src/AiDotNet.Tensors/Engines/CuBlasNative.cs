@@ -876,6 +876,7 @@ public static class CuBlasNative
     public const int CUBLAS_COMPUTE_32F = 68;
     public const int CUBLAS_COMPUTE_32F_PEDANTIC = 69;  // Strict fp32 — forbids TF32 in cublasGemmEx
     public const int CUBLAS_COMPUTE_32F_FAST_16F = 74;
+    public const int CUBLAS_COMPUTE_32F_FAST_16BF = 75;
     public const int CUBLAS_COMPUTE_32F_FAST_TF32 = 77;
 
     // cublasGemmAlgo_t. DEFAULT is -1 in cublas_api.h; zero is the first fixed algorithm,

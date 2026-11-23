@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// machine, or <c>AIDOTNET_DISABLE_CUBLAS=1</c>) the generated GEMM runs the same problem. cuBLAS loads lazily, on the
 /// first GEMM, and its absence is normal: no exception, no warning.
 /// </summary>
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IGemmAutocastBackend
 {
     // AIDOTNET_DISABLE_CUBLAS=1 runs every GEMM on the generated kernels, as on a machine without cuBLAS.
     private static readonly bool CublasDisabledByEnvironment =
@@ -59,12 +59,68 @@ public sealed partial class CudaBackend
     // A GEMM calls cuBLAS when it is loadable and the user has not opted out (TensorCodecOptions.UseCublas).
     private bool UsesCublas => IsCublasAvailable && CudaDispatchPolicy.UseCublasForMatMul;
 
+    // Matmul autocast (EnterGemmAutocast): the cuBLAS compute type every FP32 GEMM takes while a scope is open, 0 when
+    // none is. Instance state, not thread-local: a compiled step's ops may run on the BLAS pool's threads.
+    private int _gemmAutocastComputeType;
+
+    private int GemmAutocastComputeType => Volatile.Read(ref _gemmAutocastComputeType);
+
+    // An autocast scope is open (and cuBLAS serves GEMMs): the FP32-only generated and narrow GEMM kernels step aside so
+    // every product reaches cuBLAS/cuBLASLt in the scope's compute type, as PyTorch's autocast sends matmuls to cuBLAS.
+    private bool GemmAutocastActive => UsesCublas && GemmAutocastComputeType != 0;
+
+    /// <summary>
+    /// Opens a matmul autocast scope (PyTorch's <c>torch.autocast</c> for matmuls): until it is disposed every FP32 GEMM
+    /// this backend issues through cuBLAS multiplies in <paramref name="precision"/> (FP16 or BF16 tensor cores, operands
+    /// down-converted inside the kernel) and accumulates and writes FP32. Operands and results stay FP32 tensors, so
+    /// nothing else in a step changes. A captured graph keeps the compute type its capture ran with. Without cuBLAS the
+    /// generated FP32 GEMM runs unchanged.
+    /// </summary>
+    IDisposable IGemmAutocastBackend.EnterGemmAutocast(Gpu.PrecisionMode precision)
+    {
+        int compute = precision switch
+        {
+            Gpu.PrecisionMode.Float32 => 0,
+            Gpu.PrecisionMode.Float16 => CuBlasNative.CUBLAS_COMPUTE_32F_FAST_16F,
+            Gpu.PrecisionMode.BFloat16 => CuBlasNative.CUBLAS_COMPUTE_32F_FAST_16BF,
+            _ => throw new NotSupportedException($"Matmul autocast supports FP16 and BF16, not {precision}."),
+        };
+        int previous = Interlocked.Exchange(ref _gemmAutocastComputeType, compute);
+        return new GemmAutocastScope(this, previous);
+    }
+
+    private sealed class GemmAutocastScope : IDisposable
+    {
+        private CudaBackend? _owner;
+        private readonly int _previous;
+        public GemmAutocastScope(CudaBackend owner, int previous) { _owner = owner; _previous = previous; }
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _owner, null) is { } owner)
+                Volatile.Write(ref owner._gemmAutocastComputeType, _previous);
+        }
+    }
+
     /// <summary><c>cublasSgemm</c>, or the generated FP32 GEMM without cuBLAS.</summary>
     private void BlasSgemm(CublasOperation opA, CublasOperation opB, int m, int n, int k, ref float alpha,
         IntPtr a, int lda, IntPtr b, int ldb, ref float beta, IntPtr c, int ldc, string what)
     {
         if (UsesCublas)
         {
+            if (GemmAutocastComputeType is int autocast and not 0)
+            {
+                // Autocast: FP32 operands and result, the product down-converted to FP16/BF16 inside the kernel's tensor
+                // core loads and accumulated in FP32 (no cast kernels, no low-precision copies to cache or invalidate).
+                unsafe
+                {
+                    float alphaValue = alpha, betaValue = beta;
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasGemmEx(_cublasHandle, opA, opB, m, n, k, (IntPtr)(&alphaValue),
+                            a, CuBlasNative.CUDA_R_32F, lda, b, CuBlasNative.CUDA_R_32F, ldb, (IntPtr)(&betaValue),
+                            c, CuBlasNative.CUDA_R_32F, ldc, autocast, CuBlasNative.CUBLAS_GEMM_DEFAULT), what + " (autocast)");
+                }
+                return;
+            }
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSgemm(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, b, ldb, ref beta, c, ldc), what);
             return;
@@ -79,6 +135,19 @@ public sealed partial class CudaBackend
     {
         if (UsesCublas)
         {
+            if (GemmAutocastComputeType is int autocast and not 0)
+            {
+                unsafe
+                {
+                    float alphaValue = alpha, betaValue = beta;
+                    CuBlasNative.CheckCublasStatus(
+                        CuBlasNative.cublasGemmStridedBatchedEx(_cublasHandle, opA, opB, m, n, k, (IntPtr)(&alphaValue),
+                            a, CuBlasNative.CUDA_R_32F, lda, strideA, b, CuBlasNative.CUDA_R_32F, ldb, strideB,
+                            (IntPtr)(&betaValue), c, CuBlasNative.CUDA_R_32F, ldc, strideC, batch, autocast,
+                            CuBlasNative.CUBLAS_GEMM_DEFAULT), what + " (autocast)");
+                }
+                return;
+            }
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSgemmStridedBatched(_cublasHandle, opA, opB, m, n, k, ref alpha, a, lda, strideA,
                     b, ldb, strideB, ref beta, c, ldc, strideC, batch), what);

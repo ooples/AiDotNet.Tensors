@@ -2874,6 +2874,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
+        if (GemmAutocastActive)
+        {
+            using var autocastContext = PushContext();
+            CublasGemm(A, B, C, M, N, K, alpha, beta);
+            return;
+        }
+
         if (alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
@@ -2937,19 +2944,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
 
-        if (alpha == 1.0f && beta == 0.0f &&
+        if (!GemmAutocastActive && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
-        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
         MatMulTransposedIncumbent(A, B, C, M, N, K, alpha, beta);
     }
 
     // MatMulTransposed after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
     private void MatMulTransposedIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
-        if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -2993,15 +3000,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
-        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
         MatMulTransposedAIncumbent(A, B, C, M, N, K, alpha, beta);
     }
 
     // MatMulTransposedA after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
     private void MatMulTransposedAIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
-        if (TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -3066,12 +3073,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
 
-        if (alpha == 1.0f && beta == 0.0f &&
+        if (!GemmAutocastActive && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
                 batchCount))
             return;
-        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
         BatchedGemmIncumbent(A, B, C, M, N, K, batchCount, alpha, beta);
     }
 
@@ -3693,8 +3700,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
         // asks for strict fp32, which is what PEDANTIC gives the classic handle.
-        var compute = !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
-            ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
+        // Under matmul autocast the scope's compute type (CUBLAS_COMPUTE_32F_FAST_16F / _16BF, raw cuBLAS values).
+        var compute = GemmAutocastComputeType is int autocast and not 0 ? (CublasComputeType)autocast
+            : !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
+                ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
         return lt.TryMatmulColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, compute,
             workspace.Handle, (ulong)CublasWorkspaceFloats * sizeof(float), _stream) == CublasStatus.Success;
     }

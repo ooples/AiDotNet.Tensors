@@ -580,6 +580,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _disposed = true;
         GC.SuppressFinalize(this);
         LandGradientsOnHost();
+        _lossScaleDevice?.Dispose();
+        _lossScaleDevice = null;
         if (StepTiming.Enabled)
             try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
                 System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }
@@ -3985,6 +3987,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (!Enum.IsDefined(typeof(Engines.Gpu.NonFiniteGradientPolicy), policy))
             throw new ArgumentOutOfRangeException(nameof(policy), policy, "Undefined non-finite gradient policy.");
+        if (_lossScaling is not null) RequireDiscardingNonFinitePolicy(policy);
         _nonFiniteGradientPolicy = policy;
         RetireCapturedOptimizerIfIneligible();   // a captured clip baked the previous policy in
     }
@@ -4687,6 +4690,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         RunGpuStepBodyForCapture(cb);
                         RestoreInPlaceState(inPlaceState);
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = true;
+                        PrepareLossScalingForCapture();
                         _stepIo = TryCreateStepIo(cb);
                         if (_stepIo is not null && _capturedOptimizerFactory?.Invoke() is { } capturedOptimizer)
                         {
@@ -4889,9 +4893,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
                         DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
+                    UnscaleLossScaledGradients();
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
+                    CompleteLossScaledStep();
                     completedWorkspaceStep = true;
 
                     return _lossOutput;
@@ -5228,6 +5234,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         _stepIo?.CapturePrologue(parity);
         RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
+        CaptureLossScaling();   // after the backward, before the captured clip and update
         if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
         {
             if (parity == 0) optimizer.Capture(io);
@@ -5921,7 +5928,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     ?? throw new InvalidOperationException(
                         "Could not make the loss-gradient seed GPU-resident for the captured backward; the captured "
                         + "reseed (CopyBufferDtoD) would be skipped and the backward would start from a zero loss gradient.");
-                backend.Fill(seedResident, 1f, _lossGradSeed.Length);
+                FillLossGradientSeedOnDevice(backend, seedResident, _lossGradSeed.Length);
             }
         }
         // Every device write below leaves the host copy stale, so each written tensor is re-bound (re-arming its
@@ -6418,6 +6425,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var destArr = _cachedLossGradDestArray;
         if (seedArr != null && destArr != null)
         {
+            if (_lossScaling is not null)
+            {
+                var seedValue = MathHelper.GetNumericOperations<T>().FromDouble(HostLossScaleForSeed());
+                for (int i = 0; i < seedArr.Length; i++) seedArr[i] = seedValue;
+            }
             Array.Copy(seedArr, destArr, seedArr.Length);
             if (_lossGradDest is not null) InvalidateStaleDeviceCopy(_lossGradDest);   // same reason as the gradient clear
             // The seed is the destination's first write: a contribution arriving there must add, not replace it.
@@ -6534,6 +6546,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
+        UnscaleLossScaledGradients();
         RegularizeAndClipGradients();
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
