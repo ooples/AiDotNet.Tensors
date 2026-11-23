@@ -24,7 +24,10 @@ internal static class VulkanTorchParityElementwiseKernels
 
     private static readonly ConcurrentDictionary<string, string> Sources = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-    private static string Cached(string key, Func<string> build) => Sources.GetOrAdd(key, _ => build());
+    // A double shader's header depends on the float-controls modes the device grants, which are set when a device
+    // initialises: a source built before that, or for another device, must not be reused under the other modes.
+    private static string Cached(string key, Func<string> build)
+        => Sources.GetOrAdd((PreserveDoubleSpecials ? "s" : "-") + (PreserveDoubleDenormals ? "d" : "-") + ":" + key, _ => build());
 
     /// <summary>Every shader of this kernel set, by name: what a test compiles to prove the sources are valid GLSL.</summary>
     public static System.Collections.Generic.IEnumerable<(string Name, string Source)> All()

@@ -294,6 +294,10 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
             MetalCommandQueue.EndEncoding(blit);
             MetalCommandQueue.Commit(commandBuffer);
             MetalCommandQueue.WaitUntilCompleted(commandBuffer);
+            // A blit that ended in the error state copied nothing reliable: a staged copy must not go on to read scratch.
+            string? error = MetalCommandQueue.GetError(commandBuffer);
+            if (!string.IsNullOrEmpty(error) || MetalCommandQueue.GetStatus(commandBuffer) == MetalNativeBindings.MTLCommandBufferStatus.Error)
+                throw new InvalidOperationException($"The Metal double copy failed: {error ?? "the command buffer ended in error"}");
         }
         finally
         {

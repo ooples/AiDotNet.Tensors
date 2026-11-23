@@ -435,6 +435,17 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
     protected override string SkipReason => "No Vulkan device with shaderFloat64 and libshaderc.";
 
     protected override bool EmulatesDoubles => false;
+
+    // A device that does not offer DenormPreserve for doubles is measured instead (NVIDIA's driver offers no mode); this
+    // runs that measurement on every device, so it is exercised where the mode is granted too.
+    [SkippableFact]
+    public void The_subnormal_measurement_runs_and_agrees_with_the_kernels()
+    {
+        Skip.If(_backend is null, SkipReason);
+        var vulkan = (AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend)_backend!;
+        Assert.True(vulkan.MeasureSubnormals());
+        Assert.True(((IGpuFloat64Elementwise)vulkan).SupportsFloat64Elementwise);
+    }
 }
 
 /// <summary>Metal: binary64 computed in integer arithmetic, Metal Shading Language having no 64-bit float.</summary>

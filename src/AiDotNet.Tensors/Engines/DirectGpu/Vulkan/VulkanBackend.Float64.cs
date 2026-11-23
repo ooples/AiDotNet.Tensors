@@ -29,14 +29,77 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     /// <inheritdoc/>
     public bool SupportsFloat64MatrixMultiply => SupportsFloat64Compute;
 
-    // The kernels must keep subnormal results (2^-1022 * 0.5 is 2^-1023, not 0), which Vulkan promises only under
-    // DenormPreserve. A device that cannot grant it keeps double storage but computes doubles on the CPU.
-    private bool SupportsFloat64Compute => SupportsFloat64Storage && _device.DenormPreserveFloat64;
+    // The kernels must keep subnormal results (2^-1022 * 0.5 is 2^-1023, not 0). Vulkan promises that under
+    // DenormPreserve. A device that does not offer the mode (an RTX 3080's driver does not) leaves denormal handling to
+    // the implementation, so the compiled kernels are measured once instead: a device whose kernels flush computes
+    // doubles on the CPU and keeps double storage.
+    private bool SupportsFloat64Compute => SupportsFloat64Storage && (_device.DenormPreserveFloat64 || KeepsSubnormals());
+
+    private readonly object _subnormalProbeLock = new object();
+    private bool? _keepsSubnormals;
+
+    private bool KeepsSubnormals()
+    {
+        if (_keepsSubnormals is bool known) return known;
+        lock (_subnormalProbeLock)
+        {
+            if (_keepsSubnormals is bool settled) return settled;
+            bool kept;
+            try
+            {
+                kept = MeasureSubnormals();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException || ex is NotSupportedException)
+            {
+                // A kernel that cannot be built or run here cannot compute doubles either.
+                kept = false;
+            }
+            _keepsSubnormals = kept;
+            return kept;
+        }
+    }
+
+    // Runs each arithmetic kernel on operands whose exact results are subnormal or come from subnormals, and compares
+    // the bits with the host's. Every double kernel here is built from these operations and the same header.
+    internal bool MeasureSubnormals()
+    {
+        const double smallestNormal = 2.2250738585072014E-308, smallestSubnormal = double.Epsilon;
+        var left = new[] { smallestNormal, smallestSubnormal, 3 * smallestSubnormal, smallestNormal, 1.0E-300 };
+        var right = new[] { 0.5, smallestSubnormal, smallestSubnormal, 4.0, 1.0E-10 };
+        int n = left.Length;
+        using var a = AllocateBuffer(n, GpuElementType.Float64);
+        using var b = AllocateBuffer(n, GpuElementType.Float64);
+        using var output = AllocateBuffer(n, GpuElementType.Float64);
+        this.UploadBuffer<double>(a, left);
+        this.UploadBuffer<double>(b, right);
+        var actual = new double[n];
+        foreach (GpuFloat64BinaryOperation operation in new[]
+        {
+            GpuFloat64BinaryOperation.Multiply, GpuFloat64BinaryOperation.Add,
+            GpuFloat64BinaryOperation.Subtract, GpuFloat64BinaryOperation.Divide,
+        })
+        {
+            ParityDispatch(operation + "_f64", VulkanFloat64Kernels.Binary(operation), n, new[] { (uint)n }, a, b, output);
+            this.DownloadBuffer<double>(output, actual);
+            for (int i = 0; i < n; i++)
+            {
+                double expected = operation switch
+                {
+                    GpuFloat64BinaryOperation.Multiply => left[i] * right[i],
+                    GpuFloat64BinaryOperation.Add => left[i] + right[i],
+                    GpuFloat64BinaryOperation.Subtract => left[i] - right[i],
+                    _ => left[i] / right[i],
+                };
+                if (BitConverter.DoubleToInt64Bits(expected) != BitConverter.DoubleToInt64Bits(actual[i])) return false;
+            }
+        }
+        return true;
+    }
 
     private IGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {
         EnsureInitialized();
-        if (!SupportsFloat64Storage)
+        if (!SupportsFloat64Compute)
             throw new GpuCapabilityUnavailableException("Double-precision kernels are not available on this Vulkan device.");
         if (buffer is null) throw new ArgumentNullException(name);
         if (buffer.ElementType != GpuElementType.Float64 || buffer is not VulkanGpuBuffer)
