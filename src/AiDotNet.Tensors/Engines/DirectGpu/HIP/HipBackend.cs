@@ -89,6 +89,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
     private IntPtr _missingLookupModule;
+    private IntPtr _integerModule;
     private IntPtr _octonionModule;
     private IntPtr _sparseModule;
     private IntPtr _locallyConnectedModule;
@@ -758,6 +759,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // squash / squash_backward and octonion_linear_forward already come from other modules.
             CompileKernelModule(CUDA.Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup", ref _missingLookupModule,
                 new[] { "copy_2d_strided", "var_axis", "csr_segmented_max", "csr_segmented_min", "csr_segmented_stddev" });
+            // Integer and bool element-wise ops and sums, in the buffers' own element type (IGpuIntegerElementwise).
+            CompileKernelModule(GpuIntegerKernelSource.Build(GpuIntegerKernelDialect.Cuda), "integer", ref _integerModule,
+                GpuIntegerKernelSource.KernelNames.ToArray(), useFastMath: false);
             CompileKernelModule(Kernels.HipOctonionKernels.GetSource(), "octonion", ref _octonionModule,
                 Kernels.HipOctonionKernels.GetKernelNames().Where(name => name != "octonion_linear_forward").ToArray());
             CompileKernelModule(Kernels.HipDotProductKernels.GetSource(), "dot_product", ref _dotProductModule,
@@ -11939,6 +11943,53 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             UnloadModule(_missingLookupModule);
             _missingLookupModule = IntPtr.Zero;
+        }
+        if (_octonionModule != IntPtr.Zero)
+        {
+            UnloadModule(_octonionModule);
+            _octonionModule = IntPtr.Zero;
+        }
+        if (_locallyConnectedModule != IntPtr.Zero)
+        {
+            UnloadModule(_locallyConnectedModule);
+            _locallyConnectedModule = IntPtr.Zero;
+        }
+        if (_deformableConvModule != IntPtr.Zero)
+        {
+            UnloadModule(_deformableConvModule);
+            _deformableConvModule = IntPtr.Zero;
+        }
+        if (_optimizerModule != IntPtr.Zero)
+        {
+            UnloadModule(_optimizerModule);
+            _optimizerModule = IntPtr.Zero;
+        }
+        if (_fusedConvolutionModule != IntPtr.Zero)
+        {
+            UnloadModule(_fusedConvolutionModule);
+            _fusedConvolutionModule = IntPtr.Zero;
+        }
+        if (_sparseModule != IntPtr.Zero)
+        {
+            // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+            UnloadModule(_sparseModule);
+            _sparseModule = IntPtr.Zero;
+        }
+        if (_specializedModule != IntPtr.Zero)
+        {
+            UnloadModule(_specializedModule);
+            _specializedModule = IntPtr.Zero;
+        }
+        if (_fp16Module != IntPtr.Zero)
+        {
+            UnloadModule(_fp16Module);
+            _fp16Module = IntPtr.Zero;
+        }
+
+        if (_integerModule != IntPtr.Zero)
+        {
+            UnloadModule(_integerModule);
+            _integerModule = IntPtr.Zero;
         }
         if (_octonionModule != IntPtr.Zero)
         {

@@ -1379,6 +1379,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         CompileKernelModule(device, Kernels.CudaMissingLookupKernels.GetSource(), "missing_lookup_kernels",
             Kernels.CudaMissingLookupKernels.GetKernelNames());
 
+        // Integer and bool element-wise ops and sums, in the buffers' own element type (IGpuIntegerElementwise).
+        CompileKernelModule(device, GpuIntegerKernelSource.Build(GpuIntegerKernelDialect.Cuda), "integer_kernels",
+            GpuIntegerKernelSource.KernelNames.ToArray(), useFastMath: false);
+
         // Several device copies in one launch (CopyMany): one graph node for a stateful plan's state writes.
         CompileKernelModule(device, KernelSourceResources.Read("CudaCopyMany.c"), "copy_many_kernels", new[] { "copy_many8" });
 

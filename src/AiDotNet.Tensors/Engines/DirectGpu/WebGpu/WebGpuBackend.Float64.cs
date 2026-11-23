@@ -45,8 +45,11 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     // A uniform reaches the device as floats, and a float does not carry every bit pattern through every host (a NaN
     // pattern has no JSON form). A double therefore travels as four 16-bit pieces, each a small integer.
     private static float[] Uniforms(int n, int p0 = 0, int p1 = 0, double scalar = 0.0)
+        => UniformBits(n, p0, p1, BitConverter.DoubleToInt64Bits(scalar));
+
+    // The same block with the 64 scalar bits given directly (an integer scalar occupies the low pieces).
+    private static float[] UniformBits(int n, int p0, int p1, long bits)
     {
-        long bits = BitConverter.DoubleToInt64Bits(scalar);
         return new[]
         {
             Word(n), Word(p0), Word(p1), 0f,

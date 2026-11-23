@@ -901,3 +901,53 @@ AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64Elementwise
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64MatrixMultiply.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64Reductions.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.UnaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64UnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Add = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.And = 5 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Max = 4 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Min = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Multiply = 2 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Or = 6 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Subtract = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Xor = 7 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Negate = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Not = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerElementwise
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerElementwise.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerElementwise.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerElementwise.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerElementwise.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerReductions
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerReductions.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.IGpuIntegerReductions.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsIntegerElementwise(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsIntegerReductions(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.UnaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void

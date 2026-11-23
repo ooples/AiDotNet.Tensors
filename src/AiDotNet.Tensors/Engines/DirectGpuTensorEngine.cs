@@ -5688,6 +5688,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Double operands already on the device stay there, computed in double.
         if (input is Tensor<double> doubles && TryUnaryFloat64(doubles, callerName) is { } doubleResult)
             return DoublesAs<T>(doubleResult);
+        if (TryUnaryIntegerAny(input, callerName) is { } integerResult)
+            return integerResult;
         if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
             return null;
         var precisionOperation = PrecisionOperationForUnary(callerName);
@@ -9905,6 +9907,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
             return (T)(object)doubleSum;
+        if (TrySumIntegerAny(tensor, out T integerSum))
+            return integerSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
@@ -16227,6 +16231,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.UnregisterPersistentTensor(tensor);
         if (tensor is Tensor<double> unregisteredDoubles) DropResident(unregisteredDoubles);
+        DropIntegerResident(tensor);
 
         // Cache identity is a read-only concern. GetDataArray() advertises writable access and
         // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
@@ -16274,6 +16279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.InvalidatePersistentTensor(tensor);
         if (tensor is Tensor<double> invalidatedDoubles) DropResident(invalidatedDoubles);
+        DropIntegerResident(tensor);
 
         if (!TryGetBackend(out var backend))
             return;
@@ -23851,6 +23857,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return ShapesMatch(a.Shape._dims, b.Shape._dims)
                 ? TryBinaryFloat64(leftDoubles, rightDoubles, callerName) as Tensor<T>
                 : null;
+        // Integer operands likewise: their own kernels, computed in the element type.
+        if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryIntegerAny(a, b, callerName) is { } integerResult)
+            return integerResult;
         if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
@@ -25345,6 +25354,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", onDevice, tensor,
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { doubleScalar });
             return onDevice;
+        }
+        if (scalar is not null
+            && TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Multiply, nameof(TensorMultiplyScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", integerResult, tensor,
+                Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
+            return integerResult;
         }
         if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
@@ -29023,6 +29039,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
             return onDevice;
         }
+        if (TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Add, nameof(TensorAddScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+            return integerResult;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -29065,6 +29086,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var onDevice = DoublesAs<T>(doubleResult);
             Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", onDevice, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
             return onDevice;
+        }
+        if (TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Subtract, nameof(TensorSubtractScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+            return integerResult;
         }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision

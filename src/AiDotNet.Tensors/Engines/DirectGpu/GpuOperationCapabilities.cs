@@ -104,7 +104,15 @@ public static class GpuOperationCapabilities
                 GpuOperationFamily.MatrixMultiply => physical is IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true },
                 _ => false,
             },
-            // Half, integer and bool buffers are held and moved, not yet computed on.
+            GpuElementType.Int8 or GpuElementType.UInt8 or GpuElementType.Int16 or GpuElementType.Int32 or GpuElementType.Int64
+                or GpuElementType.Bool => family switch
+            {
+                // In the element type itself; for Bool, the logical operations.
+                GpuOperationFamily.Elementwise => physical is IGpuIntegerElementwise integers && integers.SupportsIntegerElementwise(elementType),
+                GpuOperationFamily.Reduction => physical is IGpuIntegerReductions sums && sums.SupportsIntegerReductions(elementType),
+                _ => false,
+            },
+            // Half buffers are held and moved, not yet computed on through this table's interfaces.
             _ => false,
         };
     }
