@@ -294,6 +294,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // sync (race-free + bounds mid-step peak). DEFAULT ON; opt out with AIDOTNET_CUDA_ASYNC_ALLOC=0
     // (the legacy synchronous allocator, which can hit a sticky CUDA-700 under heavy buffer churn).
     private bool _asyncAlloc;
+
+    /// <summary>Whether buffers come from the driver's stream-ordered pool (off under AIDOTNET_CUDA_ASYNC_ALLOC=0, and
+    /// on a driver that does not expose the pool).</summary>
+    internal bool UsesStreamOrderedAllocation => _asyncAlloc && _asyncMemPool != IntPtr.Zero;
     private IntPtr _asyncMemPool; // the stream-ordered default mem pool (when _asyncAlloc); trimmed on sync-path OOM
     /// <summary>Diagnostic (#558): the nvrtc error if the FP16 kernel module failed to compile (which
     /// silently disables the whole FP16 GPU path). Null when FP16 compiled successfully.</summary>
@@ -383,6 +387,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     // This device's memory counters (GpuMemoryStats): every owning buffer below charges them.
     private readonly DeviceMemoryAccount _memoryAccount;
+    private readonly object _accountedMemoryToken = new object();
     DeviceMemoryAccount
         IDeviceMemoryAccounted.MemoryAccount => _memoryAccount;
 
@@ -436,12 +441,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             || IsCapturingOnThisThread || _backendStreamCaptureActive)
             return null;
         return _stepArena ??= new CudaStepArena(_cudaContext, _contextGeneration,
-            bytes => AllocDeviceMemoryWithRetry(bytes),
+            AllocArenaBlock,
             FreeArenaBlock);
+    }
+
+    // A backing block is reserved device memory for as long as it lives: the buffers carved from it are not counted
+    // one by one, so without this the budget would admit every later block against a total that holds none of them.
+    private IntPtr AllocArenaBlock(ulong bytes)
+    {
+        IntPtr block = AllocDeviceMemoryWithRetry(bytes);
+        CudaAccountedMemory.Track(block, _memoryAccount, (long)bytes);
+        return block;
     }
 
     private void FreeArenaBlock(IntPtr ptr)
     {
+        // Returned whether or not the free below runs: a block it skips goes with its context.
+        CudaAccountedMemory.Untrack(ptr);
         if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return;
         lock (ContextLifecycleLock)
         {
@@ -813,6 +829,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CuBlasNative.cuDevicePrimaryCtxRetain(out _cudaContext, device),
                 "cuDevicePrimaryCtxRetain");
             _cuDevice = device;
+            // The scratch memory other CUDA code allocates on this context is counted and budgeted on this account.
+            // The release is reached through a weak reference: the table is static and must not keep the backend.
+            var weakBackend = new WeakReference<CudaBackend>(this);
+            CudaAccountedMemory.Register(_cudaContext, _memoryAccount,
+                () => { if (weakBackend.TryGetTarget(out var backend)) backend.ReclaimForBudget(); },
+                _accountedMemoryToken);
             // cuCtxCreate made the new context current on this thread, and the rest of construction (stream,
             // modules, cuBLAS) depends on that; cuDevicePrimaryCtxRetain does not, so push it the same way.
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
@@ -2299,10 +2321,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         => _memoryAccount.Admit((long)byteSize, ReclaimForBudget,
             message => CudaAllocationError(CudaResult.OutOfMemory, message));
 
+    // The admission is held until the caller's buffer reserves the bytes; an allocation that fails gives it back.
     private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
     {
         byteSize = AllocationBytesOverrideForTests ?? byteSize;
         AdmitUnderBudget(byteSize);
+        try
+        {
+            return AllocAdmittedDeviceMemoryWithRetry(byteSize);
+        }
+        catch
+        {
+            DeviceMemoryAccount.SettleAdmission();
+            throw;
+        }
+    }
+
+    private IntPtr AllocAdmittedDeviceMemoryWithRetry(ulong byteSize)
+    {
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
@@ -2519,8 +2555,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // freed block (its release threshold is maxed), so a request its free blocks cover reserves nothing. Charging the
         // whole request would send each step's reuse near the budget through a synchronizing reclaim that trims the very
         // cache the step reuses. A request the free blocks do not fit (fragmentation) is caught after the allocation.
-        bool budgeted = _memoryAccount.LimitBytes > 0;
-        if (budgeted) AdmitUnderBudget(PoolGrowthBound(byteSize));
+        bool budgeted = _memoryAccount.LimitBytes is not null;
+        if (!budgeted) return AllocDeviceMemoryAsync(byteSize, budgeted: false, reservedBefore: 0);
+        AdmitUnderBudget(PoolGrowthBound(byteSize));
+        try
+        {
+            // What the pool held before this request: only what the request adds to it is judged afterwards.
+            return AllocDeviceMemoryAsync(byteSize, budgeted: true, reservedBefore: _memoryAccount.ReservedBytes);
+        }
+        finally
+        {
+            // The pool's own counter holds the growth now (or the request failed): nothing is in flight.
+            DeviceMemoryAccount.SettleAdmission();
+        }
+    }
+
+    private IntPtr AllocDeviceMemoryAsync(ulong byteSize, bool budgeted, long reservedBefore)
+    {
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
@@ -2535,6 +2586,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (r == CudaResult.OutOfMemory)
                 throw CudaAllocationError(r, $"cuMemAllocAsync (during capture) failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
             CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync (during capture)");
+            if (budgeted) p = EnforceBudgetAfterPoolGrowth(p, byteSize, reservedBefore);
             GpuMemoryTracker.OnAlloc(p, (long)byteSize);
             return p;
         }
@@ -2572,7 +2624,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (r == CudaResult.OutOfMemory)
             throw CudaAllocationError(r, $"cuMemAllocAsync failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
-        if (budgeted) p = EnforceBudgetAfterPoolGrowth(p, byteSize);
+        if (budgeted) p = EnforceBudgetAfterPoolGrowth(p, byteSize, reservedBefore);
         GpuMemoryTracker.OnAlloc(p, (long)byteSize);
         return p;
     }
@@ -2585,14 +2637,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return free <= 0 ? byteSize : byteSize > (ulong)free ? byteSize - (ulong)free : 0;
     }
 
-    // After a stream-ordered allocation that took this process past its budget (the pool grew though free blocks
-    // seemed to cover the request): give it back, release what the budget's reclaim releases, and allocate once more;
-    // still over, refuse as a driver out-of-memory. Mid-capture nothing may synchronize, so the allocation stands.
-    private IntPtr EnforceBudgetAfterPoolGrowth(IntPtr p, ulong byteSize)
+    // After a stream-ordered allocation that took this process past its budget by growing the pool (free blocks
+    // seemed to cover the request, and did not fit it): give it back, release what the budget's reclaim releases, and
+    // allocate once more; still over, refuse as a driver out-of-memory. A request the pool served without growing
+    // reserved nothing and always stands, also under a budget set below what the pool already holds.
+    // Mid-capture nothing may synchronize, so there is no release to run: the request is refused at once, which
+    // aborts the capture (as a failed capture-time allocation does) and leaves the step to the eager path.
+    private IntPtr EnforceBudgetAfterPoolGrowth(IntPtr p, ulong byteSize, long reservedBefore)
     {
-        long limit = _memoryAccount.LimitBytes;
-        if (limit <= 0 || _memoryAccount.ReservedBytes <= limit || IsStreamCapturing()) return p;
+        if (_memoryAccount.LimitBytes is not long limit) return p;
+        long reserved = _memoryAccount.ReservedBytes;
+        if (reserved <= limit || reserved <= reservedBefore) return p;
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemFreeAsync(p, _mainStream), "cuMemFreeAsync (memory budget)");
+        if (IsStreamCapturing())
+        {
+            _memoryAccount.CountBudgetRefusal();
+            throw CudaAllocationError(CudaResult.OutOfMemory,
+                $"GPU memory budget of {limit} bytes on {_memoryAccount.Device} exceeded during a stream capture: "
+                + $"{byteSize} bytes requested grew the stream-ordered pool to {reserved} reserved (GpuMemoryBudget).");
+        }
+
         ReclaimForBudget();
         var r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _mainStream);
         if (r == CudaResult.Success && _memoryAccount.ReservedBytes <= limit) return p;
@@ -7798,7 +7862,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // CUDNN_STATUS_BAD_PARAM_STREAM_MISMATCH and cuDNN can't address our
             // device buffers. Callers MUST hold PushContext when they call this.
             _cudnnContext ??= CuDnnContext.ForCurrentContext();
-            _cudnnConv = new CuDnnConvolution(_cudnnContext) { MemoryAccount = _memoryAccount };
+            _cudnnConv = new CuDnnConvolution(_cudnnContext) { MemoryAccount = _memoryAccount, BudgetReclaim = ReclaimForBudget };
         }
     }
 
@@ -19882,6 +19946,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             System.Diagnostics.Trace.TraceWarning($"[CUDA] cuBLAS prewarm worker failed during disposal: {ex}");
         }
+        CudaAccountedMemory.Unregister(_cudaContext, _accountedMemoryToken);
         Dispose(disposing: true);
         GC.SuppressFinalize(this);
     }

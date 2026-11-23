@@ -364,11 +364,11 @@ public sealed class CuRand : IDeviceRng, IDisposable
             if (BufferBytes >= bytes) return true;
             if (Buffer != IntPtr.Zero)
             {
-                CudaNativeBindings.cuMemFree(Buffer);
+                CudaAccountedMemory.Free(Buffer);
                 Buffer = IntPtr.Zero;
                 BufferBytes = 0;
             }
-            if (CudaNativeBindings.cuMemAlloc(out var buffer, bytes) != CudaResult.Success) return false;
+            if (CudaAccountedMemory.Alloc(out var buffer, bytes) != CudaResult.Success) return false;
             Buffer = buffer;
             BufferBytes = bytes;
             return true;
@@ -378,7 +378,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
         public void Release()
         {
             if (Handle != IntPtr.Zero) CuRandNative.curandDestroyGenerator(Handle);
-            if (Buffer != IntPtr.Zero) CudaNativeBindings.cuMemFree(Buffer);
+            if (Buffer != IntPtr.Zero) CudaAccountedMemory.Free(Buffer);
             Handle = IntPtr.Zero;
             Buffer = IntPtr.Zero;
             BufferBytes = 0;
@@ -433,7 +433,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
         try
         {
             ulong bytes = (ulong)output.Length * sizeof(float);
-            if (CudaNativeBindings.cuMemAlloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+            if (CudaAccountedMemory.Alloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
 
             if (CuRandNative.curandCreateGenerator(out generator, CuRandNative.GeneratorType.PseudoPhilox4_32_10) != CuRandNative.Status.Success) return false;
             CuRandNative.curandSetPseudoRandomGeneratorSeed(generator, _cpuFallback.Seed);
@@ -466,7 +466,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
         finally
         {
             if (generator != IntPtr.Zero) CuRandNative.curandDestroyGenerator(generator);
-            if (dPtr != IntPtr.Zero) CudaNativeBindings.cuMemFree(dPtr);
+            if (dPtr != IntPtr.Zero) CudaAccountedMemory.Free(dPtr);
         }
     }
 
@@ -485,7 +485,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
         try
         {
             ulong bytes = (ulong)output.Length * sizeof(double);
-            if (CudaNativeBindings.cuMemAlloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
+            if (CudaAccountedMemory.Alloc(out dPtr, bytes) != AiDotNet.Tensors.Engines.CudaResult.Success) return false;
 
             if (CuRandNative.curandCreateGenerator(out generator, CuRandNative.GeneratorType.PseudoPhilox4_32_10) != CuRandNative.Status.Success) return false;
             CuRandNative.curandSetPseudoRandomGeneratorSeed(generator, _cpuFallback.Seed);
@@ -514,7 +514,7 @@ public sealed class CuRand : IDeviceRng, IDisposable
         finally
         {
             if (generator != IntPtr.Zero) CuRandNative.curandDestroyGenerator(generator);
-            if (dPtr != IntPtr.Zero) CudaNativeBindings.cuMemFree(dPtr);
+            if (dPtr != IntPtr.Zero) CudaAccountedMemory.Free(dPtr);
         }
     }
 }

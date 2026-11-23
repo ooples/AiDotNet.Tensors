@@ -2334,7 +2334,11 @@ public sealed partial class CuDnnConvolution : IDisposable
     /// <summary>The device's memory counters, which count the workspace (PyTorch counts cuDNN's as allocated).</summary>
     internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
 
-    private bool WithinBudget(ulong bytes) => MemoryAccount is not { } account || account.TryAdmit((long)bytes, null, out _);
+    /// <summary>The release the device's budget runs before refusing workspace growth: the owning backend's, which
+    /// frees pooled and unreachable memory as a driver out-of-memory does (and nothing inside a stream capture).</summary>
+    internal Action? BudgetReclaim { get; set; }
+
+    private bool WithinBudget(ulong bytes) => MemoryAccount is not { } account || account.TryAdmit((long)bytes, BudgetReclaim, out _);
     private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
 
     private void EnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize = false)
@@ -2360,7 +2364,11 @@ public sealed partial class CuDnnConvolution : IDisposable
             size = requiredSize;
             result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
         }
-        if (result != CudaResult.Success) return false;
+        if (result != CudaResult.Success)
+        {
+            DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
+            return false;
+        }
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
         // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
@@ -2372,6 +2380,7 @@ public sealed partial class CuDnnConvolution : IDisposable
         _workspaceSize = size;
         _workspaceMemory = default;
         _workspaceMemory.OnAllocated(MemoryAccount, (long)size);
+        DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
         return true;
     }
 
