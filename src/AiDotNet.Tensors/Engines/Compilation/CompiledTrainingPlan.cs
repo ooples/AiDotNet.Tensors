@@ -580,6 +580,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _disposed = true;
         GC.SuppressFinalize(this);
         LandGradientsOnHost();
+        DisposeCheckpointBuffers();
         _lossScaleDevice?.Dispose();
         _lossScaleDevice = null;
         if (StepTiming.Enabled)
@@ -2104,7 +2105,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         long observation = ++_diagnosticObservations;
         string failure = (GraphCaptureFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
         string residentFailure = (_residentStepFailureReason ?? "(none)").Replace('\r', ' ').Replace('\n', ' ');
-        AiDotNetEngine.LogDiagnostic($"[PLAN-EXEC] plan={_planId} parameters={_parameters.Length} observation={observation} graph_enabled={s_graphStepEnabled} eligible={_graphStepEligible} disabled={_graphStepDisabled} graph_bound={_stepGraphExec != IntPtr.Zero} warmup_calls={_graphStepCalls} plan_replays={_planGraphReplayCount} process_replays={GraphReplayCount} resident_failed={_residentStepFailed} data_forward_replay={_dataForwardReplay is not null} checkpointing={_checkpointing is not null} half_training={_fp16HeteroOrder is not null} span_candidates={ForwardSpanLeaseCandidates} failure={failure} resident_failure={residentFailure}");
+        AiDotNetEngine.LogDiagnostic($"[PLAN-EXEC] plan={_planId} parameters={_parameters.Length} observation={observation} graph_enabled={s_graphStepEnabled} eligible={_graphStepEligible} disabled={_graphStepDisabled} graph_bound={_stepGraphExec != IntPtr.Zero} warmup_calls={_graphStepCalls} plan_replays={_planGraphReplayCount} process_replays={GraphReplayCount} resident_failed={_residentStepFailed} data_forward_replay={_dataForwardReplay is not null} checkpointing={_checkpointing is not null} checkpoint_segments={CheckpointSegmentCount} recomputed_actions={CheckpointRecomputedActionCount} released_actions={CheckpointReleasedActionCount} scratch_bytes={ScratchBufferBytes} half_training={_fp16HeteroOrder is not null} span_candidates={ForwardSpanLeaseCandidates} failure={failure} resident_failure={residentFailure}");
         if (storage && _scratchPool is { } pool)
         {
             var categories = pool.SnapshotStorage(_forwardActions.Length);
@@ -2699,6 +2700,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         if (_dataForwardReplay is not null) throw new NotSupportedException(ForwardOnlyHeterogeneousReplay.UnsupportedScheduleReason);
         if (_isFrozenWeights) return;
+        // The checkpoint schedule names forward actions by index; specialized actions would write elsewhere.
+        if (_checkpoint is not null)
+            throw new NotSupportedException("EnableFrozenWeightOptimizations does not compose with activation checkpoint segments.");
         if (_forwardSteps is null)
             throw new InvalidOperationException(
                 "EnableFrozenWeightOptimizations requires a compiled plan with retained forward steps. " +
@@ -5520,11 +5524,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool WritesLeasableOutput(int action)
         => action < _spanStepOfAction!.Length && _spanStepOfAction[action] is int s and >= 0 && _spanReleaseAfter![s] >= 0;
 
-    private void ScheduleForwardSpanLeases(int action)
+    private void ScheduleForwardSpanLeases(int action, bool trackOutput = true)
     {
         var pool = _scratchPool!;
         var steps = _forwardSteps;
-        if (steps is not null && action < _spanStepOfAction!.Length && _spanStepOfAction[action] is int s and >= 0
+        if (trackOutput && steps is not null && action < _spanStepOfAction!.Length && _spanStepOfAction[action] is int s and >= 0
             && steps[s].OutputBuffer is Tensor<float> output && output.TryGetGpuBuffer() is { } buffer)
         {
             int release = _spanReleaseAfter![s];
@@ -5861,20 +5865,32 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         bool spanLeases = de is not null && LeaseForwardOutputs && _spanStepOfAction is not null && _scratchPool is not null
             && _checkpointing is null;
         if (spanLeases) _spanLive.Clear();
+        // Activation checkpoint segments: a segment's internal outputs are held for its forward only, and its recompute
+        // runs inside the backward below.
+        var checkpoint = _checkpoint;
+        var checkpointPool = checkpoint is not null && de is not null ? _scratchPool : null;
+        bool capturingBody = IsCapturing();
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
             de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
             // An action writing a leasable output takes a free buffer for a slot it allocates for the first time, so the
             // first run already reuses what earlier outputs released instead of allocating every output once.
             if (spanLeases) _scratchPool!.ReuseFreeForNewSlots = WritesLeasableOutput(i);
+            bool heldByCheckpoint = false;
+            if (checkpoint is not null)
+            {
+                CheckpointBeforeForwardAction(i, backend, capturingBody);
+                if (checkpointPool is not null) heldByCheckpoint = CheckpointHoldsForwardAction(i, checkpointPool);
+            }
             long rs = 0;
             if (resFwdUs is not null) { ProfSync(engine); rs = System.Diagnostics.Stopwatch.GetTimestamp(); }
             fwd[i](engine);
             if (resFwdUs is not null) { ProfSync(engine); resFwdUs[i] += ProfElapsedUs(rs); }
+            if (checkpointPool is not null) CheckpointAfterForwardAction(i, checkpointPool);
             if (spanLeases)
             {
                 _scratchPool!.ReuseFreeForNewSlots = false;
-                ScheduleForwardSpanLeases(i);
+                ScheduleForwardSpanLeases(i, trackOutput: !heldByCheckpoint);
             }
             if (capDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
             {
@@ -6003,12 +6019,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             for (int i = 0; i < bwd.Length; i++)
             {
                 if (pooledGrads is not null) ZeroPooledGradientsStartingAt(i, backend, residentEngine, esz);
+                // A checkpoint segment whose backward starts here is recomputed first, keyed above the backward actions.
+                if (checkpoint is not null)
+                    CheckpointBeforeBackwardAction(i, engine, de, checkpointPool, backend, capturingBody, fwd, fwd.Length + bwd.Length);
                 de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
                 long rb = 0;
                 if (resBwdUs is not null) { ProfSync(engine); rb = System.Diagnostics.Stopwatch.GetTimestamp(); }
                 bwd[i](engine);
                 if (resBwdUs is not null) { ProfSync(engine); resBwdUs[i] += ProfElapsedUs(rb); }
                 de?.EndScratchAction();
+                if (checkpoint is not null) CheckpointAfterBackwardAction(i, checkpointPool);
                 if (lendPool is not null && lend is not null && lend[i] is { } dead) lendPool.Lend(dead);
                 if (bwdDiag && cb is not null && cb.StreamCaptureStatusRaw() == 2)
                 {
@@ -6024,6 +6044,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
             // Settle a failed action's leases before withdrawing any lent forward slots.
             de?.EndScratchAction();
+            CheckpointAbandonRun(checkpointPool);
             lendPool?.WithdrawLent();   // the next forward writes them again
         }
         CommitReplacedParameterGradients(engine);
@@ -10796,6 +10817,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     ReplaysHostState = typed.ReplaysHostState,
                     RecordedUnderNoGrad = typed.RecordedUnderNoGrad,
                     DifferentiableInputIndices = typed.DifferentiableInputIndices,
+                    CheckpointSegment = scope.CheckpointSegmentOf(typed.RecordOrder),
                 });
                 // CRITICAL (issue #350 root cause): clear LazySource on every
                 // forward-step output BEFORE the plan starts executing. Each
@@ -11883,8 +11905,26 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : null;
 
             plan._pooledForwardOutputs = pooledForwardOutputs;
+            // Activation checkpoint segments the trace marked: released after their forward, recomputed in the backward.
+            var spanUnsafe = retainedOutputs;
+            if (BuildCheckpointSchedule(forwardSteps, genericActionOfStep, forwardActions.Length, actionCoverage,
+                    backwardActions.Count, parameters, lossOutput, retainedOutputs, engine) is { } checkpoint)
+            {
+                if (dataReplay is not null || fp16HeteroOrder is not null || pooledForwardOutputs > 0)
+                    throw new NotSupportedException(
+                        "Activation checkpointing inside a compiled training plan does not compose with a heterogeneous "
+                        + "(mixed-dtype) forward replay or with host forward-output pooling.");
+                plan._checkpoint = checkpoint;
+                plan.ApplyCheckpointLifetimes();
+                // The forward span leases must leave alone what a segment holds itself and what its recompute reads.
+                spanUnsafe = new HashSet<Tensor<T>>(retainedOutputs, ReferenceEqualityComparer<Tensor<T>>.Instance);
+                spanUnsafe.UnionWith(CheckpointRecomputeInputs(checkpoint, forwardSteps));
+                for (int i = 0; i < forwardSteps.Count; i++)
+                    if (genericActionOfStep[i] >= 0 && checkpoint.SegmentOfForwardAction[genericActionOfStep[i]] >= 0)
+                        spanUnsafe.Add(forwardSteps[i].OutputBuffer);
+            }
             if (dataReplay is null && typeof(T) == typeof(float) && engine.SupportsGpu && fp16HeteroOrder is null
-                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, retainedOutputs, backwardReadSteps) is { } spans)
+                && ForwardSpanLeasePlan(forwardSteps, forwardEmitKinds, parameters, lossOutput, spanUnsafe, backwardReadSteps) is { } spans)
             {
                 plan._spanStepOfAction = spans.StepOfAction;
                 plan._spanReleaseAfter = spans.ReleaseAfter;
