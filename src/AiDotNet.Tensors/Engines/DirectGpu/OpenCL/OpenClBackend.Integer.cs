@@ -9,17 +9,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     public sealed partial class OpenClBackend : IGpuIntegerElementwise, IGpuIntegerReductions
     {
         private readonly object _integerKernelLock = new object();
-        private bool _integerKernelsReady;
+        // The integer kernels have their own registry: the shared kernel cache is read without a lock by every other
+        // operation, so nothing is added to it after construction. The registry is built off to the side and
+        // published whole; a reader sees none of it or all of it.
+        private System.Collections.Generic.Dictionary<string, DirectOpenClKernel>? _integerKernels;
         private bool _integerKernelsFailed;
 
-        private bool EnsureIntegerKernels()
+        private System.Collections.Generic.Dictionary<string, DirectOpenClKernel>? EnsureIntegerKernels()
         {
-            if (_integerKernelsReady) return true;
-            if (_integerKernelsFailed || _context == null) return false;
+            // A disposed backend has released them (ReleaseIntegerKernels), whatever was published before.
+            if (!IsAvailable) return null;
+            if (System.Threading.Volatile.Read(ref _integerKernels) is { } ready) return ready;
+            if (_integerKernelsFailed || _context == null) return null;
             lock (_integerKernelLock)
             {
-                if (_integerKernelsReady) return true;
-                if (_integerKernelsFailed) return false;
+                if (!IsAvailable) return null;
+                if (_integerKernels is { } published) return published;
+                if (_integerKernelsFailed) return null;
+                var built = new System.Collections.Generic.Dictionary<string, DirectOpenClKernel>(StringComparer.Ordinal);
                 try
                 {
                     var program = CompileOrLoadCached(
@@ -28,22 +35,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         "Integer kernels");
                     _programs.Add(program);
                     foreach (string name in GpuIntegerKernelSource.KernelNames)
-                        _kernelCache[name] = new DirectOpenClKernel(_context, program, name);
-                    _integerKernelsReady = true;
-                    return true;
+                        built[name] = new DirectOpenClKernel(_context, program, name);
+                    System.Threading.Volatile.Write(ref _integerKernels, built);
+                    return built;
                 }
                 catch (InvalidOperationException buildFailure)
                 {
+                    foreach (var kernel in built.Values) kernel.Dispose();
                     _integerKernelsFailed = true;
                     System.Diagnostics.Trace.TraceWarning("OpenCL integer kernels are unavailable: {0}", buildFailure);
-                    return false;
+                    return null;
                 }
+            }
+        }
+
+        // Called by Dispose once IsAvailable is false: no registry is published past this point.
+        private void ReleaseIntegerKernels()
+        {
+            lock (_integerKernelLock)
+            {
+                if (_integerKernels is not { } kernels) return;
+                System.Threading.Volatile.Write(ref _integerKernels, null);
+                foreach (var kernel in kernels.Values) kernel.Dispose();
             }
         }
 
         /// <inheritdoc/>
         public bool SupportsIntegerElementwise(GpuElementType type)
-            => GpuIntegerLayout.IsIntegerOrBool(type) && SupportsElementType(type) && EnsureIntegerKernels();
+            => GpuIntegerLayout.IsIntegerOrBool(type) && SupportsElementType(type) && EnsureIntegerKernels() is not null;
 
         /// <inheritdoc/>
         public bool SupportsIntegerReductions(GpuElementType type)
@@ -51,9 +70,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private DirectOpenClKernel IntegerKernel(string name)
         {
-            if (!EnsureIntegerKernels())
+            if (EnsureIntegerKernels() is not { } kernels || !kernels.TryGetValue(name, out var kernel))
                 throw new GpuCapabilityUnavailableException("Integer kernels are not available on this OpenCL device.");
-            return _kernelCache[name];
+            return kernel;
         }
 
         private static IntPtr IntegerHandle(IGpuBuffer buffer)
@@ -122,17 +141,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (size == 0) return 0;
             var later = IntegerKernel(GpuIntegerKernelSource.Sum(GpuElementType.Int64));
             int block = GpuIntegerKernelSource.SumBlock;
-            int partials = (size + block - 1) / block;
+            int partials = GpuIntegerLayout.Blocks(size, block);
             // Two scratch buffers, alternated: a pass never reads the buffer it writes.
             using var even = AllocateBuffer(partials, GpuElementType.Int64);
-            using var odd = AllocateBuffer(Math.Max(1, (partials + block - 1) / block), GpuElementType.Int64);
+            using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int64);
             IGpuBuffer current = a;
             IGpuBuffer target = even;
             int count = size;
             var kernel = first;
             while (true)
             {
-                int blocks = (count + block - 1) / block;
+                int blocks = GpuIntegerLayout.Blocks(count, block);
                 kernel.SetArg(0, IntegerHandle(current));
                 kernel.SetArg(1, IntegerHandle(target));
                 kernel.SetArg(2, count);

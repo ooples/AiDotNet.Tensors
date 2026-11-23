@@ -125,6 +125,12 @@ internal static class GpuIntegerLayout
         return type;
     }
 
+    /// <summary>
+    /// How many blocks of <paramref name="block"/> hold <paramref name="count"/> elements, rounded up in 64 bits: the
+    /// largest buffers are within a block of <see cref="int.MaxValue"/>, where a 32-bit round-up wraps negative.
+    /// </summary>
+    public static int Blocks(int count, int block) => (int)(((long)count + block - 1) / block);
+
     /// <summary><paramref name="value"/> wrapped to <paramref name="type"/>'s width and widened again.</summary>
     public static long Wrap(long value, GpuElementType type) => type switch
     {

@@ -826,6 +826,8 @@ public class HalfOperations : INumericOperations<Half>
     // Computed in FP32 and rounded once, as Tanh and Exp are: evaluating the formula in Half rounds every intermediate.
     public void GELU(ReadOnlySpan<Half> x, Span<Half> destination)
     {
+        if (x.Length != destination.Length)
+            throw new ArgumentException($"GELU requires equal-length spans: x={x.Length}, destination={destination.Length}.");
         int len = x.Length;
         float[] xf = ArrayPool<float>.Shared.Rent(len);
         float[] df = ArrayPool<float>.Shared.Rent(len);

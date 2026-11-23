@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 public sealed partial class OpenClBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply
 {
     private bool NarrowFloatKernelsReady(GpuElementType type)
-        => GpuNarrowFloatLayout.IsNarrowFloat(type) && EnsureIntegerKernels();
+        => GpuNarrowFloatLayout.IsNarrowFloat(type) && EnsureIntegerKernels() is not null;
 
     private bool HalfKernel(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
         => type == GpuElementType.Float16 && operation == GpuNarrowFloatBinaryOperation.Add && SupportsFp16NativeOps;

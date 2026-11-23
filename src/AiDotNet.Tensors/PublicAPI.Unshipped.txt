@@ -1006,6 +1006,7 @@ AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.Im2colKNFp16(AiDotNet.Tensors.
 AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.MatMulBackwardFp16Fused(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradCFp16, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! aFp16, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! bFp16, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradAOut, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! gradBOut, int m, int n, int k, bool gradOutHalf) -> void
 AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.SupportsFp16FusedBackward.get -> bool
 AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.SupportsFp16NativeOps.get -> bool
+AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.SupportsHgemm.get -> bool
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuFp16ElementwiseBackend
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuFp16ElementwiseBackend.Fp16Add(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! left, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! right, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 *REMOVED*AiDotNet.Tensors.Engines.Gpu.IGpuFp16ElementwiseBackend.Fp16Gelu(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void

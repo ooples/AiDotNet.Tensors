@@ -32,14 +32,18 @@ public sealed partial class HipBackend : IGpuIntegerElementwise, IGpuIntegerRedu
         return kernel;
     }
 
+    // The handle is launched as a device pointer of this API: a buffer of another backend carries a handle that is
+    // not one, however well its type and size fit.
     private static IntPtr IntegerHandle(IGpuBuffer buffer)
     {
+        if (buffer is not HipGpuBuffer && buffer is not HipGpuByteBuffer)
+            throw new ArgumentException("The buffer does not belong to the HIP backend.", nameof(buffer));
         IntPtr handle = buffer.Handle;
         if (handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(buffer));
         return handle;
     }
 
-    private static uint IntegerGrid(int work) => (uint)((work + IntegerBlock - 1) / IntegerBlock);
+    private static uint IntegerGrid(int work) => (uint)GpuIntegerLayout.Blocks(work, IntegerBlock);
 
     /// <inheritdoc/>
     public unsafe void BinaryInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
@@ -115,17 +119,17 @@ public sealed partial class HipBackend : IGpuIntegerElementwise, IGpuIntegerRedu
         if (size == 0) return 0;
         IntPtr later = IntegerKernel(GpuIntegerKernelSource.Sum(GpuElementType.Int64));
         int block = GpuIntegerKernelSource.SumBlock;
-        int partials = (size + block - 1) / block;
+        int partials = GpuIntegerLayout.Blocks(size, block);
         // Two scratch buffers, alternated: a pass never reads the buffer it writes.
         using var even = AllocateBuffer(partials, GpuElementType.Int64);
-        using var odd = AllocateBuffer(Math.Max(1, (partials + block - 1) / block), GpuElementType.Int64);
+        using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int64);
         IGpuBuffer current = a;
         IGpuBuffer target = even;
         int count = size;
         void** args = stackalloc void*[4];
         while (true)
         {
-            int blocks = (count + block - 1) / block;
+            int blocks = GpuIntegerLayout.Blocks(count, block);
             // (a, 64-bit o, count, blocks), one thread per block.
             IntPtr inputPtr = IntegerHandle(current);
             IntPtr outputPtr = IntegerHandle(target);

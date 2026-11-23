@@ -55,16 +55,16 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
         string source = WebGpuInt32Kernels.SumBlocks;
         if (size == 0) return 0;
         int block = GpuInt32ShaderSource.SumBlock;
-        int partials = (size + block - 1) / block;
+        int partials = GpuIntegerLayout.Blocks(size, block);
         // Two scratch buffers, alternated: a pass never reads the buffer it writes.
         using var even = AllocateBuffer(partials, GpuElementType.Int32);
-        using var odd = AllocateBuffer(Math.Max(1, (partials + block - 1) / block), GpuElementType.Int32);
+        using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int32);
         IGpuBuffer current = a;
         IGpuBuffer target = even;
         int count = size;
         while (true)
         {
-            int outputs = (count + block - 1) / block;
+            int outputs = GpuIntegerLayout.Blocks(count, block);
             Dispatch2BufferAsync("I32Sum", source, "main", current, target, Uniforms(outputs, count), outputs).GetAwaiter().GetResult();
             if (outputs == 1)
                 return BitConverter.ToInt32(DownloadByteBuffer(target, sizeof(int)), 0);

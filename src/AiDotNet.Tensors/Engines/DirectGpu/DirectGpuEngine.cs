@@ -606,7 +606,7 @@ public sealed class DirectGpuEngine : IDisposable
         // through to the FP32 path below if the backend has no Hgemm support.
         if (typeof(T) == typeof(Half)
             && _backend is AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels halfBackend
-            && GpuNarrowFloatLayout.HasHalfMatrixMultiply(halfBackend))
+            && halfBackend.SupportsHgemm)
         {
             float[] aHalfIn = ToFloatArray(A);
             float[] bHalfIn = ToFloatArray(B);

@@ -13,6 +13,13 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 public interface IGpuHalfFusedKernels
 {
     /// <summary>
+    /// Whether the half GEMM kernels behind <see cref="GemmFp16In32fOut"/> and the half conversions are loaded. This is
+    /// not <see cref="IGpuNarrowFloatMatrixMultiply.SupportsNarrowFloatMatrixMultiply"/>: a backend may multiply
+    /// <see cref="GpuElementType.Float16"/> matrices through its typed kernels without having these.
+    /// </summary>
+    bool SupportsHgemm { get; }
+
+    /// <summary>
     /// Mixed-precision matmul: A, B are FP16, accumulator + output C are
     /// FP32. Maps to cuBLAS <c>cublasGemmEx</c> with input dtypes
     /// <c>CUDA_R_16F</c> and compute type <c>CUBLAS_COMPUTE_32F</c>.

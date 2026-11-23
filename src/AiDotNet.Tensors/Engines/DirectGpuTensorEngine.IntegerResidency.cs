@@ -146,11 +146,16 @@ public partial class DirectGpuTensorEngine
             if (uploads > downloads) return null;
 
             using var a = ResolveResidentOperand(backend, left, type);
-            using var b = ReferenceEquals(left, right) ? new OwnedBuffer(a.Buffer, ownsBuffer: false) : ResolveResidentOperand(backend, right, type);
+            using var b = ReferenceEquals(left, right)
+                ? new OwnedBuffer(a.Buffer, ownsBuffer: false)
+                : ResolveResidentOperand(backend, right, type, left.DataVector);
             var output = RentResidentBuffer(backend, type, length, left.DataVector, right.DataVector);
             try
             {
                 kernel(a.Buffer, b.Buffer, output, length);
+                // An operand uploaded for this launch is still being read by it: released in queue order, not now.
+                a.DisposeAfterQueuedUse(backend);
+                b.DisposeAfterQueuedUse(backend);
                 var result = RegisterResidentResult<T>(backend, output, length, left.Shape.ToArray(), type);
                 result.Layout = left.Layout;
                 return result;
@@ -232,6 +237,7 @@ public partial class DirectGpuTensorEngine
             try
             {
                 kernel(a.Buffer, output, length);
+                a.DisposeAfterQueuedUse(backend);
                 var result = RegisterResidentResult<T>(backend, output, length, input.Shape.ToArray(), type);
                 // The kernel maps the elements in storage order, so the result is laid out as its input is.
                 result.Layout = input.Layout;

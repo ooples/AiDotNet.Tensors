@@ -70,17 +70,17 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
         var pipeline = Int32Pipeline("i32k_sum");
         if (size == 0) return 0;
         int block = GpuInt32ShaderSource.SumBlock;
-        int partials = (size + block - 1) / block;
+        int partials = GpuIntegerLayout.Blocks(size, block);
         // Two scratch buffers, alternated: a pass never reads the buffer it writes.
         using var even = AllocateBuffer(partials, GpuElementType.Int32);
-        using var odd = AllocateBuffer(Math.Max(1, (partials + block - 1) / block), GpuElementType.Int32);
+        using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int32);
         MetalGpuBuffer current = Int32Buffer(a);
         MetalGpuBuffer target = Int32Buffer(even);
         MetalGpuBuffer other = Int32Buffer(odd);
         int count = size;
         while (true)
         {
-            int outputs = (count + block - 1) / block;
+            int outputs = GpuIntegerLayout.Blocks(count, block);
             LaunchFloat64(pipeline, outputs, new[] { current, target }, (uint)outputs, (uint)count);
             if (outputs == 1)
                 return BitConverter.ToInt32(DownloadByteBuffer(target, sizeof(int)), 0);

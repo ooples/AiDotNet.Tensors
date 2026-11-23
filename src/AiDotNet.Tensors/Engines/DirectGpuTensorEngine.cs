@@ -8289,7 +8289,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bool fp16PathRan = false;
             if (typeof(T) == typeof(Half)
                 && backend is Engines.Gpu.IGpuHalfFusedKernels halfBackend
-                && GpuNarrowFloatLayout.HasHalfMatrixMultiply(halfBackend))
+                && halfBackend.SupportsHgemm)
             {
                 // Issue #560: FP16 vendor-library fast path. cublasGemmEx with
                 // FP16 inputs and an FP32 accumulator is the standard
@@ -8878,7 +8878,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (b > 1 && batchedConvGemm is null) fp16ConvWorth = false;
                 if (s_fp16Conv && fp16ConvWorth
                     && rbk is Engines.Gpu.IGpuHalfFusedKernels hbConvR
-                    && GpuNarrowFloatLayout.HasHalfMatrixMultiply(hbConvR) && hbConvR.Fp16Im2colAvailable)
+                    && hbConvR.SupportsHgemm && hbConvR.Fp16Im2colAvailable)
                 {
                     int K = gemmK, N = gemmN, M = gemmM;
                     // STABLE cached col scratch (NOT a per-call `using` alloc) — capture-replay-safe (see method doc).
@@ -9907,6 +9907,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private bool ShouldReduceOnDevice<T>(Tensor<T> tensor)
     {
         if (typeof(T) == typeof(double)) return false;
+        // The reductions behind this gate run in FP32: an integer above 2^24 would come back rounded. Integer tensors
+        // have their own exact sum (TrySumIntegerAny); everything else of theirs reduces on the host.
+        if (typeof(T) == typeof(int) || typeof(T) == typeof(long) || typeof(T) == typeof(short)
+            || typeof(T) == typeof(sbyte) || typeof(T) == typeof(byte)) return false;
         return tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor) || IsFp16Resident(tensor);
     }
 
@@ -25898,7 +25902,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (plan.InputStorage == Gpu.GpuScalarType.Float16)
             {
-                if (backend is not IGpuHalfFusedKernels halfBackend || !GpuNarrowFloatLayout.HasHalfMatrixMultiply(halfBackend))
+                if (backend is not IGpuHalfFusedKernels halfBackend || !halfBackend.SupportsHgemm)
                     throw new NotSupportedException($"{backend.BackendName} advertised FP16 GEMM without an executable half GEMM route.");
 
                 using var fp16A = AllocateReducedPrecisionInput(backend, bufferA.Buffer, checked(m * k), plan);

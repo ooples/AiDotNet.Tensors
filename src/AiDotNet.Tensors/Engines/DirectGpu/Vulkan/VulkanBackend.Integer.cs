@@ -49,17 +49,19 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
         GpuInt32ShaderSource.RequireSum(a, size);
         string glsl = VulkanInt32Kernels.SumBlocks;
         if (size == 0) return 0;
+        // The result is read back between passes, which resets the command buffer an open batch is recording into.
+        ThrowIfHostSpanOpInsideOpenBatch();
         int block = GpuInt32ShaderSource.SumBlock;
-        int partials = (size + block - 1) / block;
+        int partials = GpuIntegerLayout.Blocks(size, block);
         // Two scratch buffers, alternated: a pass never reads the buffer it writes.
         using var even = AllocateBuffer(partials, GpuElementType.Int32);
-        using var odd = AllocateBuffer(Math.Max(1, (partials + block - 1) / block), GpuElementType.Int32);
+        using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int32);
         IGpuBuffer current = a;
         IGpuBuffer target = even;
         int count = size;
         while (true)
         {
-            int outputs = (count + block - 1) / block;
+            int outputs = GpuIntegerLayout.Blocks(count, block);
             ParityDispatch("sum_i32", glsl, outputs, new[] { (uint)outputs, (uint)count }, current, target);
             if (outputs == 1)
                 return BitConverter.ToInt32(DownloadByteBuffer(target, sizeof(int)), 0);

@@ -11991,47 +11991,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             UnloadModule(_integerModule);
             _integerModule = IntPtr.Zero;
         }
-        if (_octonionModule != IntPtr.Zero)
-        {
-            UnloadModule(_octonionModule);
-            _octonionModule = IntPtr.Zero;
-        }
-        if (_locallyConnectedModule != IntPtr.Zero)
-        {
-            UnloadModule(_locallyConnectedModule);
-            _locallyConnectedModule = IntPtr.Zero;
-        }
-        if (_deformableConvModule != IntPtr.Zero)
-        {
-            UnloadModule(_deformableConvModule);
-            _deformableConvModule = IntPtr.Zero;
-        }
-        if (_optimizerModule != IntPtr.Zero)
-        {
-            UnloadModule(_optimizerModule);
-            _optimizerModule = IntPtr.Zero;
-        }
-        if (_fusedConvolutionModule != IntPtr.Zero)
-        {
-            UnloadModule(_fusedConvolutionModule);
-            _fusedConvolutionModule = IntPtr.Zero;
-        }
-        if (_sparseModule != IntPtr.Zero)
-        {
-            // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
-            UnloadModule(_sparseModule);
-            _sparseModule = IntPtr.Zero;
-        }
-        if (_specializedModule != IntPtr.Zero)
-        {
-            UnloadModule(_specializedModule);
-            _specializedModule = IntPtr.Zero;
-        }
-        if (_fp16Module != IntPtr.Zero)
-        {
-            UnloadModule(_fp16Module);
-            _fp16Module = IntPtr.Zero;
-        }
 
         if (_lstmModule != IntPtr.Zero)
         {
