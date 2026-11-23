@@ -2258,6 +2258,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
+            if (TryKeepResidentInputBinding(backend, tensor) is { } residentInput)
+                return residentInput;
 
             // Stale snapshot — also clear any matching activation-cache entry so
             // the lookup below re-uploads instead of returning the same stale
@@ -2727,6 +2729,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (IsLiveDeviceBuffer(tensor._gpuBuffer)
                 && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
+            if (TryKeepResidentInputBinding(backend, tensor) is { } residentInput)
+                return residentInput;
 
             var staleArray = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (staleArray is not null)
@@ -4435,6 +4439,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, ResidentInputBinding> _residentInputBindings = new();
+
+    /// <summary>
+    /// A buffer <see cref="EnsureResidentInput{T}"/> bound to a compiled plan's input, which a captured graph reads
+    /// through a baked pointer, stays bound when an op outside the plan reads the tensor (validation between training
+    /// steps): it is returned as is, after the host's value is written into it in place if the host changed since. The
+    /// stale-snapshot path would drop the binding instead (it is neither the tensor's own buffer nor a cache entry), and
+    /// the plan, finding its input rebound, stops replaying its graph.
+    /// </summary>
+    private OwnedBuffer? TryKeepResidentInputBinding<T>(IDirectGpuBackend backend, Tensor<T> tensor)
+    {
+        if (typeof(T) != typeof(float) || tensor._gpuBuffer is not { } bound || !ReferenceEquals(tensor._gpuBackend, backend)
+            || !IsLiveDeviceBuffer(bound) || !_residentInputBindings.TryGetValue(tensor, out var binding)
+            || !ReferenceEquals(binding.Buffer, bound))
+            return null;
+        if (tensor._gpuBufferVersion != tensor.GpuCacheVersion) EnsureResidentInput(tensor);
+        return ReferenceEquals(tensor._gpuBuffer, bound) ? new OwnedBuffer(bound, ownsBuffer: false) : null;
+    }
 
     private void NoteResidentInputBinding(object tensor, IGpuBuffer buffer)
     {
