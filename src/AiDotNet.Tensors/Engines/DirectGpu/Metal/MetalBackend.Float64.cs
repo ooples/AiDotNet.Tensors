@@ -135,13 +135,18 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
         {
             if (!SharesStorageWithAnEarlierArgument(buffers, i)) continue;
             // One repeated argument at a time: bind a copy in its place and launch again, which separates the rest.
-            using var copy = AllocateBuffer(buffers[i].Size, GpuElementType.Float64);
+            // The copy has the argument's own element type and width: the integer kernels launch through here too,
+            // and an Int32 buffer staged as doubles would be read at twice its bytes.
+            var type = buffers[i].ElementType;
+            using var copy = AllocateBuffer(buffers[i].Size, type);
             var separate = (MetalGpuBuffer)copy;
-            CopyFloat64(buffers[i], 0, separate, 0, buffers[i].Size);
+            ulong bytes = (ulong)buffers[i].Size * (ulong)GpuElementTypes.SizeInBytes(type);
+            BlitFloat64(buffers[i].Handle, (ulong)buffers[i].ByteOffset, separate.Handle, (ulong)separate.ByteOffset, bytes);
             var rebound = (MetalGpuBuffer[])buffers.Clone();
             rebound[i] = separate;
             LaunchFloat64(pipeline, work, rebound, parameters);
-            if (i == last) CopyFloat64(separate, 0, buffers[last], 0, buffers[last].Size);
+            if (i == last)
+                BlitFloat64(separate.Handle, (ulong)separate.ByteOffset, buffers[last].Handle, (ulong)buffers[last].ByteOffset, bytes);
             return;
         }
 
@@ -159,12 +164,34 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     private void DispatchFloat64(MetalPipelineState pipeline, int work, MetalGpuBuffer[] buffers, uint[] parameters)
     {
         var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(work);
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        int index = 0;
-        foreach (var buffer in buffers) encoder.SetBuffer(buffer, index++);
-        foreach (uint parameter in parameters) encoder.SetBytes(parameter, (ulong)index++);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+        // Not a `using`: the scope's Dispose waits for the command buffer but does not look at how it ended, and a
+        // launch that failed must not be taken for a result (copied back, or registered as a resident tensor).
+        var encoder = _commandQueue.CreateScopedComputeEncoder();
+        if (!encoder.IsValid)
+        {
+            encoder.Dispose();
+            throw new InvalidOperationException("Failed to create a Metal compute encoder.");
+        }
+
+        IntPtr commandBuffer = encoder.CommandBuffer;
+        try
+        {
+            encoder.SetPipelineState(pipeline.Handle);
+            int index = 0;
+            foreach (var buffer in buffers) encoder.SetBuffer(buffer, index++);
+            foreach (uint parameter in parameters) encoder.SetBytes(parameter, (ulong)index++);
+            encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+            MetalCommandQueue.EndEncoding(encoder.Handle);
+            MetalCommandQueue.Commit(commandBuffer);
+            MetalCommandQueue.WaitUntilCompleted(commandBuffer);
+            string? error = MetalCommandQueue.GetError(commandBuffer);
+            if (!string.IsNullOrEmpty(error) || MetalCommandQueue.GetStatus(commandBuffer) == MetalNativeBindings.MTLCommandBufferStatus.Error)
+                throw new InvalidOperationException($"The Metal compute launch failed: {error ?? "the command buffer ended in error"}");
+        }
+        finally
+        {
+            _commandQueue.ReturnCommandBuffer(commandBuffer);
+        }
     }
 
     /// <inheritdoc/>

@@ -78,8 +78,8 @@ internal static class GpuNarrowFloatLayout
 
     /// <summary>
     /// Validates one launch: <paramref name="type"/> is a 16-bit float type, <paramref name="count"/> is not negative,
-    /// and no buffer is typed as the other 16-bit float type or holds fewer than its share of elements. (A raw byte
-    /// buffer carries no element type; the device bounds it by its byte capacity.)
+    /// and no buffer is typed as the other 16-bit float type or holds fewer than its share of elements. A raw byte
+    /// buffer carries no element type and is checked against its byte capacity.
     /// </summary>
     public static void Require(string operation, GpuElementType type, int count, params (IGpuBuffer Buffer, int Elements)[] buffers)
     {
@@ -89,7 +89,15 @@ internal static class GpuNarrowFloatLayout
         foreach (var (buffer, elements) in buffers)
         {
             if (buffer is null) throw new System.ArgumentNullException(nameof(buffers));
-            if (!IsNarrowFloat(buffer.ElementType)) continue;
+            if (!IsNarrowFloat(buffer.ElementType))
+            {
+                // A raw byte buffer carries no element count: it is bounded by its bytes, two an element.
+                if ((long)elements * sizeof(ushort) > buffer.SizeInBytes)
+                    throw new System.ArgumentOutOfRangeException(nameof(count),
+                        $"{operation}: {elements} 16-bit elements are outside a buffer of {buffer.SizeInBytes} bytes.");
+                continue;
+            }
+
             if (buffer.ElementType != type)
                 throw new System.ArgumentException($"{operation} on {type} was given a {buffer.ElementType} buffer.", nameof(buffers));
             if (elements > buffer.Size)

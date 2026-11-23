@@ -76,6 +76,14 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
     private bool SynchronousRouteAvailable => IsAvailable && WebGpuNativeBindings.CompletesSynchronously;
 
+    // For the synchronous entry points that would otherwise block on a submission that cannot finish here.
+    private void RequireSynchronousRoute()
+    {
+        if (!WebGpuNativeBindings.CompletesSynchronously)
+            throw new GpuCapabilityUnavailableException(
+                "WebGPU in a browser has no synchronous dispatch: the wait would block the thread the device completes on. Use the asynchronous members.");
+    }
+
     /// <inheritdoc/>
     public string BackendName => "WebGPU";
     public TensorDevice DeviceType => TensorDevice.WebGPU;

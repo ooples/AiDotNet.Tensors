@@ -98,13 +98,20 @@ internal sealed class GpuTypedBufferPool
         // A snapshot: entries are removed as they drain.
         foreach (var entry in _idle.Where(idle => idle.Key != (keepType, keepLength)).ToArray())
         {
-            // Removed first: a buffer whose free throws leaves no half-drained entry behind.
-            _idle.Remove(entry.Key);
-            while (entry.Value.Count > 0)
+            try
             {
-                // Accounted before the dispose: a buffer whose free throws is gone from the pool either way.
-                Bytes -= BytesOf(entry.Key.Type, entry.Key.Length);
-                entry.Value.Pop().Dispose();
+                while (entry.Value.Count > 0)
+                {
+                    // Accounted before the dispose: a buffer whose free throws is gone from the pool either way.
+                    Bytes -= BytesOf(entry.Key.Type, entry.Key.Length);
+                    entry.Value.Pop().Dispose();
+                }
+            }
+            finally
+            {
+                // The bucket goes only once it is empty: if a free threw, the buffers behind it stay reachable (and
+                // counted) for the next Trim or Clear.
+                if (entry.Value.Count == 0) _idle.Remove(entry.Key);
             }
         }
     }
