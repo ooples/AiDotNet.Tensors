@@ -794,6 +794,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuDeviceTotalMem(out ulong totalMem, device), "cuDeviceTotalMem");
             GlobalMemoryBytes = (long)totalMem;
+            _memoryAccount.DeviceTotalBytes = (long)totalMem;   // what a GpuMemoryBudget fraction is of
             _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             // Issue #285: per-allocation cap. CUDA has no formal cap attribute;
             // practical limit is the largest contiguous free block. We use
@@ -2270,9 +2271,38 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// </summary>
     internal static ulong? AllocationBytesOverrideForTests;
 
+    /// <summary>
+    /// The release <see cref="GpuMemoryBudget"/> runs before refusing an allocation: the host-side reuse pools, memory
+    /// only unreachable tensors hold, event-deferred frees, and the stream-ordered pool's unused reservation, as a
+    /// driver out-of-memory reclaims. Inside a stream capture nothing that synchronizes may run, so it releases nothing
+    /// there (the capture then fails over to the eager step, which can).
+    /// </summary>
+    private void ReclaimForBudget()
+    {
+        if (IsStreamCapturing()) return;
+        ReclaimUnreachableForRetry();
+        DrainDeferredFrees(blockOldest: true);
+        _stepArena?.FreeRetiredBlocks();
+        _bufferPool.DrainAll();
+        DrainPeerPools();
+        CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (memory budget reclamation)");
+        if (_asyncMemPool != IntPtr.Zero)
+        {
+            var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+            if (trimStatus != CudaResult.Success)
+                System.Diagnostics.Trace.TraceWarning($"[CudaBackend] cuMemPoolTrimTo failed during memory budget reclamation: {trimStatus}.");
+        }
+    }
+
+    // Refuses a driver allocation past this process's GpuMemoryBudget with the error a driver out-of-memory raises.
+    private void AdmitUnderBudget(ulong byteSize)
+        => _memoryAccount.Admit((long)byteSize, ReclaimForBudget,
+            message => CudaAllocationError(CudaResult.OutOfMemory, message));
+
     private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
     {
         byteSize = AllocationBytesOverrideForTests ?? byteSize;
+        AdmitUnderBudget(byteSize);
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
@@ -2485,6 +2515,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
         byteSize = AllocationBytesOverrideForTests ?? byteSize;
+        AdmitUnderBudget(byteSize);
         var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _mainStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {

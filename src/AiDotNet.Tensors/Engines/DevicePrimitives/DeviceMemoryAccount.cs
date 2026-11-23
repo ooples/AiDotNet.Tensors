@@ -73,6 +73,62 @@ internal sealed class DeviceMemoryAccount
         _resetDriverPeak = resetPeak;
     }
 
+    // The device's memory, as its backend reports it (0 until one does): what a fraction budget is a fraction of.
+    private long _deviceTotalBytes;
+
+    /// <summary>The device's total memory as its backend reported it, or 0 when none has.</summary>
+    internal long DeviceTotalBytes
+    {
+        get => Interlocked.Read(ref _deviceTotalBytes);
+        set => Interlocked.Exchange(ref _deviceTotalBytes, value);
+    }
+
+    /// <summary>
+    /// The most this process may hold reserved on the device (<see cref="GpuMemoryBudget"/>), or 0 for no limit: an
+    /// explicit byte limit, else a fraction of <see cref="DeviceTotalBytes"/>.
+    /// </summary>
+    internal long LimitBytes => GpuMemoryBudget.LimitFor(Device, DeviceTotalBytes);
+
+    /// <summary>Memory the library holds from the driver now: its own reservations and the driver pool's.</summary>
+    internal long ReservedBytes => Interlocked.Read(ref _reserved) + (ReadDriver()?.Current ?? 0);
+
+    /// <summary>
+    /// Admits a new driver allocation of <paramref name="bytes"/> under the device's budget. Over it, runs
+    /// <paramref name="reclaim"/> (the backend's release of cached and unreachable memory, as for a driver
+    /// out-of-memory) once and checks again; still over, throws the error <paramref name="outOfMemory"/> builds, the
+    /// same type the backend raises when the driver itself is out of memory, so every caller's fallback applies alike.
+    /// PyTorch's per-process memory fraction caps its caching allocator's reserved memory the same way.
+    /// </summary>
+    internal void Admit(long bytes, Action? reclaim, Func<string, Exception> outOfMemory)
+    {
+        if (!TryAdmit(bytes, reclaim, out string? refusal)) throw outOfMemory(refusal!);
+    }
+
+    /// <summary>As <see cref="Admit"/>, for an allocator that reports failure by its result: false (with the reason)
+    /// where <see cref="Admit"/> would throw.</summary>
+    internal bool TryAdmit(long bytes, Action? reclaim, out string? refusal)
+    {
+        refusal = null;
+        long limit = LimitBytes;
+        if (limit <= 0 || bytes <= 0) return true;
+        if (ReservedBytes + bytes <= limit) return true;
+        Interlocked.Increment(ref _budgetReclaims);
+        reclaim?.Invoke();
+        long reserved = ReservedBytes;
+        if (reserved + bytes <= limit) return true;
+        Interlocked.Increment(ref _budgetRefusals);
+        refusal = $"GPU memory budget of {limit} bytes on {Device} exceeded: {bytes} bytes requested with {reserved} "
+                  + "reserved (GpuMemoryBudget).";
+        return false;
+    }
+
+    private long _budgetReclaims, _budgetRefusals;
+
+    /// <summary>Allocations the budget sent through a reclaim, and those it refused (tests, diagnostics).</summary>
+    internal long BudgetReclaims => Interlocked.Read(ref _budgetReclaims);
+
+    internal long BudgetRefusals => Interlocked.Read(ref _budgetRefusals);
+
     /// <summary>A fresh driver allocation of <paramref name="bytes"/>.</summary>
     internal void Reserve(long bytes)
     {

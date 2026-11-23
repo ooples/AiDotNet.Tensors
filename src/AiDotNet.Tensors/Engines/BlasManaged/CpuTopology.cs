@@ -38,6 +38,8 @@ internal static class CpuTopology
     private static extern bool GetProcessAffinityMask(IntPtr hProcess, out nuint processMask, out nuint systemMask);
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessAffinityMask(IntPtr hProcess, nuint mask);
     [DllImport("kernel32.dll")]
     private static extern uint GetActiveProcessorCount(ushort groupNumber);
 
@@ -189,6 +191,7 @@ internal static class CpuTopology
     [MethodImpl(Hot)]
     internal static (ushort Group, byte Number)[] UsableCores()
     {
+        if (RequestedCores is { } requested) return ConfineToRequestedCores(requested);
         var own = UsableCoresInCurrentGroup();
         // AIDOTNET_CPU_SPAN_GROUPS=0 keeps the pool in the process's own group (the pre-#653 placement).
         if (own.Length == 0 || Environment.GetEnvironmentVariable("AIDOTNET_CPU_SPAN_GROUPS") == "0"
@@ -199,6 +202,79 @@ internal static class CpuTopology
         foreach (var core in DetectPhysicalCores().Where(c => c.Group != home && c.Mask != 0))
             list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
         return list.ToArray();
+    }
+
+    /// <summary>The environment variable that confines this process's CPU work to a set of physical cores.</summary>
+    internal const string CoresEnvironmentVariable = "AIDOTNET_CPU_CORES";
+
+    /// <summary>
+    /// The physical cores <c>AIDOTNET_CPU_CORES</c> confines this process to, as indexes into
+    /// <see cref="DetectPhysicalCores"/> (machine order, across processor groups), or null when it is not set. Two
+    /// processes sharing a machine otherwise both bind their pool's first worker to core 0, the second to core 1 and so
+    /// on: each takes the other's cores. Giving each its own set (<c>0-31</c> and <c>32-63</c>) keeps them apart.
+    /// The list takes indexes and ranges: <c>0-15,32,40-47</c>. A malformed value throws on first use.
+    /// </summary>
+    internal static int[]? RequestedCores => s_requestedCores.Value;
+
+    private static readonly Lazy<int[]?> s_requestedCores = new(() =>
+    {
+        string? text = Environment.GetEnvironmentVariable(CoresEnvironmentVariable);
+        return string.IsNullOrWhiteSpace(text) ? null : ParseCoreList(text!);
+    });
+
+    /// <summary>Parses a core list (<c>0-15,32,40-47</c>) into distinct indexes in the order given.</summary>
+    internal static int[] ParseCoreList(string text)
+    {
+        var cores = new List<int>();
+        var seen = new HashSet<int>();
+        foreach (string rawPart in text.Split(','))
+        {
+            string part = rawPart.Trim();
+            int dash = part.IndexOf('-');
+            string first = dash < 0 ? part : part.Substring(0, dash).Trim();
+            string last = dash < 0 ? part : part.Substring(dash + 1).Trim();
+            if (!int.TryParse(first, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int lo)
+                || !int.TryParse(last, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int hi)
+                || hi < lo)
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable}={text}: '{part}' is not a core index or an ascending range such as 0-15.");
+            for (int c = lo; c <= hi; c++)
+                if (seen.Add(c)) cores.Add(c);
+        }
+        return cores.ToArray();
+    }
+
+    // The requested cores as (group, first logical processor), and -- when they all lie in the process's primary group,
+    // the only group a process affinity mask can name -- the process confined to their logical processors (SMT siblings
+    // included), so the threads that dispatch work stay there too, not only the pool's workers.
+    private static (ushort Group, byte Number)[] ConfineToRequestedCores(int[] requested)
+    {
+        var all = DetectPhysicalCores();
+        if (all.Length == 0) return Array.Empty<(ushort, byte)>();   // no topology (not Windows): nothing to bind
+        var (cores, group, mask) = MapRequestedCores(requested, all);
+        if (group is { } only && GetThreadGroupAffinity(GetCurrentThread(), out var primary) && primary.Group == only)
+            SetProcessAffinityMask(GetCurrentProcess(), (nuint)mask);
+        return cores;
+    }
+
+    /// <summary>The requested cores of <paramref name="all"/> as (group, first logical processor); their single group
+    /// (null when they span several) and the mask of their logical processors in it.</summary>
+    internal static ((ushort Group, byte Number)[] Cores, ushort? Group, ulong Mask) MapRequestedCores(int[] requested, Domain[] all)
+    {
+        var list = new List<(ushort, byte)>(requested.Length);
+        ulong mask = 0;
+        ushort? group = requested.Length > 0 && requested[0] < all.Length ? all[requested[0]].Group : null;
+        foreach (int index in requested)
+        {
+            if (index >= all.Length)
+                throw new InvalidOperationException(
+                    $"{CoresEnvironmentVariable} names core {index}, but this machine has {all.Length} physical cores (0-{all.Length - 1}).");
+            var core = all[index];
+            list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(core.Mask)));
+            if (core.Group != group) group = null;
+            else mask |= core.Mask;
+        }
+        return (list.ToArray(), group, group is null ? 0 : mask);
     }
 
     private static readonly Lazy<bool> s_affinityAllowsOtherGroups = new(ComputeAffinityAllowsOtherGroups);

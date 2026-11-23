@@ -19,6 +19,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         internal static void EnsureFits(DirectOpenClContext context, long requestedBytes)
         {
+            // Past this process's GpuMemoryBudget: the out-of-memory error clCreateBuffer raises, so the engine's
+            // reclaim-and-retry (and every other caller's handling) applies as to a driver refusal.
+            context.MemoryAccount?.Admit(requestedBytes, null,
+                message => new GpuOutOfMemoryException(message, -4));   // CL_MEM_OBJECT_ALLOCATION_FAILURE
             ulong cap = context.MaxMemAllocSize;
             // MaxMemAllocSize == 0 means the query failed at context init —
             // skip the guard rather than wrongly reject every allocation. The

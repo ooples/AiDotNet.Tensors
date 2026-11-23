@@ -39,6 +39,10 @@ public static class CpuParallelSettings
     {
         if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CPU_THREADS"), out int requested) && requested > 0)
             return requested;
+        // A process confined to a core set (AIDOTNET_CPU_CORES) runs one thread per core of it.
+#if NET5_0_OR_GREATER
+        if (Engines.BlasManaged.CpuTopology.RequestedCores is { Length: > 0 } cores) return cores.Length;
+#endif
         int physical = DetectPhysicalCores();
         return physical > 0 && physical <= Environment.ProcessorCount ? physical : Environment.ProcessorCount;
     }

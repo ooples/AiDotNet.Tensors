@@ -191,6 +191,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         var sizeInBytes = (ulong)elementCount * sizeof(float);
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Past this process's GpuMemoryBudget, after the release a refused allocation runs: the same error.
+        device.MemoryAccount.Admit((long)sizeInBytes, () => ReclaimForRetry(device),
+            message => new OutOfMemoryException(message));
         _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
         if (_buffer == IntPtr.Zero)
         {
@@ -336,6 +339,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         var sizeInBytes = (ulong)data.Length * sizeof(float);
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Past this process's GpuMemoryBudget, after the release a refused allocation runs: the same error.
+        device.MemoryAccount.Admit((long)sizeInBytes, () => ReclaimForRetry(device),
+            message => new OutOfMemoryException(message));
         var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
 
         try

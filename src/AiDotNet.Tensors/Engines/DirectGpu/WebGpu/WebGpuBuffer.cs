@@ -192,6 +192,14 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
         // Ensure buffer size is aligned to 4 bytes (required by WebGPU)
         var alignedSize = (_sizeBytes + 3) & ~3;
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Past this process's GpuMemoryBudget, after the release a refused creation runs below: out of memory. WebGPU
+        // reports no device memory size, so only a byte limit (GpuMemoryBudget.SetMemoryLimit) applies here.
+        Account.Admit(alignedSize, () =>
+            {
+                DeviceMemoryReclaim.CollectUnreachable();
+                PendingFrees.Drain();
+                Pool.DrainAll();
+            }, message => new GpuOutOfMemoryException(message, 0));
         int bufferId = WebGpuNativeBindings.CreateBuffer(alignedSize, (int)usage);
         if (bufferId < 0)
         {

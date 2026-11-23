@@ -1,0 +1,64 @@
+# Sharing one machine between trainings
+
+Two training processes can run on one machine at once. Each one can be given its own share of GPU memory and its own
+set of CPU cores. Two settings do this; both are read from the environment, so a launcher can apply them without changing
+the program.
+
+| Setting | What it does |
+|---|---|
+| `AIDOTNET_GPU_MEMORY_FRACTION=0.5` | Caps the GPU memory this process reserves on each device at that fraction of the device's memory. |
+| `AIDOTNET_CPU_CORES=0-31` | Binds this process's worker pool to those physical cores, and runs one thread per core by default. |
+
+In code, `GpuMemoryBudget.SetPerProcessMemoryFraction(0.5, "cuda:0")` or `GpuMemoryBudget.SetMemoryLimit(bytes, "cuda:0")`
+sets the GPU budget for one device. It takes precedence over the environment variable. This is the same feature as
+PyTorch's `torch.cuda.set_per_process_memory_fraction`.
+
+## Example: two jobs on one GPU and one CPU
+
+On a 64-core machine with one GPU:
+
+```
+AIDOTNET_GPU_MEMORY_FRACTION=0.45 AIDOTNET_CPU_CORES=0-31  train-a
+AIDOTNET_GPU_MEMORY_FRACTION=0.45 AIDOTNET_CPU_CORES=32-63 train-b
+```
+
+Leave part of the GPU unbudgeted. The CUDA context, cuBLAS/cuDNN handles and the display use memory that the budget does
+not count.
+
+## GPU memory budget
+
+- **What counts.** The budget counts *reserved* memory, as PyTorch's does: tensors in use plus the memory the library's
+  pools keep for reuse, including CUDA's stream-ordered pool.
+- **Over the budget.** A new device allocation that would pass the budget first releases cached and unreachable memory,
+  the same release a driver out-of-memory triggers. If it is still over, it fails with the backend's out-of-memory error
+  (`GpuOutOfMemoryException` on CUDA, OpenCL, Vulkan and WebGPU; `OutOfMemoryException` on Metal; `hipErrorOutOfMemory` on
+  HIP). Code that already handles a driver out-of-memory, such as a kernel that falls back to needing no workspace,
+  handles a budget refusal the same way.
+- **Reuse is not checked.** Reusing pooled memory is not a new reservation, so the budget never refuses it.
+- **Why it matters on Windows.** Without a budget, a process that outgrows the GPU does not fail. The Windows driver backs
+  the overflow with system memory, and both processes slow down severalfold instead.
+- **Device names.** Devices are named as `GpuMemoryStats` names them: `cuda:0`, `hip:0`, `opencl:0`, `vulkan:0`,
+  `metal:0`, `webgpu:0`.
+- **Fractions.** A fraction is of the memory the backend reports. For Metal that is the recommended working-set size. WebGPU
+  reports no memory size, so only a byte limit applies there.
+
+## CPU core set
+
+- **What it fixes.** The worker pool binds each worker to its own physical core. Without a core set, every process binds
+  its workers to the first cores of its processor group. Two processes started in the same group then run on the same
+  cores and slow each other down.
+- **Format.** Physical cores are numbered in machine order, across processor groups. The list takes indexes and ranges:
+  `0-15,32,40-47`.
+- **What is confined.**
+  - When every listed core is in the process's own processor group, the whole process is confined to those cores and
+    their SMT siblings, so the threads that dispatch work stay there too.
+  - Otherwise only the pool's workers are bound. A process's affinity mask can name only its own group.
+- **Thread count.** `AIDOTNET_CPU_THREADS`, when set, still sets the thread count.
+- **Platforms.** Binding is done on Windows. On Linux, confine the process with `taskset` or `numactl`; the pool keeps to the
+  process's affinity.
+
+## What is not isolated
+
+Neither setting isolates speed on the GPU. On consumer GPUs (no MIG, and no MPS on Windows), kernels from two processes
+take turns on the device. Each training runs slower than it would alone, and timings taken on a shared GPU are not
+benchmark numbers.

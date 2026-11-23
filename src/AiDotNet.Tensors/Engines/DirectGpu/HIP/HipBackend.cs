@@ -353,6 +353,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             DeviceName = _deviceProps.Name?.Trim() ?? "Unknown AMD GPU";
             ComputeUnits = _deviceProps.MultiProcessorCount;
             GlobalMemoryBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
+            _memoryAccount.DeviceTotalBytes = GlobalMemoryBytes;   // what a GpuMemoryBudget fraction is of
             _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             LocalMemoryBytes = (long)(ulong)_deviceProps.SharedMemPerBlock;
             // Issue #285: same approach as CUDA — total VRAM as conservative
@@ -1647,6 +1648,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         reclaimEpoch = -1;
         DrainCollectedBuffers();
+        // Past this process's GpuMemoryBudget, after releasing what the driver-OOM path below releases: the driver's
+        // own out-of-memory result, so every caller handles it as one.
+        if (!_memoryAccount.TryAdmit((long)(ulong)sizeBytes, () =>
+            {
+                DeviceMemoryReclaim.CollectUnreachable();
+                DrainCollectedBuffers();
+                _bufferPool.DrainAll();
+            }, out _))
+            return HipError.ErrorOutOfMemory;
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         if (result == HipError.Success) reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
         if (result != HipError.ErrorOutOfMemory) return result;

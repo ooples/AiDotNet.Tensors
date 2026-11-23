@@ -2333,6 +2333,8 @@ public sealed partial class CuDnnConvolution : IDisposable
 
     /// <summary>The device's memory counters, which count the workspace (PyTorch counts cuDNN's as allocated).</summary>
     internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
+
+    private bool WithinBudget(ulong bytes) => MemoryAccount is not { } account || account.TryAdmit((long)bytes, null, out _);
     private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
 
     private void EnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize = false)
@@ -2350,11 +2352,13 @@ public sealed partial class CuDnnConvolution : IDisposable
         // Grow at least twofold, so the retired workspaces below add up to less than the live one.
         // A low-memory fallback must request only its required size.
         ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
-        result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
+        // Past this process's GpuMemoryBudget a request is refused as the driver refuses one: out of memory.
+        IntPtr grown = IntPtr.Zero;
+        result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
         if (result == CudaResult.OutOfMemory && size > requiredSize)
         {
             size = requiredSize;
-            result = CuBlasNative.cuMemAlloc(out grown, size);
+            result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
         }
         if (result != CudaResult.Success) return false;
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
