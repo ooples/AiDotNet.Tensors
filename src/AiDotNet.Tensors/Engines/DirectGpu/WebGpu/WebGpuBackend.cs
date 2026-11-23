@@ -128,8 +128,20 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <summary>
     /// Creates a new WebGPU backend instance.
     /// </summary>
-    public WebGpuBackend()
+    /// <exception cref="PlatformNotSupportedException">In a browser. Every synchronous member here waits for the
+    /// device, and a browser completes that work on the same thread through its event loop, so the wait could never
+    /// finish. Use <see cref="WebGpuAwaitableBackend"/> there.</exception>
+    public WebGpuBackend() : this(allowSynchronousUse: true)
     {
+    }
+
+    // The awaitable backend's private core may exist in a browser: it calls only the task-returning members.
+    internal WebGpuBackend(bool allowSynchronousUse)
+    {
+        if (allowSynchronousUse && OperatingSystem.IsBrowser())
+            throw new PlatformNotSupportedException(
+                "The synchronous WebGPU backend cannot run in a browser, where waiting for the device blocks the only thread "
+                + "that can complete it. Use WebGpuAwaitableBackend (or the async engine) instead.");
         _device = WebGpuDevice.Instance;
         _shaderLibrary = new WebGpuShaderModule();
     }

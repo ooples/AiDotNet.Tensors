@@ -23,7 +23,7 @@ internal static class GpuBufferSizeGuard
     /// <param name="requestedBytes">Size of the allocation in bytes.</param>
     /// <param name="deviceCap">
     /// Device-reported per-allocation cap in bytes (from
-    /// <see cref="IDirectGpuBackend.MaxBufferAllocBytes"/>). Pass 0 when the
+    /// <see cref="IGpuDevice.MaxBufferAllocBytes"/>). Pass 0 when the
     /// cap is unknown / not queryable; the guard then defers to the user
     /// override (<see cref="GpuFallbackOptions.MaxBufferBytes"/>) if any,
     /// or skips validation when no override is set.
