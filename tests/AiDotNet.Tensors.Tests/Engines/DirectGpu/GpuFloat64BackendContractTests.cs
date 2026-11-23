@@ -466,7 +466,18 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
     {
         Skip.If(_backend is null, SkipReason);
         var vulkan = (AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend)_backend!;
-        bool measured = vulkan.MeasureSubnormals();
+        // A kernel that cannot be built or run here measures as "does not compute doubles", which is how the backend's
+        // own gate reads it; anything else thrown is a defect and fails the test.
+        bool measured;
+        try
+        {
+            measured = vulkan.MeasureSubnormals();
+        }
+        catch (Exception unavailable) when (unavailable is InvalidOperationException or NotSupportedException)
+        {
+            measured = false;
+        }
+
         Assert.Equal(measured, ((IGpuFloat64Elementwise)vulkan).SupportsFloat64Elementwise);
         Assert.Equal(measured, ((IGpuFloat64Reductions)vulkan).SupportsFloat64Reductions);
         Assert.Equal(measured, ((IGpuFloat64MatrixMultiply)vulkan).SupportsFloat64MatrixMultiply);

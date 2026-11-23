@@ -4,28 +4,24 @@ using System;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-// 16-bit float compute (Float16 and BFloat16) on typed or raw half-width buffers. The half add, relu, gelu and matrix
-// multiply this backend already had keep their kernels; everything else, and all of BFloat16, runs the kernels generated
-// with the integer program (GpuNarrowFloatKernelSource), which HIP and OpenCL also run.
+// 16-bit float compute (Float16 and BFloat16) on typed or raw half-width buffers. Every element-wise operation runs the
+// kernels generated with the integer program (GpuNarrowFloatKernelSource), which HIP and OpenCL also run: they compute
+// in FP32 once and round to nearest even, which is what the host does. The half add and gelu this backend had before
+// do not (the add rounds a tie away from zero, the gelu is another formula), so they are not behind this interface.
 public sealed partial class CudaBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply
 {
     private bool NarrowFloatKernelsReady(GpuElementType type)
         => IsAvailable && GpuNarrowFloatLayout.IsNarrowFloat(type) && IntegerKernelsLoaded();
 
-    private bool HalfKernel(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
-        => type == GpuElementType.Float16 && operation == GpuNarrowFloatBinaryOperation.Add && SupportsFp16NativeOps;
 
-    private bool HalfKernel(GpuNarrowFloatUnaryOperation operation, GpuElementType type)
-        => type == GpuElementType.Float16 && SupportsFp16NativeOps
-           && operation is GpuNarrowFloatUnaryOperation.Relu or GpuNarrowFloatUnaryOperation.Gelu;
 
     /// <inheritdoc/>
     public bool SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
-        => NarrowFloatKernelsReady(type) || HalfKernel(operation, type);
+        => NarrowFloatKernelsReady(type);
 
     /// <inheritdoc/>
     public bool SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation operation, GpuElementType type)
-        => NarrowFloatKernelsReady(type) || HalfKernel(operation, type);
+        => NarrowFloatKernelsReady(type);
 
     /// <inheritdoc/>
     public bool SupportsNarrowFloatMatrixMultiply(GpuElementType type)
@@ -36,12 +32,6 @@ public sealed partial class CudaBackend : IGpuNarrowFloatElementwise, IGpuNarrow
         IGpuBuffer output, int size)
     {
         GpuNarrowFloatLayout.Require(nameof(BinaryNarrowFloat), type, size, (a, size), (b, size), (output, size));
-        if (HalfKernel(operation, type))
-        {
-            if (size > 0) Fp16Add(a, b, output, size);
-            return;
-        }
-
         IntPtr kernel = IntegerKernel(GpuNarrowFloatKernelSource.Binary(operation, type));
         if (size == 0) return;
         using var _ = PushContext();
@@ -61,14 +51,6 @@ public sealed partial class CudaBackend : IGpuNarrowFloatElementwise, IGpuNarrow
     public unsafe void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
     {
         GpuNarrowFloatLayout.Require(nameof(UnaryNarrowFloat), type, size, (a, size), (output, size));
-        if (HalfKernel(operation, type))
-        {
-            if (size == 0) return;
-            if (operation == GpuNarrowFloatUnaryOperation.Relu) Fp16Relu(a, output, size);
-            else Fp16Gelu(a, output, size);
-            return;
-        }
-
         IntPtr kernel = IntegerKernel(GpuNarrowFloatKernelSource.Unary(operation, type));
         if (size == 0) return;
         using var _ = PushContext();

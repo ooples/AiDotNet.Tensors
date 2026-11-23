@@ -9911,6 +9911,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // have their own exact sum (TrySumIntegerAny); everything else of theirs reduces on the host.
         if (typeof(T) == typeof(int) || typeof(T) == typeof(long) || typeof(T) == typeof(short)
             || typeof(T) == typeof(sbyte) || typeof(T) == typeof(byte)) return false;
+        // A BFloat16 tensor resident on the device is 16-bit words: the FP32 reduction would read two elements as one
+        // float, and past the end of the buffer.
+        if (typeof(T) == typeof(AiDotNet.Tensors.NumericOperations.BFloat16)) return false;
         return tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor) || IsFp16Resident(tensor);
     }
 
