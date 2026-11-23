@@ -131,7 +131,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
                 GpuPrecisionImplementation.Native,
                 fp16ReducesStorageBytes: true,
                 fp16OutputStorage: IsFp16Elementwise(operation) ? GpuScalarType.Float16 : GpuScalarType.Float32,
-                fp16MultiplyType: GpuScalarType.Float32);
+                fp16MultiplyType: GpuScalarType.Float32,
+                supportsFloat64: SupportsFloat64(operation),
+                float64Implementation: GpuPrecisionImplementation.Emulated);
+
+        // Double add, subtract, multiply, divide and matrix multiply run on the device in integer arithmetic (MSL has
+        // no 64-bit float): exact, and reported as emulated so the planner routes them there only on request.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {
@@ -198,7 +210,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
                 GpuPrecisionImplementation.Packed,
                 fp16ReducesStorageBytes: true,
                 fp16OutputStorage: IsFp16Elementwise(operation) ? GpuScalarType.Float16 : GpuScalarType.Float32,
-                fp16MultiplyType: GpuScalarType.Float32);
+                fp16MultiplyType: GpuScalarType.Float32,
+                supportsFloat64: SupportsFloat64(operation));
+
+        // Double add, subtract, multiply, divide and matrix multiply have GLSL double kernels over double buffers on a
+        // device with shaderFloat64.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
 
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {
@@ -233,12 +256,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu
                 // It must not claim the memory or transfer benefit of native shader-f16.
                 fp16ReducesStorageBytes: false,
                 fp16OutputStorage: IsFp16Elementwise(operation) ? GpuScalarType.Float16 : GpuScalarType.Float32,
-                fp16MultiplyType: GpuScalarType.Float32);
+                fp16MultiplyType: GpuScalarType.Float32,
+                supportsFloat64: SupportsFloat64(operation),
+                float64Implementation: GpuPrecisionImplementation.Emulated);
 #else
             => GpuPrecisionCapabilityCatalog.Float32Only;
 #endif
 
 #if NET7_0_OR_GREATER
+        // Double add, subtract, multiply, divide and matrix multiply run on the device in integer arithmetic (WGSL has
+        // no 64-bit float): exact, and reported as emulated so the planner routes them there only on request.
+        private bool SupportsFloat64(GpuPrecisionOperation operation) => operation switch
+        {
+            GpuPrecisionOperation.Add or GpuPrecisionOperation.Subtract
+                or GpuPrecisionOperation.Multiply or GpuPrecisionOperation.Divide => SupportsFloat64Elementwise,
+            GpuPrecisionOperation.MatMul => SupportsFloat64MatrixMultiply,
+            _ => false,
+        };
+
         private bool SupportsFp16(GpuPrecisionOperation operation) => operation switch
         {
             GpuPrecisionOperation.MatMul => SupportsHgemm,

@@ -745,6 +745,7 @@ public unsafe struct VkPhysicalDeviceFloatControlsProperties
 {
     public const int Count = 15;
     public const int SignedZeroInfNanPreserveFloat64 = 2;
+    internal const int DenormPreserveFloat64 = 5;
     public int sType;
     public void* pNext;
     public uint denormBehaviorIndependence;

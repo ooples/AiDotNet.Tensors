@@ -6,8 +6,12 @@ using AiDotNet.Tensors.Engines.Gpu;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
-    public sealed partial class OpenClBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+    public sealed partial class OpenClBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply,
+        IGpuFloat64UnaryAvailability
     {
+        // Every unary kernel is built with the rest of the double kernels here: none can be missing alone.
+        bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation) => SupportsFloat64Elementwise;
+
         private bool _float64ReductionsReady;
 
         /// <inheritdoc/>

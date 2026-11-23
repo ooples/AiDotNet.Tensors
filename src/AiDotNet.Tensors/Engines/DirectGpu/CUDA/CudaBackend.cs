@@ -2617,6 +2617,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         TraceCapturePathHostRead();
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
@@ -11166,7 +11167,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
-        ulong byteSize = (ulong)size * sizeof(float);
+        ulong byteSize = (ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(Copy));
         // #1650/#638 capture: async device->device on the backend's own stream so this op is
         // CAPTURABLE inside a CUDA graph. The synchronous cuMemcpyDtoD throws CUDA 906
         // ("operation not permitted while stream is capturing") and aborts graph capture — it was
@@ -12209,7 +12210,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)size * sizeof(float), _stream),
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle,
+                (ulong)size * (ulong)GpuCopyLayout.CheckedElementBytes(source, 0, destination, 0, size, nameof(CopyBuffer)), _stream),
             "cuMemcpyDtoDAsync (CopyBuffer)");
         GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see the note on the 3-arg Copy
     }
@@ -17504,9 +17506,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
 
         using var _ = PushContext();
-        IntPtr srcPtr = source.Handle + sourceOffset * sizeof(float);
-        IntPtr dstPtr = destination.Handle + destinationOffset * sizeof(float);
-        ulong byteSize = (ulong)length * sizeof(float);
+        long width = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
+        IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
+        IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
+        ulong byteSize = (ulong)length * (ulong)width;
         // Stream-ordered async DtoD (same fix as the 3-arg Copy): the synchronous cuMemcpyDtoD is NOT
         // capturable — it aborts CUDA-graph stream capture (CUDA 906). The async copy on _stream records
         // as a graph node and stays correctly ordered with the surrounding kernels (e.g. the resident

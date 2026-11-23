@@ -338,9 +338,14 @@ public sealed unsafe partial class VulkanBackend
     }
 
     /// <inheritdoc/>
-    // Not yet: this backend serves every buffer from 4-byte float allocations, so only the 4-byte types have storage.
+    // Every buffer is a 4-byte-word allocation. Doubles are held two words each (the layout the double kernels read,
+    // low word first) on a device that computes in double; the narrower types have no storage here yet.
     public bool SupportsElementType(GpuElementType type)
-        => type is GpuElementType.Float32 or GpuElementType.Int32;
+        => type is GpuElementType.Float32 or GpuElementType.Int32
+           || (type == GpuElementType.Float64 && SupportsFloat64Storage);
+
+    /// <summary>Whether this device holds and computes doubles: shaderFloat64 and the runtime GLSL compiler.</summary>
+    internal bool SupportsFloat64Storage => IsGlslCompilerAvailable && _device.SupportsShaderFloat64;
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
@@ -362,6 +367,7 @@ public sealed unsafe partial class VulkanBackend
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
         EnsureInitialized();
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new GpuCapabilityUnavailableException("Vulkan buffer transfer not initialized.");
@@ -378,6 +384,7 @@ public sealed unsafe partial class VulkanBackend
         EnsureInitialized();
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         var vb = AsVulkan(buffer);
@@ -451,11 +458,13 @@ public sealed unsafe partial class VulkanBackend
         ThrowIfPendingBatchUpload(src, "copy");
         ThrowIfPendingBatchUpload(dst, "copy");
 
+        // Offsets and size count elements of the buffers' type (a double is two words).
+        ulong width = (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
         GpuLaunchProbe.OnLaunch();
         _transfer.CopyDeviceToDevice(
-            src.Storage, checked((ulong)srcOffset * sizeof(float)),
-            dst.Storage, checked((ulong)destOffset * sizeof(float)),
-            checked((ulong)size * sizeof(float)));
+            src.Storage, checked((ulong)srcOffset * width),
+            dst.Storage, checked((ulong)destOffset * width),
+            checked((ulong)size * width));
     }
 
     // Int buffers share the float allocation paths (same width); the tag is what tells a reader the bits are int32.

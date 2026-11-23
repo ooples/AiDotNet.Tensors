@@ -232,6 +232,119 @@ public class GpuElementTypeTests
         Assert.True(backend.SupportsElementType(GpuElementType.Float32));
     }
 
+    // The float download moves Size * 4 bytes as 32-bit words: of a double buffer that is half its bytes read as
+    // unrelated floats, of a byte-wide buffer a read past the allocation. Both are refused by name.
+    [SkippableFact]
+    public void FloatDownload_RefusesABufferThatIsNotFourByteWords()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        foreach (var type in new[] { GpuElementType.Float64, GpuElementType.Int64, GpuElementType.Float16, GpuElementType.Int8, GpuElementType.Bool })
+        {
+            if (!backend.SupportsElementType(type)) continue;
+            using var typed = backend.AllocateBuffer(6, type);
+            var refused = Assert.Throws<InvalidOperationException>(() => backend.DownloadBuffer(typed, new float[6]));
+            Assert.Contains(type.ToString(), refused.Message);
+            Assert.Throws<InvalidOperationException>(() => backend.DownloadBuffer(typed));
+        }
+        using var floats = backend.AllocateBuffer(new[] { 1f, 2f, 3f });
+        Assert.Equal(new[] { 1f, 2f, 3f }, backend.DownloadBuffer(floats));
+        using var ints = backend.AllocateBuffer(3, GpuElementType.Int32);
+        backend.UploadBuffer<int>(ints, new[] { 7, -8, 9 });
+        var words = new int[3];
+        backend.DownloadBuffer<int>(ints, words);
+        Assert.Equal(new[] { 7, -8, 9 }, words);
+    }
+
+    // A device copy counts elements of the buffers' type: of doubles it moves eight bytes each, at element offsets.
+    [SkippableFact]
+    public void DeviceCopy_OfATypedBuffer_MovesWholeElements()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.IfNot(backend.SupportsElementType(GpuElementType.Float64), "The backend holds no Float64 buffers.");
+        var values = new[] { 1.5, -2.25, 1e300, double.Epsilon, 5.0, -6.0 };
+        using var source = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(source, values);
+
+        using var whole = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.Copy(source, whole, values.Length);
+        var read = new double[values.Length];
+        backend.DownloadBuffer<double>(whole, read);
+        Assert.Equal(values, read);
+
+        using var buffered = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.CopyBuffer(source, buffered, values.Length);
+        backend.DownloadBuffer<double>(buffered, read);
+        Assert.Equal(values, read);
+
+        using var part = backend.AllocateBuffer(values.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(part, new double[values.Length]);
+        backend.Copy(source, 2, part, 1, 3);
+        backend.DownloadBuffer<double>(part, read);
+        Assert.Equal(new[] { 0.0, 1e300, double.Epsilon, 5.0, 0.0, 0.0 }, read);
+
+        // Elements of different widths: the count would mean different things on each side.
+        using var floats = backend.AllocateBuffer(values.Length, GpuElementType.Float32);
+        Assert.Throws<InvalidOperationException>(() => backend.Copy(source, floats, values.Length));
+        Assert.Throws<InvalidOperationException>(() => backend.Copy(floats, 0, source, 0, 1));
+        Assert.Throws<InvalidOperationException>(() => backend.CopyBuffer(source, floats, values.Length));
+    }
+
+#if NETCOREAPP
+    // The table on a backend that holds only floats (the mock): every family for Float32, nothing else, and a wrapper
+    // answers for what it wraps.
+    [Fact]
+    public void CapabilityTable_OfAFloatOnlyBackend_IsFloat32Alone()
+    {
+        IDirectGpuBackend backend = MockDirectGpuBackend.Create(new MockBackendState());
+        var wrapped = new AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend(backend);
+        foreach (var candidate in new[] { backend, wrapped })
+        {
+            var rows = candidate.DescribeOperations();
+            Assert.Equal(40, rows.Count);
+            Assert.Equal(rows.Count, rows.Select(row => (row.Family, row.ElementType)).Distinct().Count());
+            Assert.All(rows, row => Assert.Equal(row.ElementType == GpuElementType.Float32, row.IsNative));
+            Assert.False(candidate.SupportsOperation(GpuOperationFamily.Storage, GpuElementType.Unspecified));
+        }
+        Assert.Throws<ArgumentOutOfRangeException>(() => backend.SupportsOperation((GpuOperationFamily)99, GpuElementType.Float32));
+        Assert.Equal("Reduction<Float64>: CPU", new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, false).ToString());
+        // Emulation qualifies a route the device has; a row the device cannot run is never "emulated".
+        var emulated = new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, true, isEmulated: true);
+        Assert.True(emulated.IsEmulated);
+        Assert.Equal("Reduction<Float64>: emulated (on request)", emulated.ToString());
+        Assert.NotEqual(emulated, new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, true));
+        Assert.False(new GpuOperationCapability(GpuOperationFamily.Reduction, GpuElementType.Float64, false, isEmulated: true).IsEmulated);
+    }
+#endif
+
+    // On a device, the table is what the backend's own capability members say, row for row.
+    [SkippableFact]
+    public void CapabilityTable_AgreesWithTheBackendsCapabilityMembers()
+    {
+        var gpu = AiDotNetEngine.Current as DirectGpuTensorEngine;
+        Skip.If(gpu is null, "Not a DirectGpu engine.");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No GPU backend on this host.");
+        foreach (var row in backend.DescribeOperations())
+        {
+            bool held = backend.SupportsElementType(row.ElementType);
+            bool expected = row.Family == GpuOperationFamily.Storage ? held
+                : row.ElementType == GpuElementType.Float32 ? held
+                : row.ElementType != GpuElementType.Float64 || !held ? false
+                : row.Family == GpuOperationFamily.Elementwise ? backend is IGpuFloat64Elementwise { SupportsFloat64Elementwise: true }
+                : row.Family == GpuOperationFamily.Reduction ? backend is IGpuFloat64Reductions { SupportsFloat64Reductions: true }
+                : backend is IGpuFloat64MatrixMultiply { SupportsFloat64MatrixMultiply: true };
+            Assert.True(expected == row.IsNative, $"{row} disagrees with the backend ({backend.BackendName}).");
+        }
+        Assert.True(backend.SupportsOperation(GpuOperationFamily.MatrixMultiply, GpuElementType.Float32));
+        Assert.False(backend.SupportsOperation(GpuOperationFamily.Elementwise, GpuElementType.Int8));
+    }
+
     private static void RoundTrip<T>(IDirectGpuBackend backend, GpuElementType type, T[] values) where T : unmanaged
     {
         if (!backend.SupportsElementType(type))
