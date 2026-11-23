@@ -3694,13 +3694,24 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
     {
+        // Under matmul autocast the problem runs on its measured route (cuBLASLt, the classic GemmEx, or a fixed-order
+        // split-K: CudaBackend.AutocastGemm).
+        if (GemmAutocastComputeType is int autocast and not 0 && UsesCublas && CurrentCublasHasWorkspace)
+            return TryAutocastGemmColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, autocast);
+        return TryLtMatmulCore(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta);
+    }
+
+    /// <summary>The cuBLASLt GEMM of <see cref="TryLtMatmulColumnMajor"/> itself.</summary>
+    private bool TryLtMatmulCore(bool transA, bool transB, int m, int n, int k,
+        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
+    {
         // cuBLASLt is part of cuBLAS: a caller that opted out of it (TensorCodecOptions.UseCublas) gets the generated kernels.
         if (!UsesCublas || !CurrentCublasHasWorkspace) return false;
         var lt = TryGetCuBlasLt();
         if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
         // asks for strict fp32, which is what PEDANTIC gives the classic handle.
-        // Under matmul autocast the scope's compute type (CUBLAS_COMPUTE_32F_FAST_16F / _16BF, raw cuBLAS values).
+        // Under matmul autocast the scope's compute type (CUBLAS_COMPUTE_32F_FAST_16F / _16BF).
         var compute = GemmAutocastComputeType is int autocast and not 0 ? (CublasComputeType)autocast
             : !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
                 ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
@@ -20182,6 +20193,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _cudnnContext = null;
         }
 
+        DisposeAutocastGemmBuffers();
         if (_cublasLt is not null)
         {
             _cublasLt.Dispose();

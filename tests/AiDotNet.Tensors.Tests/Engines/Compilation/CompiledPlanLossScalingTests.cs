@@ -112,7 +112,7 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
     {
         SkipUnlessAvailable(true);
         var engine = _fixture.Engine!;
-        const int m = 64, k = 256, n = 64;
+        const int m = 512, k = 1024, n = 512;   // large enough that cuBLAS takes tensor cores (FAST_* permits, not requires)
         var a = new Tensor<float>(new[] { m, k }, new Vector<float>(Data(m * k, 0.731, 0.2))).Gpu();
         var b = new Tensor<float>(new[] { k, n }, new Vector<float>(Data(k * n, 0.293, 0.5))).Gpu();
         var previous = AiDotNetEngine.Current;
@@ -142,7 +142,10 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             Assert.True(worst <= 1.0, $"{precision}: an element exceeds the rounding bound by {worst:F2}x");
             Skip.If(engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend,
                 "The backend has no matmul autocast (FP32 GEMM is the documented fallback).");
-            Assert.True(any > 0, $"{precision} autocast produced bit-identical FP32 results: the reduced precision did not run");
+            // FAST_16F/_16BF permit the reduced precision rather than require it: cuBLAS may keep an FP32 kernel (it does
+            // for BF16 at some shapes on GA102), which the bound above also admits. FP16 at this shape takes tensor cores.
+            if (precision == PrecisionMode.Float16)
+                Assert.True(any > 0, "FP16 autocast produced bit-identical FP32 results: the reduced precision did not run");
         }
         finally
         {
