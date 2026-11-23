@@ -96,10 +96,25 @@ internal sealed partial class CompiledTrainingPlan<T>
                 foreach (var item in nested) if (!InspectSaved(item)) return false;
                 return true;
             }
+            // A fused-attention node saves the row log-sum-exp its forward wrote for its backward.
+            if (saved is DirectGpuTensorEngine.FusedAttentionRecordedNode attention)
+            {
+                ProtectBuffer(attention.Lse?._gpuBuffer);
+                return true;
+            }
+            // A fused readout's mutation guard holds the readout weight and bias.
+            if (saved is CpuEngine.ReadoutMutationGuard<T> readout)
+            {
+                Protect(readout.Weight);
+                Protect(readout.Bias);
+                return true;
+            }
             // An opaque saved-state owner may hide native pointers. Refuse it rather than presume its buffers died.
             var type = saved.GetType();
-            return type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
+            bool plain = type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
                 || saved is float[] || saved is double[] || saved is bool[] || saved is int[][];
+            if (!plain) _workspaceOpaqueSavedType = type.FullName;
+            return plain;
         }
         foreach (var step in _forwardSteps!) _workspaceProduced.Add(step.OutputBuffer);
         foreach (var parameter in _parameters) { Protect(parameter); Protect(parameter.Grad); }
@@ -181,7 +196,6 @@ internal sealed partial class CompiledTrainingPlan<T>
     // Idle step memory lent to the backend between captured steps (IIdleDeviceMemoryLender).
     private IIdleDeviceMemoryLender? _idleLender;
     private IGpuBuffer[]? _idleBuffers;
-    private (IntPtr Exec, IntPtr Odd, int Assignment, int Count) _idleBuffersFor;
 
     /// <summary>Bytes this plan lent after its last step (tests and diagnostics).</summary>
     internal long IdleLentBytesLastStep { get; private set; }
@@ -194,22 +208,25 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void LendIdleStepMemory()
     {
         IdleLentBytesLastStep = 0;
+        if (s_idleLendDiag)
+            AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} enabled={LendIdleStepMemoryEnabled} graph={HasLiveStepGraph} " +
+                $"pool={_scratchPool is not null} forward_steps={_forwardSteps is not null} ");
         if (!LendIdleStepMemoryEnabled || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
             || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
             || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
             return;
-        var key = (_stepGraphExec, _stepGraphExecOdd, pool.PinnedCount, pool.BufferCount);
-        if (_idleBuffers is null || _idleBuffersFor != key)
+        // Rebuilt every step: what outlives a step (a rebased readout, a retained output) can change between steps.
+        _idleBuffers = null;
+        if (!BuildWorkspaceProtection())
         {
-            _idleBuffers = null;
-            if (!BuildWorkspaceProtection()) return;
-            _workspaceCandidates.Clear();
-            pool.CollectIdleBetweenRuns(_forwardActions.Length, IsUnprotectedRoot, _workspaceCandidates);
-            _idleBuffers = new IGpuBuffer[_workspaceCandidates.Count];
-            _workspaceCandidates.CopyTo(_idleBuffers);
-            _workspaceCandidates.Clear();
-            _idleBuffersFor = key;
+            if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: an opaque saved state {_workspaceOpaqueSavedType}");
+            return;
         }
+        _workspaceCandidates.Clear();
+        pool.CollectIdleBetweenRuns(_forwardActions.Length, IsUnprotectedRoot, _workspaceCandidates);
+        _idleBuffers = new IGpuBuffer[_workspaceCandidates.Count];
+        _workspaceCandidates.CopyTo(_idleBuffers);
+        _workspaceCandidates.Clear();
         if (_idleBuffers.Length == 0) return;
         lender.LendIdle(this, _idleBuffers);
         _idleLender = lender;
@@ -223,6 +240,9 @@ internal sealed partial class CompiledTrainingPlan<T>
     {
         if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is { } lender) lender.ReclaimIdle(this);
     }
+
+    private string? _workspaceOpaqueSavedType;
+    private static readonly bool s_idleLendDiag = Environment.GetEnvironmentVariable("AIDOTNET_IDLE_LOAN_DIAG") == "1";
 
     /// <summary>Process switch for tests that need the backend's own allocations between steps.</summary>
     internal static bool LendIdleStepMemoryEnabled { get; set; } = true;

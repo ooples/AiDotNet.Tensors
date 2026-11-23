@@ -2127,10 +2127,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Recording: the logical end of this buffer's lifetime, for the same reason.
             _stepArena?.OnReturned(released);
         }
+        // A loan of idle step memory is reused only by later work on this stream (or the lender's next replay), so its
+        // range goes back now, in stream order, like a stream-ordered free.
         // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
         // work, so free immediately — deferring via an event would delay pool reclamation and erase the
         // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
-        if ((buffer is CudaGpuBuffer cb && cb.IsAsyncFreed) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
+        if ((buffer is CudaGpuBuffer cb && (cb.IsAsyncFreed || cb.IsIdleLoan)) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
         {
             buffer.Dispose();
             return;

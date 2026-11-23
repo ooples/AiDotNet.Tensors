@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -88,6 +89,8 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
         internal readonly long Offset;
         internal readonly long Length;
         internal readonly WeakReference<CudaGpuBuffer> Borrower;
+        // AIDOTNET_IDLE_LOAN_DIAG: where the loan was taken, reported if it has to be moved.
+        internal string? Origin;
         private int _state;   // 0 lent, 1 returned, 2 moved to memory of its own
 
         internal bool TryMarkReturned() => Interlocked.CompareExchange(ref _state, 1, 0) == 0;
@@ -229,6 +232,10 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
             else best.Free[bestRange] = (offset + need, length - need);
             var borrower = CudaGpuBuffer.ForIdleLoan(_cudaContext, best.Base + (nint)offset, size);
             var loan = new IdleLoan(this, best, offset, need, borrower);
+            if (s_idleLoanDiag)
+                loan.Origin = string.Join(" < ", new System.Diagnostics.StackTrace(2, false).GetFrames()
+                    .Select(f => f.GetMethod()).Where(m => m?.DeclaringType is { } t && !t.FullName!.Contains("CudaBackend"))
+                    .Take(5).Select(m => m!.DeclaringType!.Name + "." + m.Name));
             borrower.AttachIdleLoan(loan);
             _idleLoans.Add(loan);
             _idleLoanCount++;
@@ -282,6 +289,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
                 "A buffer borrowed from a compiled plan's idle step memory was baked into a captured graph or exported; "
                 + "it cannot be moved before the plan's next step overwrites that memory.");
         int size = borrower.Size;
+        if (s_idleLoanDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-MOVE] bytes={loan.Length} at {loan.Origin}");
         using var _ = PushContext();
         CudaGpuBuffer owned;
         using (NoIdleLoans())
