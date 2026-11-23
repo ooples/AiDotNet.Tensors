@@ -588,34 +588,36 @@ static inline uint2 sf_select(uint2 a, uint2 b, bool c) { return c ? b : a; }
         if (wgsl is null) throw new ArgumentNullException(nameof(wgsl));
         var metal = new StringBuilder(wgsl.Length + wgsl.Length / 8);
         var prototypes = new StringBuilder();
-        foreach (string raw in wgsl.Replace("\r\n", "\n").Split('\n'))
-        {
-            string line = raw;
-            var function = Function.Match(line);
-            if (function.Success)
-            {
-                var parameters = new StringBuilder();
-                foreach (string parameter in function.Groups[2].Value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    int colon = parameter.IndexOf(':');
-                    if (colon < 0)
-                        throw new InvalidOperationException($"The soft-float source has an untyped parameter: '{parameter}'.");
-                    if (parameters.Length > 0) parameters.Append(", ");
-                    parameters.Append(MetalType(parameter.Substring(colon + 1))).Append(' ').Append(parameter.Substring(0, colon).Trim());
-                }
-
-                string signature = "static inline " + MetalType(function.Groups[3].Value) + " " + function.Groups[1].Value + "(" + parameters + ")";
-                prototypes.Append(signature).Append(';').Append('\n');
-                line = signature + " {" + line.Substring(function.Length);
-            }
-
-            line = Local.Replace(line, "auto $1 =");
-            line = line.Replace("vec2<u32>", "uint2").Replace("vec4<u32>", "uint4");
-            line = Conversion.Replace(line, match => match.Groups[1].Value == "u32" ? "uint(" : "int(");
-            line = line.Replace("countLeadingZeros(", "clz(").Replace("select(", "sf_select(");
-            metal.Append(line).Append('\n');
-        }
+        foreach (string line in wgsl.Replace("\r\n", "\n").Split('\n'))
+            metal.Append(TranslateLine(line, prototypes)).Append('\n');
 
         return prototypes.Append(metal).ToString();
+    }
+
+    // One line of the soft-float WGSL in Metal; a function signature also adds its prototype to `prototypes`.
+    private static string TranslateLine(string line, StringBuilder prototypes)
+    {
+        var function = Function.Match(line);
+        if (function.Success)
+        {
+            var parameters = new StringBuilder();
+            foreach (string parameter in function.Groups[2].Value.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                int colon = parameter.IndexOf(':');
+                if (colon < 0)
+                    throw new InvalidOperationException($"The soft-float source has an untyped parameter: '{parameter}'.");
+                if (parameters.Length > 0) parameters.Append(", ");
+                parameters.Append(MetalType(parameter.Substring(colon + 1))).Append(' ').Append(parameter.Substring(0, colon).Trim());
+            }
+
+            string signature = "static inline " + MetalType(function.Groups[3].Value) + " " + function.Groups[1].Value + "(" + parameters + ")";
+            prototypes.Append(signature).Append(';').Append('\n');
+            line = signature + " {" + line.Substring(function.Length);
+        }
+
+        line = Local.Replace(line, "auto $1 =");
+        line = line.Replace("vec2<u32>", "uint2").Replace("vec4<u32>", "uint4");
+        line = Conversion.Replace(line, match => match.Groups[1].Value == "u32" ? "uint(" : "int(");
+        return line.Replace("countLeadingZeros(", "clz(").Replace("select(", "sf_select(");
     }
 }
