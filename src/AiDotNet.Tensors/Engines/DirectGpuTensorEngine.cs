@@ -931,6 +931,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
     }
 
+    /// <summary>
+    /// A buffer of <paramref name="count"/> halves: typed <see cref="GpuElementType.Float16"/> where the backend holds
+    /// that type (so a float read of it is refused and its size is in elements), a raw byte buffer otherwise.
+    /// </summary>
+    private static IGpuBuffer AllocateHalfBuffer(IDirectGpuBackend backend, int count)
+        => backend.SupportsElementType(GpuElementType.Float16)
+            ? backend.AllocateBuffer(count, GpuElementType.Float16)
+            : backend.AllocateByteBuffer(checked(count * 2));
+
+    private static IGpuBuffer AllocateHalfBuffer(IFp16ActivationBackend device, int count)
+        => device is IDirectGpuBackend backend ? AllocateHalfBuffer(backend, count) : device.AllocateByteBuffer(checked(count * 2));
+
     /// <summary>True when <paramref name="t"/>'s resident buffer currently holds FP16 data (and FP16-act is on).</summary>
     internal bool IsFp16Resident<T>(Tensor<T> t)
     {
@@ -2931,7 +2943,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             IGpuBuffer fp16;
             try
             {
-                fp16 = cuda.AllocateByteBuffer(elementCount * 2);
+                fp16 = AllocateHalfBuffer((IDirectGpuBackend)cuda, elementCount);
                 cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
             }
             catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryCompressActivationFp16ByKey", capabilityGap); return false; }
@@ -4007,7 +4019,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         else
         {
-            oBuf = cb.AllocateByteBuffer(n * 2);
+            oBuf = AllocateHalfBuffer(cb, n);
             cb.CopyBufferDtoD(rBuf, oBuf, bytes);
         }
         // Half-aware deferred materializer (DownloadBuffer is FP32-only) so any HOST read of o stays correct:
@@ -4948,7 +4960,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
             return resident;
         using var f = GetOrAllocateBuffer(backend, t);
-        owned = backend.AllocateByteBuffer(elems * 2);
+        owned = AllocateHalfBuffer(backend, elems);
         backend.ConvertToFp16(f.Buffer, owned, elems);
         return owned;
     }
@@ -4961,7 +4973,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (TryGetResidentFp16Buffer(t, backend, out var resident) && resident is not null)
             return resident;
         using var f = GetOrAllocateBuffer(backend, t);
-        owned = cb.AllocateByteBuffer(elems * 2);
+        owned = AllocateHalfBuffer(cb, elems);
         cb.ConvertToFp16Native(f.Buffer, owned, elems);
         return owned;
     }
@@ -17241,7 +17253,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, output.Length, cbS, backend, out hgOwned);
                         var ho = ResolveToFp16(output, output.Length, cbS, backend, out hoOwned);
-                        hOut = cbS.AllocateByteBuffer(output.Length * 2);
+                        hOut = AllocateHalfBuffer(cbS, output.Length);
                         cbS.Fp16SoftmaxBackward(hg, ho, hOut, outerSize, features);
                         var resultH = FinishGpuOpHalfStore(cbS, hOut, output.Length, output.Shape.ToArray());
                         hOut = null;
@@ -18247,9 +18259,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     invVarBuf = cbL.AllocateBuffer(batchSize);
                     cbL.AddScalar(varianceOwned.Value.Buffer, invVarBuf, (float)epsilon, batchSize);
                     cbL.RsqrtKernel(invVarBuf, invVarBuf, batchSize);
-                    giOut = cbL.AllocateByteBuffer(input.Length * 2);
-                    ggOut = cbL.AllocateByteBuffer(normalizedSize * 2);
-                    gbOut = cbL.AllocateByteBuffer(normalizedSize * 2);
+                    giOut = AllocateHalfBuffer(cbL, input.Length);
+                    ggOut = AllocateHalfBuffer(cbL, normalizedSize);
+                    gbOut = AllocateHalfBuffer(cbL, normalizedSize);
                     cbL.Fp16LayerNormBackward(hg, hi, hgam, meanOwned.Value.Buffer, invVarBuf,
                         giOut, batchSize, normalizedSize);
                     cbL.Fp16LayerNormGradParams(hg, hi, meanOwned.Value.Buffer, invVarBuf,
@@ -24358,7 +24370,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var hA = ResolveToFp16(a, a.Length, cbA, bkA, out hAOwned);
                 var hB = ResolveToFp16(b, b.Length, cbA, bkA, out hBOwned);
-                hOut = cbA.AllocateByteBuffer(a.Length * 2);
+                hOut = AllocateHalfBuffer(cbA, a.Length);
                 cbA.Fp16Add(hA, hB, hOut, a.Length);
                 var resultH = FinishGpuOpHalfStore(cbA, hOut, a.Length, a.Shape._dims);
                 hOut = null;
@@ -24727,7 +24739,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbR, backend, out hgOwned);
                         var hi = ResolveToFp16(input, input.Length, cbR, backend, out hiOwned);
-                        hOut = cbR.AllocateByteBuffer(gradOutput.Length * 2);
+                        hOut = AllocateHalfBuffer(cbR, gradOutput.Length);
                         cbR.Fp16ReluBackward(hg, hi, hOut, gradOutput.Length);
                         var resultH = FinishGpuOpHalfStore(cbR, hOut, gradOutput.Length, gradOutput.Shape._dims);
                         hOut = null;
@@ -24849,7 +24861,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     {
                         var hg = ResolveToFp16(gradOutput, gradOutput.Length, cbG, backend, out hgOwned);
                         var hi = ResolveToFp16(input, input.Length, cbG, backend, out hiOwned);
-                        hOut = cbG.AllocateByteBuffer(gradOutput.Length * 2);
+                        hOut = AllocateHalfBuffer(cbG, gradOutput.Length);
                         cbG.Fp16GeluBackward(hg, hi, hOut, gradOutput.Length);
                         var resultH = FinishGpuOpHalfStore(cbG, hOut, gradOutput.Length, gradOutput.Shape._dims);
                         hOut = null;
@@ -25842,7 +25854,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new NotSupportedException($"No conversion implementation exists for {plan.InputStorage} input storage.");
 
         var reduced = plan.ReducesStorageBytes
-            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            ? AllocateHalfBuffer(backend, elementCount)
             : backend.AllocateBuffer(elementCount);
         try
         {
@@ -25865,7 +25877,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new NotSupportedException($"No reduced output allocation exists for {plan.OutputStorage} storage.");
 
         return plan.ReducesStorageBytes
-            ? backend.AllocateByteBuffer(checked(elementCount * 2))
+            ? AllocateHalfBuffer(backend, elementCount)
             : backend.AllocateBuffer(elementCount);
     }
 
@@ -26185,7 +26197,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 {
                     var hAi = ResolveToFp16(a, M * K, backend, out hAiOwned);
                     var hBi = ResolveToFp16(b, K * N, backend, out hBiOwned);
-                    hOut = backend.AllocateByteBuffer(M * N * 2);
+                    hOut = AllocateHalfBuffer(backend, M * N);
                     hpFwd.Hgemm(hAi, hBi, hOut, M, N, K);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, M * N, new[] { M, N }); // takes ownership of hOut
                     hOut = null;
@@ -26814,7 +26826,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
                     var hG = ResolveToFp16(gamma, normSize, backend, out hGOwned);
                     var hB = ResolveToFp16(beta, normSize, backend, out hBOwned);
-                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hOut = AllocateHalfBuffer(backend, input.Length);
                     mBuf = AllocateOutputBuffer(backend, outerSize);
                     vBuf = AllocateOutputBuffer(backend, outerSize);
                     hpL.Fp16LayerNorm(hIn, hG, hB, hOut, mBuf.Buffer, vBuf.Buffer, outerSize, normSize, (float)epsilon);
@@ -27251,7 +27263,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     var hIn = ResolveToFp16(input, input.Length, backend, out hInOwned);
-                    hOut = backend.AllocateByteBuffer(input.Length * 2);
+                    hOut = AllocateHalfBuffer(backend, input.Length);
                     hpS.Fp16Softmax(hIn, hOut, outerSize, features);
                     var resultH = FinishGpuOpHalfStore(backend, hOut, input.Length, input.Shape._dims);
                     hOut = null;
@@ -28458,7 +28470,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var hIn = ResolveToFp16(tensor, tensor.Length, cbR, bkR, out hInOwned);
-                hOut = cbR.AllocateByteBuffer(tensor.Length * 2);
+                hOut = AllocateHalfBuffer(cbR, tensor.Length);
                 cbR.Fp16Relu(hIn, hOut, tensor.Length);
                 var resultH = FinishGpuOpHalfStore(cbR, hOut, tensor.Length, tensor.Shape._dims);
                 hOut = null;
@@ -28504,7 +28516,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 var hIn = ResolveToFp16(tensor, tensor.Length, cbG, bkG, out hInOwned);
-                hOut = cbG.AllocateByteBuffer(tensor.Length * 2);
+                hOut = AllocateHalfBuffer(cbG, tensor.Length);
                 cbG.Fp16Gelu(hIn, hOut, tensor.Length);
                 var resultH = FinishGpuOpHalfStore(cbG, hOut, tensor.Length, tensor.Shape._dims);
                 hOut = null;
