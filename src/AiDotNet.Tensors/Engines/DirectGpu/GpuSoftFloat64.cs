@@ -16,9 +16,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// Add, subtract, multiply, divide and square root are correctly rounded (round to nearest even), including
 /// subnormals and infinities: they equal the host's results bit for bit, except that every NaN result is the one
 /// quiet NaN <c>0xFFF8000000000000</c>, whatever NaN operand produced it (an operand's payload and sign are not
-/// carried). The arithmetic follows Berkeley SoftFloat 3; division and square root are digit recurrences with a sticky bit. Exp and log follow fdlibm, and tanh
-/// and the logistic function are built on exp; measured against the host's <c>Math</c> functions over 262,144 arguments
-/// each they are within 1, 0, 4 and 0 ulp.
+/// carried). The arithmetic follows Berkeley SoftFloat 3; division and square root are digit recurrences with a sticky
+/// bit. Exp and log follow fdlibm, and tanh and the logistic function are built on exp; measured against the host's
+/// <c>Math</c> functions over 262,144 arguments each, exp, log and tanh are within 1, 0 and 4 ulp.
 /// </para>
 /// <para>
 /// The source is written once, in WGSL, and translated to Metal Shading Language by <see cref="ToMetal"/>, so both

@@ -193,7 +193,8 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     private Tensor<double>? TryUnaryFloat64(Tensor<double> input, string callerName)
         => Float64UnaryOperationFor(callerName) is { } operation
-            ? TryMapFloat64(input, callerName, (elementwise, a, output, size) => elementwise.UnaryFloat64(operation, a, output, size))
+            ? TryMapFloat64(input, callerName, (elementwise, a, output, size) => elementwise.UnaryFloat64(operation, a, output, size),
+                elementwise => elementwise is not IGpuFloat64UnaryAvailability availability || availability.SupportsFloat64Unary(operation))
             : null;
 
     /// <summary>
@@ -205,12 +206,15 @@ public partial class DirectGpuTensorEngine
             ? null
             : TryMapFloat64(input, callerName, (elementwise, a, output, size) => elementwise.ScalarFloat64(operation, a, scalar, output, size));
 
-    private Tensor<double>? TryMapFloat64(Tensor<double> input, string callerName, Action<IGpuFloat64Elementwise, IGpuBuffer, IGpuBuffer, int> launch)
+    private Tensor<double>? TryMapFloat64(Tensor<double> input, string callerName, Action<IGpuFloat64Elementwise, IGpuBuffer, IGpuBuffer, int> launch,
+        Func<IGpuFloat64Elementwise, bool>? available = null)
     {
         int length = input.Length;
         if (length < Float64ElementwiseMinLength) return null;
         if (ResidentStepActive || !IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend)) return null;
         if (backend is not IGpuFloat64Elementwise { SupportsFloat64Elementwise: true } elementwise) return null;
+        // A kernel the backend already knows it cannot build: answer on the CPU before any operand is uploaded.
+        if (available is not null && !available(elementwise)) return null;
         if (!backend.SupportsElementType(GpuElementType.Float64) || !GpuPrecisionPlanner.Float64DeviceRouteAllowed(backend)) return null;
         // Only the type-preserving policy takes this route; a speed-first scope narrows to float on its own path.
         if (AutocastScope.IsEnabled

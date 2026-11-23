@@ -117,7 +117,12 @@ public sealed partial class WebGpuBackend
     private static bool CopiesDoubles(IGpuBuffer source, IGpuBuffer destination, int sourceOffset, int destinationOffset, int length,
         string operation)
     {
-        if (GpuCopyLayout.ElementBytes(source, destination, operation) == sizeof(float)) return false;
+        int elementBytes = GpuCopyLayout.ElementBytes(source, destination, operation);
+        if (elementBytes == sizeof(float)) return false;
+        // Only 4- and 8-byte elements have a copy here: a narrower element counted as a double would address twice
+        // the bytes the range check allowed.
+        if (elementBytes != sizeof(double))
+            throw new NotSupportedException($"{operation} on WebGPU copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
         GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, operation);
         return length > 0;
     }

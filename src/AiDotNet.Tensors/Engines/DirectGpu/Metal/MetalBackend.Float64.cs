@@ -1,7 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
-using System.Collections.Generic;
 using System.Threading;
 using System.Text;
 
@@ -11,13 +10,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 //
 // Metal Shading Language has no 64-bit float, so these kernels compute IEEE binary64 in 32-bit integer arithmetic
 // (GpuSoftFloat64, the library the WebGPU backend runs): the four arithmetic operations and the square root equal the
-// host bit for bit (a NaN result is always the one quiet NaN, not an operand's payload), and exp, log, tanh and the
+// host bit for bit (a NaN result is always the one quiet NaN 0xFFF8000000000000, whatever the sign and payload of the
+// host's NaN), and exp, log, tanh and the
 // logistic function are within a few ulp. A double is two 4-byte words of
 // the buffer, low word first.
 //
 // Emulation costs hundreds of integer operations an element. The backend reports the capability as Emulated, and the
 // engine sends doubles here only when a policy asks for device residency; by default they stay on the CPU.
-public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply,
+    IGpuFloat64UnaryAvailability
 {
     private const string Float64LibraryName = "Float64";
     private const string Float64ElementaryLibraryName = "Float64Elementary";
@@ -27,6 +28,8 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     // A library the Metal compiler rejected: kept so later calls report the gap without compiling it again.
     private Exception? _float64LibraryFailure;
     private Exception? _float64ElementaryLibraryFailure;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Exception> _float64PipelineFailures =
+        new System.Collections.Concurrent.ConcurrentDictionary<string, Exception>(StringComparer.Ordinal);
 
     /// <inheritdoc/>
     public bool SupportsFloat64Reductions => IsAvailable && Volatile.Read(ref _float64LibraryFailure) is null;
@@ -36,6 +39,19 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
 
     /// <inheritdoc/>
     public bool SupportsFloat64MatrixMultiply => IsAvailable && Volatile.Read(ref _float64LibraryFailure) is null;
+
+    /// <summary>
+    /// Whether <paramref name="operation"/> can still run here: exp, log, tanh and the logistic need the elementary
+    /// library, which the compiler can reject while the arithmetic one builds, and a kernel whose pipeline Metal
+    /// refused stays refused.
+    /// </summary>
+    bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation)
+    {
+        if (!SupportsFloat64Elementwise) return false;
+        string kernel = "f64k_" + MetalFloat64Kernels.Name(operation, out bool elementary);
+        return (!elementary || Volatile.Read(ref _float64ElementaryLibraryFailure) is null)
+            && !_float64PipelineFailures.ContainsKey(kernel);
+    }
 
     private MetalGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {
@@ -60,7 +76,20 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
                 () => _shaderLibrary.CompileLibrary(Float64ElementaryLibraryName, MetalFloat64Kernels.ElementarySource))
             : Float64Library(ref _float64Library, ref _float64LibraryFailure, Float64LibraryName,
                 () => _shaderLibrary.CompileLibrary(Float64LibraryName, MetalFloat64Kernels.ArithmeticSource));
-        return GetPipeline(elementary ? Float64ElementaryLibraryName : Float64LibraryName, library, kernel);
+        string libraryName = elementary ? Float64ElementaryLibraryName : Float64LibraryName;
+        if (_float64PipelineFailures.TryGetValue(kernel, out var known))
+            throw new GpuCapabilityUnavailableException($"Metal cannot build the double-precision kernel '{kernel}': {known.Message}", known);
+        try
+        {
+            return GetPipeline(libraryName, library, kernel);
+        }
+        catch (InvalidOperationException rejected)
+        {
+            // The library compiled but this kernel's pipeline did not: a lasting gap for this kernel alone. A successful
+            // pipeline stays cached by GetPipeline; execution faults are not raised here and still propagate.
+            _float64PipelineFailures.TryAdd(kernel, rejected);
+            throw new GpuCapabilityUnavailableException($"Metal cannot build the double-precision kernel '{kernel}': {rejected.Message}", rejected);
+        }
     }
 
     private IntPtr Float64Library(ref IntPtr library, ref Exception? failure, string name, Func<IntPtr> compile)
@@ -102,29 +131,21 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     private void LaunchFloat64(MetalPipelineState pipeline, int work, MetalGpuBuffer[] buffers, params uint[] parameters)
     {
         int last = buffers.Length - 1;
-        MetalGpuBuffer[]? bound = null;
-        List<IGpuBuffer>? copies = null;
-        try
+        for (int i = 1; i < buffers.Length; i++)
         {
-            for (int i = 1; i < buffers.Length; i++)
-            {
-                if (!SharesStorageWithAnEarlierArgument(buffers, i)) continue;
-                var copy = AllocateBuffer(buffers[i].Size, GpuElementType.Float64);
-                (copies ??= new List<IGpuBuffer>()).Add(copy);
-                var separate = (MetalGpuBuffer)copy;
-                CopyFloat64(buffers[i], 0, separate, 0, buffers[i].Size);
-                (bound ??= (MetalGpuBuffer[])buffers.Clone())[i] = separate;
-            }
+            if (!SharesStorageWithAnEarlierArgument(buffers, i)) continue;
+            // One repeated argument at a time: bind a copy in its place and launch again, which separates the rest.
+            using var copy = AllocateBuffer(buffers[i].Size, GpuElementType.Float64);
+            var separate = (MetalGpuBuffer)copy;
+            CopyFloat64(buffers[i], 0, separate, 0, buffers[i].Size);
+            var rebound = (MetalGpuBuffer[])buffers.Clone();
+            rebound[i] = separate;
+            LaunchFloat64(pipeline, work, rebound, parameters);
+            if (i == last) CopyFloat64(separate, 0, buffers[last], 0, buffers[last].Size);
+            return;
+        }
 
-            DispatchFloat64(pipeline, work, bound ?? buffers, parameters);
-            if (bound is not null && !ReferenceEquals(bound[last], buffers[last]))
-                CopyFloat64(bound[last], 0, buffers[last], 0, buffers[last].Size);
-        }
-        finally
-        {
-            if (copies is not null)
-                foreach (var copy in copies) copy.Dispose();
-        }
+        DispatchFloat64(pipeline, work, buffers, parameters);
     }
 
     // Views of one allocation share its handle, so equal handles are treated as overlapping storage.
@@ -239,11 +260,45 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
         LaunchFloat64(Float64Pipeline("f64k_matmul"), elements, new[] { left, right, product }, (uint)elements, (uint)n, (uint)k);
     }
 
-    // A device copy of doubles moves their words as integers: a float load and store need not keep every bit pattern.
+    // A device copy of doubles is a blit of their bytes: every bit pattern survives, and it needs no compiled kernel, so
+    // Float64 storage keeps working when the compiler rejects the arithmetic library. A blit's ranges must not overlap,
+    // so a copy within one allocation goes through a scratch buffer.
     private void CopyFloat64(MetalGpuBuffer source, int sourceOffset, MetalGpuBuffer destination, int destinationOffset, int length)
     {
-        LaunchFloat64(Float64Pipeline("f64k_copy"), 2 * length, new[] { source, destination },
-            (uint)(2 * length), (uint)(2 * sourceOffset), (uint)(2 * destinationOffset));
+        if (length <= 0) return;
+        ulong bytes = (ulong)length * sizeof(double);
+        ulong from = (ulong)(source.ByteOffset + (long)sourceOffset * sizeof(double));
+        ulong to = (ulong)(destination.ByteOffset + (long)destinationOffset * sizeof(double));
+        if (source.Handle != destination.Handle)
+        {
+            BlitFloat64(source.Handle, from, destination.Handle, to, bytes);
+            return;
+        }
+
+        using var scratch = AllocateBuffer(length, GpuElementType.Float64);
+        var staged = (MetalGpuBuffer)scratch;
+        BlitFloat64(source.Handle, from, staged.Handle, (ulong)staged.ByteOffset, bytes);
+        BlitFloat64(staged.Handle, (ulong)staged.ByteOffset, destination.Handle, to, bytes);
+    }
+
+    // Queued behind the compute work on the same queue, and waited for, like every launch here.
+    private void BlitFloat64(IntPtr source, ulong sourceOffset, IntPtr destination, ulong destinationOffset, ulong bytes)
+    {
+        var commandBuffer = _commandQueue.CreateCommandBuffer();
+        if (commandBuffer == IntPtr.Zero) throw new InvalidOperationException("Failed to create a Metal command buffer.");
+        try
+        {
+            var blit = _commandQueue.CreateBlitEncoder(commandBuffer);
+            if (blit == IntPtr.Zero) throw new InvalidOperationException("Failed to create a Metal blit encoder.");
+            MetalCommandQueue.CopyBuffer(blit, source, sourceOffset, destination, destinationOffset, bytes);
+            MetalCommandQueue.EndEncoding(blit);
+            MetalCommandQueue.Commit(commandBuffer);
+            MetalCommandQueue.WaitUntilCompleted(commandBuffer);
+        }
+        finally
+        {
+            _commandQueue.ReturnCommandBuffer(commandBuffer);
+        }
     }
 }
 
@@ -402,18 +457,6 @@ kernel void f64k_matmul(
     f64k_store(o, gid, y);
 }
 
-// Copies n words from word offset srcOffset of the source to word offset dstOffset of the destination.
-kernel void f64k_copy(
-    device const uint* a [[buffer(0)]],
-    device uint* o [[buffer(1)]],
-    constant uint& n [[buffer(2)]],
-    constant uint& srcOffset [[buffer(3)]],
-    constant uint& dstOffset [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) { return; }
-    o[dstOffset + gid] = a[srcOffset + gid];
-}
 ");
         return source.ToString();
     }

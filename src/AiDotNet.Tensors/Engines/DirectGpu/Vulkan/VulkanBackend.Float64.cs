@@ -14,16 +14,24 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // GLSL has no double exp / log / hyperbolic functions: those come from the parity kernels' double library
 // (VulkanTorchParityMath). The four arithmetic operations and the square root are single IEEE operations and are
 // declared `precise`, so the compiler may not contract a multiply into a following add or rewrite a division.
-public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply,
+    IGpuFloat64UnaryAvailability
 {
-    /// <inheritdoc/>
-    public bool SupportsFloat64Reductions => SupportsFloat64Storage;
+    // Every unary kernel is built with the rest of the double kernels here: none can be missing alone.
+    bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation) => SupportsFloat64Elementwise;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64Elementwise => SupportsFloat64Storage;
+    public bool SupportsFloat64Reductions => SupportsFloat64Compute;
 
     /// <inheritdoc/>
-    public bool SupportsFloat64MatrixMultiply => SupportsFloat64Storage;
+    public bool SupportsFloat64Elementwise => SupportsFloat64Compute;
+
+    /// <inheritdoc/>
+    public bool SupportsFloat64MatrixMultiply => SupportsFloat64Compute;
+
+    // The kernels must keep subnormal results (2^-1022 * 0.5 is 2^-1023, not 0), which Vulkan promises only under
+    // DenormPreserve. A device that cannot grant it keeps double storage but computes doubles on the CPU.
+    private bool SupportsFloat64Compute => SupportsFloat64Storage && _device.DenormPreserveFloat64;
 
     private IGpuBuffer Float64Operand(IGpuBuffer buffer, int size, string name)
     {

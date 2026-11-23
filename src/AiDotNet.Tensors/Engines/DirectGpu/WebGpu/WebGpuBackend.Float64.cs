@@ -9,13 +9,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 // Double-precision compute over Float64 buffers.
 //
 // WGSL has no 64-bit float, so these kernels compute IEEE binary64 in 32-bit integer arithmetic (GpuSoftFloat64): the
-// four arithmetic operations and the square root equal the host bit for bit (a NaN result is always the one quiet NaN,
-// not an operand's payload), and exp, log, tanh and the logistic function are within a few ulp. A double is two 4-byte words of the buffer, low word first.
+// four arithmetic operations and the square root equal the host bit for bit (a NaN result is always the one quiet NaN
+// 0xFFF8000000000000, whatever the sign and payload of the host's NaN), and exp, log, tanh and the logistic function are within a few ulp. A double is two 4-byte words of the buffer, low word first.
 //
 // Emulation costs hundreds of integer operations an element. The backend reports the capability as Emulated, and the
 // engine sends doubles here only when a policy asks for device residency; by default they stay on the CPU.
-public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply
+public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64Elementwise, IGpuFloat64MatrixMultiply,
+    IGpuFloat64UnaryAvailability
 {
+    // Every unary kernel is built with the rest of the double kernels here: none can be missing alone.
+    bool IGpuFloat64UnaryAvailability.SupportsFloat64Unary(GpuFloat64UnaryOperation operation) => SupportsFloat64Elementwise;
+
     /// <inheritdoc/>
     public bool SupportsFloat64Reductions => IsAvailable;
 
@@ -165,7 +169,23 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     }
 
     // A device copy of doubles moves their words as integers: a float load and store need not keep every bit pattern.
+    // A copy within one buffer would bind it read-only and writable at once, which WebGPU rejects even for disjoint
+    // ranges: it goes through a scratch buffer.
     private void CopyFloat64(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
+    {
+        if (ReferenceEquals(source, destination)
+            || (source is WebGpuBuffer from && destination is WebGpuBuffer to && from.BufferId == to.BufferId))
+        {
+            using var scratch = AllocateBuffer(length, GpuElementType.Float64);
+            CopyFloat64Words(source, sourceOffset, scratch, 0, length);
+            CopyFloat64Words(scratch, 0, destination, destinationOffset, length);
+            return;
+        }
+
+        CopyFloat64Words(source, sourceOffset, destination, destinationOffset, length);
+    }
+
+    private void CopyFloat64Words(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
         Dispatch2BufferAsync("F64Copy", WebGpuFloat64Kernels.CopyWords, "main", source, destination,
             Uniforms(2 * length, 2 * sourceOffset, 2 * destinationOffset), 2 * length).GetAwaiter().GetResult();

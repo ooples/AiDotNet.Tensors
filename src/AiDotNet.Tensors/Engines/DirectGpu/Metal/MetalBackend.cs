@@ -701,7 +701,12 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
         // Offsets and size count elements of the buffers' type. The float kernel below moves one 4-byte word an
         // element; a buffer of doubles (two words each) is copied by the word kernel, its range checked in doubles.
-        if (GpuCopyLayout.ElementBytes(source, destination, nameof(Copy)) != sizeof(float))
+        // Only 4- and 8-byte elements have a copy here: a narrower element counted as a double would address twice
+        // the bytes the range check allowed.
+        int elementBytes = GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
+            throw new NotSupportedException($"{nameof(Copy)} on Metal copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
+        if (elementBytes == sizeof(double))
         {
             GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
             if (size > 0) CopyFloat64(srcBuffer, srcOffset, destBuffer, destOffset, size);

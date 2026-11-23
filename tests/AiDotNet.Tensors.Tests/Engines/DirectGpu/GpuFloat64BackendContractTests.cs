@@ -261,6 +261,38 @@ public abstract class GpuFloat64BackendContractTests
         Assert.True(Math.Abs(dot - hostDot) <= 1e-12 * Math.Abs(hostDot), $"Dot(a, a): host {hostDot:R}, device {dot:R}.");
     }
 
+    // A result below 2^-1022 is a subnormal double, not zero: a device that flushes denormals fails the IEEE contract.
+    [SkippableFact]
+    public void Subnormal_results_are_kept()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        double smallestNormal = 2.2250738585072014E-308, smallestSubnormal = double.Epsilon;
+        var left = new[] { smallestNormal, smallestSubnormal, 3 * smallestSubnormal, smallestNormal, 1.0E-300 };
+        var right = new[] { 0.5, smallestSubnormal, smallestSubnormal, 4.0, 1.0E-10 };
+        var cases = new (GpuFloat64BinaryOperation Operation, Func<double, double, double> Host)[]
+        {
+            (GpuFloat64BinaryOperation.Multiply, (x, y) => x * y),
+            (GpuFloat64BinaryOperation.Add, (x, y) => x + y),
+            (GpuFloat64BinaryOperation.Subtract, (x, y) => x - y),
+            (GpuFloat64BinaryOperation.Divide, (x, y) => x / y),
+        };
+        using var a = backend.AllocateBuffer(left.Length, GpuElementType.Float64);
+        using var b = backend.AllocateBuffer(left.Length, GpuElementType.Float64);
+        using var output = backend.AllocateBuffer(left.Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, left);
+        backend.UploadBuffer<double>(b, right);
+        foreach (var (operation, host) in cases)
+        {
+            Elementwise(backend).BinaryFloat64(operation, a, b, output, left.Length);
+            var actual = new double[left.Length];
+            backend.DownloadBuffer<double>(output, actual);
+            var expected = new double[left.Length];
+            for (int i = 0; i < left.Length; i++) expected[i] = host(left[i], right[i]);
+            AssertBitEqual(expected, actual);
+        }
+    }
+
     // The logistic in its overflow-free form: exp(x) / (1 + exp(x)) below zero, where exp(-x) overflows from x = -710
     // while the result is still representable.
     private static double HostUnary(GpuFloat64UnaryOperation operation, double x) => operation switch
