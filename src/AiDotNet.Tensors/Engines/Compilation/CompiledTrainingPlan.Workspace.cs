@@ -45,7 +45,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         && typeof(T) == typeof(float) && !_workspaceSharingBodyAllowed
         && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
-        && !engine.InferenceCaptureActive && !Gpu.AutocastScope.IsEnabled && Gpu.DeferredScope.Current?.IsRecording != true;
+        && !engine.InferenceCaptureActive && Gpu.DeferredScope.Current?.IsRecording != true;
 
     /// <summary>
     /// After a whole executed run: offers this plan's step-transient scratch to the engine's other plans, when the pool
@@ -175,6 +175,11 @@ internal sealed partial class CompiledTrainingPlan<T>
                 foreach (var item in nested) if (!InspectSaved(item)) return false;
                 return true;
             }
+            // A fused node's saved inner backward (ConvChannelEpilogueBackward keeps the convolution's): a static method
+            // captures nothing. A closure may hold buffers, so it stays opaque below.
+            if (saved is Delegate { Target: null }) return true;
+            // A channels-last fused node's layouts: its geometry, and the convolution input it reads in the backward.
+            if (saved is ChannelsLastSlot slot) return InspectSaved(slot.Input);
             // An opaque saved-state owner may hide native pointers. Refuse it rather than presume its buffers died.
             var type = saved.GetType();
             return type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
