@@ -3461,7 +3461,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private void ClearActivationCacheCore()
     {
-        ClearFloat64Residents();
+        ClearTypedResidents();
         // Snapshot the (key, entry) pairs this cache owns, then clear.
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
@@ -16226,7 +16226,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.UnregisterPersistentTensor(tensor);
-        if (tensor is Tensor<double> unregisteredDoubles) DropFloat64Resident(unregisteredDoubles);
+        if (tensor is Tensor<double> unregisteredDoubles) DropResident(unregisteredDoubles);
 
         // Cache identity is a read-only concern. GetDataArray() advertises writable access and
         // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
@@ -16273,7 +16273,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         base.InvalidatePersistentTensor(tensor);
-        if (tensor is Tensor<double> invalidatedDoubles) DropFloat64Resident(invalidatedDoubles);
+        if (tensor is Tensor<double> invalidatedDoubles) DropResident(invalidatedDoubles);
 
         if (!TryGetBackend(out var backend))
             return;
