@@ -339,7 +339,8 @@ public sealed unsafe partial class VulkanBackend
 
     /// <inheritdoc/>
     // Every buffer is a 4-byte-word allocation. Doubles are held two words each (the layout the double kernels read,
-    // low word first) on a device that computes in double; the narrower types have no storage here yet.
+    // low word first) on a device that computes in double. The 8- and 16-bit types and Int64 are held as bytes in
+    // whole words and computed by the packed kernels (GpuPackedKernelSource).
     public bool SupportsElementType(GpuElementType type)
         => type is GpuElementType.Float32 or GpuElementType.Int32
            || (type == GpuElementType.Float64 && SupportsFloat64Storage)
