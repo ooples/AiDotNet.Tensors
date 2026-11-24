@@ -1,4 +1,6 @@
+using System;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -1005,7 +1007,7 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
 
-    // An LM-sized vocabulary: the index backward runs in row chunks (320 rows at V = 49152), so 1500 rows take five
+    // An LM-sized vocabulary: the index backward runs in row chunks (672 rows at V = 49152), so 1500 rows take three
     // chunks and the weight and bias gradients accumulate across them (GEMM beta = 1 after the first chunk).
     private const int ChunkRows = 1500, ChunkDim = 16, ChunkVocab = 49152;
     private static readonly Tensor<float> ChunkHidden = Rand([ChunkRows, ChunkDim], seed: 491);
@@ -1020,7 +1022,7 @@ public class GpuTapeGradientParityTests : IDisposable
         // These gradients peak near 1e-4 (the loss is a mean over 1500 rows), so the default tolerance, an absolute
         // 1e-4 below |g| = 1, would accept an all-zero gradient.
         AssertGradientParity(opName, x, op, tol: 1e-6);
-        Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+        Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
     }
 
     [SkippableFact]
@@ -1058,12 +1060,12 @@ public class GpuTapeGradientParityTests : IDisposable
                 var cpuGrad = GradientOf(new CpuEngine(), ChunkHidden, Op);
                 DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
                 var first = GradientOf(gpu, ChunkHidden, Op);
-                Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeBackwardChunks);   // 320 rows a chunk
+                Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);   // 672 rows a chunk
                 var second = GradientOf(gpu, ChunkHidden, Op);
                 Assert.Equal(first, second);   // bit-identical run to run
                 for (int i = 0; i < cpuGrad.Length; i++)
                     Assert.True(Math.Abs(first[i] - cpuGrad[i]) <= 1e-6, $"gradient[{i}] {first[i]} vs CPU {cpuGrad[i]}");
-                long chunkCells = 320L * ChunkVocab;
+                long chunkCells = 672L * ChunkVocab;
                 Assert.True(cuda!.SortedScatterScratchBytes < chunkCells,
                     $"sort scratch {cuda.SortedScatterScratchBytes} bytes, a start slot per logit of a chunk is {chunkCells * 4}.");
             }
@@ -1086,23 +1088,25 @@ public class GpuTapeGradientParityTests : IDisposable
             // A device without room for the chunk scratch takes the supported fused-kernel fallback: no chunks to count.
             Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined,
                 "The chunked forward declined on this device (scratch did not fit or a primitive is unavailable).");
-            Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeForwardChunks);   // 320 rows a chunk
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);   // 672 rows a chunk
             Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
             Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
         }
     }
 
-    // The forward and the backward each hold two [chunk, vocab] blocks (logits and their exponentials or
-    // probabilities). At 672 rows a chunk (V = 49152) each pair was 2 x 127 MiB, the largest transient of a 16-layer
-    // LM's training step and its peak; a block is now 16M elements, so a pair is 128 MiB.
+    // The forward and the backward each held two [chunk, vocab] blocks (logits and their exponentials or
+    // probabilities): at 672 rows a chunk (V = 49152) each pair was 2 x 126 MiB, the largest transient of a 16-layer
+    // LM's training step and its peak. A backend that transforms rows in place holds one block per direction, at the
+    // same 672-row chunks (halving the block instead doubled the chunks and the step's launches).
     [SkippableFact]
-    public void FusedLinearCrossEntropy_index_chunked_scratch_is_two_blocks_of_16M_elements()
+    public void FusedLinearCrossEntropy_index_chunked_scratch_is_one_block_per_direction()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu!)
         {
             var backend = gpu.GetBackend();
             Skip.If(backend is null, "No device backend.");
+            Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend holds two blocks (no in-place row transforms).");
             static Tensor<float> Op(IEngine e, Tensor<float> t) =>
                 e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds);
             DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined = false;
@@ -1115,16 +1119,60 @@ public class GpuTapeGradientParityTests : IDisposable
             DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
             _ = GradientOf(gpu, ChunkHidden, Op);
             long peak = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(backend!).PeakAllocatedBytes;
-            Assert.True(DirectGpuTensorEngine.LastFusedCeForwardChunks > 1, "The forward did not run in chunks.");
-            Assert.True(DirectGpuTensorEngine.LastFusedCeBackwardChunks > 1, "The backward did not run in chunks.");
-            // What the forward and backward hold at once beyond what was live before them: the two blocks, plus the
-            // inputs (if not kept on the device by the first call), the gradients they return and small row scratch.
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);    // 672 rows a chunk
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+            // What the forward and backward hold at once beyond what was live before them: one block, plus the inputs
+            // (if not kept on the device by the first call), the gradients they return and small row scratch.
             long inputs = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
             long gradients = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
-            long twoBlocks = 2L * 4 * (16 * 1024 * 1024);
+            long oneBlock = 4L * 672 * ChunkVocab;
             long held = peak - before;
-            Assert.True(held <= twoBlocks + inputs + gradients + (8L << 20),
-                $"The fused CE held {held} bytes at once; two 16M-element blocks are {twoBlocks}.");
+            Assert.True(held <= oneBlock + inputs + gradients + (8L << 20),
+                $"The fused CE held {held} bytes at once; one [672, {ChunkVocab}] block is {oneBlock}.");
+        }
+    }
+
+    // The in-place row transforms the chunked fused CE relies on give exactly the out-of-place values, at its chunk
+    // shapes (a full 672-row chunk and the 156-row remainder of 1500 rows at V = 49152).
+    [SkippableTheory]
+    [InlineData(672)]
+    [InlineData(156)]
+    public void FusedLinearCrossEntropy_index_chunked_in_place_row_transforms_match(int rows)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var backend = gpu.GetBackend();
+            Skip.If(backend is null, "No device backend.");
+            Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend does not declare in-place row transforms.");
+            int v = ChunkVocab, cells = rows * v;
+            var rng = new Random(rows);
+            var x = new float[cells];
+            for (int i = 0; i < cells; i++) x[i] = (float)(rng.NextDouble() * 8 - 4);
+            var bias = new float[v];
+            for (int i = 0; i < v; i++) bias[i] = (float)(rng.NextDouble() - 0.5);
+            using var biasB = backend!.AllocateBuffer(bias);
+            using var scaleB = backend.AllocateBuffer(new[] { 0.37f });
+
+            void Check(string op, Action<IGpuBuffer, IGpuBuffer> apply)
+            {
+                using var input = backend.AllocateBuffer(x);
+                using var output = backend.AllocateBuffer(new float[cells]);
+                apply(input, output);
+                var expected = backend.DownloadBuffer(output);
+                using var inPlace = backend.AllocateBuffer(x);
+                apply(inPlace, inPlace);
+                var got = backend.DownloadBuffer(inPlace);
+                int first = -1;
+                for (int i = 0; i < cells && first < 0; i++)
+                    if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i])) first = i;
+                Assert.True(first < 0, first < 0 ? "" : $"{op} in place: [{first}] {got[first]:R} vs {expected[first]:R}");
+            }
+
+            Check("BiasAdd", (a, c) => backend.BiasAdd(a, biasB, c, rows, v));
+            Check("Exp", (a, c) => backend.Exp(a, c, cells));
+            Check("Softmax", (a, c) => backend.Softmax(a, c, rows, v));
+            Check("BroadcastMultiplyLastAxis", (a, c) => backend.BroadcastMultiplyLastAxis(a, scaleB, c, cells, 1));
         }
     }
 

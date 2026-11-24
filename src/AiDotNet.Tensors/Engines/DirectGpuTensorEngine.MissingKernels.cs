@@ -6810,12 +6810,13 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // Scratch per row chunk of the chunked fused CE, so a V=49152 head takes row chunks instead of [N, V] tensors.
-    // Elements of one [chunk, vocab] block. The forward and the backward each hold two (the logits and their exponentials
-    // or probabilities, as no portable primitive transforms them in place), so the pair is 128 MiB of fp32 whatever the
-    // vocabulary. At 32M elements a block (672 rows at V = 49152) the pair was 254 MiB, the largest transient of a
-    // 16-layer LM's training step and its peak, in the forward and again in the backward.
-    private const int FusedCeBlockElements = 16 * 1024 * 1024;
+    // Scratch per row chunk of the chunked fused CE, so a V=49152 head takes row chunks instead of [N, V] tensors:
+    // elements of one [chunk, vocab] block (128 MiB of fp32; 672 rows at V = 49152). A backend that transforms rows in
+    // place (IInPlaceRowTransformsBackend) holds one block per direction; any other holds two (the logits and their
+    // exponentials or probabilities). Two blocks were 254 MiB, the largest transient of a 16-layer LM's training step
+    // and its peak, in the forward and again in the backward. Halving the block instead (16M elements) also halved the
+    // pair, but doubled the row chunks: 66 more nodes in each captured step and 2.8 ms a step (of 106) of launch time.
+    private const int FusedCeBlockElements = 32 * 1024 * 1024;
 
     /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
     internal static int LastFusedCeBackwardChunks;
@@ -6848,8 +6849,12 @@ public partial class DirectGpuTensorEngine
         // Each row's target position inside its chunk's [chunk, vocab] block, as int bits (the gather reads the bits).
         if (!TryFusedCeTargetPositions(backend, targetIds, deviceIds, n, chunk, vocab, out var positions)) return false;
         using var _positions = positions;
+        // In place, the block holds h_c·W, then the logits, then their exponentials; otherwise a second block takes the
+        // GEMM's output and the exponentials. The values are the same either way.
+        bool inPlace = backend is DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var ones = AllocateStreamOrderedScratch(backend, chunk);
         using var picked = AllocateStreamOrderedScratch(backend, chunk);
@@ -6935,8 +6940,12 @@ public partial class DirectGpuTensorEngine
         using var dWeight = needWeight ? AllocateOutputBuffer(backend, d * vocab) : default;
         using var dBias = needBias ? AllocateOutputBuffer(backend, vocab) : default;
         // Stream-ordered scratch: still read by queued kernels when this returns.
+        // In place, one block holds the logits, then the probabilities, then dLogits; otherwise the second block takes
+        // the biased logits and dLogits. The values are the same either way.
+        bool inPlace = backend is DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var dhChunk = needHidden ? AllocateStreamOrderedScratch(backend, chunk * d) : default;
         using var ones = needBias ? AllocateStreamOrderedScratch(backend, chunk) : default;
