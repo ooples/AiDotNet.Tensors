@@ -1018,10 +1018,11 @@ __device__ __forceinline__ float2 mo_pair_add(float hi, float lo, float y)
     float s = mo_exact(hi + y);
     if (!mo_isfinite(s)) { return make_float2(s, 0.0f); }
     float bb = mo_exact(s - hi);
-    float e = (hi - (s - bb)) + (y - bb);
+    // The residual operands too: reassociated, (hi - (s - bb)) + (y - bb) becomes (hi + y) - s, which is 0.
+    float e = (hi - mo_exact(s - bb)) + mo_exact(y - bb);
     float t = lo + e;
     float h = mo_exact(s + t);
-    float l = t - (h - s);
+    float l = t - mo_exact(h - s);
     return make_float2(h, l);
 }
 

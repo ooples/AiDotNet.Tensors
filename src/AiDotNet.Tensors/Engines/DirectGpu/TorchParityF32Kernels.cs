@@ -208,9 +208,10 @@ __device__ __forceinline__ float2 tp_df_add(float2 a, float2 b)
     // Past overflow the error term is inf - inf: carry the plain float result, as the CPU's double overflows to it.
     if (tp_isinf(s) || tp_isnan(s)) { return make_float2(s, 0.0f); }
     float bb = tp_exact(s - a.x);
-    float e = (a.x - (s - bb)) + (b.x - bb) + a.y + b.y;
+    // The residual operands too: reassociated, (a - (s - bb)) + (b - bb) becomes (a + b) - s, which is 0.
+    float e = (a.x - tp_exact(s - bb)) + tp_exact(b.x - bb) + a.y + b.y;
     float hi = tp_exact(s + e);
-    return make_float2(hi, e - (hi - s));
+    return make_float2(hi, e - tp_exact(hi - s));
 }
 
 __device__ __forceinline__ float2 tp_df_neg(float2 a) { return make_float2(-a.x, -a.y); }
@@ -221,7 +222,7 @@ __device__ __forceinline__ float2 tp_df_mul(float2 a, float2 b)
     if (tp_isinf(p) || tp_isnan(p)) { return make_float2(p, 0.0f); }
     float e = tp_two_prod_err(a.x, b.x, p) + (a.x * b.y + a.y * b.x);
     float hi = tp_exact(p + e);
-    return make_float2(hi, e - (hi - p));
+    return make_float2(hi, e - tp_exact(hi - p));
 }
 
 __device__ __forceinline__ float2 tp_df_div(float2 a, float2 b)
@@ -231,7 +232,7 @@ __device__ __forceinline__ float2 tp_df_div(float2 a, float2 b)
     float2 r = tp_df_add(a, tp_df_neg(tp_df_mul(make_float2(q, 0.0f), b)));
     float q2 = r.x / b.x;
     float hi = tp_exact(q + q2);
-    return make_float2(hi, q2 - (hi - q));
+    return make_float2(hi, q2 - tp_exact(hi - q));
 }";
 
     private const string SpecialFunctions = @"
