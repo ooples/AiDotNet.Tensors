@@ -33,6 +33,8 @@ internal static class CudaVisibleDevices
     internal static HashSet<string>? Resolve(string? value, Func<List<string>?> cudaVisibleUuids)
     {
         if (value is null) return null;
+        // MIG instances have UUIDs of their own, which never match a Vulkan device's whole-GPU UUID: not filtered.
+        if (value.IndexOf("MIG-", StringComparison.OrdinalIgnoreCase) >= 0) return null;
         if (cudaVisibleUuids() is { } fromDriver) return new HashSet<string>(fromDriver, StringComparer.Ordinal);
         var fromValue = new HashSet<string>(StringComparer.Ordinal);
         foreach (var raw in value.Split(','))
@@ -62,8 +64,13 @@ internal static class CudaVisibleDevices
     {
         try
         {
-            if (CuBlasNative.cuInit(0) != CudaResult.Success) return null;
-            if (CuBlasNative.cuDeviceGetCount(out int count) != CudaResult.Success) return null;
+            // No visible device (CUDA_VISIBLE_DEVICES=-1, or ids that name none): every NVIDIA device is hidden.
+            var init = CuBlasNative.cuInit(0);
+            if (init == CudaResult.NoDevice) return new List<string>();
+            if (init != CudaResult.Success) return null;
+            var counted = CuBlasNative.cuDeviceGetCount(out int count);
+            if (counted == CudaResult.NoDevice) return new List<string>();
+            if (counted != CudaResult.Success) return null;
             var uuids = new List<string>(count);
             for (int ordinal = 0; ordinal < count; ordinal++)
             {

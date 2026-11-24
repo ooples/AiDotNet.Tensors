@@ -48,7 +48,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     private bool CanCoOwnStepScratch(DirectGpuTensorEngine engine) => SharedStepScratch.Enabled
         && typeof(T) == typeof(float) && !_workspaceSharingBodyAllowed
         && !(_workspaceExplicitGraphDisable && _graphStepDisabled)
-        && _dataForwardReplay is null && _checkpointing is null && _forwardSteps is not null
+        && _dataForwardReplay is null && _checkpointing is null && _checkpoint is null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
         && !engine.InferenceCaptureActive && Gpu.DeferredScope.Current?.IsRecording != true;
 
@@ -279,7 +279,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (s_idleLendDiag)
             AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} enabled={LendIdleStepMemoryEnabled} graph={HasLiveStepGraph} " +
                 $"pool={_scratchPool is not null} forward_steps={_forwardSteps is not null}");
-        if (!LendIdleStepMemoryEnabled || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
+        if (!LendIdleStepMemoryEnabled || _idleLendingFailed || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
             || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
             || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
             return;
@@ -323,7 +323,9 @@ internal sealed partial class CompiledTrainingPlan<T>
             return null;
         }
         _workspaceCandidates.Clear();
-        pool.CollectIdleBetweenRuns(_forwardActions.Length, IsStepTransient, _workspaceCandidates);
+        // Scratch co-owned with other plans (SharedStepScratch) is never lent: another plan's replay writes it.
+        pool.CollectIdleBetweenRuns(_forwardActions.Length,
+            buffer => IsStepTransient(buffer) && !SharedStepScratch.IsShared(buffer), _workspaceCandidates);
         var idle = new IGpuBuffer[_workspaceCandidates.Count];
         _workspaceCandidates.CopyTo(idle);
         _workspaceCandidates.Clear();
@@ -334,10 +336,28 @@ internal sealed partial class CompiledTrainingPlan<T>
     }
 
     /// <summary>Takes back the memory <see cref="LendIdleStepMemory"/> lent: before a step, an invalidation or disposal.</summary>
+    /// <remarks>A loan that cannot be moved (no memory for it, or it was baked into a graph) still reads memory the next
+    /// replay overwrites: the plan then stops replaying its graph and lending, and trains eagerly from here on.</remarks>
     private void ReclaimIdleStepMemory()
     {
-        if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is { } lender) lender.ReclaimIdle(this);
+        if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is not { } lender) return;
+        try
+        {
+            lender.ReclaimIdle(this);
+        }
+        catch (Exception ex)
+        {
+            _idleLendingFailed = true;
+            InvalidateCapturedStepGraph();
+            _graphStepDisabled = true;
+            RecordGraphCaptureFailure("a buffer borrowed from this plan's idle step memory could not be moved back ("
+                + ex.GetType().Name + "); this plan trains eagerly from now on");
+            throw;
+        }
     }
+
+    // Set once a reclaim failed: the plan lends nothing again.
+    private bool _idleLendingFailed;
 
     private string? _workspaceOpaqueSavedType;
     private static readonly bool s_idleLendDiag = Environment.GetEnvironmentVariable("AIDOTNET_IDLE_LOAN_DIAG") == "1";

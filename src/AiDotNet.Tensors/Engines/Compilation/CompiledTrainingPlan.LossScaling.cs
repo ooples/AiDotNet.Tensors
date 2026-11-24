@@ -23,6 +23,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     /// <inheritdoc />
     public void ConfigureLossScaling(LossScalingOptions? options, LossScaleState? initialState = null)
     {
+        if (initialState is { } given && (!(given.Scale > 0f) || float.IsInfinity(given.Scale)))
+            throw new ArgumentOutOfRangeException(nameof(initialState),
+                $"A loss scale state to resume from needs a finite positive scale, not {given.Scale}.");
         if (options is not null)
         {
             if (typeof(T) != typeof(float))
@@ -30,9 +33,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             options.Validate();
             RequireDiscardingNonFinitePolicy(_nonFiniteGradientPolicy);
         }
-        if (initialState is { } given && (!(given.Scale > 0f) || float.IsInfinity(given.Scale)))
-            throw new ArgumentOutOfRangeException(nameof(initialState),
-                $"A loss scale state to resume from needs a finite positive scale, not {given.Scale}.");
         lock (_stepSync)
         {
             DisposeLossScaleDevice();
@@ -274,8 +274,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         MoveLossScaleToHost();
         float inverse = 1f / _lossScaleHost.Scale;
         bool nonFinite = false;
-        // By the memory a gradient covers, as the device path dedupes by buffer: two tensors over the same elements
-        // (a tied weight's gradient, a view over a gradient's storage) are unscaled once.
+        // By the memory a gradient covers, as the device path dedupes by buffer: two tensors over exactly the same elements
+        // (a tied weight's gradient, a view over a gradient's storage) are unscaled once. Optimizer gradients never
+        // partially overlap (aliased views are of intermediate gradients, which this does not visit).
         var seen = new HashSet<(object Storage, int Offset, int Length)>(new StorageRangeComparer());
         foreach (var grad in ActiveOptimizerGradients())
         {

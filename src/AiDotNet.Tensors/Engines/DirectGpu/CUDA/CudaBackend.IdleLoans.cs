@@ -187,7 +187,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
             foreach (var loan in live)
             {
                 try { MoveIdleLoan(loan); }
-                catch (Exception ex)
+                catch (Exception ex)   // OOM included: the remaining loans still have to move; rethrown below
                 {
                     (failures ??= new()).Add(ex);
                 }

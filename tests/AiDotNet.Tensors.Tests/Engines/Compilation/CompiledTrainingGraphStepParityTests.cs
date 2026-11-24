@@ -1024,6 +1024,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     [SkippableTheory]
     [InlineData(false, 0.0)]
     [InlineData(true, 0.0)]
+    [InlineData(false, 0.5)]
     [InlineData(true, 0.5)]
     public void A_fused_cross_entropy_step_captures_its_update_and_trains_like_the_eager_step(bool residentLabels, double clip)
     {

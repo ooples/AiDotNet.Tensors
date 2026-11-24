@@ -63,7 +63,8 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     // Matmul autocast (EnterGemmAutocast): the cuBLAS compute type every FP32 GEMM takes while a scope is open, 0 when
     // none is. Instance state, not thread-local: a compiled step's ops may run on the BLAS pool's threads, so every
     // thread's GEMMs on this backend take the open scope's type. The newest scope still open wins; scopes may close in
-    // any order (two threads' scopes overlapping), and the type returns to FP32 once the last one closes.
+    // any order (two threads' scopes overlapping), and the type returns to FP32 once the last one closes. A scope that is
+    // never disposed keeps its type in force, as an undisposed torch.autocast context would.
     private int _gemmAutocastComputeType;
     private readonly List<GemmAutocastScope> _gemmAutocastScopes = new();
 

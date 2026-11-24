@@ -8696,8 +8696,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 return null;
             // A fused cross-entropy flags out-of-range device labels in a word on the device (the uncaptured update
             // validates it on the host before it writes). The captured update reads that word as a gate, so a step with
-            // a bad label applies nothing, and the host check after the step still throws for it. The word exists once
-            // the resident pre-pass has run the fused cross-entropy; without it the update stays uncaptured.
+            // a bad label applies nothing, and the host check throws for it when the next step begins (the gated step is
+            // counted as a skipped non-finite step meanwhile). The word is this rank's own: under a gradient exchange a
+            // rank with a bad label skips its update while the others apply theirs, until it throws at its next step.
+            // The word exists once the resident pre-pass has run the fused cross-entropy; without it the update stays
+            // uncaptured.
             Engines.DirectGpu.IGpuBuffer? labelGate = null;
             if (_usesFusedCe)
             {

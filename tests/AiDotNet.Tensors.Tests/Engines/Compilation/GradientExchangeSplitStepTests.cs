@@ -143,10 +143,13 @@ public class GradientExchangeSplitStepTests
     /// non-finite on every rank, and every rank must skip that step and back its scale off. The overflow check therefore
     /// runs on the exchanged gradient, in the update graph; checked on the local gradient before the exchange (the
     /// backward graph), this rank would see finite values, take the step on the non-finite sum, and leave the ranks'
-    /// scales and weights apart.
+    /// scales and weights apart. RMSprop's update is not captured (the graph holds the backward only and the update runs
+    /// after each replay): the scaler then runs uncaptured after the exchange, with the same outcome.
     /// </summary>
-    [SkippableFact]
-    public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow()
+    [SkippableTheory]
+    [InlineData(OptimizerType.SGD, true)]
+    [InlineData(OptimizerType.RMSprop, false)]
+    public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow(OptimizerType optimizer, bool capturedUpdate)
     {
         DirectGpuTensorEngine gpu;
         try { gpu = new DirectGpuTensorEngine(); }
@@ -177,7 +180,7 @@ public class GradientExchangeSplitStepTests
             using (plan)
             {
                 var compiled = (CompiledTrainingPlan<float>)plan;
-                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+                plan.ConfigureOptimizer(optimizer, learningRate: 1e-2);
                 var scaled = (ICompiledTrainingPlanLossScaling)plan;
                 scaled.ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f, GrowthInterval = 1000 });
                 compiled.SetGradientExchange(exchange =>
@@ -197,8 +200,8 @@ public class GradientExchangeSplitStepTests
                 var state = Assert.NotNull(scaled.ReadLossScaleState());
                 Console.WriteLine($"scale={state.Scale} overflowSteps={state.OverflowSteps} steps={state.Steps} "
                     + $"updateGraphLaunches={compiled.UpdateGraphReplayCount} split={compiled.HasSplitStepGraph}");
-                Assert.True(compiled.HasSplitStepGraph, "the step did not capture as a backward graph and an update graph");
-                Assert.Equal(steps - 3, compiled.UpdateGraphReplayCount);
+                Assert.Equal(capturedUpdate, compiled.HasSplitStepGraph);
+                Assert.Equal(capturedUpdate ? steps - 3 : 0, compiled.UpdateGraphReplayCount);
                 // The overflowed step changed nothing, the steps around it trained, and the scale backed off once.
                 Assert.Equal(weightsAtExchange[overflowStep - 1], weightsAtExchange[overflowStep]);
                 Assert.NotEqual(weightsAtExchange[overflowStep - 2], weightsAtExchange[overflowStep - 1]);
@@ -207,6 +210,31 @@ public class GradientExchangeSplitStepTests
                 Assert.Equal(1, state.OverflowSteps);
                 Assert.Equal(512f, state.Scale);
             }
+        }
+    }
+
+    // A loss scale state to resume from with no usable scale is refused, not silently replaced by the default.
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(-1f)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NaN)]
+    public void ConfigureLossScaling_RejectsAResumeStateWithoutAFinitePositiveScale(float scale)
+    {
+        var engine = new CpuEngine();
+        var x = Rows(Values(Batch * In, 1, 2f), In, 0, Batch);
+        var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Values(In * Out, 5, 0.4f)));
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMatMul(x, w), null);
+            plan = scope.CompileTraining(new[] { w });
+        }
+        using (plan)
+        {
+            var scaled = (ICompiledTrainingPlanLossScaling)plan;
+            Assert.Throws<ArgumentOutOfRangeException>(() =>
+                scaled.ConfigureLossScaling(new LossScalingOptions(), new LossScaleState(scale, 0, 0, 0)));
         }
     }
 }

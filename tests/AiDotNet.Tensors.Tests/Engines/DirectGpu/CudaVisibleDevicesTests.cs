@@ -34,6 +34,8 @@ public class CudaVisibleDevicesTests
         Assert.Equal(new[] { "3cc6845a128eb8623de97b3ea1e8495d" }, visible!.ToArray());
         // Indices (or UUID prefixes) need the driver's ordering: unmapped, nothing is filtered.
         Assert.Null(CudaVisibleDevices.Resolve("0,1", () => null));
+        // MIG instance UUIDs never match a whole-GPU Vulkan UUID: not filtered.
+        Assert.Null(CudaVisibleDevices.Resolve("MIG-1b2c3d4e-0000-1111-2222-333344445555", () => new List<string>()));
         Assert.Null(CudaVisibleDevices.Resolve("GPU-3cc6845a", () => null));
         // An empty value hides every device, as it does for CUDA.
         Assert.Empty(CudaVisibleDevices.Resolve("", () => null)!);
@@ -67,12 +69,13 @@ public class CudaVisibleDevicesTests
         Skip.IfNot(backend.Initialize(), "No Vulkan device.");
         _output.WriteLine($"Vulkan device: {backend.DeviceName}; hidden: {string.Join(" ", hidden)}");
         System.Threading.Thread.Sleep(1000);
-        int me = Environment.ProcessId;
+        int me = Process.GetCurrentProcess().Id;
         var mine = (NvidiaSmi("--query-compute-apps=pid,gpu_uuid --format=csv,noheader") ?? Array.Empty<string>())
             .Select(l => l.Split(',')).Where(f => f.Length == 2 && int.TryParse(f[0].Trim(), out int pid) && pid == me)
             .Select(f => f[1].Trim()).Distinct().ToArray();
         _output.WriteLine($"this process is on: {string.Join(" ", mine)}");
-        Assert.NotEmpty(mine);   // the Vulkan device itself is listed, on a visible GPU
+        // Some drivers (WDDM, graphics-only contexts) do not list a Vulkan context as a compute app.
+        Skip.If(mine.Length == 0, "nvidia-smi does not list this process's Vulkan context as a compute app.");
         Assert.Empty(mine.Intersect(hidden));
     }
 
@@ -83,9 +86,16 @@ public class CudaVisibleDevicesTests
             var start = new ProcessStartInfo("nvidia-smi", arguments) { RedirectStandardOutput = true, UseShellExecute = false };
             using var process = Process.Start(start);
             if (process is null) return null;
-            string text = process.StandardOutput.ReadToEnd();
-            process.WaitForExit();
-            return process.ExitCode == 0 ? text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Select(l => l.Trim()).ToArray() : null;
+            var output = process.StandardOutput.ReadToEndAsync();
+            // A stalled nvidia-smi skips the test instead of hanging the run.
+            if (!process.WaitForExit(15000) || !output.Wait(5000))
+            {
+                try { process.Kill(); } catch (InvalidOperationException) { }
+                return null;
+            }
+            return process.ExitCode == 0
+                ? output.Result.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(l => l.Trim()).ToArray()
+                : null;
         }
         catch (System.ComponentModel.Win32Exception)
         {

@@ -101,13 +101,22 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
         var a = autocast.EnterGemmAutocast(PrecisionMode.Float16);
         var b = autocast.EnterGemmAutocast(PrecisionMode.BFloat16);
-        Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
-        a.Dispose();
-        Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
-        b.Dispose();
-        Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
-        b.Dispose();   // twice is a no-op
-        Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
+        try
+        {
+            Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+            a.Dispose();
+            Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+            b.Dispose();
+            Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
+            b.Dispose();   // twice is a no-op
+            Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
+        }
+        finally
+        {
+            // A failed assertion must not leave the shared fixture's backend in autocast.
+            a.Dispose();
+            b.Dispose();
+        }
     }
 
     // Every autocast route (cuBLASLt, the classic GemmEx, the fixed-order split-K) computes

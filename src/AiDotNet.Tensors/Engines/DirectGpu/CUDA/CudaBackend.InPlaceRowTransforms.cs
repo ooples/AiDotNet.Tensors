@@ -12,6 +12,7 @@ public sealed partial class CudaBackend : IInPlaceRowTransformsBackend
     void IInPlaceRowTransformsBackend.BiasAddInPlace(IGpuBuffer data, IGpuBuffer bias, int rows, int cols)
         => LaunchBiasAddReference(data, bias, data, rows, cols, relu: false);
 
+    // The scalar exp_vector kernel itself: LaunchUnaryKernel would try a declared program and the vec4 kernel first.
     unsafe void IInPlaceRowTransformsBackend.ExpInPlace(IGpuBuffer data, int size)
     {
         if (size <= 0) return;
