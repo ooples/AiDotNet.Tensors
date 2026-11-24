@@ -1430,6 +1430,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             io.WriteLearningRates(replay, first, rates);
         }
         LaunchStepGraph(cb, exec);
+        if (_updateGraphExec != IntPtr.Zero)
+        {
+            // The backward graph's gradients, reduced across ranks, then the update graph on them. The exchange's
+            // download synchronizes the stream (the backward has finished) and its upload completes before the launch.
+            ExchangeGradients(deviceAuthoritative: true);
+            LaunchStepGraph(cb, _updateGraphExec);
+            UpdateGraphReplayCount++;
+        }
         io.Flush();
         _stepIoLaunched = replay + 1;
     }
@@ -1742,7 +1750,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             if (_stepGraphExec != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExec);
             if (_stepGraphExecOdd != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExecOdd);
+            DestroyUpdateGraph(gte);
         }
+        _updateGraphExec = IntPtr.Zero;
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
@@ -4700,6 +4710,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 0));
                         StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
+                        if (exec != IntPtr.Zero && _gradientExchange is not null && _capturedOptimizer is not null && _stepIo is not null)
+                        {
+                            using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("UpdateGraphCapture"))
+                                _updateGraphExec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureUpdateGraphBody(parity: 0));
+                            if (_updateGraphExec == IntPtr.Zero)
+                            {
+                                gte.DestroyGpuGraph(exec);
+                                exec = IntPtr.Zero;   // handled below as a failed capture
+                            }
+                        }
                     }
                     catch (Exception captureFailure)
                     {
@@ -4776,6 +4796,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // capture step. Its kernels enqueue (in order) after the graph launch.
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
+                    ExchangeGradients(deviceAuthoritative: true);
                     RegularizeAndClipGradients();
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
@@ -4836,6 +4857,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         NoteGradientNormRecord(capturedReplayBackend, capturedReplayNorm);
                     return _lossOutput;
                 }
+                ExchangeGradients(deviceAuthoritative: true);
                 RegularizeAndClipGradients();
                 CommitHostOptimizerGradients();
                 InvokeOptimizerUpdate();
@@ -4888,6 +4910,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
                         DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
+                    ExchangeGradients(deviceAuthoritative: false);
                     UnscaleLossScaledGradients();
                     RegularizeAndClipGradients();   // in the order the eager and graph steps use
                     CommitHostOptimizerGradients();
@@ -5224,6 +5247,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>One step graph's capture body: the step I/O prologue, the step, the captured update, the epilogue.</summary>
     private void CaptureStepGraphBody(Engines.DirectGpu.IGpuGraphCapture cb, int parity)
     {
+        // A gradient exchange splits the step: this graph ends after the backward, and the update graph (clip, fused
+        // optimizer and the epilogue) launches after the exchange.
+        bool split = _gradientExchange is not null && _capturedOptimizer is not null && _stepIo is not null;
         _prologueSeedSource = _prologueSeedDestination = null;
         if (_stepIo is { } prologueIo)
         {
@@ -5241,6 +5267,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepIo?.CapturePrologue(parity);
         RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
         CaptureLossScaling();   // after the backward, before the captured clip and update
+        if (split) return;
+        CaptureUpdateGraphBody(parity);
+    }
+
+    // The update half of the step: the captured clip and fused optimizer, then the epilogue that publishes the replay.
+    private void CaptureUpdateGraphBody(int parity)
+    {
         if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
         {
             if (parity == 0) optimizer.Capture(io);
@@ -6584,6 +6617,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
+        ExchangeGradients(deviceAuthoritative: false);
         UnscaleLossScaledGradients();
         RegularizeAndClipGradients();
 
