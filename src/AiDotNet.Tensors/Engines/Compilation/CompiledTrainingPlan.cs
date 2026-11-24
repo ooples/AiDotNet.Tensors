@@ -5466,6 +5466,41 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    /// <summary>
+    /// At compile: frees the device values the trace left on forward outputs that hold them without owning them. An op
+    /// that read its input while the forward was traced realized the lazy chain under it on the device (the GPU RMSNorm,
+    /// over a SwiGLU block's Swish and multiply); a resident op bound each result to a buffer it allocated and nothing
+    /// owns. Every step recomputes those outputs and rebinds them, which drops only the reference, so each value waited
+    /// for its buffer's finalizer: 56 MiB of a 16-layer LM's Swish outputs beside its second training step, its peak.
+    /// A buffer another of the plan's tensors is bound to (a parameter, a view's base, another output) is kept, and so
+    /// are the loss and the outputs a caller retains.
+    /// </summary>
+    private static void ReleaseTraceTimeDeviceValues(Engines.DirectGpuTensorEngine gte, List<CompiledStep<T>> forwardSteps,
+        Tensor<T>[] parameters, HashSet<Tensor<T>> retainedOutputs, Tensor<T>? loss)
+    {
+        var bindings = new Dictionary<Engines.DirectGpu.IGpuBuffer, int>(
+            ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
+        var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        void Count(Tensor<T>? t)
+        {
+            if (t?._gpuBuffer is { } b && seen.Add(t)) bindings[b] = bindings.TryGetValue(b, out int n) ? n + 1 : 1;
+        }
+        foreach (var p in parameters) Count(p);
+        foreach (var step in forwardSteps)
+        {
+            Count(step.OutputBuffer);
+            foreach (var input in step.Inputs) Count(input);
+        }
+        foreach (var step in forwardSteps)
+        {
+            var output = step.OutputBuffer;
+            if (output?._gpuBuffer is not { } buffer || ReferenceEquals(output, loss) || retainedOutputs.Contains(output)
+                || bindings[buffer] != 1)
+                continue;
+            gte.ReleaseTraceTimeDeviceValue(output);
+        }
+    }
+
     private bool _releasedUnusedMemory;
 
     internal static bool ReleaseUnusedMemoryBeforeCapture { get; set; } =
@@ -11755,6 +11790,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (deferrable.Count > 0 && engine.Is<DirectGpuTensorEngine>()) plan._gradientDeferral = new Autodiff.GradientDeferral(deferrable);
             scope.ReleaseStorageLeases();
             DropStorageOfRemovedOutputs(scope.Nodes, optimized, forwardSteps, parameters);
+            if (engine.As<DirectGpuTensorEngine>() is { } traceGpu)
+                ReleaseTraceTimeDeviceValues(traceGpu, forwardSteps, parameters, retainedOutputs, lossTarget);
             if (dataReplay is null) plan.ReleaseFusedChainInternals(convEpilogueDeadInternals);
             // Only complete coverage proves a step has no emitted backward. This includes explicit NoGrad forwards
             // and frozen-parameter chains that were excluded by the requested gradient set.

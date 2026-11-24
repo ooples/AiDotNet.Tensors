@@ -2951,6 +2951,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_ownsDirectGpu) _ownedResults.Add(destination.DataVector, backend);
     }
 
+    /// <summary>
+    /// Frees, without downloading it, the device value a traced forward output is bound to but does not own: for a value
+    /// nothing will read, a compiled forward output its steps recompute. Either this engine's activation cache holds it
+    /// for the tensor's storage, or the tensor has no host storage and a resident op outside a step allocated the buffer
+    /// and bound it with a deferred download, so nothing else owns it and only its finalizer would free it. The caller
+    /// has checked that no other tensor of the plan is bound to it. False, and nothing changes, otherwise (an owned
+    /// buffer, a view, during a step).
+    /// </summary>
+    internal bool ReleaseTraceTimeDeviceValue<T>(Tensor<T> tensor)
+    {
+        if (tensor._ownsGpuBuffer || tensor._gpuBuffer is not { } buffer || ResidentStepActive || tensor.IsView) return false;
+        object? key = null;
+        lock (_activationCacheLock)
+        {
+            foreach (var candidate in new object?[] { tensor.GetBackingArrayForCacheLookupUnsafe(), tensor.DataVector })
+                if (candidate is not null && _activationCache.TryGetValue(candidate, out var entry)
+                    && ReferenceEquals(entry.Buffer, buffer))
+                {
+                    key = candidate;
+                    break;
+                }
+        }
+        bool borrowed = key is null && tensor.HasDeferredHostStorage && tensor._gpuMaterializerCallback is not null
+            && ReferenceEquals(tensor._gpuMaterializerKey, tensor.DataVector);
+        if (key is null && !borrowed) return false;
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Remove(array);
+        Helpers.HostSync.Remove(tensor.DataVector);
+        tensor._gpuMaterializerCallback = null;
+        tensor._gpuMaterializerKey = null;
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+        if (key is not null) RemoveActivationCacheEntry(key);
+        else buffer.Dispose();
+        return true;
+    }
+
     private void RemoveActivationCacheEntry(object cacheKey)
     {
         ActivationCacheEntry? removed = null;
