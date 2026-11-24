@@ -72,22 +72,35 @@ internal static class GpuNarrowFloatKernelSource
 
     public static string MatrixMultiply(GpuElementType type) => "nfgemm_" + Suffix(type);
 
+    /// <summary>The kernel of <c>o[i] = a[i] op y</c> for a 32-bit float <c>y</c>: arguments (a, o, y, size).</summary>
+    public static string Scalar(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
+    {
+        string name = Binary(operation, type);
+        return name.Substring(0, name.Length - Suffix(type).Length) + "s_" + Suffix(type);
+    }
+
     public static void AddNames(List<string> names)
     {
         foreach (var type in Types)
         {
-            foreach (var operation in BinaryOperations) names.Add(Binary(operation, type));
+            foreach (var operation in BinaryOperations)
+            {
+                names.Add(Binary(operation, type));
+                names.Add(Scalar(operation, type));
+            }
+
             foreach (var operation in UnaryOperations) names.Add(Unary(operation, type));
             names.Add(MatrixMultiply(type));
         }
     }
 
-    private static string Symbol(GpuNarrowFloatBinaryOperation operation) => operation switch
+    // The binary32 result of `x` and `y`.
+    private static string Combine(GpuNarrowFloatBinaryOperation operation) => operation switch
     {
-        GpuNarrowFloatBinaryOperation.Add => "+",
-        GpuNarrowFloatBinaryOperation.Subtract => "-",
-        GpuNarrowFloatBinaryOperation.Divide => "/",
-        _ => "*",
+        GpuNarrowFloatBinaryOperation.Add => "x + y",
+        GpuNarrowFloatBinaryOperation.Subtract => "x - y",
+        GpuNarrowFloatBinaryOperation.Divide => "nf_div(x, y)",
+        _ => "x * y",
     };
 
     /// <summary>Appends the kernels to a program that already has the integer program's prelude.</summary>
@@ -168,6 +181,46 @@ NF_FN float nf_gelu(float x)
     if (z < -20.0f) z = -20.0f;
     return 0.5f * x * (1.0f + NF_TANH(z));
 }
+/* The quotient on the bits, correctly rounded: a device's own division need not round a subnormal quotient as the
+   host does (an OpenCL device returned -3.203125 / FLT_MAX one unit off). */
+NF_FN float nf_div(float fa, float fb)
+{
+    const u32t a = NF_BITS(fa), b = NF_BITS(fb);
+    const u32t sign = (a ^ b) & 0x80000000u;
+    const u32t ea = (a >> 23) & 0xFFu, eb = (b >> 23) & 0xFFu;
+    u32t ma = a & 0x7FFFFFu, mb = b & 0x7FFFFFu;
+    const int za = ea == 0u && ma == 0u, zb = eb == 0u && mb == 0u;
+    int xa = (int)ea, xb = (int)eb, x;
+    u64t q, n;
+    u32t s, r, tail;
+    if ((ea == 255u && ma != 0u) || (eb == 255u && mb != 0u)) return NF_FLOAT(0x7FC00000u);
+    if (ea == 255u) return NF_FLOAT(eb == 255u ? 0x7FC00000u : (sign | 0x7F800000u));
+    if (eb == 255u) return NF_FLOAT(sign);
+    if (zb) return NF_FLOAT(za ? 0x7FC00000u : (sign | 0x7F800000u));
+    if (za) return NF_FLOAT(sign);
+    if (ea == 0u) { xa = 1; while ((ma & 0x800000u) == 0u) { ma <<= 1; xa--; } } else ma |= 0x800000u;
+    if (eb == 0u) { xb = 1; while ((mb & 0x800000u) == 0u) { mb <<= 1; xb--; } } else mb |= 0x800000u;
+    x = xa - xb + 127;
+    if (ma < mb) { ma <<= 1; x--; }
+    /* 27 quotient bits in [2^26, 2^27): 24 and three to round on, whatever remains sticky. */
+    n = (u64t)ma << 26;
+    q = n / (u64t)mb;
+    s = (u32t)q | (q * (u64t)mb != n ? 1u : 0u);
+    if (x <= 0)
+    {
+        const u32t down = (u32t)(1 - x);
+        if (down > 27u) s = s != 0u ? 1u : 0u;
+        else { const u32t lost = s & ((1u << down) - 1u); s >>= down; if (lost != 0u) s |= 1u; }
+        x = 1;
+    }
+    tail = s & 7u;
+    r = s >> 3;
+    if (tail > 4u || (tail == 4u && (r & 1u) != 0u)) r++;
+    if (r >= 0x1000000u) { r >>= 1; x++; }
+    if (r < 0x800000u) return NF_FLOAT(sign | r);
+    if (x >= 255) return NF_FLOAT(sign | 0x7F800000u);
+    return NF_FLOAT(sign | ((u32t)x << 23) | (r & 0x7FFFFFu));
+}
 /* Below -80, e^-x overflows on its way to the quotient (a zero, where the result is e^x: 8e-40 at -90). */
 NF_FN float nf_sigmoid(float x) { return x < -80.0f ? NF_EXP(x) : 1.0f / (1.0f + NF_EXP(-x)); }
 ");
@@ -181,7 +234,11 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? NF_EXP(x) : 1.0f / (1.0f +
                 source.Append("IK_KERNEL ").Append(Binary(operation, type))
                     .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
                     .Append("    if (i < size) { const float x = ").Append(widen).Append("(a[i]); const float y = ").Append(widen)
-                    .Append("(b[i]); const float r = x ").Append(Symbol(operation)).Append(" y; o[i] = ").Append(narrow).Append("(r); }\n}\n");
+                    .Append("(b[i]); const float r = ").Append(Combine(operation)).Append("; o[i] = ").Append(narrow).Append("(r); }\n}\n");
+                source.Append("IK_KERNEL ").Append(Scalar(operation, type))
+                    .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const float y, const int size)\n{\n    const int i = IK_GID;\n")
+                    .Append("    if (i < size) { const float x = ").Append(widen).Append("(a[i]); const float r = ")
+                    .Append(Combine(operation)).Append("; o[i] = ").Append(narrow).Append("(r); }\n}\n");
             }
 
             source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Negate, type))

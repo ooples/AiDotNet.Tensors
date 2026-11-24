@@ -192,6 +192,24 @@ public class GpuIntegerResidencyTests
                 ("Tanh", engine.TensorTanh(x), (a, _) => Math.Tanh(a), false),
                 ("Sigmoid", engine.TensorSigmoid(x), (a, _) => 1.0 / (1.0 + Math.Exp(-a)), false),
             };
+            var scalar = BFloat16.FromFloat(2.75f);
+            float s = (float)scalar;
+            var byScalar = new (string Name, Tensor<BFloat16> Result, Func<float, float> Function)[]
+            {
+                ("AddScalar", engine.TensorAddScalar(x, scalar), a => a + s),
+                ("SubtractScalar", engine.TensorSubtractScalar(x, scalar), a => a - s),
+                ("MultiplyScalar", engine.TensorMultiplyScalar(x, scalar), a => a * s),
+                ("DivideScalar", engine.TensorDivideScalar(x, scalar), a => a / s),
+            };
+            foreach (var (name, result, function) in byScalar)
+            {
+                Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");
+                var values = result.GetReadOnlyDataArray();
+                for (int i = 0; i < Large; i++)
+                    Assert.True(BFloat16.FromFloat(function((float)xValues[i])).RawValue == values[i].RawValue,
+                        $"{name} at {i} of {(float)xValues[i]:R}: expected {function((float)xValues[i]):R}, device {(float)values[i]:R}.");
+            }
+
             foreach (var (name, result, function, exact) in results)
             {
                 Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");

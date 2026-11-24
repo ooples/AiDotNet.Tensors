@@ -365,15 +365,30 @@ internal static class GpuPackedKernelSource
             GpuNarrowFloatBinaryOperation.Divide => "nfdiv",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
         };
+        return Kernel("pk_" + stem + "_" + Suffix(type), 3, FloatLibrary,
+            () => LaneBody(type, second: true, scalar: false, FloatBinaryValue(operation, type, Widen(type) + "(y)")));
+    }
+
+    /// <summary><c>o[i] = a[i] op scalar</c> on 16-bit floats, buffers (a, o): <c>pb</c> is the scalar's binary32 bits.</summary>
+    public static GpuPackedKernel Scalar(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
+    {
+        RequireFloat(type);
+        // LaneBody's `yw` is the whole parameter word: the scalar as it was passed, already binary32.
+        return Kernel(Binary(operation, type).Name + "_s", 2, FloatLibrary,
+            () => LaneBody(type, second: false, scalar: true, FloatBinaryValue(operation, type, "yw")));
+    }
+
+    // `x` widened, combined on the bits with `right` (binary32 bits) and rounded once into the type.
+    private static string FloatBinaryValue(GpuNarrowFloatBinaryOperation operation, GpuElementType type, string right)
+    {
         string w = Widen(type), n = Narrow(type);
-        string value = operation switch
+        return operation switch
         {
-            GpuNarrowFloatBinaryOperation.Add => n + "(pk_fadd(" + w + "(x), " + w + "(y)))",
-            GpuNarrowFloatBinaryOperation.Subtract => n + "(pk_fadd(" + w + "(x), " + w + "(y) ^ 0x80000000u))",
-            GpuNarrowFloatBinaryOperation.Divide => n + "(pk_fdiv(" + w + "(x), " + w + "(y)))",
-            _ => n + "(pk_fmul(" + w + "(x), " + w + "(y)))",
+            GpuNarrowFloatBinaryOperation.Add => n + "(pk_fadd(" + w + "(x), " + right + "))",
+            GpuNarrowFloatBinaryOperation.Subtract => n + "(pk_fadd(" + w + "(x), " + right + " ^ 0x80000000u))",
+            GpuNarrowFloatBinaryOperation.Divide => n + "(pk_fdiv(" + w + "(x), " + right + "))",
+            _ => n + "(pk_fmul(" + w + "(x), " + right + "))",
         };
-        return Kernel("pk_" + stem + "_" + Suffix(type), 3, FloatLibrary, () => LaneBody(type, second: true, scalar: false, value));
     }
 
     // A function of the widened operand's binary32 bits, its result narrowed into the type.
@@ -470,7 +485,12 @@ internal static class GpuPackedKernelSource
 
         foreach (var type in FloatTypes)
         {
-            foreach (var operation in FloatBinaryOperations) all.Add(Binary(operation, type));
+            foreach (var operation in FloatBinaryOperations)
+            {
+                all.Add(Binary(operation, type));
+                all.Add(Scalar(operation, type));
+            }
+
             foreach (var operation in FloatUnaryOperations) all.Add(Unary(operation, type));
             all.Add(MatrixMultiply(type));
         }

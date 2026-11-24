@@ -216,6 +216,58 @@ public abstract class GpuNarrowFloatContractTests
 
     // The function itself, evaluated in double: a binary32 evaluation of 1 / (1 + e^-x) overflows to a zero below
     // -88.7, where the logistic function is still 8e-40 (a value BFloat16 holds).
+    // The scalar is a binary32 value, not one of the type's: a value the type holds, one it does not (0.1), zeros of
+    // both signs, a binary32 subnormal, an infinity and the largest float.
+    [SkippableTheory]
+    [InlineData(GpuNarrowFloatBinaryOperation.Add)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Subtract)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Multiply)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Divide)]
+    public void Scalar_kernels_round_as_the_host_conversion_does(GpuNarrowFloatBinaryOperation operation)
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        float[] scalars = { 1.5f, -3f, 0.1f, 0f, -0f, 1e-40f, float.PositiveInfinity, float.MaxValue, 1024f };
+        int[] sizes = { 1, 3, 257, 4097 };
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatBinary(operation, type)) continue;
+            foreach (int size in sizes)
+            {
+                var left = Patterns(type, size, 9);
+                foreach (float y in scalars)
+                {
+                    using var a = Upload(backend, type, left);
+                    using var output = backend.AllocateBuffer(size, type);
+                    elementwise.ScalarNarrowFloat(operation, type, a, y, output, size);
+                    var actual = Download(backend, type, output, size);
+                    for (int i = 0; i < size; i++)
+                    {
+                        float x = Widen(type, left[i]);
+                        float expected = operation switch
+                        {
+                            GpuNarrowFloatBinaryOperation.Add => x + y,
+                            GpuNarrowFloatBinaryOperation.Subtract => x - y,
+                            GpuNarrowFloatBinaryOperation.Divide => x / y,
+                            _ => x * y,
+                        };
+                        AssertSame(type, expected, actual[i], $"{operation}<{type}> by {y:R} at {i} of {size} (0x{left[i]:X4})");
+                    }
+
+                    // The output may be the operand.
+                    elementwise.ScalarNarrowFloat(operation, type, a, y, a, size);
+                    Assert.Equal(actual, Download(backend, type, a, size));
+                }
+
+                ran++;
+            }
+        }
+
+        RequireRan(ran, Types.Length * sizes.Length, $"{operation} scalar kernel");
+    }
+
     private static float HostFunction(GpuNarrowFloatUnaryOperation operation, float x) => (float)(operation switch
     {
         GpuNarrowFloatUnaryOperation.Sqrt => Math.Sqrt(x),

@@ -42,6 +42,20 @@ public sealed partial class OpenClBackend : IGpuNarrowFloatElementwise, IGpuNarr
     }
 
     /// <inheritdoc/>
+    public void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar,
+        IGpuBuffer output, int size)
+    {
+        GpuNarrowFloatLayout.Require(nameof(ScalarNarrowFloat), type, size, (a, size), (output, size));
+        var kernel = IntegerKernel(GpuNarrowFloatKernelSource.Scalar(operation, type));
+        if (size == 0) return;
+        kernel.SetArg(0, IntegerHandle(a));
+        kernel.SetArg(1, IntegerHandle(output));
+        kernel.SetArg(2, scalar);
+        kernel.SetArg(3, size);
+        kernel.Execute1D(size, CalculateOptimalWorkGroupSize1D(size));
+    }
+
+    /// <inheritdoc/>
     public void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
     {
         GpuNarrowFloatLayout.Require(nameof(UnaryNarrowFloat), type, size, (a, size), (output, size));

@@ -89,6 +89,24 @@ public partial class DirectGpuTensorEngine
                 : null) as Tensor<T>;
     }
 
+    /// <summary>
+    /// <c>input (op) scalar</c> for a BFloat16 tensor on the device, computed in FP32 and stored as BFloat16. Null when
+    /// the CPU engine takes it, and under a graph trace or anomaly mode (which keep the CPU engine's path, as the
+    /// integer and double routes do).
+    /// </summary>
+    private Tensor<T>? TryScalarNarrowFloatAny<T>(Tensor<T> input, T scalar, GpuNarrowFloatBinaryOperation operation, string callerName)
+    {
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return null;
+        if (input is not Tensor<NumericOperations.BFloat16> values || scalar is not NumericOperations.BFloat16 narrowScalar) return null;
+        const GpuElementType Type = GpuElementType.BFloat16;
+        float wide = NumericOperations.BFloat16.ToFloat(narrowScalar);
+        return TryMapTyped(values, Type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(Type)
+            && elementwise.SupportsNarrowFloatBinary(operation, Type)
+                ? (a, output, size) => elementwise.ScalarNarrowFloat(operation, Type, a, wide, output, size)
+                : null) as Tensor<T>;
+    }
+
     /// <summary>A unary operation of a BFloat16 tensor on the device. Null when the CPU engine takes it.</summary>
     private Tensor<T>? TryUnaryNarrowFloatAny<T>(Tensor<T> input, string callerName)
     {

@@ -114,6 +114,16 @@ internal static class GpuPackedCompute
         launch(GpuPackedKernelSource.Binary(operation, type), Work(type, size), (uint)size, 0u, 0u, 0u, new[] { a, b, output });
     }
 
+    /// <summary><c>output[i] = a[i] op scalar</c> on 16-bit floats, the scalar a binary32 value; the output may be the operand.</summary>
+    public static void Scalar(GpuPackedLaunch launch, GpuNarrowFloatBinaryOperation operation, GpuElementType type,
+        IGpuBuffer a, float scalar, IGpuBuffer output, int size)
+    {
+        GpuNarrowFloatLayout.Require(nameof(IGpuNarrowFloatElementwise.ScalarNarrowFloat), type, size, (a, size), (output, size));
+        if (size == 0) return;
+        launch(GpuPackedKernelSource.Scalar(operation, type), Work(type, size), (uint)size, 0u,
+            GpuNarrowFloatLayout.Bits(scalar), 0u, new[] { a, output });
+    }
+
     /// <summary><c>output[i] = op a[i]</c> on 16-bit floats; the output may be the operand.</summary>
     public static void Unary(GpuPackedLaunch launch, GpuNarrowFloatUnaryOperation operation, GpuElementType type,
         IGpuBuffer a, IGpuBuffer output, int size)

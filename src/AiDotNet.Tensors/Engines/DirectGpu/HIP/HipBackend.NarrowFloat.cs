@@ -47,6 +47,26 @@ public sealed partial class HipBackend : IGpuNarrowFloatElementwise, IGpuNarrowF
     }
 
     /// <inheritdoc/>
+    public unsafe void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar,
+        IGpuBuffer output, int size)
+    {
+        GpuNarrowFloatLayout.Require(nameof(ScalarNarrowFloat), type, size, (a, size), (output, size));
+        IntPtr kernel = IntegerKernel(GpuNarrowFloatKernelSource.Scalar(operation, type));
+        if (size == 0) return;
+        // (a, o, float y, size)
+        IntPtr aPtr = IntegerHandle(a);
+        IntPtr outputPtr = IntegerHandle(output);
+        float y = scalar;
+        int n = size;
+        void** args = stackalloc void*[4];
+        args[0] = &aPtr;
+        args[1] = &outputPtr;
+        args[2] = &y;
+        args[3] = &n;
+        LaunchKernel(kernel, IntegerGrid(size), IntegerBlock, args);
+    }
+
+    /// <inheritdoc/>
     public unsafe void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
     {
         GpuNarrowFloatLayout.Require(nameof(UnaryNarrowFloat), type, size, (a, size), (output, size));

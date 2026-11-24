@@ -27,6 +27,11 @@ public sealed partial class WebGpuBackend : IGpuNarrowFloatElementwise, IGpuNarr
         => GpuPackedCompute.Binary(LaunchPacked, operation, type, a, b, output, size);
 
     /// <inheritdoc/>
+    public void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar,
+        IGpuBuffer output, int size)
+        => GpuPackedCompute.Scalar(LaunchPacked, operation, type, a, scalar, output, size);
+
+    /// <inheritdoc/>
     public void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
         => GpuPackedCompute.Unary(LaunchPacked, operation, type, a, output, size);
 

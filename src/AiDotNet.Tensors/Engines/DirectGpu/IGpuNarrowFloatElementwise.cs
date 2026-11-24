@@ -76,6 +76,13 @@ public interface IGpuNarrowFloatElementwise
     /// <summary><c>output[i] = a[i] (operation) b[i]</c> for the first <paramref name="size"/> elements.</summary>
     void BinaryNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
 
+    /// <summary>
+    /// <c>output[i] = a[i] (operation) scalar</c> for the first <paramref name="size"/> elements, wherever
+    /// <see cref="SupportsNarrowFloatBinary"/> has the operation. The scalar is a 32-bit float (a 16-bit scalar
+    /// widened): the element is widened, the operation done once in 32 bits and the result rounded into the type.
+    /// </summary>
+    void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar, IGpuBuffer output, int size);
+
     /// <summary><c>output[i] = (operation) a[i]</c> for the first <paramref name="size"/> elements.</summary>
     void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size);
 }
@@ -131,6 +138,9 @@ internal static class GpuNarrowFloatLayout
                 throw new System.ArgumentOutOfRangeException(nameof(count), $"{operation}: {elements} elements are outside a buffer of {buffer.Size}.");
         }
     }
+
+    /// <summary>The binary32 bits of <paramref name="value"/> (BitConverter.SingleToUInt32Bits is not on every target).</summary>
+    public static unsafe uint Bits(float value) => *(uint*)&value;
 
     /// <summary>Whether <paramref name="backend"/> multiplies <see cref="GpuElementType.Float16"/> matrices.</summary>
     public static bool HasHalfMatrixMultiply(object? backend)
