@@ -49,5 +49,5 @@ internal interface IDeviceGradScalerFactory
 internal interface IGemmAutocastBackend
 {
     /// <summary>Until the scope is disposed, FP32 GEMMs multiply in <paramref name="precision"/> and accumulate FP32.</summary>
-    IDisposable EnterGemmAutocast(Gpu.PrecisionMode precision);
+    IDisposable EnterGemmAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode = Gpu.MatMulAutocastMode.CastOperands);
 }

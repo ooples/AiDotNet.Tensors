@@ -18,8 +18,10 @@ public sealed partial class CudaBackend
 {
     private enum AutocastGemmRoute { Lt = 0, Classic = 1, SplitK = 2 }
 
+    // InputType is A's and B's element type: CUDA_R_32F (the fast compute type reads FP32 operands) or the 16-bit type
+    // the operands were cast to (CastOperands, under CUBLAS_COMPUTE_32F).
     private readonly record struct AutocastGemmProblem(bool TransA, bool TransB, int M, int N, int K, int Lda, int Ldb,
-        int Ldd, int Compute);
+        int Ldd, int Compute, int InputType = CuBlasNative.CUDA_R_32F);
 
     private readonly Dictionary<AutocastGemmProblem, (AutocastGemmRoute Route, int Splits)> _autocastGemmRoutes = new();
     private readonly object _autocastGemmLock = new();
@@ -36,7 +38,19 @@ public sealed partial class CudaBackend
     private bool TryAutocastGemmColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta, int compute)
     {
-        var problem = new AutocastGemmProblem(transA, transB, m, n, k, lda, ldb, ldd, compute);
+        if (GemmAutocastCastType is int castType and not 0
+            && TryCastAutocastGemm(transA, transB, m, n, k, alpha, a, lda, 0, b, ldb, 0, beta, d, ldd, 0, 1, castType,
+                "autocast GEMM"))
+            return true;
+        return RunAutocastGemmOnRoute(new AutocastGemmProblem(transA, transB, m, n, k, lda, ldb, ldd, compute),
+            a, b, d, alpha, beta);
+    }
+
+    private bool RunAutocastGemmOnRoute(in AutocastGemmProblem problem, IntPtr a, IntPtr b, IntPtr d, float alpha,
+        float beta)
+    {
+        bool transA = problem.TransA, transB = problem.TransB;
+        int m = problem.M, n = problem.N, k = problem.K, lda = problem.Lda, ldb = problem.Ldb, ldd = problem.Ldd;
         (AutocastGemmRoute Route, int Splits) route;
         bool known;
         lock (_autocastGemmLock) known = _autocastGemmRoutes.TryGetValue(problem, out route);
@@ -55,14 +69,19 @@ public sealed partial class CudaBackend
             case AutocastGemmRoute.SplitK when route.Splits > 1 && EnsureSplitKBuffers(problem, route.Splits):
                 return RunAutocastSplitK(problem, route.Splits, a, b, d, alpha, beta);
             default:
-                return TryLtMatmulCore(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta);
+                // cuBLASLt here reads FP32 operands; 16-bit ones (a split-K route that cannot get its buffers) take the
+                // classic GemmEx.
+                return problem.InputType == CuBlasNative.CUDA_R_32F
+                    ? TryLtMatmulCore(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta)
+                    : RunAutocastClassic(problem, a, b, d, alpha, beta);
         }
     }
 
     private (Helpers.Autotune.KernelId Id, Helpers.Autotune.ShapeProfile Shape) AutocastGemmKey(in AutocastGemmProblem p)
     {
         ulong version = CuBlasLtNative.cublasLtGetVersion().ToUInt64();
-        var id = new Helpers.Autotune.KernelId("cublas-autocast-gemm", $"{DeviceName}-sm{_ccMajor}{_ccMinor}-lt{version}-c{p.Compute}");
+        string input = p.InputType == CuBlasNative.CUDA_R_32F ? string.Empty : "-i" + p.InputType;
+        var id = new Helpers.Autotune.KernelId("cublas-autocast-gemm", $"{DeviceName}-sm{_ccMajor}{_ccMinor}-lt{version}-c{p.Compute}{input}");
         return (id, new Helpers.Autotune.ShapeProfile(p.TransA ? 1 : 0, p.TransB ? 1 : 0, p.M, p.N, p.K, p.Lda, p.Ldb, p.Ldd));
     }
 
@@ -91,14 +110,18 @@ public sealed partial class CudaBackend
 
     private (AutocastGemmRoute, int) ChooseAutocastGemmRoute(AutocastGemmProblem p, IntPtr a, IntPtr b)
     {
-        var lt = (AutocastGemmRoute.Lt, 0);
+        // cuBLASLt here takes FP32 operands only, so 16-bit operands choose between the classic GemmEx and split-K.
+        bool castOperands = p.InputType != CuBlasNative.CUDA_R_32F;
+        var lt = castOperands ? (AutocastGemmRoute.Classic, 0) : (AutocastGemmRoute.Lt, 0);
         var (id, shape) = AutocastGemmKey(p);
         if (Helpers.Autotune.AutotuneCache.Lookup(id, shape) is { } recorded && ParseRoute(recorded.Variant) is { } parsed)
             return parsed;
         // A capture cannot time (or allocate): cuBLASLt runs and nothing is recorded, so a later uncaptured call measures.
         if (IsStreamCapturing()) return lt;
 
-        var candidates = new List<(AutocastGemmRoute, int)> { lt, (AutocastGemmRoute.Classic, 0) };
+        var candidates = castOperands
+            ? new List<(AutocastGemmRoute, int)> { lt }
+            : new List<(AutocastGemmRoute, int)> { lt, (AutocastGemmRoute.Classic, 0) };
         foreach (int s in SplitKCandidates(p)) candidates.Add((AutocastGemmRoute.SplitK, s));
 
         ulong bytes = (ulong)p.Ldd * (ulong)p.N * sizeof(float);
@@ -163,7 +186,7 @@ public sealed partial class CudaBackend
         return CuBlasNative.cublasGemmEx(_cublasHandle,
             p.TransA ? CublasOperation.Transpose : CublasOperation.None,
             p.TransB ? CublasOperation.Transpose : CublasOperation.None,
-            p.M, p.N, p.K, (IntPtr)(&alphaValue), a, CuBlasNative.CUDA_R_32F, p.Lda, b, CuBlasNative.CUDA_R_32F, p.Ldb,
+            p.M, p.N, p.K, (IntPtr)(&alphaValue), a, p.InputType, p.Lda, b, p.InputType, p.Ldb,
             (IntPtr)(&betaValue), d, CuBlasNative.CUDA_R_32F, p.Ldd, p.Compute, CuBlasNative.CUBLAS_GEMM_DEFAULT)
             == Engines.CublasStatus.Success;
     }
@@ -182,8 +205,8 @@ public sealed partial class CudaBackend
         if (CuBlasNative.cublasGemmStridedBatchedEx(handle,
                 p.TransA ? CublasOperation.Transpose : CublasOperation.None,
                 p.TransB ? CublasOperation.Transpose : CublasOperation.None,
-                p.M, p.N, kc, (IntPtr)(&alphaValue), a, CuBlasNative.CUDA_R_32F, p.Lda, strideA,
-                b, CuBlasNative.CUDA_R_32F, p.Ldb, strideB, (IntPtr)(&zero),
+                p.M, p.N, kc, (IntPtr)(&alphaValue), a, p.InputType, p.Lda, strideA,
+                b, p.InputType, p.Ldb, strideB, (IntPtr)(&zero),
                 tc.SplitKPartials!.Handle, CuBlasNative.CUDA_R_32F, p.M, outputs, splits, p.Compute,
                 CuBlasNative.CUBLAS_GEMM_DEFAULT) != Engines.CublasStatus.Success)
             return false;
@@ -223,6 +246,124 @@ public sealed partial class CudaBackend
             tc.SplitKPartials = AllocateBuffer(checked((int)size));
         }
         return true;
+    }
+
+    private static long s_autocastCastDeclines;
+
+    /// <summary>Tests: autocast GEMMs that could not cast their operands and ran the fast compute type instead.</summary>
+    internal static long AutocastCastDeclinesForTest => System.Threading.Interlocked.Read(ref s_autocastCastDeclines);
+
+    // Elements a column-major operand of `rows` x `cols` with leading dimension `ld` spans, over `batch` matrices
+    // `stride` apart (stride 0: one matrix every batch entry reads).
+    private static long OperandSpan(int rows, int cols, int ld, long stride, int batch)
+    {
+        if (rows <= 0 || cols <= 0) return 0;
+        long one = (long)(cols - 1) * ld + rows;
+        return batch <= 1 || stride == 0 ? one : stride * (batch - 1) + one;
+    }
+
+    /// <summary>
+    /// The autocast GEMM with its operands cast (PyTorch's autocast): A and B rounded to <paramref name="castType"/>
+    /// (round to nearest even) into stream-ordered scratch on the GEMM's stream, then multiplied and accumulated in FP32
+    /// (CUBLAS_COMPUTE_32F) into the FP32 result. With 16-bit operands cuBLAS runs tensor-core kernels for every shape
+    /// where the device has them, and the products are those of the rounded operands whatever kernel it picks. A single
+    /// GEMM (batch 1) takes its measured route (the classic GemmEx or a fixed-order split-K); a strided batch runs
+    /// cublasGemmStridedBatchedEx. False -- nothing launched -- when the cast cannot run here (no 16-bit conversion
+    /// kernel, no scratch); the caller then runs the fast compute type.
+    /// </summary>
+    private unsafe bool TryCastAutocastGemm(bool transA, bool transB, int m, int n, int k, float alpha,
+        IntPtr a, int lda, long strideA, IntPtr b, int ldb, long strideB, float beta, IntPtr c, int ldc, long strideC,
+        int batch, int castType, string what)
+    {
+        long aCount = OperandSpan(transA ? k : m, transA ? m : k, lda, strideA, batch);
+        long bCount = OperandSpan(transB ? n : k, transB ? k : n, ldb, strideB, batch);
+        var storage = castType == CuBlasNative.CUDA_R_16BF ? FftElementType.BFloat16 : FftElementType.Float16;
+        if (aCount <= 0 || bCount <= 0 || aCount > int.MaxValue || bCount > int.MaxValue
+            || !TryGetCastKernel(storage, out IntPtr kernel))
+        {
+            System.Threading.Interlocked.Increment(ref s_autocastCastDeclines);
+            return false;
+        }
+
+        IntPtr stream = GemmLaunchStream != IntPtr.Zero ? GemmLaunchStream : _stream;
+        IntPtr a16 = IntPtr.Zero, b16 = IntPtr.Zero;
+        try
+        {
+            if (!TryAllocCastScratch(stream, aCount, out a16) || !TryAllocCastScratch(stream, bCount, out b16))
+            {
+                System.Threading.Interlocked.Increment(ref s_autocastCastDeclines);
+                return false;
+            }
+            LaunchCast(kernel, a, a16, (int)aCount, stream);
+            LaunchCast(kernel, b, b16, (int)bCount, stream);
+            if (batch == 1 && GemmLaunchStream == IntPtr.Zero)
+            {
+                var problem = new AutocastGemmProblem(transA, transB, m, n, k, lda, ldb, ldc, CuBlasNative.CUBLAS_COMPUTE_32F,
+                    castType);
+                if (!RunAutocastGemmOnRoute(problem, a16, b16, c, alpha, beta))
+                    throw new InvalidOperationException(what + " (autocast, cast operands): cuBLAS declined the GEMM.");
+            }
+            else if (batch == 1)
+            {
+                // A fan-out slice: the classic GemmEx on the slice's stream (no route measurement there).
+                var problem = new AutocastGemmProblem(transA, transB, m, n, k, lda, ldb, ldc, CuBlasNative.CUBLAS_COMPUTE_32F,
+                    castType);
+                if (!RunAutocastClassic(problem, a16, b16, c, alpha, beta))
+                    throw new InvalidOperationException(what + " (autocast, cast operands): cuBLAS declined the GEMM.");
+            }
+            else
+            {
+                float alphaValue = alpha, betaValue = beta;
+                CuBlasNative.CheckCublasStatus(
+                    CuBlasNative.cublasGemmStridedBatchedEx(_cublasHandle,
+                        transA ? CublasOperation.Transpose : CublasOperation.None,
+                        transB ? CublasOperation.Transpose : CublasOperation.None,
+                        m, n, k, (IntPtr)(&alphaValue), a16, castType, lda, strideA, b16, castType, ldb, strideB,
+                        (IntPtr)(&betaValue), c, CuBlasNative.CUDA_R_32F, ldc, strideC, batch,
+                        CuBlasNative.CUBLAS_COMPUTE_32F, CuBlasNative.CUBLAS_GEMM_DEFAULT), what + " (autocast, cast operands)");
+            }
+            return true;
+        }
+        finally
+        {
+            // Freed in the GEMM stream's order: the pool reuses the memory once the GEMM that reads it has run.
+            if (b16 != IntPtr.Zero) CuBlasNative.cuMemFreeAsync(b16, stream);
+            if (a16 != IntPtr.Zero) CuBlasNative.cuMemFreeAsync(a16, stream);
+        }
+    }
+
+    private bool TryGetCastKernel(FftElementType storage, out IntPtr kernel)
+    {
+        kernel = IntPtr.Zero;
+        try
+        {
+            kernel = RequireGenericFftKernel("fftg_from_f32" + storage.KernelSuffix(), storage);
+            return kernel != IntPtr.Zero;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException
+                                       or GpuCapabilityUnavailableException)
+        {
+            return false;
+        }
+    }
+
+    // 16-bit scratch for `count` elements from the stream-ordered pool, allocated in `stream`'s order (inside a capture,
+    // a memory node of the graph, as the step's other transient scratch is).
+    private static bool TryAllocCastScratch(IntPtr stream, long count, out IntPtr pointer)
+    {
+        ulong bytes = (ulong)((count + 1) / 2) * sizeof(float);   // whole floats, as the backend's 16-bit buffers are
+        if (CuBlasNative.cuMemAllocAsync(out pointer, bytes, stream) == CudaResult.Success) return true;
+        pointer = IntPtr.Zero;
+        return false;
+    }
+
+    private unsafe void LaunchCast(IntPtr kernel, IntPtr source, IntPtr destination, int count, IntPtr stream)
+    {
+        void** args = stackalloc void*[3];
+        args[0] = &source;
+        args[1] = &destination;
+        args[2] = &count;
+        LaunchKernelOnStream(kernel, GridFor(count), DefaultBlockSize, args, stream);
     }
 
     /// <summary>Runs one route (0 cuBLASLt, 1 classic, 2 split-K over <paramref name="splits"/>) for tests.</summary>

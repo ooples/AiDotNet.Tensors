@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
+using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -49,6 +50,12 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     [InlineData(2048, 256, 2048)]
     public void Bf16Autocast_RoundsCoarserThanFp16(int m, int k, int n)
     {
+        foreach (var mode in new[] { MatMulAutocastMode.CastOperands, MatMulAutocastMode.FastComputeType })
+            Bf16RoundsCoarserThanFp16(m, k, n, mode);
+    }
+
+    private void Bf16RoundsCoarserThanFp16(int m, int k, int n, MatMulAutocastMode mode)
+    {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
         var engine = _fixture.Engine!;
         Skip.If(engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend,
@@ -73,20 +80,124 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             double Error(PrecisionMode precision)
             {
                 float[] mixed;
-                using (engine.EnterMatMulAutocast(precision)) mixed = engine.TensorMatMul(a, b).ToArray();
+                using (engine.EnterMatMulAutocast(precision, mode)) mixed = engine.TensorMatMul(a, b).ToArray();
                 double sum = 0;
                 for (int i = 0; i < exact.Length; i++) sum += Math.Abs(exact[i] - mixed[i]);
                 return sum / exact.Length;
             }
             double fp16 = Error(PrecisionMode.Float16), bf16 = Error(PrecisionMode.BFloat16);
-            Assert.True(fp16 > 0, "FP16 autocast was bit-identical to FP32");
+            Assert.True(fp16 > 0, $"{mode}: FP16 autocast was bit-identical to FP32");
             // Unit roundoff 2^-8 against 2^-11: the mean error ratio is ~8; require at least 3.
-            Assert.True(bf16 > 3 * fp16, $"BF16 mean error {bf16:E2} is not coarser than FP16's {fp16:E2}");
+            Assert.True(bf16 > 3 * fp16, $"{mode}: BF16 mean error {bf16:E2} is not coarser than FP16's {fp16:E2}");
         }
         finally
         {
             AiDotNetEngine.Current = previous;
         }
+    }
+
+    private static int Bits(float f) => BitConverter.ToInt32(BitConverter.GetBytes(f), 0);
+
+    // f rounded to FP16 (round to nearest even; |f| within FP16's range), as __float2half_rn does.
+    private static float RoundToHalf(float f)
+    {
+        if (f == 0) return f;
+        int exponent = ((Bits(f) >> 23) & 0xFF) - 127;
+        double quantum = Math.Pow(2, Math.Max(exponent, -14) - 10);   // below 2^-14, FP16's subnormal step 2^-24
+        return (float)(Math.Round(f / quantum, MidpointRounding.ToEven) * quantum);
+    }
+
+    // f rounded to BF16 (round to nearest even): the top 16 bits of the float.
+    private static float RoundToBFloat16(float f)
+    {
+        int bits = Bits(f);
+        bits += 0x7FFF + ((bits >> 16) & 1);
+        return BitConverter.ToSingle(BitConverter.GetBytes(bits & unchecked((int)0xFFFF0000)), 0);
+    }
+
+    // The default autocast (CastOperands) is PyTorch's: every product is that of the operands rounded to 16 bits, on a
+    // small GEMM as on a large one. The fast compute type only permits 16-bit math, and cuBLAS kept FP32 kernels for
+    // small shapes (a 16-32-8 MLP's GEMMs came back FP32-exact on GA102), so a model's precision depended on its batch.
+    [SkippableTheory]
+    [InlineData(16, 16, 32, 1)]
+    [InlineData(32, 32, 8, 1)]
+    [InlineData(64, 256, 64, 1)]
+    [InlineData(672, 256, 1024, 1)]
+    [InlineData(16, 32, 32, 3)]     // a strided batch
+    public void CastOperands_RoundsTheOperandsTo16Bits_AtEveryShape(int m, int k, int n, int batch)
+    {
+        Skip.If(!_fixture.IsAvailable, "No GPU device.");
+        var engine = _fixture.Engine!;
+        Skip.If(engine.GetBackend() is not CudaBackend, "Matmul autocast is CUDA's.");
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var hostA = Data(batch * m * k, 0.731, 0.2);
+            var hostB = Data(batch * k * n, 0.293, 0.5);
+            int[] aShape = batch == 1 ? new[] { m, k } : new[] { batch, m, k };
+            int[] bShape = batch == 1 ? new[] { k, n } : new[] { batch, k, n };
+            var a = new Tensor<float>(aShape, new Vector<float>(hostA)).Gpu();
+            var b = new Tensor<float>(bShape, new Vector<float>(hostB)).Gpu();
+            foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
+            {
+                Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
+                float[] mixed;
+                long declines = CudaBackend.AutocastCastDeclinesForTest;
+                using (engine.EnterMatMulAutocast(precision)) mixed = engine.TensorMatMul(a, b).ToArray();
+                Assert.Equal(declines, CudaBackend.AutocastCastDeclinesForTest);   // cast, not the fast fallback
+                double roundedErr = 0, exactErr = 0;
+                for (int z = 0; z < batch; z++)
+                    for (int i = 0; i < m; i++)
+                        for (int j = 0; j < n; j++)
+                        {
+                            double rounded = 0, exact = 0, magnitude = 0;
+                            for (int t = 0; t < k; t++)
+                            {
+                                float x = hostA[(z * m + i) * k + t], y = hostB[(z * k + t) * n + j];
+                                double product = (double)round(x) * round(y);
+                                rounded += product;
+                                magnitude += Math.Abs(product);
+                                exact += (double)x * y;
+                            }
+                            double got = mixed[(z * m + i) * n + j];
+                            // FP32 accumulation of the exact 16-bit products: within k float roundings of the magnitude.
+                            double bound = k * Math.Pow(2, -23) * magnitude + 1e-30;
+                            Assert.True(Math.Abs(got - rounded) <= bound,
+                                $"{precision} [{z},{i},{j}]: {got:R} is {Math.Abs(got - rounded):E2} from the rounded-operand product {rounded:R} (bound {bound:E2})");
+                            roundedErr += Math.Abs(got - rounded);
+                            exactErr += Math.Abs(got - exact);
+                        }
+                // The operands' rounding shows: the result is far closer to the rounded-operand product than to the
+                // exact one (an FP32 or TF32 GEMM is the other way round).
+                Assert.True(exactErr > 10 * roundedErr,
+                    $"{precision} {m}x{k}x{n}: mean distance to the exact product {exactErr / mixed.Length:E2} is not well above the distance to the rounded-operand product {roundedErr / mixed.Length:E2}");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    // The fast compute type keeps its behaviour behind the option: FP32 operands, no cast, the permissive compute type.
+    [SkippableFact]
+    public void FastComputeType_keeps_FP32_operands_and_the_permissive_compute_type()
+    {
+        Skip.If(!_fixture.IsAvailable, "No GPU device.");
+        Skip.IfNot(_fixture.Engine!.GetBackend() is CudaBackend, "CUDA only.");
+        var cuda = (CudaBackend)_fixture.Engine!.GetBackend()!;
+        using (_fixture.Engine!.EnterMatMulAutocast(PrecisionMode.Float16, MatMulAutocastMode.FastComputeType))
+        {
+            Assert.Equal((int)CublasComputeType.Float32Fast16F, cuda.GemmAutocastComputeTypeForTest);
+            Assert.Equal(0, cuda.GemmAutocastCastTypeForTest);
+        }
+        using (_fixture.Engine!.EnterMatMulAutocast(PrecisionMode.BFloat16))
+        {
+            Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+            Assert.Equal(CuBlasNative.CUDA_R_16BF, cuda.GemmAutocastCastTypeForTest);
+        }
+        Assert.Equal(0, cuda.GemmAutocastCastTypeForTest);
     }
 
     // Scopes that close out of order (two threads' scopes overlapping) leave the newest open one in force and FP32 once

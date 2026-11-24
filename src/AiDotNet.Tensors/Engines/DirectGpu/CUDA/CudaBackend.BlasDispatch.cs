@@ -70,6 +70,14 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
 
     private int GemmAutocastComputeType => Volatile.Read(ref _gemmAutocastComputeType);
 
+    // The open scope's 16-bit operand type when it casts the operands before the GEMM (CastOperands: CUDA_R_16F or
+    // CUDA_R_16BF), 0 when it passes FP32 operands with a permissive compute type (FastComputeType) or none is open.
+    private int _gemmAutocastCastType;
+    private int GemmAutocastCastType => Volatile.Read(ref _gemmAutocastCastType);
+
+    /// <summary>Tests: the 16-bit operand type autocast GEMMs cast to now (0: none, or the fast compute type).</summary>
+    internal int GemmAutocastCastTypeForTest => GemmAutocastCastType;
+
     /// <summary>Tests: the compute type GEMMs take now (0: FP32).</summary>
     internal int GemmAutocastComputeTypeForTest => GemmAutocastComputeType;
 
@@ -84,7 +92,7 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     /// nothing else in a step changes. A captured graph keeps the compute type its capture ran with. Without cuBLAS the
     /// generated FP32 GEMM runs unchanged.
     /// </summary>
-    IDisposable IGemmAutocastBackend.EnterGemmAutocast(Gpu.PrecisionMode precision)
+    IDisposable IGemmAutocastBackend.EnterGemmAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode)
     {
         int compute = precision switch
         {
@@ -93,10 +101,13 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
             Gpu.PrecisionMode.BFloat16 => (int)CublasComputeType.Float32FastBF16,
             _ => throw new NotSupportedException($"Matmul autocast supports FP16 and BF16, not {precision}."),
         };
-        var scope = new GemmAutocastScope(this, compute);
+        int castType = compute == 0 || mode == Gpu.MatMulAutocastMode.FastComputeType ? 0
+            : precision == Gpu.PrecisionMode.BFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        var scope = new GemmAutocastScope(this, compute, castType);
         lock (_gemmAutocastScopes)
         {
             _gemmAutocastScopes.Add(scope);
+            Volatile.Write(ref _gemmAutocastCastType, castType);
             Volatile.Write(ref _gemmAutocastComputeType, compute);
         }
         return scope;
@@ -106,7 +117,14 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     {
         private CudaBackend? _owner;
         internal readonly int Compute;
-        public GemmAutocastScope(CudaBackend owner, int compute) { _owner = owner; Compute = compute; }
+        internal readonly int CastType;
+        public GemmAutocastScope(CudaBackend owner, int compute, int castType)
+        {
+            _owner = owner;
+            Compute = compute;
+            CastType = castType;
+        }
+
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _owner, null) is not { } owner) return;
@@ -114,7 +132,9 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
             lock (scopes)
             {
                 scopes.Remove(this);
-                Volatile.Write(ref owner._gemmAutocastComputeType, scopes.Count == 0 ? 0 : scopes[scopes.Count - 1].Compute);
+                var newest = scopes.Count == 0 ? null : scopes[scopes.Count - 1];
+                Volatile.Write(ref owner._gemmAutocastCastType, newest?.CastType ?? 0);
+                Volatile.Write(ref owner._gemmAutocastComputeType, newest?.Compute ?? 0);
             }
         }
     }
@@ -127,8 +147,14 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
         {
             if (GemmAutocastComputeType is int autocast and not 0)
             {
-                // Autocast: FP32 operands and result, the product down-converted to FP16/BF16 inside the kernel's tensor
-                // core loads and accumulated in FP32 (no cast kernels, no low-precision copies to cache or invalidate).
+                // Autocast, casting the operands (the default): A and B rounded to 16 bits, multiplied and accumulated in
+                // FP32 into the FP32 result.
+                if (GemmAutocastCastType is int castType and not 0
+                    && TryCastAutocastGemm(opA != CublasOperation.None, opB != CublasOperation.None, m, n, k, alpha, a,
+                        lda, 0, b, ldb, 0, beta, c, ldc, 0, 1, castType, what))
+                    return;
+                // The fast compute type: FP32 operands and result, the product down-converted to FP16/BF16 inside the
+                // kernel's tensor core loads where cuBLAS chooses to, and accumulated in FP32.
                 unsafe
                 {
                     float alphaValue = alpha, betaValue = beta;
@@ -155,6 +181,10 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
         {
             if (GemmAutocastComputeType is int autocast and not 0)
             {
+                if (GemmAutocastCastType is int castType and not 0
+                    && TryCastAutocastGemm(opA != CublasOperation.None, opB != CublasOperation.None, m, n, k, alpha, a,
+                        lda, strideA, b, ldb, strideB, beta, c, ldc, strideC, batch, castType, what))
+                    return;
                 unsafe
                 {
                     float alphaValue = alpha, betaValue = beta;

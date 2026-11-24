@@ -1076,6 +1076,10 @@ AiDotNet.Tensors.Engines.Compilation.LossScalingOptions.MaxScale.set -> void
 AiDotNet.Tensors.Engines.Compilation.LossScalingOptions.MinScale.get -> float
 AiDotNet.Tensors.Engines.Compilation.LossScalingOptions.MinScale.set -> void
 AiDotNet.Tensors.Engines.DirectGpuTensorEngine.EnterMatMulAutocast(AiDotNet.Tensors.Engines.Gpu.PrecisionMode precision) -> System.IDisposable!
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.EnterMatMulAutocast(AiDotNet.Tensors.Engines.Gpu.PrecisionMode precision, AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode mode) -> System.IDisposable!
+AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode
+AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode.CastOperands = 0 -> AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode
+AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode.FastComputeType = 1 -> AiDotNet.Tensors.Engines.Gpu.MatMulAutocastMode
 const AiDotNet.Tensors.Engines.CuBlasNative.CUBLAS_COMPUTE_32F_FAST_16BF = 75 -> int
 override AiDotNet.Tensors.Engines.Compilation.LossScaleState.GetHashCode() -> int
 static AiDotNet.Tensors.Engines.Compilation.LossScaleState.operator !=(AiDotNet.Tensors.Engines.Compilation.LossScaleState left, AiDotNet.Tensors.Engines.Compilation.LossScaleState right) -> bool

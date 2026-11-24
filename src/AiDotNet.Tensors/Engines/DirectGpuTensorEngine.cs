@@ -506,18 +506,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Opens a matmul autocast scope, PyTorch's <c>torch.autocast(dtype=float16|bfloat16)</c> for matrix products: until
-    /// the returned scope is disposed, every FP32 GEMM this engine's CUDA backend runs through cuBLAS multiplies on FP16 or
-    /// BF16 tensor cores (the operands are down-converted inside the GEMM kernel) and accumulates and returns FP32.
-    /// Tensors, master weights and every non-matmul op stay FP32, and a compiled training plan traced or captured inside
-    /// the scope records the reduced-precision GEMMs. <see cref="Gpu.PrecisionMode.Float32"/> opens a scope that turns
-    /// autocast off. A backend without cuBLAS (or a non-CUDA backend) runs its FP32 GEMMs unchanged.
+    /// the returned scope is disposed, every FP32 GEMM this engine's CUDA backend runs through cuBLAS rounds its operands
+    /// to FP16 or BF16 (round to nearest even), multiplies them on tensor cores and accumulates and returns FP32, whatever
+    /// the shape (<see cref="Gpu.MatMulAutocastMode.CastOperands"/>). Tensors, master weights and every non-matmul op stay
+    /// FP32, and a compiled training plan traced or captured inside the scope records the reduced-precision GEMMs.
+    /// <see cref="Gpu.PrecisionMode.Float32"/> opens a scope that turns autocast off. A backend without cuBLAS (or a
+    /// non-CUDA backend) runs its FP32 GEMMs unchanged.
     /// </summary>
     /// <param name="precision">FP16, BF16 or FP32.</param>
     public IDisposable EnterMatMulAutocast(Gpu.PrecisionMode precision)
+        => EnterMatMulAutocast(precision, Gpu.MatMulAutocastMode.CastOperands);
+
+    /// <summary>
+    /// <see cref="EnterMatMulAutocast(Gpu.PrecisionMode)"/> with the way the products reach 16 bits:
+    /// <see cref="Gpu.MatMulAutocastMode.CastOperands"/> (the default, PyTorch's semantics) rounds the operands to 16 bits
+    /// before every GEMM; <see cref="Gpu.MatMulAutocastMode.FastComputeType"/> passes the FP32 operands to cuBLAS with a
+    /// compute type that permits 16-bit tensor-core math, which cuBLAS may decline for a shape it serves faster in FP32.
+    /// </summary>
+    /// <param name="precision">FP16, BF16 or FP32.</param>
+    /// <param name="mode">How the operands reach 16 bits.</param>
+    public IDisposable EnterMatMulAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode)
     {
         if (precision is not (Gpu.PrecisionMode.Float32 or Gpu.PrecisionMode.Float16 or Gpu.PrecisionMode.BFloat16))
             throw new ArgumentOutOfRangeException(nameof(precision), precision, "Matmul autocast supports FP16, BF16 and FP32.");
-        return GetBackend() is DirectGpu.IGemmAutocastBackend autocast ? autocast.EnterGemmAutocast(precision) : NoOpScope.Instance;
+        if (mode is not (Gpu.MatMulAutocastMode.CastOperands or Gpu.MatMulAutocastMode.FastComputeType))
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown matmul autocast mode.");
+        return GetBackend() is DirectGpu.IGemmAutocastBackend autocast ? autocast.EnterGemmAutocast(precision, mode) : NoOpScope.Instance;
     }
 
     private sealed class NoOpScope : IDisposable

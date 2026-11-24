@@ -7333,6 +7333,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     internal static readonly bool s_launchCheck =
         System.Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_LAUNCH_CHECK") == "1";
 
+    /// <summary>A 1D launch on <paramref name="stream"/> (the stream a GEMM fan-out slice runs on, or the backend's).</summary>
+    private unsafe void LaunchKernelOnStream(IntPtr kernel, uint gridX, uint blockX, void** args, IntPtr stream)
+    {
+        if (stream == _stream)
+        {
+            LaunchKernelWithSharedMem(kernel, gridX, blockX, 0, args);
+            return;
+        }
+        lock (GpuDispatchLock)
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernel, gridX, 1, 1, blockX, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel");
+            GpuLaunchProbe.OnLaunch();
+        }
+    }
+
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)
     {
         // #226: serialize the host-side launch (shared _stream + launch state) across threads. Innermost lock.
