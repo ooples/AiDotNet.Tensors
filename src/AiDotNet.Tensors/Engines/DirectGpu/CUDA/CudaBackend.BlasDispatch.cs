@@ -89,8 +89,10 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
 
     /// <summary>
     /// Opens a matmul autocast scope (PyTorch's <c>torch.autocast</c> for matmuls): until it is disposed every FP32 GEMM
-    /// this backend issues through cuBLAS multiplies in <paramref name="precision"/> (FP16 or BF16 tensor cores, operands
-    /// down-converted inside the kernel) and accumulates and writes FP32. Operands and results stay FP32 tensors, so
+    /// this backend issues through cuBLAS multiplies in <paramref name="precision"/> on FP16 or BF16 tensor cores and
+    /// accumulates and writes FP32: with <see cref="Gpu.MatMulAutocastMode.CastOperands"/> the operands are rounded to 16
+    /// bits into scratch first; with <see cref="Gpu.MatMulAutocastMode.FastComputeType"/> they stay FP32 and cuBLAS may
+    /// down-convert them inside its kernel. Operands and results stay FP32 tensors, so
     /// nothing else in a step changes. A captured graph keeps the compute type its capture ran with. Without cuBLAS the
     /// generated FP32 GEMM runs unchanged.
     /// </summary>

@@ -7351,9 +7351,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CudaNativeBindings.cuLaunchKernel(kernel, gridX, 1, 1, blockX, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero),
                 "cuLaunchKernel");
             GpuLaunchProbe.OnLaunch();
-            if (s_launchCheck && !IsStreamCapturingCurrentContext())   // AIDOTNET_KERNEL_LAUNCH_CHECK, as on _stream
-                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream), "kernel launch check (side stream)");
         }
+        // AIDOTNET_KERNEL_LAUNCH_CHECK, as on _stream; the wait is outside the dispatch lock.
+        if (s_launchCheck && !IsStreamCapturingCurrentContext())
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream), "kernel launch check (side stream)");
     }
 
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)

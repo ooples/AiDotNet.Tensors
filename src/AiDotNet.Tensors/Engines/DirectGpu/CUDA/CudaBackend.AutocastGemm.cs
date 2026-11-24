@@ -366,6 +366,13 @@ public sealed partial class CudaBackend
     {
         kernel = IntPtr.Zero;
         why = null;
+        // The device check first: a device without the 16-bit type (BF16 below compute capability 8.0) declines without
+        // building and catching an exception on every GEMM.
+        if (!SupportsFftElementType(storage))
+        {
+            why = $"the device has no {storage} conversion";
+            return false;
+        }
         try
         {
             kernel = RequireGenericFftKernel("fftg_from_f32" + storage.KernelSuffix(), storage);
@@ -379,16 +386,34 @@ public sealed partial class CudaBackend
         }
     }
 
-    // 16-bit scratch in `stream`'s order (inside a capture, a memory node of the graph). On OOM the backend's pooled
-    // buffers are released and the request retried once; a second failure throws.
+    // 16-bit scratch in `stream`'s order (a GEMM fan-out slice's lease stream; fan-out does not run inside a capture).
+    // Admitted under a GpuMemoryBudget like any stream-ordered request. On OOM the backend reclaims as its own allocator
+    // does -- pooled and peer buffers released, unreachable results finalized, the context synchronized and the pool
+    // trimmed -- and retries once; a second failure throws.
     private IntPtr AllocCastScratchOnStream(IntPtr stream, int words, string what)
     {
         ulong bytes = (ulong)words * sizeof(float);
-        var r = CuBlasNative.cuMemAllocAsync(out IntPtr pointer, bytes, stream);
-        if (r == CudaResult.OutOfMemory && !IsStreamCapturing())
+        bool budgeted = _memoryAccount.LimitBytes is not null;
+        if (budgeted) AdmitUnderBudget(PoolGrowthBound(bytes));
+        CudaResult r;
+        IntPtr pointer;
+        try
         {
-            _bufferPool.DrainAll();
             r = CuBlasNative.cuMemAllocAsync(out pointer, bytes, stream);
+            if (r == CudaResult.OutOfMemory && !IsStreamCapturing())
+            {
+                _bufferPool.DrainAll();
+                DrainPeerPools();
+                ReclaimUnreachableForRetry();
+                CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext),
+                    "cuCtxSynchronize (autocast operand scratch OOM reclamation)");
+                if (_asyncMemPool != IntPtr.Zero) TrimPool(_asyncMemPool);
+                r = CuBlasNative.cuMemAllocAsync(out pointer, bytes, stream);
+            }
+        }
+        finally
+        {
+            if (budgeted) AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
         }
         if (r == CudaResult.OutOfMemory)
             throw CudaAllocationError(r, $"{what} (autocast, cast operands): cuMemAllocAsync of {bytes} bytes failed.");

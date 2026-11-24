@@ -303,6 +303,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         using var db = backend.AllocateBuffer(hb);
         foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
         {
+            if (precision == PrecisionMode.BFloat16 && backend.ComputeCapabilityMajorForTest < 8) continue;   // no BF16 GEMM
             Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
             float A(int i, int kk) => round(transA ? ha[i * lda + kk] : ha[kk * lda + i]);
             float B(int kk, int j) => round(transB ? hb[kk * ldb + j] : hb[j * ldb + kk]);
