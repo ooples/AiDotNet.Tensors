@@ -254,6 +254,8 @@ public class GpuIntegerResidencyTests
         }
         finally
         {
+            gpu.UnregisterPersistentTensor(x);
+            gpu.UnregisterPersistentTensor(y);
             gpu.ClearTypedResidents();
         }
     }

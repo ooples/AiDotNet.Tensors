@@ -32,10 +32,10 @@ internal static class GpuNarrowFloatKernelSource
     private static string? FloatFunction(GpuNarrowFloatUnaryOperation operation) => operation switch
     {
         GpuNarrowFloatUnaryOperation.Gelu => "nf_gelu",
-        GpuNarrowFloatUnaryOperation.Sqrt => "NF_SQRT",
-        GpuNarrowFloatUnaryOperation.Exp => "NF_EXP",
-        GpuNarrowFloatUnaryOperation.Log => "NF_LOG",
-        GpuNarrowFloatUnaryOperation.Tanh => "NF_TANH",
+        GpuNarrowFloatUnaryOperation.Sqrt => "nf_sqrt",
+        GpuNarrowFloatUnaryOperation.Exp => "nf_exp",
+        GpuNarrowFloatUnaryOperation.Log => "nf_log",
+        GpuNarrowFloatUnaryOperation.Tanh => "nf_tanh",
         GpuNarrowFloatUnaryOperation.Sigmoid => "nf_sigmoid",
         _ => null,
     };
@@ -231,8 +231,57 @@ NF_FN float nf_div(float fa, float fb)
     if (x >= 255) return NF_FLOAT(sign | 0x7F800000u);
     return NF_FLOAT(sign | ((u32t)x << 23) | (r & 0x7FFFFFu));
 }
+/* The functions below decide on the bits what a device that flushes binary32 subnormals would lose: a subnormal
+   operand (a bfloat16 subnormal widens to one) is rebuilt from its integer significand, and a subnormal result is
+   rounded from a scaled one. */
+NF_FN float nf_sqrt(float x)
+{
+    const u32t b = NF_BITS(x);
+    const u32t m = b & 0x7FFFFFu;
+    if ((b & 0x7F800000u) == 0u && m != 0u)
+    {
+        if ((b >> 31) != 0u) return NF_FLOAT(0x7FC00000u);
+        /* m 2^-149 is (2m) 2^-150: the root of the integer, exact to scale by 2^-75. */
+        return NF_SQRT((float)(m << 1)) * NF_FLOAT(0x1A000000u);
+    }
+    return NF_SQRT(x);
+}
+NF_FN float nf_log(float x)
+{
+    const u32t b = NF_BITS(x);
+    const u32t m = b & 0x7FFFFFu;
+    if ((b & 0x7F800000u) == 0u && m != 0u)
+        return (b >> 31) != 0u ? NF_FLOAT(0x7FC00000u) : NF_LOG((float)m) - 103.27892990343185f;
+    return NF_LOG(x);
+}
+/* r 2^-64 rounded to nearest even, for a positive normal r. */
+NF_FN float nf_down64(float r)
+{
+    const u32t b = NF_BITS(r);
+    const int e = (int)(b >> 23) - 64;
+    u32t m, lost, mid;
+    int down;
+    if (e >= 1) return NF_FLOAT(((u32t)e << 23) | (b & 0x7FFFFFu));
+    down = 1 - e;
+    if (down > 24) return 0.0f;
+    m = (b & 0x7FFFFFu) | 0x800000u;
+    mid = 1u << (down - 1);
+    lost = m & ((mid << 1) - 1u);
+    m >>= down;
+    if (lost > mid || (lost == mid && (m & 1u) != 0u)) m++;
+    return NF_FLOAT(m);
+}
+NF_FN float nf_exp(float x)
+{
+    if ((NF_BITS(x) & 0x7F800000u) == 0u) return 1.0f;
+    /* Below -87 the result is subnormal: e^(x + 64 ln 2), scaled down on the bits. */
+    if (x < -87.0f) return x < -104.0f ? 0.0f : nf_down64(NF_EXP(x + 44.3614195558365f));
+    return NF_EXP(x);
+}
+/* Below 2^-13 the tangent is its operand to the last bit of either type. */
+NF_FN float nf_tanh(float x) { return ((NF_BITS(x) >> 23) & 0xFFu) < 114u ? x : NF_TANH(x); }
 /* Below -80, e^-x overflows on its way to the quotient (a zero, where the result is e^x: 8e-40 at -90). */
-NF_FN float nf_sigmoid(float x) { return x < -80.0f ? NF_EXP(x) : 1.0f / (1.0f + NF_EXP(-x)); }
+NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f + NF_EXP(-x)); }
 ");
         foreach (var type in Types)
         {

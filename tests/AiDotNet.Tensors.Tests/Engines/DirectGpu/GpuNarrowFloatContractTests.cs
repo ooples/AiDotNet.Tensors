@@ -296,7 +296,8 @@ public abstract class GpuNarrowFloatContractTests
     {
         var backend = Device();
         Skip.If(backend is null, SkipReason);
-        Skip.If(backend is not IGpuNarrowFloatReductions, SkipReason);
+        if (RunsEveryOperation) Assert.IsAssignableFrom<IGpuNarrowFloatReductions>(backend);
+        Skip.If(backend is not IGpuNarrowFloatReductions, "No 16-bit float reductions on this device.");
         var reductions = (IGpuNarrowFloatReductions)backend;
         int[] sizes = { 1, 3, 63, 64, 65, 257, 4096, 4097, 70001 };
         int ran = 0;
@@ -342,6 +343,9 @@ public abstract class GpuNarrowFloatContractTests
 
         RequireRan(ran, Types.Length * sizes.Length, "sum kernel");
     }
+
+    // A value's place among the type's values: the zeros share 0, and negative values count down from it.
+    private static int Ordered(ushort bits) => (bits & 0x8000) != 0 ? -(bits & 0x7FFF) : bits & 0x7FFF;
 
     private static float HostFunction(GpuNarrowFloatUnaryOperation operation, float x) => (float)(operation switch
     {
@@ -397,9 +401,6 @@ public abstract class GpuNarrowFloatContractTests
         foreach (var type in Types)
         {
             if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatUnary(operation, type)) continue;
-            float ulp = type == GpuElementType.Float16 ? 1f / 1024f : 1f / 128f;
-            // The smallest positive value of the type: a result that small may be rounded to it or to zero.
-            float tiny = Widen(type, 0x0001);
             foreach (int size in Sizes)
             {
                 // Both ranges: every bit pattern, and operands of moderate size where the functions vary fastest.
@@ -414,7 +415,8 @@ public abstract class GpuNarrowFloatContractTests
                     {
                         float x = Widen(type, values[i]);
                         float got = Widen(type, actual[i]);
-                        float expected = Widen(type, Narrow(type, HostFunction(operation, x)));
+                        ushort expectedBits = Narrow(type, HostFunction(operation, x));
+                        float expected = Widen(type, expectedBits);
                         string what = $"{operation}<{type}> at {i} of {size} (0x{values[i]:X4} = {x:R}) gave 0x{actual[i]:X4} = {got:R}, host {expected:R}";
                         if (float.IsNaN(expected))
                         {
@@ -422,19 +424,10 @@ public abstract class GpuNarrowFloatContractTests
                             continue;
                         }
 
+                        // Two units in the last place, counted on the storage bits: adjacent values of the type are
+                        // adjacent patterns, the infinity next to the largest finite value included.
                         Assert.False(float.IsNaN(got), what);
-                        if (float.IsInfinity(expected) || float.IsInfinity(got))
-                        {
-                            // An infinity on one side only is a result at the edge of the type's range: within two
-                            // units of its largest finite value.
-                            float largest = Widen(type, type == GpuElementType.Float16 ? (ushort)0x7BFF : (ushort)0x7F7F);
-                            float finite = float.IsInfinity(expected) ? got : expected;
-                            Assert.True(expected == got || (Math.Sign(expected) == Math.Sign(got) && Math.Abs(finite) >= largest * (1f - 2f * ulp)), what);
-                            continue;
-                        }
-
-                        Assert.True(Math.Abs(expected - got) <= 2f * tiny + 2f * ulp * Math.Abs(expected), what);
-                        if (expected != 0f && got != 0f) Assert.True(Math.Sign(expected) == Math.Sign(got), what);
+                        Assert.True(Math.Abs(Ordered(expectedBits) - Ordered(actual[i])) <= 2, what);
                     }
                 }
 
