@@ -206,7 +206,7 @@ public class GradientExchangeSplitStepTests
                 Assert.Equal(weightsAtExchange[overflowStep - 1], weightsAtExchange[overflowStep]);
                 Assert.NotEqual(weightsAtExchange[overflowStep - 2], weightsAtExchange[overflowStep - 1]);
                 Assert.NotEqual(weightsAtExchange[overflowStep], weightsAtExchange[overflowStep + 1]);
-                Assert.All(w.ToArray(), v => Assert.True(float.IsFinite(v), "a non-finite update reached the weights"));
+                Assert.All(w.ToArray(), v => Assert.True(!float.IsNaN(v) && !float.IsInfinity(v), "a non-finite update reached the weights"));
                 Assert.Equal(1, state.OverflowSteps);
                 Assert.Equal(512f, state.Scale);
             }

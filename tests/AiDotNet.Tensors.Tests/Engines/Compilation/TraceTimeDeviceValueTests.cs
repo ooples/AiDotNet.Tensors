@@ -62,7 +62,7 @@ public class TraceTimeDeviceValueTests
                     float first = plan.Step().ToArray()[0];
                     for (int step = 2; step <= 6; step++)
                         Assert.Equal(first, plan.Step().ToArray()[0]);
-                    Assert.True(float.IsFinite(first) && first > 0);
+                    Assert.True(!float.IsNaN(first) && !float.IsInfinity(first) && first > 0);
                     Assert.False(ReferenceEquals(swish._gpuBuffer, traced));
                     Assert.True(traced!.IsReleased || traced.RawDevicePointer == IntPtr.Zero,
                         "the trace-time Swish value is still allocated; only its finalizer would free it");

@@ -323,12 +323,16 @@ internal sealed partial class CompiledTrainingPlan<T>
             return null;
         }
         _workspaceCandidates.Clear();
-        // Scratch co-owned with other plans (SharedStepScratch) is never lent: another plan's replay writes it.
+        // Scratch another plan co-owns (SharedStepScratch) is never lent: that plan's replay writes it. What is lent is
+        // marked so that no other plan takes it until the loan ends (ReclaimIdleStepMemory).
+        var shared = _engine.As<DirectGpuTensorEngine>()?.SharedStepScratch;
         pool.CollectIdleBetweenRuns(_forwardActions.Length,
-            buffer => IsStepTransient(buffer) && !SharedStepScratch.IsShared(buffer), _workspaceCandidates);
+            buffer => IsStepTransient(buffer) && shared?.HasOtherOwner(buffer, pool) != true, _workspaceCandidates);
         var idle = new IGpuBuffer[_workspaceCandidates.Count];
         _workspaceCandidates.CopyTo(idle);
         _workspaceCandidates.Clear();
+        var marked = _idleMarkedLent ??= new HashSet<IGpuBuffer>(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
+        foreach (var buffer in idle) if (marked.Add(buffer)) SharedStepScratch.MarkLent(buffer);
         long bytes = 0;
         foreach (var buffer in idle) bytes += buffer.SizeInBytes;
         IdleLentBytesLastStep = bytes;
@@ -344,6 +348,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         try
         {
             lender.ReclaimIdle(this);
+            if (System.Threading.Interlocked.Exchange(ref _idleMarkedLent, null) is { } lent)
+                foreach (var buffer in lent) SharedStepScratch.ClearLent(buffer);
         }
         catch (Exception ex)
         {
@@ -356,8 +362,15 @@ internal sealed partial class CompiledTrainingPlan<T>
         }
     }
 
-    // Set once a reclaim failed: the plan lends nothing again.
+    // Set once a reclaim failed: the plan lends nothing again (and what it lent stays marked, so no plan takes it).
     private bool _idleLendingFailed;
+    private HashSet<IGpuBuffer>? _idleMarkedLent;
+
+    /// <summary>Tests: the buffers this plan has lent since its last step began, and its step scratch.</summary>
+    internal IReadOnlyCollection<IGpuBuffer> IdleLentBuffersForTest
+        => (IReadOnlyCollection<IGpuBuffer>?)_idleMarkedLent ?? Array.Empty<IGpuBuffer>();
+
+    internal StepScratchPool? ScratchPoolForTest => _scratchPool;
 
     private string? _workspaceOpaqueSavedType;
     private static readonly bool s_idleLendDiag = Environment.GetEnvironmentVariable("AIDOTNET_IDLE_LOAN_DIAG") == "1";

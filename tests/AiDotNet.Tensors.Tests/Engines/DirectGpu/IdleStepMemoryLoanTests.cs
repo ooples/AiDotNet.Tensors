@@ -310,9 +310,13 @@ public class IdleStepMemoryLoanTests
         {
             Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
             bool previous = CompiledTrainingPlan<float>.LendIdleStepMemoryEnabled;
+            bool previousSharing = SharedStepScratch.Enabled;
             try
             {
                 const int steps = 10;
+                // Without co-owned step scratch: the plans trained one after another on this engine would otherwise
+                // co-own their scratch, which is never lent (another plan's step writes it).
+                SharedStepScratch.Enabled = false;
                 var plain = Train(gpu, steps, validate: false);
                 var validated = Train(gpu, steps, validate: true);
                 CompiledTrainingPlan<float>.LendIdleStepMemoryEnabled = false;
@@ -334,6 +338,65 @@ public class IdleStepMemoryLoanTests
             finally
             {
                 CompiledTrainingPlan<float>.LendIdleStepMemoryEnabled = previous;
+                SharedStepScratch.Enabled = previousSharing;
+            }
+        }
+    }
+
+    // Scratch another plan co-owns is never lent: that plan's step writes it while a borrower would still be using it.
+    // Two plans on one engine step in turn and co-own scratch; validation between the first plan's steps borrows only
+    // what that plan holds alone, and computes what it computes without lending.
+    [SkippableFact]
+    public void Scratch_another_plan_co_owns_is_never_lent()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
+            bool previousSharing = SharedStepScratch.Enabled;
+            try
+            {
+                SharedStepScratch.Enabled = true;
+                ICompiledTrainingPlan<float> Compile(int seed)
+                {
+                    var x = Filled(new[] { 256, 256 }, seed, 1f);
+                    var w1 = Filled(new[] { 256, 512 }, seed + 1, 0.05f);
+                    var w2 = Filled(new[] { 512, 256 }, seed + 2, 0.05f);
+                    using var scope = GraphMode.Enable();
+                    var h = gpu.ReLU(gpu.TensorMatMul(x, w1));
+                    var y = gpu.TensorMatMul(h, w2);
+                    gpu.ReduceSum(gpu.TensorMultiply(y, y), null);
+                    var compiled = scope.CompileTraining(new[] { w1, w2 });
+                    compiled.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-4f);
+                    return compiled;
+                }
+                using var a = Compile(10);
+                using var b = Compile(20);
+                var held = Filled(new[] { 256, 256 }, 30, 1f);
+                for (int s = 0; s < 8; s++)
+                {
+                    a.Step();
+                    b.Step();
+                    a.Step();
+                    // An allocation between a's steps: whatever a lends must not be scratch b co-owns.
+                    var v = gpu.ReLU(gpu.TensorMatMul(held, held));
+                    var lent = ((CompiledTrainingPlan<float>)a).IdleLentBuffersForTest;
+                    Assert.All(lent, buffer => Assert.False(
+                        gpu.SharedStepScratch.HasOtherOwner(buffer, ((CompiledTrainingPlan<float>)a).ScratchPoolForTest!),
+                        "a lent scratch another plan co-owns"));
+                    GC.KeepAlive(v);
+                }
+                Assert.True(gpu.SharedStepScratch.Takes > 0, "the two plans did not co-own any scratch: the test cannot tell");
+            }
+            finally
+            {
+                SharedStepScratch.Enabled = previousSharing;
             }
         }
     }

@@ -1169,7 +1169,7 @@ public class GpuTapeGradientParityTests : IDisposable
                 var got = backend.DownloadBuffer(inPlace);
                 int first = -1;
                 for (int i = 0; i < cells && first < 0; i++)
-                    if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(expected[i])) first = i;
+                    if (BitConverter.ToInt32(BitConverter.GetBytes(got[i]), 0) != BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0)) first = i;
                 Assert.True(first < 0, first < 0 ? "" : $"{op} in place: [{first}] {got[first]:R} vs {expected[first]:R}");
             }
 
