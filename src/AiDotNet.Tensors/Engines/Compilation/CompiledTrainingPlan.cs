@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, ICompiledTrainingPlanStreamedState, ICompiledTrainingPlanRegularizationOrder, IPingPongOwner, INonFiniteGradientPolicyTarget
+internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>, ICompiledTrainingPlanStreamedState, ICompiledTrainingPlanRegularizationOrder, ICompiledTrainingPlanGradientNorm, IPingPongOwner, INonFiniteGradientPolicyTarget
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -4765,6 +4765,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (_capturedOptimizer is { } capturedFirst)
                     {
                         capturedFirst.AfterReplay?.Invoke();   // the graph ran the update
+                    if (capturedFirst.ClipNorm > 0.0 && _stepIo?.GlobalNormRecord is { } capturedFirstNorm && cb is Engines.DirectGpu.IDirectGpuBackend capturedFirstBackend)
+                        NoteGradientNormRecord(capturedFirstBackend, capturedFirstNorm);
                         return _lossOutput;
                     }
                     // The optimizer update is run eagerly (NOT captured): its closure
@@ -4830,6 +4832,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_capturedOptimizer is { } capturedReplay)
                 {
                     capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
+                    if (capturedReplay.ClipNorm > 0.0 && _stepIo?.GlobalNormRecord is { } capturedReplayNorm && cb is Engines.DirectGpu.IDirectGpuBackend capturedReplayBackend)
+                        NoteGradientNormRecord(capturedReplayBackend, capturedReplayNorm);
                     return _lossOutput;
                 }
                 RegularizeAndClipGradients();
@@ -13822,6 +13826,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
         }
         _hostClipSumFinite = !double.IsNaN(totalNormSq) && !double.IsInfinity(totalNormSq);
+        NoteHostGradientNorm(Math.Sqrt(totalNormSq));
         double coefficient;
         if (!_hostClipSumFinite)
         {
@@ -14699,6 +14704,47 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
+    // The last global gradient norm a clip computed: a device norm record (DeterministicGradientNorm layout) the step's
+    // clip wrote, read only on request, or a host value from the host clip.
+    private Engines.DirectGpu.IGpuBuffer? _gradientNormRecord;
+    private Engines.DirectGpu.IDirectGpuBackend? _gradientNormBackend;
+    private double _hostGradientNorm = double.NaN;
+    private long _gradientNormSteps;
+
+    private void NoteGradientNormRecord(Engines.DirectGpu.IDirectGpuBackend backend, Engines.DirectGpu.IGpuBuffer record)
+    {
+        _gradientNormRecord = record;
+        _gradientNormBackend = backend;
+        System.Threading.Interlocked.Increment(ref _gradientNormSteps);
+    }
+
+    private void NoteHostGradientNorm(double norm)
+    {
+        _gradientNormRecord = null;
+        _gradientNormBackend = null;
+        _hostGradientNorm = norm;
+        System.Threading.Interlocked.Increment(ref _gradientNormSteps);
+    }
+
+    /// <inheritdoc/>
+    public long GradientNormSteps => System.Threading.Interlocked.Read(ref _gradientNormSteps);
+
+    /// <inheritdoc/>
+    public bool TryGetLastGradientNorm(out double norm)
+    {
+        norm = double.NaN;
+        if (GradientNormSteps == 0) return false;
+        if (_gradientNormRecord is { } record && _gradientNormBackend is { } backend)
+        {
+            var words = Engines.DirectGpu.MultiTensorArgs.RecordFromSlots(backend.DownloadBuffer(record));
+            norm = Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle(
+                unchecked((int)words[Engines.Gpu.DeterministicGradientNorm.WordNorm]));
+            return true;
+        }
+        norm = _hostGradientNorm;
+        return true;
+    }
+
     private bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
         // The device reduction/scale path is float-typed. For a Tensor<double> (or any
@@ -14780,6 +14826,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // device and is raised here, from one read of the record (the clip runs outside graph capture).
             Engines.DirectGpu.MultiTensorArgs.NormAndClipScale(multi, buffers, sizes, sumSquares, (float)maxNorm, scale,
                 policy == Engines.Gpu.NonFiniteGradientPolicy.Error ? Engines.Gpu.NonFiniteGradientPolicy.LeaveUnscaled : policy);
+            NoteGradientNormRecord(cb, sumSquares);
             if (policy == Engines.Gpu.NonFiniteGradientPolicy.Error)
             {
                 var record = Engines.DirectGpu.MultiTensorArgs.RecordFromSlots(cb.DownloadBuffer(sumSquares));

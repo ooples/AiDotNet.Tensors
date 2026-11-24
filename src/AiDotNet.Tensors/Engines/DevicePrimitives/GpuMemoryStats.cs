@@ -155,6 +155,23 @@ public static class GpuMemoryStats
         HostShadowMemory.ResetPeak();
     }
 
+    /// <summary>
+    /// Free and total memory of <paramref name="backend"/>'s device as its driver reports them (cuMemGetInfo on CUDA,
+    /// hipMemGetInfo on HIP): what every process on the device uses, as <c>nvidia-smi</c> shows, where
+    /// <see cref="Snapshot(IDirectGpuBackend)"/> counts this process's allocators. False when the backend's driver
+    /// reports no free memory (Metal, WebGPU).
+    /// </summary>
+    public static bool TryGetDeviceMemory(IDirectGpuBackend backend, out long freeBytes, out long totalBytes)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        freeBytes = totalBytes = 0;
+        if (backend is not IDeviceMemoryPressure pressure || !pressure.TryGetDeviceMemory(out ulong free, out ulong total))
+            return false;
+        freeBytes = (long)free;
+        totalBytes = (long)total;
+        return true;
+    }
+
     /// <summary>Device memory summed over every GPU device the process has used.</summary>
     public static GpuMemorySnapshot Snapshot() => DeviceMemoryAccount.Total.Snapshot();
 

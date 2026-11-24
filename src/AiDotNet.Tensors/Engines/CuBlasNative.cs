@@ -412,6 +412,10 @@ public static class CuBlasNative
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPopCurrent_v2")]
     public static extern CudaResult cuCtxPopCurrent(out IntPtr context);
 
+    /// <summary>Free and total memory of the current context's device.</summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuMemGetInfo_v2")]
+    internal static extern CudaResult cuMemGetInfo(out ulong free, out ulong total);
+
     /// <summary>
     /// Allocates device memory.
     /// </summary>
@@ -1067,6 +1071,17 @@ public sealed class CudaBlasContext : IDisposable
     /// </summary>
     public IntPtr CublasHandle => _cublasHandle;
 
+    /// <summary>Free and total memory of this context's device (cuMemGetInfo with the context current); false when the
+    /// context is gone or the driver call fails.</summary>
+    internal bool TryGetMemoryInfo(out ulong free, out ulong total)
+    {
+        free = total = 0;
+        if (_disposed || _cudaContext == IntPtr.Zero) return false;
+        if (CuBlasNative.cuCtxPushCurrent(_cudaContext) != CudaResult.Success) return false;
+        try { return CuBlasNative.cuMemGetInfo(out free, out total) == CudaResult.Success && total > 0; }
+        finally { CuBlasNative.cuCtxPopCurrent(out _); }
+    }
+
     /// <summary>
     /// Gets whether this context is valid.
     /// </summary>
@@ -1594,12 +1609,14 @@ public sealed class CuBlasMatMul : IDisposable
     }
 
     /// <summary>
-    /// Gets GPU memory usage for diagnostic purposes.
+    /// Gets the device's memory in use (by every process, as the driver reports it: total minus free) and its total, in
+    /// bytes, from cuMemGetInfo. (0, 0) when cuBLAS cannot initialize or the driver call fails.
     /// </summary>
     public (long used, long total) GetMemoryInfo()
     {
-        // Note: Would need cuMemGetInfo P/Invoke for accurate data
-        return (0, 0);
+        if (!EnsureInitialized() || _context is null || !_context.TryGetMemoryInfo(out ulong free, out ulong total))
+            return (0, 0);
+        return ((long)(total - free), (long)total);
     }
 
     public void Dispose()

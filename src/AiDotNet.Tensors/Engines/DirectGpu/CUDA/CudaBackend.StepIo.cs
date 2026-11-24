@@ -387,6 +387,8 @@ public sealed partial class CudaBackend
                 _guard, _dynamicScalars!.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state!.Handle);
         }
 
+        public IGpuBuffer? GlobalNormRecord => _clipRecord;
+
         public void PrepareGlobalNormClip()
         {
             if (_gradientTable is not { } table)

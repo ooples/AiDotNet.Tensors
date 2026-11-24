@@ -868,10 +868,11 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
-    /// <summary>Outstanding reservations from in-flight
-    /// <see cref="WeightRegistry.AllocateStreaming{T}"/> calls. Internal
-    /// — exposed for tests via InternalsVisibleTo, not public API.</summary>
-    internal long ReservedBytes
+    /// <summary>Bytes reserved by in-flight
+    /// <see cref="WeightRegistry.AllocateStreaming{T}"/> calls: memory
+    /// the pool has promised to tensors being streamed in but not yet
+    /// counted as resident.</summary>
+    public long ReservedBytes
     {
         get { lock (_lock) return _reservedBytes; }
     }

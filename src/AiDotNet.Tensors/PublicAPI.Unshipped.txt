@@ -1034,3 +1034,10 @@ AiDotNet.Tensors.Engines.Gpu.IGpuHalfFusedKernels.SupportsHgemm.get -> bool
 *REMOVED*AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16 = 74 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32Fast16F = 74 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType.Float32FastBF16 = 75 -> AiDotNet.Tensors.Engines.DirectGpu.CUDA.CublasComputeType
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanGradientNorm
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanGradientNorm.GradientNormSteps.get -> long
+AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanGradientNorm.TryGetLastGradientNorm(out double norm) -> bool
+AiDotNet.Tensors.Engines.DevicePrimitives.GpuUtilization
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuUtilization.TryRead(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, out int gpuPercent, out int memoryPercent) -> bool
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.TryGetDeviceMemory(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, out long freeBytes, out long totalBytes) -> bool
+AiDotNet.Tensors.LinearAlgebra.StreamingTensorPool.ReservedBytes.get -> long

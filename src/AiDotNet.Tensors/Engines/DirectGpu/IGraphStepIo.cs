@@ -146,6 +146,12 @@ internal interface IGraphStepIo : IDisposable
     void PrepareGlobalNormClip();
 
     /// <summary>
+    /// The norm record (<see cref="Gpu.DeterministicGradientNorm"/> layout) the captured clip writes on every replay, or
+    /// null before <see cref="PrepareGlobalNormClip"/>. Reading it waits for the replay that writes it.
+    /// </summary>
+    IGpuBuffer? GlobalNormRecord { get; }
+
+    /// <summary>
     /// Records, inside the capture and ahead of the update, a global L2-norm clip of the gradients
     /// <see cref="PrepareOptimizer"/> named: their norm and the coefficient min(1, maxNorm / norm) computed on the
     /// device, then every gradient scaled by it, with non-finite gradients handled by <paramref name="policy"/>
