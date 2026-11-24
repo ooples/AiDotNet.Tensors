@@ -888,9 +888,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     _asyncMemPool = memPool;
                     // Stream-ordered buffers are not counted as reserved one by one: freed ones stay in this pool, so
                     // the pool's own counter is the device memory they hold. It captures the handle, not the backend.
+                    // Never less than what the pool reports in use: after the pool has been trimmed, a driver can report
+                    // less backing memory than memory in use (96 MB reserved with 487 MB used, on WDDM), and a budget
+                    // read from the backing counter alone would then admit what the device no longer has.
                     _memoryAccount.SetDriverReserved(
-                        () => (RequireMemPoolBytes(memPool, 5), RequireMemPoolBytes(memPool, 6)),
-                        () => { ulong zero = 0; CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero); });
+                        () => (Math.Max(RequireMemPoolBytes(memPool, 5), RequireMemPoolBytes(memPool, 7)),
+                               Math.Max(RequireMemPoolBytes(memPool, 6), RequireMemPoolBytes(memPool, 8))),
+                        () =>
+                        {
+                            ulong zero = 0;
+                            CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero);
+                            zero = 0;
+                            CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
+                        });
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                     if (poolAttrStatus != CudaResult.Success)
@@ -2651,7 +2661,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return p;
     }
 
-    // The most a stream-ordered request can add to the pool's reservation: what its free blocks do not cover.
+    // The most a stream-ordered request can add to the pool's reservation: what its free blocks do not cover. Where the
+    // driver's counters cannot show free blocks (backing below use, see the constructor), the whole request is charged.
     private ulong PoolGrowthBound(ulong byteSize)
     {
         if (_asyncMemPool == IntPtr.Zero) return byteSize;
