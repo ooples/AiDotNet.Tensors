@@ -6,19 +6,64 @@ using System.Collections.Concurrent;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-// Integer compute on Int32 buffers (this backend's buffers are 4-byte words; the narrower and wider integer types have
-// no storage here). WGSL i32 arithmetic wraps by definition, as unchecked host arithmetic does.
+// Integer compute. This backend's buffers are 4-byte words: Int32 is computed by the WGSL i32 kernels below (WGSL i32
+// arithmetic wraps by definition, as unchecked host arithmetic does), and the other integer types and Bool by the
+// packed kernels (GpuPackedKernelSource), which read and write whole words.
 public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerReductions
 {
-    /// <inheritdoc/>
-    public bool SupportsIntegerElementwise(GpuElementType type) => type == GpuElementType.Int32 && SynchronousRouteAvailable;
+    private static bool PackedInteger(GpuElementType type) => Array.IndexOf(GpuPackedKernelSource.IntegerTypes, type) >= 0;
 
     /// <inheritdoc/>
-    public bool SupportsIntegerReductions(GpuElementType type) => SupportsIntegerElementwise(type);
+    public bool SupportsIntegerElementwise(GpuElementType type)
+        => (type == GpuElementType.Int32 || PackedInteger(type)) && SynchronousRouteAvailable;
+
+    /// <inheritdoc/>
+    public bool SupportsIntegerReductions(GpuElementType type) => type != GpuElementType.Bool && SupportsIntegerElementwise(type);
+
+    // Runs a packed kernel and waits for it. WebGPU rejects a bind group that binds one buffer both read-only and
+    // writable, so an output that is also an operand is computed in a copy of itself (the kernels keep the bits of
+    // the output they do not compute) and copied back.
+    private void LaunchPacked(GpuPackedKernel kernel, int work, uint count, uint pa, uint pb, uint pc, IGpuBuffer[] buffers)
+    {
+        EnsureInitialized();
+        RequireSynchronousRoute();
+        if (work <= 0) return;
+        var output = AsWebGpu(buffers[buffers.Length - 1]);
+        bool aliased = false;
+        for (int i = 0; i < buffers.Length - 1; i++)
+            aliased |= ReferenceEquals(buffers[i], output) || AsWebGpu(buffers[i]).BufferId == output.BufferId;
+        if (aliased)
+        {
+            int words = checked((int)(output.SizeInBytes / sizeof(uint)));
+            using var scratch = AllocateBufferCore(words, zeroInitialize: false);
+            CopyWordRange(output, 0, scratch, 0, words);
+            var separate = (IGpuBuffer[])buffers.Clone();
+            separate[separate.Length - 1] = scratch;
+            LaunchPacked(kernel, work, count, pa, pb, pc, separate);
+            CopyWordRange(scratch, 0, output, 0, words);
+            return;
+        }
+
+        string source = GpuPackedKernelSource.Wgsl(kernel);
+        float[] uniforms = UniformBits(work, unchecked((int)count), unchecked((int)pa), (long)(((ulong)pc << 32) | pb));
+        var launch = buffers.Length == 3
+            ? Dispatch3BufferAsync(kernel.Name, source, "main", buffers[0], buffers[1], buffers[2], uniforms, work)
+            : Dispatch2BufferAsync(kernel.Name, source, "main", buffers[0], buffers[1], uniforms, work);
+        launch.GetAwaiter().GetResult();
+    }
+
+    // Int32 has its own kernels; every other element type goes to the packed ones, which also refuse a non-integer.
+    private static bool IsInt32(IGpuBuffer? buffer) => buffer is not null && buffer.ElementType == GpuElementType.Int32;
 
     /// <inheritdoc/>
     public void BinaryInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Binary(LaunchPacked, operation, a, b, output, size);
+            return;
+        }
+
         EnsureInitialized();
         GpuInt32ShaderSource.Require(nameof(BinaryInteger), size, output, a, b);
         string source = WebGpuInt32Kernels.Binary(operation);
@@ -29,6 +74,12 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
     /// <inheritdoc/>
     public void UnaryInteger(GpuIntegerUnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Unary(LaunchPacked, operation, a, output, size);
+            return;
+        }
+
         EnsureInitialized();
         GpuInt32ShaderSource.Require(nameof(UnaryInteger), size, output, a);
         string source = WebGpuInt32Kernels.Unary(operation);
@@ -39,6 +90,12 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
     /// <inheritdoc/>
     public void ScalarInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, long scalar, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Scalar(LaunchPacked, operation, a, scalar, output, size);
+            return;
+        }
+
         EnsureInitialized();
         GpuInt32ShaderSource.Require(nameof(ScalarInteger), size, output, a);
         string source = WebGpuInt32Kernels.Scalar(operation);
@@ -50,6 +107,7 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
     /// <inheritdoc/>
     public long SumInteger(IGpuBuffer a, int size)
     {
+        if (!IsInt32(a)) return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
         EnsureInitialized();
         GpuInt32ShaderSource.RequireSum(a, size);
         string source = WebGpuInt32Kernels.SumBlocks;

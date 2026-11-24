@@ -17514,6 +17514,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
         IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
         ulong byteSize = (ulong)length * (ulong)width;
+        // A range copied onto itself moves nothing.
+        if (srcPtr == dstPtr) return;
+        if (GpuCopyLayout.Overlaps((long)srcPtr, (long)dstPtr, length * width))
+        {
+            GpuCopyLayout.ThroughScratch(this, source, sourceOffset, destination, destinationOffset, length);
+            return;
+        }
+
         // Stream-ordered async DtoD (same fix as the 3-arg Copy): the synchronous cuMemcpyDtoD is NOT
         // capturable — it aborts CUDA-graph stream capture (CUDA 906). The async copy on _stream records
         // as a graph node and stays correctly ordered with the surrounding kernels (e.g. the resident

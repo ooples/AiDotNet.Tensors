@@ -5,19 +5,36 @@ using System.Collections.Concurrent;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-// Integer compute on Int32 buffers (this backend's buffers are 4-byte words; the narrower and wider integer types have
-// no storage here). GLSL integer kernels, compiled at run time like the other parity kernels.
+// Integer compute. This backend's buffers are 4-byte words: Int32 is computed by the GLSL integer kernels below, and
+// the other integer types and Bool by the packed kernels (GpuPackedKernelSource), which read and write whole words.
+// All are compiled at run time like the other parity kernels.
 public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuIntegerReductions
 {
-    /// <inheritdoc/>
-    public bool SupportsIntegerElementwise(GpuElementType type) => type == GpuElementType.Int32 && IsGlslCompilerAvailable;
+    private static bool PackedInteger(GpuElementType type) => Array.IndexOf(GpuPackedKernelSource.IntegerTypes, type) >= 0;
 
     /// <inheritdoc/>
-    public bool SupportsIntegerReductions(GpuElementType type) => SupportsIntegerElementwise(type);
+    public bool SupportsIntegerElementwise(GpuElementType type)
+        => (type == GpuElementType.Int32 || PackedInteger(type)) && IsGlslCompilerAvailable;
+
+    /// <inheritdoc/>
+    public bool SupportsIntegerReductions(GpuElementType type) => type != GpuElementType.Bool && SupportsIntegerElementwise(type);
+
+    private void LaunchPacked(GpuPackedKernel kernel, int work, uint count, uint pa, uint pb, uint pc, IGpuBuffer[] buffers)
+        => ParityDispatch(kernel.Name, GpuPackedKernelSource.Glsl(kernel, VulkanTorchParityElementwiseKernels.LocalSize), work,
+            new[] { (uint)work, count, pa, pb, pc }, buffers);
+
+    // Int32 has its own kernels; every other element type goes to the packed ones, which also refuse a non-integer.
+    private static bool IsInt32(IGpuBuffer? buffer) => buffer is not null && buffer.ElementType == GpuElementType.Int32;
 
     /// <inheritdoc/>
     public void BinaryInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Binary(LaunchPacked, operation, a, b, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(BinaryInteger), size, output, a, b);
         string glsl = VulkanInt32Kernels.Binary(operation);
         if (size == 0) return;
@@ -27,6 +44,12 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
     /// <inheritdoc/>
     public void UnaryInteger(GpuIntegerUnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Unary(LaunchPacked, operation, a, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(UnaryInteger), size, output, a);
         string glsl = VulkanInt32Kernels.Unary(operation);
         if (size == 0) return;
@@ -36,6 +59,12 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
     /// <inheritdoc/>
     public void ScalarInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, long scalar, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Scalar(LaunchPacked, operation, a, scalar, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(ScalarInteger), size, output, a);
         string glsl = VulkanInt32Kernels.Scalar(operation);
         if (size == 0) return;
@@ -46,6 +75,13 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
     /// <inheritdoc/>
     public long SumInteger(IGpuBuffer a, int size)
     {
+        if (!IsInt32(a))
+        {
+            // The result is read back between passes, which resets the command buffer an open batch is recording into.
+            ThrowIfHostSpanOpInsideOpenBatch();
+            return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
+        }
+
         GpuInt32ShaderSource.RequireSum(a, size);
         string glsl = VulkanInt32Kernels.SumBlocks;
         if (size == 0) return 0;

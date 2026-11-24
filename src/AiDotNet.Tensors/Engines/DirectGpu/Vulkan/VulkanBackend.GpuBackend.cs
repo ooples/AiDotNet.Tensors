@@ -339,10 +339,13 @@ public sealed unsafe partial class VulkanBackend
 
     /// <inheritdoc/>
     // Every buffer is a 4-byte-word allocation. Doubles are held two words each (the layout the double kernels read,
-    // low word first) on a device that computes in double; the narrower types have no storage here yet.
+    // low word first) on a device that computes in double. The 8- and 16-bit types and Int64 are held as bytes in
+    // whole words and computed by the packed kernels (GpuPackedKernelSource).
     public bool SupportsElementType(GpuElementType type)
         => type is GpuElementType.Float32 or GpuElementType.Int32
-           || (type == GpuElementType.Float64 && SupportsFloat64Storage);
+           || (type == GpuElementType.Float64 && SupportsFloat64Storage)
+           // Held as bytes in whole words; computed by the packed kernels, which need the run-time GLSL compiler.
+           || (GpuPackedKernelSource.Computes(type) && IsGlslCompilerAvailable);
 
     /// <summary>Whether this device holds and computes doubles: shaderFloat64 and the runtime GLSL compiler.</summary>
     internal bool SupportsFloat64Storage => IsGlslCompilerAvailable && _device.SupportsShaderFloat64;
@@ -460,6 +463,15 @@ public sealed unsafe partial class VulkanBackend
 
         // Offsets and size count elements of the buffers' type (a double is two words).
         ulong width = (ulong)GpuCopyLayout.ElementBytes(source, destination, nameof(Copy));
+        // A range copied onto itself moves nothing.
+        if (ReferenceEquals(src.Storage, dst.Storage) && srcOffset == destOffset) return;
+        if (ReferenceEquals(src.Storage, dst.Storage)
+            && GpuCopyLayout.Overlaps((long)srcOffset * (long)width, (long)destOffset * (long)width, (long)size * (long)width))
+        {
+            GpuCopyLayout.ThroughScratch(this, source, srcOffset, destination, destOffset, size);
+            return;
+        }
+
         GpuLaunchProbe.OnLaunch();
         _transfer.CopyDeviceToDevice(
             src.Storage, checked((ulong)srcOffset * width),

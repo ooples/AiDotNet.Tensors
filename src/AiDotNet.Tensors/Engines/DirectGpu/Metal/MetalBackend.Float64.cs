@@ -112,7 +112,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
 
                 if (failure is { } rejection)
                     throw new GpuCapabilityUnavailableException(
-                        $"The Metal compiler rejected the double-precision library '{name}': {rejection.Message}", rejection);
+                        $"The Metal compiler rejected the kernel library '{name}': {rejection.Message}", rejection);
             }
         }
 
@@ -140,7 +140,9 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
             var type = buffers[i].ElementType;
             using var copy = AllocateBuffer(buffers[i].Size, type);
             var separate = (MetalGpuBuffer)copy;
-            ulong bytes = (ulong)buffers[i].Size * (ulong)GpuElementTypes.SizeInBytes(type);
+            // Whole words: an 8- or 16-bit buffer is a word-rounded allocation, the kernels address it in words, and
+            // a blit takes offsets and lengths in multiples of four bytes.
+            ulong bytes = ((ulong)buffers[i].Size * (ulong)GpuElementTypes.SizeInBytes(type) + 3UL) & ~3UL;
             BlitFloat64(buffers[i].Handle, (ulong)buffers[i].ByteOffset, separate.Handle, (ulong)separate.ByteOffset, bytes);
             var rebound = (MetalGpuBuffer[])buffers.Clone();
             rebound[i] = separate;
