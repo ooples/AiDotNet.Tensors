@@ -6810,9 +6810,12 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // Scratch per row chunk of the chunked fused-CE backward: two [chunk, vocab] float buffers of at most this many
-    // elements each (128 MiB), so a V=49152 head takes 672-row chunks instead of several [N, V] tensors.
-    private const int FusedCeBackwardChunkElements = 32 * 1024 * 1024;
+    // Scratch per row chunk of the chunked fused CE, so a V=49152 head takes row chunks instead of [N, V] tensors.
+    // Elements of one [chunk, vocab] block. The forward and the backward each hold two (the logits and their exponentials
+    // or probabilities, as no portable primitive transforms them in place), so the pair is 128 MiB of fp32 whatever the
+    // vocabulary. At 32M elements a block (672 rows at V = 49152) the pair was 254 MiB, the largest transient of a
+    // 16-layer LM's training step and its peak, in the forward and again in the backward.
+    private const int FusedCeBlockElements = 16 * 1024 * 1024;
 
     /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
     internal static int LastFusedCeBackwardChunks;
@@ -6838,7 +6841,7 @@ public partial class DirectGpuTensorEngine
         IGpuBuffer b, int[]? targetIds, IGpuBuffer meanLoss, int n, int d, int vocab, IGpuBuffer? deviceIds = null)
     {
         if (n <= 0 || d <= 0 || vocab <= 0 || (deviceIds is null && targetIds?.Length != n)) return false;
-        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBlockElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; }
 
@@ -6909,7 +6912,7 @@ public partial class DirectGpuTensorEngine
         int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
         if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || (deviceIds is null && targetIds?.Length != n))
             return false;
-        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBlockElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; _ = d * vocab; }
 

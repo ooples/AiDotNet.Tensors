@@ -1005,7 +1005,7 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
 
-    // An LM-sized vocabulary: the index backward runs in row chunks (672 rows at V = 49152), so 1500 rows take three
+    // An LM-sized vocabulary: the index backward runs in row chunks (320 rows at V = 49152), so 1500 rows take five
     // chunks and the weight and bias gradients accumulate across them (GEMM beta = 1 after the first chunk).
     private const int ChunkRows = 1500, ChunkDim = 16, ChunkVocab = 49152;
     private static readonly Tensor<float> ChunkHidden = Rand([ChunkRows, ChunkDim], seed: 491);
@@ -1020,7 +1020,7 @@ public class GpuTapeGradientParityTests : IDisposable
         // These gradients peak near 1e-4 (the loss is a mean over 1500 rows), so the default tolerance, an absolute
         // 1e-4 below |g| = 1, would accept an all-zero gradient.
         AssertGradientParity(opName, x, op, tol: 1e-6);
-        Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+        Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
     }
 
     [SkippableFact]
@@ -1058,12 +1058,12 @@ public class GpuTapeGradientParityTests : IDisposable
                 var cpuGrad = GradientOf(new CpuEngine(), ChunkHidden, Op);
                 DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
                 var first = GradientOf(gpu, ChunkHidden, Op);
-                Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+                Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeBackwardChunks);   // 320 rows a chunk
                 var second = GradientOf(gpu, ChunkHidden, Op);
                 Assert.Equal(first, second);   // bit-identical run to run
                 for (int i = 0; i < cpuGrad.Length; i++)
                     Assert.True(Math.Abs(first[i] - cpuGrad[i]) <= 1e-6, $"gradient[{i}] {first[i]} vs CPU {cpuGrad[i]}");
-                long chunkCells = 672L * ChunkVocab;
+                long chunkCells = 320L * ChunkVocab;
                 Assert.True(cuda!.SortedScatterScratchBytes < chunkCells,
                     $"sort scratch {cuda.SortedScatterScratchBytes} bytes, a start slot per logit of a chunk is {chunkCells * 4}.");
             }
@@ -1086,9 +1086,45 @@ public class GpuTapeGradientParityTests : IDisposable
             // A device without room for the chunk scratch takes the supported fused-kernel fallback: no chunks to count.
             Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined,
                 "The chunked forward declined on this device (scratch did not fit or a primitive is unavailable).");
-            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
+            Assert.Equal(5, DirectGpuTensorEngine.LastFusedCeForwardChunks);   // 320 rows a chunk
             Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
             Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
+        }
+    }
+
+    // The forward and the backward each hold two [chunk, vocab] blocks (logits and their exponentials or
+    // probabilities). At 672 rows a chunk (V = 49152) each pair was 2 x 127 MiB, the largest transient of a 16-layer
+    // LM's training step and its peak; a block is now 16M elements, so a pair is 128 MiB.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_scratch_is_two_blocks_of_16M_elements()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            var backend = gpu.GetBackend();
+            Skip.If(backend is null, "No device backend.");
+            static Tensor<float> Op(IEngine e, Tensor<float> t) =>
+                e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds);
+            DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined = false;
+            // Warm: kernels, pools and the inputs' uploads.
+            _ = GradientOf(gpu, ChunkHidden, Op);
+            Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined, "The chunked forward declined on this device.");
+            long before = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(backend!).AllocatedBytes;
+            AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.ResetPeakStats(backend!);
+            DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
+            DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+            _ = GradientOf(gpu, ChunkHidden, Op);
+            long peak = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(backend!).PeakAllocatedBytes;
+            Assert.True(DirectGpuTensorEngine.LastFusedCeForwardChunks > 1, "The forward did not run in chunks.");
+            Assert.True(DirectGpuTensorEngine.LastFusedCeBackwardChunks > 1, "The backward did not run in chunks.");
+            // What the forward and backward hold at once beyond what was live before them: the two blocks, plus the
+            // inputs (if not kept on the device by the first call), the gradients they return and small row scratch.
+            long inputs = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
+            long gradients = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
+            long twoBlocks = 2L * 4 * (16 * 1024 * 1024);
+            long held = peak - before;
+            Assert.True(held <= twoBlocks + inputs + gradients + (8L << 20),
+                $"The fused CE held {held} bytes at once; two 16M-element blocks are {twoBlocks}.");
         }
     }
 
