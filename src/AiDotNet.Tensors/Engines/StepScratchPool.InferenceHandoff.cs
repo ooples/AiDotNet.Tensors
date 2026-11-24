@@ -42,7 +42,7 @@ internal sealed partial class StepScratchPool
             Keys.Remove(buffer);
             _leasedThisRun.Remove(buffer);
             long bytes = buffer.SizeInBytes;
-            Untrack(buffer);
+            if (ReleaseOwnership(buffer)) continue;   // another plan still co-owns it (SharedStepScratch)
             if (backend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
             else buffer.Dispose();
             returned += bytes;

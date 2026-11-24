@@ -394,6 +394,46 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private static long ReadMemPoolBytes(IntPtr pool, int attribute)
         => CuBlasNative.cuMemPoolGetAttribute(pool, attribute, out ulong value) == CudaResult.Success ? (long)value : 0;
 
+    // The stream-ordered pool's backing memory its RESERVED counter does not report, per pool (the device's default
+    // pool is shared by every backend of the process). A driver can report less backing memory than memory in use
+    // (96 MB reserved with 487 MB used on WDDM, in a process that had trimmed the pool). The pool's free blocks are
+    // never negative, so every (used - reserved) seen is a lower bound of what is unreported; the largest seen since
+    // the last trim is kept. Backing memory is then at least reserved + this, and free blocks at least that minus use:
+    // both err on the side of charging the budget more, never less.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, System.Runtime.CompilerServices.StrongBox<long>>
+        s_poolUnreported = new();
+
+    // Samples the pool and returns (reserved counter, used counter, unreported backing memory).
+    private static (long Reserved, long Used, long Unreported) SamplePool(IntPtr pool, bool afterTrim = false)
+    {
+        long reserved = RequireMemPoolBytes(pool, 5), used = RequireMemPoolBytes(pool, 7);   // RESERVED, USED _MEM_CURRENT
+        var box = s_poolUnreported.GetOrAdd(pool, _ => new System.Runtime.CompilerServices.StrongBox<long>(0));
+        long seen = Math.Max(0, used - reserved);
+        // A trim to zero leaves no free block, so what is unreported is then exactly used - reserved.
+        if (afterTrim) Interlocked.Exchange(ref box.Value, seen);
+        long current;
+        while ((current = Interlocked.Read(ref box.Value)) < seen
+               && Interlocked.CompareExchange(ref box.Value, seen, current) != current)
+        {
+        }
+
+        return (reserved, used, Math.Max(current, seen));
+    }
+
+    // Trims the stream-ordered pool to nothing and restarts the estimate of its unreported backing memory.
+    private static CudaResult TrimPool(IntPtr pool)
+    {
+        var status = CuBlasNative.cuMemPoolTrimTo(pool, 0); // lgtm[cs/call-to-unmanaged-code] CUDA memory pools have no managed API.
+        if (status == CudaResult.Success
+            && CuBlasNative.cuMemPoolGetAttribute(pool, 5, out _) == CudaResult.Success)
+        {
+            try { SamplePool(pool, afterTrim: true); }
+            catch (InvalidOperationException) { /* the counters are unreadable: the next read reports that itself */ }
+        }
+
+        return status;
+    }
+
     // For the budget: a query that fails throws, so the account keeps its last reading instead of counting the pool
     // as empty.
     private static long RequireMemPoolBytes(IntPtr pool, int attribute)
@@ -888,9 +928,22 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     _asyncMemPool = memPool;
                     // Stream-ordered buffers are not counted as reserved one by one: freed ones stay in this pool, so
                     // the pool's own counter is the device memory they hold. It captures the handle, not the backend.
+                    // The backing memory: the pool's reserved counter plus what that counter does not report (SamplePool).
                     _memoryAccount.SetDriverReserved(
-                        () => (RequireMemPoolBytes(memPool, 5), RequireMemPoolBytes(memPool, 6)),
-                        () => { ulong zero = 0; CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero); });
+                        () =>
+                        {
+                            var pool = SamplePool(memPool);
+                            long current = pool.Reserved + pool.Unreported;
+                            return (current, Math.Max(current,
+                                Math.Max(RequireMemPoolBytes(memPool, 6) + pool.Unreported, RequireMemPoolBytes(memPool, 8))));
+                        },
+                        () =>
+                        {
+                            ulong zero = 0;
+                            CuBlasNative.cuMemPoolSetAttribute(memPool, 6, ref zero);
+                            zero = 0;
+                            CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
+                        });
                     ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                     if (poolAttrStatus != CudaResult.Success)
@@ -2325,7 +2378,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (memory budget reclamation)");
         if (_asyncMemPool != IntPtr.Zero)
         {
-            var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+            var trimStatus = TrimPool(_asyncMemPool);
             if (trimStatus != CudaResult.Success)
                 System.Diagnostics.Trace.TraceWarning($"[CudaBackend] cuMemPoolTrimTo failed during memory budget reclamation: {trimStatus}.");
         }
@@ -2373,7 +2426,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 // allocator guards against), NOT out-of-memory — throw with its real name so the OOM
                 // diagnostic below isn't misleading. Trim is best-effort: warn but still attempt the retry.
                 CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (async-pool OOM reclamation)");
-                var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                var trimStatus = TrimPool(_asyncMemPool);
                 if (trimStatus != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
                         $"[CudaBackend] cuMemPoolTrimTo failed during sync-path OOM reclamation: {trimStatus}; the cuMemAlloc retry may still OOM.");
@@ -2635,7 +2688,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
-                var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
+                var trimStatus = TrimPool(_asyncMemPool);
                 if (trimStatus != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
                         $"[CudaBackend] cuMemPoolTrimTo failed during async-path OOM reclamation: {trimStatus}; the cuMemAllocAsync retry may still OOM.");
@@ -2646,16 +2699,36 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (r == CudaResult.OutOfMemory)
             throw CudaAllocationError(r, $"cuMemAllocAsync failed: {CuBlasNative.GetCudaErrorString(r)} (requested {byteSize} bytes)");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
+        // Use is at a local maximum here: the sample that bounds the pool's unreported backing memory best.
+        NotePoolUse();
         if (budgeted) p = EnforceBudgetAfterPoolGrowth(p, byteSize, reservedBefore);
         GpuMemoryTracker.OnAlloc(p, (long)byteSize);
         return p;
     }
 
-    // The most a stream-ordered request can add to the pool's reservation: what its free blocks do not cover.
+    private void NotePoolUse()
+    {
+        if (_asyncMemPool == IntPtr.Zero) return;
+        try { SamplePool(_asyncMemPool); }
+        catch (InvalidOperationException) { /* unreadable counters: nothing to learn from this allocation */ }
+    }
+
+    // The most a stream-ordered request can add to the pool's reservation: what its free blocks do not cover (a lower
+    // bound of them, see SamplePool).
     private ulong PoolGrowthBound(ulong byteSize)
     {
         if (_asyncMemPool == IntPtr.Zero) return byteSize;
-        long free = ReadMemPoolBytes(_asyncMemPool, 5) - ReadMemPoolBytes(_asyncMemPool, 7);   // RESERVED - USED _MEM_CURRENT
+        long free;
+        try
+        {
+            var pool = SamplePool(_asyncMemPool);
+            free = pool.Reserved + pool.Unreported - pool.Used;
+        }
+        catch (InvalidOperationException)
+        {
+            return byteSize;   // unreadable counters: the whole request is charged
+        }
+
         return free <= 0 ? byteSize : byteSize > (ulong)free ? byteSize - (ulong)free : 0;
     }
 

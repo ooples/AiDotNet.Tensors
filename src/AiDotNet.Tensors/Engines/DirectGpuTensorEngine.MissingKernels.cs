@@ -11784,6 +11784,11 @@ public partial class DirectGpuTensorEngine
             var gradInBuf = AllocateOutputBuffer(backend, inLen);
             try
             {
+                // Under FP16/BF16 autocast the data gradient runs in that precision and writes its whole output.
+                if (TryAutocastConvTranspose2DBackwardInput(backend, gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
+                        batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW, stride[0], stride[1], padding[0],
+                        padding[1]))
+                    return new Tensor<T>(FinishGpuOp<T>(backend, gradInBuf, inLen), (int[])inputShape.Clone());
                 backend.ConvTranspose2DBackwardInput(gradOutBuf.Buffer, kBuf.Buffer, gradInBuf.Buffer,
                     batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW,
                     stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
@@ -11818,6 +11823,11 @@ public partial class DirectGpuTensorEngine
             var gradKBuf = AllocateOutputBuffer(backend, kLen);
             try
             {
+                // Under FP16/BF16 autocast the kernel gradient runs in that precision and writes its whole output.
+                if (TryAutocastConvTranspose2DBackwardKernel(backend, inBuf.Buffer, gradOutBuf.Buffer, gradKBuf.Buffer,
+                        batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW, stride[0], stride[1], padding[0],
+                        padding[1]))
+                    return new Tensor<T>(FinishGpuOp<T>(backend, gradKBuf, kLen), (int[])kernelShape.Clone());
                 backend.ConvTranspose2DBackwardKernel(inBuf.Buffer, gradOutBuf.Buffer, gradKBuf.Buffer,
                     batch, inChannels, inH, inW, outChannels, outH, outW, kH, kW,
                     stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);

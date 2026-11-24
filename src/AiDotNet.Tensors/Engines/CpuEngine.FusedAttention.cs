@@ -34,7 +34,7 @@ public partial class CpuEngine
 
         // The fused kernels are host float32. Other element types and GPU engines run the materialized primitive
         // chain, which every engine differentiates on its own device.
-        if (typeof(T) != typeof(float) || this is DirectGpuTensorEngine)
+        if (typeof(T) != typeof(float) || IsDeviceEngine)
             return FusedAttentionDecomposed(query, key, value, mask, scaleValue, isCausal, softcap);
 
         var plan = new FusedAttentionPlan(batch, heads, seqQ, seqK, headDim, valueDim, scaleValue, softcap, isCausal, mask);

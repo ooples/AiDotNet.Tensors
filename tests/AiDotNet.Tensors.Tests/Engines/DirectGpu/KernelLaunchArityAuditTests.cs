@@ -45,7 +45,8 @@ public class KernelLaunchArityAuditTests
     private static Dictionary<string, List<(int Count, string File)>> KernelParams(string backendDir)
     {
         var result = new Dictionary<string, List<(int, string)>>(StringComparer.Ordinal);
-        foreach (var file in Directory.EnumerateFiles(backendDir, "*.cs", SearchOption.AllDirectories))
+        foreach (var file in Directory.EnumerateFiles(backendDir, "*.cs", SearchOption.AllDirectories)
+            .Concat(EmbeddedCudaSources(backendDir)))
         {
             var src = StripComments(File.ReadAllText(file));
             foreach (Match m in Kernel.Matches(src))
@@ -59,6 +60,16 @@ public class KernelLaunchArityAuditTests
             }
         }
         return result;
+    }
+
+    // The CUDA kernel source kept as embedded resources (KernelSources, KernelSourceResources) rather than string
+    // literals: the CUDA backend compiles these too, so their definitions are audited with its own.
+    private static IEnumerable<string> EmbeddedCudaSources(string backendDir)
+    {
+        if (!string.Equals(Path.GetFileName(backendDir), "CUDA", StringComparison.Ordinal)) return Enumerable.Empty<string>();
+        string sources = Path.Combine(Path.GetDirectoryName(backendDir)!, "KernelSources");
+        return Directory.EnumerateFiles(sources, "*.c")
+            .Where(f => Path.GetFileName(f).StartsWith("Cuda", StringComparison.Ordinal) || f.EndsWith(".cuda.c", StringComparison.Ordinal));
     }
 
     /// <summary>(kernel, filled slots, location) for each launch whose kernel and argument array can be resolved.</summary>

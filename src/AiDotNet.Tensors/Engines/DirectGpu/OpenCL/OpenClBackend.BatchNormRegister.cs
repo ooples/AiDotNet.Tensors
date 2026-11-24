@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     // #1489: the register-resident training BatchNorm (IBatchNormVarianceBackend) on OpenCL, through PortableBatchNorm and
     // BatchNormRegisterKernelTemplate's kernels, compiled at initialization beside the Winograd modules.
-    public sealed partial class OpenClBackend : IBatchNormVarianceBackend
+    public sealed partial class OpenClBackend : IBatchNormVarianceBackend, IBatchNormLeakyReluBackend
     {
         // Every variant's reduction needs all 256 threads in one work-group: a driver that caps a kernel below that
         // (register pressure from the 32-value variants) leaves the composed path. Decided once.
@@ -89,5 +89,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
                 saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
                 gradResidual, beta, gradOutput2, unpacked: true, accumulateGradInput: accumulateGradInput);
+
+        bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluTraining(IGpuBuffer input, IGpuBuffer output,
+            IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels,
+            int spatial, float epsilon, float slope)
+            => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryForward(this, LaunchBatchNormRegister, input, output, gamma, beta,
+                saveMean, saveVariance, batch, channels, spatial, epsilon, true, null, unpacked: true, leakySlope: slope);
+
+        bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer leakyOutput,
+            IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer? beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
+            IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int channels, int spatial,
+            float epsilon, float slope, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+            => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
+                saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, leakyOutput,
+                null, beta, gradOutput2, unpacked: true, accumulateGradInput: accumulateGradInput, leakySlope: slope);
     }
 }

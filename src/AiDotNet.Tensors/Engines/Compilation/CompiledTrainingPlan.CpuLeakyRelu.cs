@@ -85,7 +85,59 @@ internal sealed partial class CompiledTrainingPlan<T>
             upstream = upstream.ToArray();
             CpuStorageAllocationDiagnostics.Record<float>("numeric.compiled_leaky_alias_snapshot", upstream.Length);
         }
-        for (int i = 0; i < destination.Length; i++)
+        int length = destination.Length;
+        if (length < ParallelLeakyChunk)
+        {
+            LeakyGradientRange(input, upstream, destination, slope, add);
+            return;
+        }
+        // One pass per chunk on the pool: elementwise and disjoint, so the result does not depend on the split.
+        // Serial and scalar, the DCGAN discriminator's backward spent 5-8% of a CPU step here.
+        unsafe
+        {
+            fixed (float* pi = input, pu = upstream, pd = destination)
+            {
+                nint ip = (nint)pi, up = (nint)pu, dp = (nint)pd;
+                int chunks = (length + ParallelLeakyChunk - 1) / ParallelLeakyChunk;
+                CpuParallelSettings.ParallelForOrSerial(0, chunks, length, chunk =>
+                {
+                    int start = chunk * ParallelLeakyChunk;
+                    int count = Math.Min(ParallelLeakyChunk, length - start);
+                    LeakyGradientRange(new ReadOnlySpan<float>((float*)ip + start, count),
+                        new ReadOnlySpan<float>((float*)up + start, count),
+                        new Span<float>((float*)dp + start, count), slope, add);
+                }, deterministicSafe: true);
+            }
+        }
+    }
+
+    private const int ParallelLeakyChunk = 1 << 16;
+
+    // d input = upstream where input > 0, upstream * slope elsewhere (PyTorch's strict > 0), written or added.
+    private static void LeakyGradientRange(ReadOnlySpan<float> input, ReadOnlySpan<float> upstream,
+        Span<float> destination, float slope, bool add)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.Vector256.IsHardwareAccelerated)
+        {
+            ref float ri = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(input);
+            ref float ru = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(upstream);
+            ref float rd = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(destination);
+            var vSlope = System.Runtime.Intrinsics.Vector256.Create(slope);
+            var vZero = System.Runtime.Intrinsics.Vector256<float>.Zero;
+            for (; i <= destination.Length - 8; i += 8)
+            {
+                var x = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref ri, (nuint)i);
+                var g = System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref ru, (nuint)i);
+                var value = System.Runtime.Intrinsics.Vector256.ConditionalSelect(
+                    System.Runtime.Intrinsics.Vector256.GreaterThan(x, vZero), g, g * vSlope);
+                if (add) value += System.Runtime.Intrinsics.Vector256.LoadUnsafe(ref rd, (nuint)i);
+                System.Runtime.Intrinsics.Vector256.StoreUnsafe(value, ref rd, (nuint)i);
+            }
+        }
+#endif
+        for (; i < destination.Length; i++)
         {
             float value = input[i] > 0f ? upstream[i] : upstream[i] * slope;
             destination[i] = add ? destination[i] + value : value;

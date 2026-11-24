@@ -406,8 +406,9 @@ extern "C" __global__ __launch_bounds__(256) void nchw_to_cnhw(
 }
 
 // Overlap-add of the transposed convolution's columns, one thread per output element (a gather: no atomics):
-// out[b, c, oh, ow] = bias[c] + the sum over the taps (kh, kw) whose input position ih = (oh + pH - kh) / sH,
-// iw = (ow + pW - kw) / sW is whole and in range, of col[(c*kH + kh)*kW + kw, (b*inH + ih)*inW + iw].
+// out[b, c, oh, ow] = (the sum over the taps (kh, kw) whose input position ih = (oh + pH - kh) / sH,
+// iw = (ow + pW - kw) / sW is whole and in range, of col[(c*kH + kh)*kW + kw, (b*inH + ih)*inW + iw])
+// + bias[c], added last as a separate bias pass adds it (the fused and unfused results agree bit for bit).
 extern "C" __global__ __launch_bounds__(256) void col2im_cnhw_bias(
     const float* __restrict__ col, const float* __restrict__ bias, float* __restrict__ output,
     int batch, int channels, int outH, int outW, int kH, int kW, int sH, int sW, int pH, int pW, int inH, int inW)
@@ -421,7 +422,7 @@ extern "C" __global__ __launch_bounds__(256) void col2im_cnhw_bias(
     int c = (int)(r % channels);
     int b = (int)(r / channels);
     long long n = (long long)batch * inH * inW;
-    float sum = bias != nullptr ? bias[c] : 0.0f;
+    float sum = 0.0f;
     // Only the taps congruent to (oh + pH) modulo the stride contribute.
     for (int kh = (oh + pH) % sH; kh < kH; kh += sH) {
         int ih = (oh + pH - kh) / sH;
@@ -432,5 +433,5 @@ extern "C" __global__ __launch_bounds__(256) void col2im_cnhw_bias(
             sum += col[((long long)(c * kH + kh) * kW + kw) * n + ((long long)b * inH + ih) * inW + iw];
         }
     }
-    output[idx] = sum;
+    output[idx] = bias != nullptr ? sum + bias[c] : sum;
 }

@@ -951,6 +951,7 @@ AiDotNet.Tensors.Engines.IAsyncEngine.TensorNegateAsync<T>(AiDotNet.Tensors.Line
 AiDotNet.Tensors.Engines.IAsyncEngine.TensorSqrtAsync<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>
 AiDotNet.Tensors.Engines.IAsyncEngine.TensorSubtractAsync<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! a, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! b, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) -> System.Threading.Tasks.ValueTask<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>
 static AiDotNet.Tensors.Engines.AsyncEngine.CreateAsync() -> System.Threading.Tasks.Task<AiDotNet.Tensors.Engines.IAsyncEngine!>!
+AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.ChannelsLastConvolution = 23 -> AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp
 AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget
 const AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget.FractionEnvironmentVariable = "AIDOTNET_GPU_MEMORY_FRACTION" -> string!
 static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget.ClearLimit(string! device = "cuda:0") -> void

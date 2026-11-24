@@ -203,6 +203,121 @@ public partial class CpuEngine
         }
     }
 
+    // A weight gradient of at most 64K elements (colH x outChannels) reduced over a batch of columns: too small an
+    // output for one GEMM to keep the workers busy (DCGAN's last transposed conv: 48 x 64 over K = 65536 took 50 ms,
+    // oneDNN 9 ms). Chunks of about this many column positions keep each chunk's operands cache-sized.
+    private const int ChunkedWeightGradMaxOutput = 1 << 16;
+    private const int ChunkedWeightGradPositions = 2048;
+
+    /// <summary>Weight gradients that took the chunked route (tests).</summary>
+    internal static long ChunkedWeightGradients;
+
+    private static bool UseChunkedWeightGradient(int batch, int colH, int outChannels, int colW)
+        => batch >= 2 && (long)colH * outChannels <= ChunkedWeightGradMaxOutput
+           && colW <= ChunkedWeightGradPositions
+           && batch * (long)colW >= 4L * ChunkedWeightGradPositions;
+
+    /// <summary>
+    /// gradKernelT[colH, outC] = sum over images of im2col(x_b) . g_b^T, as fixed chunks of images: each chunk builds its
+    /// own columns and transposed gradient and runs a sequential GEMM into a partial, then the partials are summed in
+    /// chunk order. The chunking depends on the shape only, so the result is the same bits at any thread count.
+    /// Overwrites <paramref name="gradKernelT"/>[0, colH * outChannels).
+    /// </summary>
+    private static unsafe void ConvWeightGradientChunked(
+        float[] inputF, float[] gradOutputF, float[] gradKernelT,
+        int batch, int inChannels, int height, int width, int outChannels,
+        int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        int colH = inChannels * kernelHeight * kernelWidth;
+        int colW = outputHeight * outputWidth;
+        int outSize = colH * outChannels;
+        int perChunk = Math.Max(1, ChunkedWeightGradPositions / colW);
+        int chunks = (batch + perChunk - 1) / perChunk;
+        int inputSliceSize = inChannels * height * width;
+        // The transpose below reads gradOutputF through a raw pointer: prove every image's [outC, colW] block is inside it.
+        if ((long)batch * outChannels * colW > gradOutputF.Length || (long)batch * inputSliceSize > inputF.Length
+            || (long)outSize > gradKernelT.Length)
+            throw new ArgumentException("ConvWeightGradientChunked: an operand is shorter than its geometry.");
+        var pool = ArrayPool<float>.Shared;
+        float[] partials = pool.Rent(chunks * outSize);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)batch * colW * outSize, j =>
+            {
+                int b0 = j * perChunk, nb = Math.Min(perChunk, batch - b0), cw = nb * colW;
+                float[] cols = pool.Rent(colH * cw);
+                float[] gT = pool.Rent(cw * outChannels);
+                try
+                {
+                    int block = outChannels * colW;
+                    for (int b = 0; b < nb; b++)
+                    {
+                        Im2ColHelper.Im2ColStridedSingle(
+                            new ReadOnlySpan<float>(inputF, (b0 + b) * inputSliceSize, inputSliceSize),
+                            new Span<float>(cols, 0, colH * cw), cw, b * colW,
+                            inChannels, height, width, kernelHeight, kernelWidth,
+                            strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                        // g_b is [outC, colW]; its rows of gT are [colW, outC]. Each image's block is taken as a span, so
+                        // its first and last element are bounds-checked against the arrays before any pointer is formed.
+                        var source = new ReadOnlySpan<float>(gradOutputF, checked((b0 + b) * block), block);
+                        var target = new Span<float>(gT, checked(b * block), block);
+#if NET5_0_OR_GREATER
+                        fixed (float* src = source, dst = target)
+                            Simd.SimdTranspose.TransposeSerial(src, dst, outChannels, colW);
+#else
+                        for (int oc = 0; oc < outChannels; oc++)
+                            for (int n = 0; n < colW; n++)
+                                target[n * outChannels + oc] = source[oc * colW + n];
+#endif
+                    }
+                    Simd.SimdGemm.SgemmForAutotune(
+                        new ReadOnlySpan<float>(cols, 0, colH * cw),
+                        new ReadOnlySpan<float>(gT, 0, cw * outChannels),
+                        new Span<float>(partials, j * outSize, outSize),
+                        colH, cw, outChannels, Simd.SgemmExecutionMode.Sequential);
+                }
+                finally
+                {
+                    pool.Return(cols);
+                    pool.Return(gT);
+                }
+            }, deterministicSafe: true);
+
+            // Chunk order per element: disjoint element ranges, each summed j = 0..chunks-1.
+            const int Span = 4096;
+            CpuParallelSettings.ParallelForOrSerial(0, (outSize + Span - 1) / Span, (long)outSize * chunks, s =>
+            {
+                int start = s * Span, count = Math.Min(Span, outSize - start);
+                var dst = new Span<float>(gradKernelT, start, count);
+                new ReadOnlySpan<float>(partials, start, count).CopyTo(dst);
+                for (int j = 1; j < chunks; j++)
+                {
+                    var src = new ReadOnlySpan<float>(partials, j * outSize + start, count);
+                    for (int i = 0; i < count; i++) dst[i] += src[i];
+                }
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            pool.Return(partials);
+        }
+        System.Threading.Interlocked.Increment(ref ChunkedWeightGradients);
+    }
+
+    // A per-image column block of at most 1 MB (an L2's worth on the targets measured) and a reduction short enough that
+    // a sequential GEMM per image beats one batch-wide GEMM, with at least one image per worker.
+    private const int PerImageSmallKMaxColH = 256;
+    private const long PerImageSmallKMaxColElements = 1L << 18;
+
+    /// <summary>Forwards that took the per-image small-K route (tests).</summary>
+    internal static long PerImageSmallKForwards;
+
+    private static bool PerImageSmallKForward(int batch, int colH, int colW)
+        => colH <= PerImageSmallKMaxColH
+           && (long)colH * colW <= PerImageSmallKMaxColElements
+           && batch >= CpuParallelSettings.MaxDegreeOfParallelism;
+
     /// <summary>
     /// Forward conv as one GEMM over the batch: out[outC, batch*colW] = W[outC, colH] . cols[colH, batch*colW], then
     /// unpacked to [batch, outC, colW]. Overwrites every element of <paramref name="outputF"/>.
@@ -219,6 +334,37 @@ public partial class CpuEngine
         int colWAll = batch * colW;
         int inputSliceSize = inChannels * height * width;
         var pool = ArrayPool<float>.Shared;
+        if (PerImageSmallKForward(batch, colH, colW))
+        {
+            // A short reduction (an RGB stem: 3 channels x 4x4 = 48) over many images: each image's columns fit in L2,
+            // so one worker per image builds them and runs its own sequential GEMM straight into the image's output.
+            // The whole-batch form wrote and re-read a 25 MB column stack and a 33 MB packed output, and split a K = 48
+            // GEMM in two dimensions: 62-107 ms for DCGAN's batch-128 stem, against oneDNN's 13 ms. Each output
+            // element is one GEMM's, summed in the same order at any thread count.
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * outChannels * colH * colW, b =>
+            {
+                var col = pool.Rent(colH * colW);
+                try
+                {
+                    Im2ColHelper.Im2ColStridedSingleChannelRange(
+                        new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                        new Span<float>(col, 0, colH * colW), colW, 0,
+                        0, inChannels, height, width, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    Simd.SimdGemm.SgemmForAutotune(
+                        new ReadOnlySpan<float>(kernelF, 0, outChannels * colH),
+                        new ReadOnlySpan<float>(col, 0, colH * colW),
+                        new Span<float>(outputF, b * outChannels * colW, outChannels * colW),
+                        outChannels, colH, colW, Simd.SgemmExecutionMode.Sequential);
+                }
+                finally
+                {
+                    pool.Return(col);
+                }
+            }, deterministicSafe: true);
+            System.Threading.Interlocked.Increment(ref PerImageSmallKForwards);
+            return;
+        }
         var cols = pool.Rent(colH * colWAll);
         var packedOut = pool.Rent(outChannels * colWAll);
         try

@@ -22,6 +22,10 @@ internal static class ConvTransposeGemmKernelTemplate
     internal const string Regroup = "convt_gemm_regroup";
     internal const string OverlapAdd = "convt_gemm_overlap_add";
 
+    /// <summary>The overlap-add plus a per-output-channel bias, added after the taps (as a separate bias pass adds it,
+    /// so the values match the transposed forward followed by the bias add bit for bit).</summary>
+    internal const string OverlapAddBias = "convt_gemm_overlap_add_bias";
+
     /// <summary>Every kernel's group size.</summary>
     internal const int GroupSize = 256;
 
@@ -72,16 +76,18 @@ internal static class ConvTransposeGemmKernelTemplate
     internal static readonly string[] OverlapAddInts =
         { "nb", "OC", "OH", "OW", "KH", "KW", "SH", "SW", "PH", "PW", "IH", "IW", "dstOffset" };
 
-    /// <summary>Both kernels, in this template's conventions (binding 1 written, binding 0 read).</summary>
+    /// <summary>The kernels, in this template's conventions (binding 1 written, every other binding read).</summary>
     internal static readonly WinogradF23KernelTemplate.Spec[] Kernels =
     {
         new(Regroup, new[] { "src", "xt" }, RegroupInts, RegroupBody),
         new(OverlapAdd, new[] { "col", "dst" }, OverlapAddInts, OverlapAddBody),
+        new(OverlapAddBias, new[] { "col", "dst", "bias" }, OverlapAddInts,
+            OverlapAddBody.Replace("dst[dstOffset + gid] = sum;", "dst[dstOffset + gid] = sum + bias[c];")),
     };
 
-    internal static string[] GetKernelNames() => new[] { Regroup, OverlapAdd };
+    internal static string[] GetKernelNames() => new[] { Regroup, OverlapAdd, OverlapAddBias };
 
-    /// <summary>Both kernels in one OpenCL C, HIP C++ or Metal Shading Language module.</summary>
+    /// <summary>The kernels in one OpenCL C, HIP C++ or Metal Shading Language module.</summary>
     internal static string GetModuleSource(WinogradKernelDialect dialect)
         => WinogradF23KernelTemplate.EmitModule(Kernels, dialect);
 
