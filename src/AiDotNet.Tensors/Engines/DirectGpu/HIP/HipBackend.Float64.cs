@@ -15,13 +15,29 @@ public sealed partial class HipBackend : IGpuFloat64Reductions, IGpuFloat64Eleme
 
     /// <inheritdoc/>
     public bool SupportsFloat64Reductions
-        => IsAvailable && _kernelCache.ContainsKey("reduce_sum_f64") && _kernelCache.ContainsKey("reduce_dot_f64");
+        => IsAvailable && _kernelCache.ContainsKey("reduce_sum_f64") && _kernelCache.ContainsKey("reduce_dot_f64")
+            && _kernelCache.ContainsKey("reduce_max_f64") && _kernelCache.ContainsKey("reduce_min_f64");
 
     /// <inheritdoc/>
     public double SumFloat64(IGpuBuffer a, int size)
     {
         CheckFloat64Operand(a, size, nameof(a));
         return size == 0 ? 0.0 : ReduceFloat64(a, null, size);
+    }
+
+    /// <inheritdoc/>
+    public double MaxFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, "reduce_max_f64");
+
+    /// <inheritdoc/>
+    public double MinFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, "reduce_min_f64");
+
+    private double ExtremeFloat64(IGpuBuffer a, int size, string kernel)
+    {
+        CheckFloat64Operand(a, size, nameof(a));
+        if (size == 0) throw new ArgumentException("An empty range has no minimum or maximum.", nameof(size));
+        if (!SupportsFloat64Reductions)
+            throw new GpuCapabilityUnavailableException("Double-precision reduction kernels are not available on this device.");
+        return ReduceFloat64(a, null, size, kernel);
     }
 
     /// <inheritdoc/>
@@ -186,9 +202,9 @@ public sealed partial class HipBackend : IGpuFloat64Reductions, IGpuFloat64Eleme
     // Reduces to one partial per block until one value is left. The first pass multiplies by `multiplier` when it is
     // given (the dot product); every later pass sums partials. A single element still takes one pass, so the product is
     // formed and the result lands in a buffer this method owns.
-    private unsafe double ReduceFloat64(IGpuBuffer input, IGpuBuffer? multiplier, int size)
+    private unsafe double ReduceFloat64(IGpuBuffer input, IGpuBuffer? multiplier, int size, string reduceKernel = "reduce_sum_f64")
     {
-        IntPtr sumKernel = _kernelCache["reduce_sum_f64"];
+        IntPtr sumKernel = _kernelCache[reduceKernel];
         IntPtr dotKernel = _kernelCache["reduce_dot_f64"];
 
         int maximumPartials = (size + Float64ReductionBlock - 1) / Float64ReductionBlock;

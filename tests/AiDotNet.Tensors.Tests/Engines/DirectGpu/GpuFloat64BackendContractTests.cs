@@ -386,6 +386,74 @@ public abstract class GpuFloat64BackendContractTests
         Assert.Equal(0.0, Reductions(backend).DotFloat64(a, b, 0));
     }
 
+    // A comparison rounds nothing: the extremes are the host's exactly, at one pass and at several, over the whole
+    // buffer and over a prefix (whose extreme usually differs, so a kernel reading past the prefix is caught).
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(63)]
+    [InlineData(64)]
+    [InlineData(65)]
+    [InlineData(257)]
+    [InlineData(4097)]
+    [InlineData(100003)]
+    public void Max_and_min_are_the_hosts_exactly(int length)
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var reductions = Reductions(backend);
+        var values = Values(length, 42);
+        using var a = backend.AllocateBuffer(length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, values);
+        foreach (int count in new[] { length, Math.Max(1, length / 2), 1 })
+        {
+            double largest = values[0], smallest = values[0];
+            for (int i = 1; i < count; i++)
+            {
+                largest = Math.Max(largest, values[i]);
+                smallest = Math.Min(smallest, values[i]);
+            }
+
+            Assert.True(largest == reductions.MaxFloat64(a, count), $"Max of the first {count} of {length}: host {largest:R}, device {reductions.MaxFloat64(a, count):R}.");
+            Assert.True(smallest == reductions.MinFloat64(a, count), $"Min of the first {count} of {length}: host {smallest:R}, device {reductions.MinFloat64(a, count):R}.");
+        }
+
+        Assert.Throws<ArgumentException>(() => reductions.MaxFloat64(a, 0));
+        Assert.Throws<ArgumentException>(() => reductions.MinFloat64(a, 0));
+    }
+
+    // A NaN anywhere is the result of both, as Math.Max and Math.Min give; the infinities are ordinary extremes. The
+    // NaN is tried in the first block, in a later one and last, so it has to survive every pass.
+    [SkippableFact]
+    public void Max_and_min_propagate_a_nan_and_order_the_infinities()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var reductions = Reductions(backend);
+        const int Length = 5000;
+        var values = Values(Length, 43);
+        values[17] = double.PositiveInfinity;
+        values[4321] = double.NegativeInfinity;
+        using var a = backend.AllocateBuffer(Length, GpuElementType.Float64);
+        backend.UploadBuffer<double>(a, values);
+        Assert.Equal(double.PositiveInfinity, reductions.MaxFloat64(a, Length));
+        Assert.Equal(double.NegativeInfinity, reductions.MinFloat64(a, Length));
+        foreach (int at in new[] { 0, 3, 2500, Length - 1 })
+        {
+            var withNaN = (double[])values.Clone();
+            withNaN[at] = double.NaN;
+            backend.UploadBuffer<double>(a, withNaN);
+            Assert.True(double.IsNaN(reductions.MaxFloat64(a, Length)), $"Max with a NaN at {at}.");
+            Assert.True(double.IsNaN(reductions.MinFloat64(a, Length)), $"Min with a NaN at {at}.");
+            // A prefix that ends before the NaN does not see it.
+            if (at > 0)
+            {
+                Assert.False(double.IsNaN(reductions.MaxFloat64(a, at)), $"Max of the {at} elements before the NaN.");
+                Assert.False(double.IsNaN(reductions.MinFloat64(a, at)), $"Min of the {at} elements before the NaN.");
+            }
+        }
+    }
+
     [SkippableFact]
     public void Matrix_multiply_matches_the_host_and_refuses_an_aliased_product()
     {

@@ -26,6 +26,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <inheritdoc/>
+        public double MaxFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, "reduce_max_f64");
+
+        /// <inheritdoc/>
+        public double MinFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, "reduce_min_f64");
+
+        private double ExtremeFloat64(IGpuBuffer a, int size, string kernel)
+        {
+            var input = Float64Operand(a, size, nameof(a));
+            if (size == 0) throw new ArgumentException("An empty range has no minimum or maximum.", nameof(size));
+            return ReduceFloat64(input, size, firstPass: null, kernel);
+        }
+
+        /// <inheritdoc/>
         public double DotFloat64(IGpuBuffer a, IGpuBuffer b, int size)
         {
             var left = Float64Operand(a, size, nameof(a));
@@ -195,9 +208,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         // Reduces to one partial per work-group until one value is left. The first pass multiplies by `firstPass` when
         // it is given (the dot product); every later pass sums partials.
-        private double ReduceFloat64(DirectOpenClGpuByteBuffer input, int size, DirectOpenClGpuByteBuffer? firstPass)
+        private double ReduceFloat64(DirectOpenClGpuByteBuffer input, int size, DirectOpenClGpuByteBuffer? firstPass, string reduceKernel = "reduce_sum_f64")
         {
-            var sumKernel = _kernelCache["reduce_sum_f64"];
+            var sumKernel = _kernelCache[reduceKernel];
             var dotKernel = _kernelCache["reduce_dot_f64"];
             int firstLocal = Float64LocalSize(firstPass is null ? sumKernel : dotKernel, size);
             int maximumPartials = Math.Max(1, (size + firstLocal - 1) / firstLocal);

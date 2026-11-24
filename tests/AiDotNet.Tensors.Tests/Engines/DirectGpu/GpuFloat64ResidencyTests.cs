@@ -211,7 +211,17 @@ public class GpuFloat64ResidencyTests : IDisposable
             double total = gpu.TensorSum(quotient);
             Assert.Equal(before + 1, GpuLaunchProbe.Readbacks);
 
+            // So do its maximum, its minimum and its mean: one scalar each.
+            double largest = gpu.TensorMaxValue(quotient);
+            double smallest = gpu.TensorMinValue(quotient);
+            double mean = gpu.TensorMean(quotient);
+            Assert.Equal(before + 4, GpuLaunchProbe.Readbacks);
+
             var expected = cpu.TensorDivide(cpu.TensorSubtract(cpu.TensorMultiply(cpu.TensorAdd(x, y), x), y), x);
+            Assert.Equal(cpu.TensorMaxValue(expected), largest);
+            Assert.Equal(cpu.TensorMinValue(expected), smallest);
+            double cpuMean = cpu.TensorMean(expected);
+            Assert.True(Math.Abs(mean - cpuMean) <= 1e-9 * Math.Abs(cpuMean) + 1e-9, $"device mean {mean:R}, cpu {cpuMean:R}");
             // Element-wise values are single IEEE operations: identical. The total differs only by summation order.
             AssertBitEqual(expected.AsSpan(), quotient.AsSpan());
             double cpuTotal = cpu.TensorSum(expected);

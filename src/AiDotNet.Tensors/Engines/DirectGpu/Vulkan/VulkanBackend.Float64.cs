@@ -160,6 +160,19 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     }
 
     /// <inheritdoc/>
+    public double MaxFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Max);
+
+    /// <inheritdoc/>
+    public double MinFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Min);
+
+    private double ExtremeFloat64(IGpuBuffer a, int size, GpuFloat64Reduction reduction)
+    {
+        var input = Float64Operand(a, size, nameof(a));
+        if (size == 0) throw new ArgumentException("An empty range has no minimum or maximum.", nameof(size));
+        return ReduceFloat64(input, null, size, reduction);
+    }
+
+    /// <inheritdoc/>
     public double DotFloat64(IGpuBuffer a, IGpuBuffer b, int size)
     {
         var left = Float64Operand(a, size, nameof(a));
@@ -169,7 +182,7 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
 
     // Each pass folds blocks of VulkanFloat64Kernels.ReduceBlock elements into one partial each, until one value is
     // left. The first pass multiplies by `second` when it is given (the dot product); every later pass sums partials.
-    private double ReduceFloat64(IGpuBuffer first, IGpuBuffer? second, int size)
+    private double ReduceFloat64(IGpuBuffer first, IGpuBuffer? second, int size, GpuFloat64Reduction reduction = GpuFloat64Reduction.Sum)
     {
         int block = VulkanFloat64Kernels.ReduceBlock;
         int partials = (size + block - 1) / block;
@@ -186,7 +199,9 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
             if (firstPass && second is not null)
                 ParityDispatch("dot_f64", VulkanFloat64Kernels.DotBlocks, outputs, new[] { (uint)outputs, (uint)count }, current, second, target);
             else
-                ParityDispatch("sum_f64", VulkanFloat64Kernels.SumBlocks, outputs, new[] { (uint)outputs, (uint)count }, current, target);
+                ParityDispatch(reduction == GpuFloat64Reduction.Sum ? "sum_f64" : reduction == GpuFloat64Reduction.Max ? "max_f64" : "min_f64",
+                    reduction == GpuFloat64Reduction.Sum ? VulkanFloat64Kernels.SumBlocks : VulkanFloat64Kernels.ExtremeBlocks(reduction == GpuFloat64Reduction.Max),
+                    outputs, new[] { (uint)outputs, (uint)count }, current, target);
             firstPass = false;
             if (outputs == 1)
                 return BitConverter.ToDouble(DownloadByteBuffer(target, sizeof(double)), 0);
@@ -401,6 +416,28 @@ void main()
     uint to = min(from + " + ReduceBlock + @"u, count);
     double y = 0.0;
     for (uint j = from; j < to; j++) y += packDouble2x32(uvec2(a[2u * j], a[2u * j + 1u]));
+" + Store + @"
+}
+");
+
+    /// <summary>
+    /// Pass of a maximum or minimum: <c>o[i]</c> is that of block <c>i</c> of the <c>count</c> input elements, a NaN
+    /// when the block holds one. A block is never empty.
+    /// </summary>
+    public static string ExtremeBlocks(bool largest) => VulkanTorchParityElementwiseKernels.DoubleKernel(largest ? "max_blocks" : "min_blocks", OneIn + @"
+layout(push_constant) uniform P { uint n; uint count; };
+", @"
+void main()
+{
+" + VulkanTorchParityElementwiseKernels.IndexGuard + @"
+    uint from = i * " + ReduceBlock + @"u;
+    uint to = min(from + " + ReduceBlock + @"u, count);
+    double y = packDouble2x32(uvec2(a[2u * from], a[2u * from + 1u]));
+    for (uint j = from + 1u; j < to; j++)
+    {
+        double v = packDouble2x32(uvec2(a[2u * j], a[2u * j + 1u]));
+        if (y == y && (v != v || v " + (largest ? ">" : "<") + @" y)) y = v;
+    }
 " + Store + @"
 }
 ");

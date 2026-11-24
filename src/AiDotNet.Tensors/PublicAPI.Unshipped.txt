@@ -807,16 +807,24 @@ virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.AllocateBuffer(int siz
 virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.SupportsElementType(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.DotFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsFloat64Reductions.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.DotFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsFloat64Reductions.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions.DotFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Reductions.SupportsFloat64Reductions.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.DotFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.SupportsFloat64Reductions.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.SupportsFloat64Elementwise.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BinaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
@@ -893,6 +901,8 @@ AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.DotFloat64(AiDotNet.Tens
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.ScalarFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, double scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsFloat64Elementwise.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsFloat64MatrixMultiply.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.SupportsFloat64Reductions.get -> bool
@@ -905,6 +915,8 @@ AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.DotFloat64(AiDotNet.Tensor
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.MatrixMultiplyFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.ScalarFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, double scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SumFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.MaxFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
+AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.MinFloat64(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> double
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64Elementwise.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64MatrixMultiply.get -> bool
 AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend.SupportsFloat64Reductions.get -> bool
