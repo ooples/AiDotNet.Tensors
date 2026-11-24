@@ -229,10 +229,16 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
         try
         {
             VulkanBuffer.LastAllocationResult = VulkanNativeBindings.VK_SUCCESS;
+            // Past this process's GpuMemoryBudget: the out-of-device-memory error a refused allocation raises below. The
+            // device's local memory is what a fraction budget is of.
+            if (Account.DeviceTotalBytes == 0) Account.DeviceTotalBytes = VulkanDevice.Instance.TotalDeviceLocalMemoryBytes;
+            Account.Admit((long)size * sizeof(float), null,
+                message => new GpuOutOfMemoryException(message, VulkanNativeBindings.VK_ERROR_OUT_OF_DEVICE_MEMORY));
             storage = VulkanBuffer.CreateStorageBuffer(size);
             staging = storage is null ? null : VulkanBuffer.CreateStagingBuffer(size);
             if (storage is null || staging is null)
             {
+                DeviceMemoryAccount.SettleAdmission();   // admitted, not created
                 int vk = VulkanBuffer.LastAllocationResult;
                 if (vk == VulkanNativeBindings.VK_ERROR_OUT_OF_DEVICE_MEMORY || vk == VulkanNativeBindings.VK_ERROR_OUT_OF_HOST_MEMORY)
                     throw new GpuOutOfMemoryException($"Failed to allocate Vulkan GPU buffer: {vk}", vk);

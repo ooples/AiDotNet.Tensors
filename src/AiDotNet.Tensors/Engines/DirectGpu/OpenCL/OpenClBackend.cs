@@ -288,6 +288,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
+                _memoryAccount.DeviceTotalBytes = GlobalMemoryBytes;   // what a GpuMemoryBudget fraction is of
+                _context.MemoryAccount = _memoryAccount;
                 _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
                 LocalMemoryBytes = (long)_context.LocalMemSize;
                 // Issue #285: per-allocation cap. Drivers cap individual buffers

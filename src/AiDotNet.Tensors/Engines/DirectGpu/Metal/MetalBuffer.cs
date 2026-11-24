@@ -217,16 +217,28 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         var sizeInBytes = (ulong)elementCount * sizeof(float);
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
-        _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
-        if (_buffer == IntPtr.Zero)
+        // Past this process's GpuMemoryBudget, after the release a refused allocation runs: the same error.
+        device.MemoryAccount.Admit((long)sizeInBytes, () => ReclaimForRetry(device),
+            message => new OutOfMemoryException(message));
+        try
         {
-            // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
-            ReclaimForRetry(device);
-            _buffer = device.CreateBuffer(sizeInBytes, options);
+            _buffer = FirstAttempt(() => device.CreateBuffer(sizeInBytes, options));
+            if (_buffer == IntPtr.Zero)
+            {
+                // Out of memory: free what unreachable and pooled buffers hold, then retry once (see DeviceMemoryReclaim).
+                ReclaimForRetry(device);
+                _buffer = device.CreateBuffer(sizeInBytes, options);
+            }
+        }
+        catch
+        {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created: the retry threw
+            throw;
         }
 
         if (_buffer == IntPtr.Zero)
         {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes");
         }
         CountDriverAllocation();
@@ -362,6 +374,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         var sizeInBytes = (ulong)data.Length * sizeof(float);
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Past this process's GpuMemoryBudget, after the release a refused allocation runs: the same error.
+        device.MemoryAccount.Admit((long)sizeInBytes, () => ReclaimForRetry(device),
+            message => new OutOfMemoryException(message));
         var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
 
         try
@@ -375,6 +390,11 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
                 _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
             }
         }
+        catch
+        {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created: the retry threw
+            throw;
+        }
         finally
         {
             handle.Free();
@@ -382,6 +402,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBufferV
 
         if (_buffer == IntPtr.Zero)
         {
+            DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new OutOfMemoryException($"Failed to allocate Metal buffer of {sizeInBytes} bytes with data");
         }
         CountDriverAllocation();

@@ -320,7 +320,7 @@ public sealed class CuBlasLtMatmul : IDisposable
         bestMs = float.MaxValue;
         try
         {
-            if (CudaNativeBindings.cuMemAlloc(out scratch, bytes) != CudaResult.Success) return 0;
+            if (CudaAccountedMemory.Alloc(out scratch, bytes) != CudaResult.Success) return 0;
             if (CudaNativeBindings.cuEventCreate(out start, 0) != CudaResult.Success
                 || CudaNativeBindings.cuEventCreate(out stop, 0) != CudaResult.Success)
                 return 0;
@@ -365,7 +365,7 @@ public sealed class CuBlasLtMatmul : IDisposable
             if (stop != IntPtr.Zero) CudaNativeBindings.cuEventSynchronize(stop);
             if (start != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(start);
             if (stop != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(stop);
-            if (scratch != IntPtr.Zero) CudaNativeBindings.cuMemFree(scratch);
+            if (scratch != IntPtr.Zero) CudaAccountedMemory.Free(scratch);
         }
     }
 

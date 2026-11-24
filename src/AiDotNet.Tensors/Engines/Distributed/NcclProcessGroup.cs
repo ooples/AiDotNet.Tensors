@@ -116,7 +116,7 @@ public sealed class NcclProcessGroup : IProcessGroup
         IntPtr dev = IntPtr.Zero;
         try
         {
-            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out dev, bytes) != CudaResult.Success)
+            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Alloc(out dev, bytes) != CudaResult.Success)
                 throw new InvalidOperationException("cuMemAlloc failed.");
 
             // Upload: pin a copy of the tensor's contents and HtoD.
@@ -150,7 +150,7 @@ public sealed class NcclProcessGroup : IProcessGroup
         }
         finally
         {
-            if (dev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemFree(dev);
+            if (dev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Free(dev);
         }
     }
 
@@ -210,9 +210,9 @@ public sealed class NcclProcessGroup : IProcessGroup
         IntPtr sendDev = IntPtr.Zero, recvDev = IntPtr.Zero;
         try
         {
-            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out sendDev, sendBytes) != CudaResult.Success)
+            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Alloc(out sendDev, sendBytes) != CudaResult.Success)
                 throw new InvalidOperationException("cuMemAlloc(send) failed.");
-            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out recvDev, recvBytes) != CudaResult.Success)
+            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Alloc(out recvDev, recvBytes) != CudaResult.Success)
                 throw new InvalidOperationException("cuMemAlloc(recv) failed.");
 
             var sendArr = GetBackingArray(input);
@@ -243,8 +243,8 @@ public sealed class NcclProcessGroup : IProcessGroup
         }
         finally
         {
-            if (sendDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemFree(sendDev);
-            if (recvDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemFree(recvDev);
+            if (sendDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Free(sendDev);
+            if (recvDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Free(recvDev);
         }
     }
 
@@ -262,8 +262,8 @@ public sealed class NcclProcessGroup : IProcessGroup
         IntPtr sendDev = IntPtr.Zero, recvDev = IntPtr.Zero;
         try
         {
-            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out sendDev, sendBytes) != CudaResult.Success) throw new InvalidOperationException("cuMemAlloc(send) failed.");
-            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemAlloc(out recvDev, recvBytes) != CudaResult.Success) throw new InvalidOperationException("cuMemAlloc(recv) failed.");
+            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Alloc(out sendDev, sendBytes) != CudaResult.Success) throw new InvalidOperationException("cuMemAlloc(send) failed.");
+            if (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Alloc(out recvDev, recvBytes) != CudaResult.Success) throw new InvalidOperationException("cuMemAlloc(recv) failed.");
 
             for (int r = 0; r < WorldSize; r++)
             {
@@ -289,8 +289,8 @@ public sealed class NcclProcessGroup : IProcessGroup
         }
         finally
         {
-            if (sendDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemFree(sendDev);
-            if (recvDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemFree(recvDev);
+            if (sendDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Free(sendDev);
+            if (recvDev != IntPtr.Zero) AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaAccountedMemory.Free(recvDev);
         }
     }
 

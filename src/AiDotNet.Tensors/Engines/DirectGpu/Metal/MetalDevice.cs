@@ -218,6 +218,8 @@ public sealed class MetalDevice : IDisposable
 
             // Get recommended working set size
             RecommendedMaxWorkingSetSize = SendMessageULongReturn(_device, Selectors.RecommendedMaxWorkingSetSize);
+            // What a GpuMemoryBudget fraction is of: the working set Metal recommends (unified memory has no VRAM size).
+            MemoryAccount.DeviceTotalBytes = (long)RecommendedMaxWorkingSetSize;
             MaxBufferLength = SendMessageULongReturn(_device, Selectors.MaxBufferLength);
             if (RecommendedMaxWorkingSetSize > 0)
             {

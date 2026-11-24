@@ -73,10 +73,141 @@ internal sealed class DeviceMemoryAccount
         _resetDriverPeak = resetPeak;
     }
 
+    // The device's memory, as its backend reports it (0 until one does): what a fraction budget is a fraction of.
+    private long _deviceTotalBytes;
+
+    /// <summary>The device's total memory as its backend reported it, or 0 when none has.</summary>
+    internal long DeviceTotalBytes
+    {
+        get => Interlocked.Read(ref _deviceTotalBytes);
+        set => Interlocked.Exchange(ref _deviceTotalBytes, value);
+    }
+
+    /// <summary>
+    /// The most this process may hold reserved on the device (<see cref="GpuMemoryBudget"/>), or 0 for no limit: an
+    /// explicit byte limit, else a fraction of <see cref="DeviceTotalBytes"/>.
+    /// </summary>
+    internal long? LimitBytes => GpuMemoryBudget.LimitFor(Device, DeviceTotalBytes);
+
+    /// <summary>Memory the library holds from the driver now: its own reservations and the driver pool's.</summary>
+    internal long ReservedBytes => Interlocked.Read(ref _reserved) + (ReadDriver()?.Current ?? 0);
+
+    // The driver pool's figures as last read. A query that fails keeps them: an unreadable pool is not an empty one,
+    // and counting it as zero would admit allocations past the budget.
+    private long _lastDriverCurrent, _lastDriverPeak;
+    private int _driverWasRead;
+
+    /// <summary>
+    /// Admits a new driver allocation of <paramref name="bytes"/> under the device's budget. Over it, runs
+    /// <paramref name="reclaim"/> (the backend's release of cached and unreachable memory, as for a driver
+    /// out-of-memory) once and checks again; still over, throws the error <paramref name="outOfMemory"/> builds, the
+    /// same type the backend raises when the driver itself is out of memory, so every caller's fallback applies alike.
+    /// PyTorch's per-process memory fraction caps its caching allocator's reserved memory the same way.
+    /// </summary>
+    internal void Admit(long bytes, Action? reclaim, Func<string, Exception> outOfMemory)
+    {
+        if (!TryAdmit(bytes, reclaim, out string? refusal)) throw outOfMemory(refusal!);
+    }
+
+    /// <summary>As <see cref="Admit"/>, for an allocator that reports failure by its result: false (with the reason)
+    /// where <see cref="Admit"/> would throw.</summary>
+    // Bytes admitted under the budget whose allocation is still being made: admitted, not yet counted as reserved.
+    // Every admission counts them, so threads allocating at the same moment cannot each be admitted against the
+    // same headroom.
+    private long _inFlight;
+
+    // The admission this thread holds. One at a time: the next admission, or the reservation of the admitted
+    // allocation, settles it.
+    [ThreadStatic] private static DeviceMemoryAccount? t_admittedOn;
+    [ThreadStatic] private static long t_admittedBytes;
+
+    /// <summary>
+    /// Whether an allocation of <paramref name="bytes"/> fits the device's budget, after running
+    /// <paramref name="reclaim"/> once when it does not. An admitted request is held against the budget until this
+    /// thread reserves it (<see cref="Reserve"/>), settles it (<see cref="SettleAdmission"/>, for an allocation the
+    /// driver's own pool counts, or one that failed), or asks for its next admission.
+    /// </summary>
+    internal bool TryAdmit(long bytes, Action? reclaim, out string? refusal)
+    {
+        refusal = null;
+        SettleAdmission();
+        if (LimitBytes is not long limit || bytes <= 0) return true;
+        if (Claim(bytes, limit)) return true;
+        Interlocked.Increment(ref _budgetReclaims);
+        reclaim?.Invoke();
+        if (Claim(bytes, limit)) return true;
+        Interlocked.Increment(ref _budgetRefusals);
+        refusal = $"GPU memory budget of {limit} bytes on {Device} exceeded: {bytes} bytes requested with {ReservedBytes} "
+                  + "reserved (GpuMemoryBudget).";
+        return false;
+    }
+
+    private readonly object _admissionLock = new object();
+
+    // Checked and counted under one lock (taken only on a device that has a budget): of the threads asking at the
+    // same moment, exactly those that fit together are admitted -- none past the limit, and none refused for a
+    // request that would have fit.
+    private bool Claim(long bytes, long limit)
+    {
+        lock (_admissionLock)
+        {
+            long inFlight = Interlocked.Read(ref _inFlight);
+            if (bytes > limit || ReservedBytes > limit - bytes - inFlight) return false;
+            Interlocked.Add(ref _inFlight, bytes);
+        }
+
+        HoldAdmission(this, bytes);
+        return true;
+    }
+
+    private static void HoldAdmission(DeviceMemoryAccount account, long bytes)
+    {
+        t_admittedOn = account;
+        t_admittedBytes = bytes;
+    }
+
+    /// <summary>Releases the admission this thread holds, if any: its allocation is now counted as reserved, or was
+    /// not made.</summary>
+    internal static void SettleAdmission()
+    {
+        if (t_admittedOn is not { } account) return;
+        Interlocked.Add(ref account._inFlight, -t_admittedBytes);
+        t_admittedOn = null;
+        t_admittedBytes = 0;
+    }
+
+    /// <summary>Bytes admitted and not yet reserved or settled.</summary>
+    internal long InFlightBytes => Interlocked.Read(ref _inFlight);
+
+    private long _budgetReclaims, _budgetRefusals;
+
+    /// <summary>Allocations the budget sent through a reclaim, and those it refused (tests, diagnostics).</summary>
+    internal long BudgetReclaims => Interlocked.Read(ref _budgetReclaims);
+
+    internal long BudgetRefusals => Interlocked.Read(ref _budgetRefusals);
+
+    /// <summary>Counts a refusal an allocator decided after allocating (it grew past the budget).</summary>
+    internal void CountBudgetRefusal() => Interlocked.Increment(ref _budgetRefusals);
+
     /// <summary>A fresh driver allocation of <paramref name="bytes"/>.</summary>
     internal void Reserve(long bytes)
     {
-        Add(ref _reserved, ref _peakReserved, bytes);
+        if (ReferenceEquals(t_admittedOn, this))
+        {
+            // The allocation this thread was admitted for is counted now. Counted and settled under the admission
+            // lock, so an admission sees the bytes in exactly one of the two figures: never in neither (admitting
+            // past the budget), never in both (refusing a request that fits).
+            lock (_admissionLock)
+            {
+                Add(ref _reserved, ref _peakReserved, bytes);
+                SettleAdmission();
+            }
+        }
+        else
+        {
+            Add(ref _reserved, ref _peakReserved, bytes);
+        }
+
         Interlocked.Increment(ref _allocations);
         if (!_isTotal) Total.Reserve(bytes);
     }
@@ -154,9 +285,21 @@ internal sealed class DeviceMemoryAccount
     {
         var read = _driverReserved;
         if (read is null) return null;
-        try { return read(); }
-        // A statistics read never fails its caller: whatever the driver query throws reads as "no driver figure".
-        catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
+        try
+        {
+            var figures = read();
+            Interlocked.Exchange(ref _lastDriverCurrent, figures.Current);
+            Interlocked.Exchange(ref _lastDriverPeak, figures.Peak);
+            Volatile.Write(ref _driverWasRead, 1);
+            return figures;
+        }
+        // A statistics read never fails its caller. A query that fails reads as the last figures it returned (none
+        // before the first successful one), not as an empty pool.
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            if (Volatile.Read(ref _driverWasRead) == 0) return null;
+            return (Interlocked.Read(ref _lastDriverCurrent), Interlocked.Read(ref _lastDriverPeak));
+        }
     }
 }
 
