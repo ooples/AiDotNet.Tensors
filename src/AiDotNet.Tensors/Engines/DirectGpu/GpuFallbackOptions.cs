@@ -64,7 +64,7 @@ public sealed class GpuFallbackOptions
     /// Override the auto-detected per-allocation cap. Useful for testing
     /// (force a low cap to exercise the chunker) or for devices that
     /// misreport. When null, the engine uses
-    /// <see cref="IDirectGpuBackend.MaxBufferAllocBytes"/>.
+    /// <see cref="IGpuDevice.MaxBufferAllocBytes"/>.
     /// </summary>
     public long? MaxBufferBytes { get; init; }
 

@@ -53,6 +53,18 @@ internal static class WebGpuDispatchFold
     }
 
     /// <summary>
+    /// Refuses a dispatch that is not folded and has a dimension past <paramref name="limit"/>. Only a 1-D dispatch
+    /// folds; a 2-D or 3-D grid past the limit (a tiled product of a million rows) would be rejected by the device,
+    /// leaving its output unwritten with nothing reported to the caller.
+    /// </summary>
+    internal static void RequireWithinLimit(int workgroupsX, int workgroupsY, int workgroupsZ, int limit)
+    {
+        if (workgroupsX > limit || workgroupsY > limit || workgroupsZ > limit)
+            throw new GpuCapabilityUnavailableException(
+                $"A dispatch of {workgroupsX} x {workgroupsY} x {workgroupsZ} workgroups is past the device's {limit} per dimension, and only a 1-D dispatch can be folded.");
+    }
+
+    /// <summary>
     /// The WGSL of <paramref name="source"/> with entry point <paramref name="entryPoint"/> folded, or null when that
     /// entry point cannot be folded (it is not found, or takes a parameter other than a builtin).
     /// </summary>

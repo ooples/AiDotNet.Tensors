@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// Verifies symmetric buffer pooling, <see cref="IDeviceMemoryPressure.ReleaseCachedBuffers"/>,
 /// <see cref="IDeviceMemoryPressure.ReclaimsOnAllocationFailure"/>, zero-initialization on pooled
-/// <see cref="IDirectGpuBackend.AllocateBuffer(int)"/> where guaranteed, and uninitialized pool reuse
+/// <see cref="IGpuDevice.AllocateBuffer(int)"/> where guaranteed, and uninitialized pool reuse
 /// across all 6 DirectGpu backends (CUDA, HIP, OpenCL, Vulkan, Metal, WebGPU).
 /// </summary>
 [Collection("DirectGpuSerial")]

@@ -52,6 +52,22 @@ public sealed class WebGpuDispatchSizingTests
         Assert.Throws<GpuCapabilityUnavailableException>(() => WebGpuDispatchFold.Grid(65535L * 65535L + 1, limit));
     }
 
+    [Theory]
+    [InlineData(1, 65536, 1)]              // a tiled product of 1,048,561 rows: (M + 15) / 16
+    [InlineData(65536, 2, 1)]              // past the limit in X, and not 1-D, so it cannot fold
+    [InlineData(1, 1, 65536)]
+    public void A_grid_past_the_limit_that_cannot_fold_is_refused(int x, int y, int z)
+    {
+        Assert.Throws<GpuCapabilityUnavailableException>(() => WebGpuDispatchFold.RequireWithinLimit(x, y, z, 65535));
+    }
+
+    [Fact]
+    public void A_grid_at_the_limit_is_dispatched()
+    {
+        WebGpuDispatchFold.RequireWithinLimit(65535, 65535, 65535, 65535);
+        WebGpuDispatchFold.RequireWithinLimit(1, 1, 1, 65535);
+    }
+
     private const string Elementwise = @"
 @group(0) @binding(0) var<storage, read> a: array<f32>;
 @group(0) @binding(1) var<storage, read_write> b: array<f32>;
