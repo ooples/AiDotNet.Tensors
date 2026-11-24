@@ -253,6 +253,72 @@ public sealed class AwaitableGpuTensorEngineHostBackendTests
 }
 
 /// <summary>An <see cref="IAwaitableGpuBackend"/> whose buffers are host arrays and whose kernels are loops.</summary>
+/// <summary>
+/// The per-allocation cap, which follows <see cref="GpuFallbackOptionsHolder.Current"/> (process-wide): serialized with
+/// the other tests that set it.
+/// </summary>
+[Collection("BufferSizeCapTests")]
+public sealed class AwaitableGpuTensorEngineBufferCapTests
+{
+    private static Tensor<float> Matrix(int rows, int columns)
+        => new(Enumerable.Range(1, rows * columns).Select(i => (float)i).ToArray(), new[] { rows, columns });
+
+    [Fact]
+    public async Task An_output_past_the_cap_is_computed_by_the_cpu_and_leaves_no_buffer()
+    {
+        // [2,1] x [1,3]: both operands fit four elements, the six-element product does not.
+        var backend = new HostAwaitableBackend { MaxBufferElements = 4 };
+        using var engine = new AwaitableGpuTensorEngine(backend);
+        var cpu = new CpuEngine();
+        Tensor<float> a = Matrix(2, 1), b = Matrix(1, 3);
+
+        Assert.Equal(cpu.TensorMatMul(a, b).ToArray(), (await engine.TensorMatMulAsync(a, b)).ToArray());
+        Assert.Equal(0, backend.Kernels);
+        Assert.Equal(0, backend.LiveBuffers);
+    }
+
+    [Fact]
+    public async Task Operands_past_the_cap_are_computed_by_the_cpu_and_fitting_ones_stay_on_the_backend()
+    {
+        var backend = new HostAwaitableBackend { MaxBufferElements = 4 };
+        using var engine = new AwaitableGpuTensorEngine(backend);
+        var cpu = new CpuEngine();
+        Tensor<float> large = Matrix(2, 3), small = Matrix(2, 2);
+
+        Assert.Equal(cpu.TensorAdd(large, large).ToArray(), (await engine.TensorAddAsync(large, large)).ToArray());
+        Assert.Equal(cpu.TensorNegate(large).ToArray(), (await engine.TensorNegateAsync(large)).ToArray());
+        Assert.Equal(0, backend.Kernels);
+        Assert.Equal(0, backend.LiveBuffers);
+
+        Assert.Equal(cpu.TensorAdd(small, small).ToArray(), (await engine.TensorAddAsync(small, small)).ToArray());
+        Assert.Equal(cpu.TensorNegate(small).ToArray(), (await engine.TensorNegateAsync(small)).ToArray());
+        Assert.Equal(2, backend.Kernels);
+        Assert.Equal(0, backend.LiveBuffers);
+    }
+
+    [Fact]
+    public async Task Under_the_fail_fast_policy_the_cap_reaches_the_caller()
+    {
+        var backend = new HostAwaitableBackend { MaxBufferElements = 4 };
+        using var engine = new AwaitableGpuTensorEngine(backend);
+        Tensor<float> a = Matrix(2, 1), b = Matrix(1, 3), large = Matrix(2, 3);
+        var previous = GpuFallbackOptionsHolder.Current;
+        try
+        {
+            GpuFallbackOptionsHolder.Current = new GpuFallbackOptions { ChunkingPolicy = GpuChunkingPolicy.NeverChunk_FailFast };
+            await Assert.ThrowsAsync<GpuBufferTooLargeException>(() => engine.TensorMatMulAsync(a, b).AsTask());
+            await Assert.ThrowsAsync<GpuBufferTooLargeException>(() => engine.TensorAddAsync(large, large).AsTask());
+            await Assert.ThrowsAsync<GpuBufferTooLargeException>(() => engine.TensorNegateAsync(large).AsTask());
+        }
+        finally
+        {
+            GpuFallbackOptionsHolder.Current = previous;
+        }
+
+        Assert.Equal(0, backend.LiveBuffers);
+    }
+}
+
 internal sealed class HostAwaitableBackend : IAwaitableGpuBackend
 {
     private int _kernels, _allocations, _live, _disposals;
@@ -267,6 +333,9 @@ internal sealed class HostAwaitableBackend : IAwaitableGpuBackend
 
     /// <summary>What a division by zero yields, when set: a device may leave it indeterminate.</summary>
     public float? DivisionByZeroResult { get; set; }
+
+    /// <summary>The most elements one buffer may hold, when set: a larger one is refused as past the device's cap.</summary>
+    public int? MaxBufferElements { get; set; }
 
     /// <summary>Extra elements a download returns past the buffer's size, as a pooled buffer has.</summary>
     public int DownloadPadding { get; set; }
@@ -289,12 +358,23 @@ internal sealed class HostAwaitableBackend : IAwaitableGpuBackend
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        RequireUnderCap(data.Length);
         var copy = new float[data.Length];
         Array.Copy(data, copy, data.Length);
         return Track(copy);
     }
 
-    public IGpuBuffer AllocateBuffer(int size) => Track(new float[size]);
+    public IGpuBuffer AllocateBuffer(int size)
+    {
+        RequireUnderCap(size);
+        return Track(new float[size]);
+    }
+
+    private void RequireUnderCap(int elements)
+    {
+        if (MaxBufferElements is { } cap && elements > cap)
+            throw new GpuBufferTooLargeException(BackendName, (long)elements * sizeof(float), (long)cap * sizeof(float), DeviceName);
+    }
 
     public bool SupportsElementType(GpuElementType type) => type == GpuElementType.Float32;
 

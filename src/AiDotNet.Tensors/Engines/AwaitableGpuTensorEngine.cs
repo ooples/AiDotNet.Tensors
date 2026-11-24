@@ -128,6 +128,10 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
             // A capability gap (GpuCapabilityUnavailableException included): the CPU computes the same product.
             product = null;
         }
+        catch (GpuBufferTooLargeException) when (BufferCapFallsBackToCpu)
+        {
+            product = null;
+        }
         if (product is null) return _cpu.TensorMatMul(a, b);
         return FromFloats<T>(product, m * n, new[] { m, n });
     }
@@ -166,6 +170,10 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
         {
             result = null;
         }
+        catch (GpuBufferTooLargeException) when (BufferCapFallsBackToCpu)
+        {
+            result = null;
+        }
         if (result is null) return await onCpu(a, b, cancellationToken).ConfigureAwait(false);
         return FromFloats<T>(result, size, shape);
     }
@@ -198,9 +206,19 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
         {
             result = null;
         }
+        catch (GpuBufferTooLargeException) when (BufferCapFallsBackToCpu)
+        {
+            result = null;
+        }
         if (result is null) return await onCpu(tensor, cancellationToken).ConfigureAwait(false);
         return FromFloats<T>(result, size, shape);
     }
+
+    // A buffer past the device's per-allocation cap follows the process's chunking policy, as on the synchronous
+    // engine: the caller sees the refusal under NeverChunk_FailFast, and the CPU answers otherwise (this engine has no
+    // chunked path, so every other policy ends at the CPU).
+    private static bool BufferCapFallsBackToCpu
+        => GpuFallbackOptionsHolder.Current.EffectiveChunkingPolicy != GpuChunkingPolicy.NeverChunk_FailFast;
 
     // Recording state is thread-local; see the remarks. Anomaly mode is too, and takes the CPU as the synchronous engine
     // does: a device may leave a float division by zero indeterminate, and the detector exists to report the CPU's Inf.

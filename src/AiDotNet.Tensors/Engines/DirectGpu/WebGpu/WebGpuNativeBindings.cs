@@ -404,6 +404,7 @@ public static partial class WebGpuNativeBindings
     {
         GpuLaunchProbe.OnLaunch();   // one kernel launch, folded or not, as the other backends count them
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, -1, workgroupsX);
+        if (PastLimit(workgroupsX, workgroupsY, workgroupsZ) is { } refused) return refused;
         if (Host is not { } host) return JsDispatchComputeAsync(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchCompute", Args(pipelineId, bindGroupId, workgroupsX, workgroupsY, workgroupsZ));
         return Task.CompletedTask;
@@ -425,6 +426,7 @@ public static partial class WebGpuNativeBindings
     {
         GpuLaunchProbe.OnLaunch();
         if (NeedsFold(workgroupsX, workgroupsY, workgroupsZ)) return DispatchFoldedAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX);
+        if (PastLimit(workgroupsX, workgroupsY, workgroupsZ) is { } refused) return refused;
         if (Host is not { } host) return JsDispatchComputeWithUniformsAsync(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ);
         host.Invoke("dispatchComputeWithUniforms", Args(pipelineId, bindGroupId, uniformBufferId, workgroupsX, workgroupsY, workgroupsZ));
         return Task.CompletedTask;
@@ -475,6 +477,20 @@ public static partial class WebGpuNativeBindings
 
     private static bool NeedsFold(int workgroupsX, int workgroupsY, int workgroupsZ)
         => workgroupsX > MaxWorkgroupsPerDimension && workgroupsY == 1 && workgroupsZ == 1;
+
+    // A grid that cannot be folded and is past the limit: the failed task its caller awaits, so nothing is submitted.
+    private static Task? PastLimit(int workgroupsX, int workgroupsY, int workgroupsZ)
+    {
+        try
+        {
+            WebGpuDispatchFold.RequireWithinLimit(workgroupsX, workgroupsY, workgroupsZ, MaxWorkgroupsPerDimension);
+            return null;
+        }
+        catch (GpuCapabilityUnavailableException refusal)
+        {
+            return Task.FromException(refusal);
+        }
+    }
 
     private static async Task DispatchFoldedAsync(int pipelineId, int bindGroupId, int uniformBufferId, int workgroups)
     {
