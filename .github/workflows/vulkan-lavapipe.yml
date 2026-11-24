@@ -1,0 +1,87 @@
+name: Vulkan (lavapipe)
+
+# Why this lane exists
+# --------------------
+# The Vulkan backend's GLSL kernels ran on no CI runner: every Vulkan suite skips without a Vulkan device. Mesa's
+# lavapipe is a conformant CPU Vulkan driver on a stock Ubuntu runner, and the test build already deploys the GLSL
+# compiler (libshaderc_shared from Silk.NET.Shaderc.Native), so the suites run here as they do on a GPU.
+#
+# lavapipe reports the spec minimum of 65535 X workgroups, where most GPUs report about 2^31, so this lane is also the
+# one that catches a 1-D launch that does not split or stride past 65535 * 256 threads.
+
+on:
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel point.
+  workflow_call:
+
+concurrency:
+  group: vulkan-lavapipe-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  MSBUILDDISABLENODEREUSE: 1
+
+jobs:
+  vulkan-lavapipe:
+    # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    name: vulkan-lavapipe
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Install lavapipe (CPU Vulkan)
+      run: |
+        # Third-party apt sources fail `apt-get update` on a mirror hiccup, and none of them provide these packages
+        # (gpu-parity-pocl.yml explains).
+        sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list
+        sudo apt-get update -o Acquire::Retries=3
+        sudo apt-get install -y -o Acquire::Retries=3 mesa-vulkan-drivers libvulkan1 vulkan-tools
+        # The suites must find a device, or every one would skip and the lane would pass having run nothing.
+        vulkaninfo --summary | grep -E "deviceName|driverName|apiVersion"
+        vulkaninfo --summary | grep -q "llvmpipe" || { echo "::error::lavapipe is not visible to the Vulkan loader."; exit 1; }
+
+    - name: Restore test dependencies
+      run: |
+        for attempt in 1 2 3; do
+          if dotnet restore tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj; then
+            exit 0
+          fi
+          echo "::warning::dotnet restore failed (attempt $attempt of 3); retrying."
+          sleep $((attempt * 15))
+        done
+        echo "::error::dotnet restore failed after three attempts."
+        exit 1
+
+    - name: Build tests (net10.0)
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0 --no-restore
+
+    - name: Run the Vulkan suites
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "FullyQualifiedName~Vulkan&Category!=Benchmark&Category!=Performance" \
+          --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=vulkan.trx" \
+          --blame-hang --blame-hang-timeout 600s --blame-crash
+
+    - name: Report skipped tests
+      # A skip does not fail a build: an unexpected one means a suite did not run. Exempt: the shipped tuning profile
+      # (asserted only on the device it was measured on), the Windows-only loader check, and the rows of the
+      # cross-backend optimizer theories that name another backend.
+      if: always()
+      run: >-
+        python3 scripts/ci/summarize-test-skips.py --title "Vulkan lavapipe" --fail-on-skip
+        --allowed-skip '^(No shipped profile is asserted for |SetDefaultDllDirectories is a Windows concern|(Cuda|Hip|Metal|OpenCl|WebGpu) backend unavailable on this system)'
+        "${{ runner.temp }}/trx/*.trx"
