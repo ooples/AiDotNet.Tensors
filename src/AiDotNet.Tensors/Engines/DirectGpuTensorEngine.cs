@@ -29275,6 +29275,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
+        if (scalar is not null && IntegerDivisorMatchesHost(scalar)
+            && TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Divide, nameof(TensorDivideScalar)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", integerResult, tensor,
+                Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar });
+            return integerResult;
+        }
         if (tensor is Tensor<double> doubles && scalar is double doubleScalar
             && TryScalarFloat64(doubles, doubleScalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation.Divide, nameof(TensorDivideScalar)) is { } doubleResult)
         {
@@ -32017,6 +32024,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
+        if (value is not null && TryScalarIntegerAny(tensor, value, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Equal, "TensorEquals") is { } integerResult)
+            return integerResult;
         if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive
             && typeof(T) == typeof(float) && tensor.IsContiguous
             && TryGetBackend(out var backend))
@@ -32049,6 +32058,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
+        if (value is not null && TryScalarIntegerAny(tensor, value, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.NotEqual, "TensorNotEquals") is { } integerResult)
+            return integerResult;
         if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive
             && typeof(T) == typeof(float) && tensor.IsContiguous
             && TryGetBackend(out var backend))
@@ -32080,6 +32091,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
+        if (!Compilation.GraphMode.IsActive && ShapesMatch(a.Shape._dims, b2.Shape._dims)
+            && TryBinaryIntegerAny(a, b2, "TensorEquals") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
@@ -32099,6 +32113,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
+        if (!Compilation.GraphMode.IsActive && ShapesMatch(a.Shape._dims, b2.Shape._dims)
+            && TryBinaryIntegerAny(a, b2, "TensorNotEquals") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
@@ -32121,6 +32138,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorGreaterThan<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
+        if (!Compilation.GraphMode.IsActive && ShapesMatch(a.Shape._dims, b2.Shape._dims)
+            && TryBinaryIntegerAny(a, b2, "TensorGreaterThan") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
@@ -32140,6 +32160,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
+        if (value is not null && TryScalarIntegerAny(tensor, value, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Greater, "TensorGreaterThan") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var backend))
         {
@@ -32162,6 +32184,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorLessThan<T>(Tensor<T> a, Tensor<T> b2)
     {
         using var __gpuOp = EnterGpuOp();
+        if (!Compilation.GraphMode.IsActive && ShapesMatch(a.Shape._dims, b2.Shape._dims)
+            && TryBinaryIntegerAny(a, b2, "TensorLessThan") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
@@ -32181,6 +32206,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.TensorLessThan<T>(Tensor<T> tensor, T value)
     {
         using var __gpuOp = EnterGpuOp();
+        if (value is not null && TryScalarIntegerAny(tensor, value, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Less, "TensorLessThan") is { } integerResult)
+            return integerResult;
         if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && TryGetBackend(out var backend))
         {

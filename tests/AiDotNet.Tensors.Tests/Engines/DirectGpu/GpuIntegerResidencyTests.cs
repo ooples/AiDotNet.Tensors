@@ -85,6 +85,40 @@ public class GpuIntegerResidencyTests
             var expectedValues = expected.GetReadOnlyDataArray();
             for (int i = 0; i < Large; i++)
                 Assert.True(expectedValues[i].Equals(actualValues[i]), $"{type} chain at {i}: CPU {expectedValues[i]}, device {actualValues[i]}.");
+
+            // The operations whose device result is the CPU engine's for these operands.
+            var others = new (string Name, Tensor<T> Device, Tensor<T> Host)[]
+            {
+                ("Remainder", engine.TensorRemainder(x, y), cpu.TensorRemainder(hostX, hostY)),
+                ("Equals", engine.TensorEquals(x, y), cpu.TensorEquals(hostX, hostY)),
+                ("NotEquals", engine.TensorNotEquals(x, y), cpu.TensorNotEquals(hostX, hostY)),
+                ("GreaterThan", engine.TensorGreaterThan(x, y), cpu.TensorGreaterThan(hostX, hostY)),
+                ("LessThan", engine.TensorLessThan(x, y), cpu.TensorLessThan(hostX, hostY)),
+                ("Equals scalar", engine.TensorEquals(x, xValues[5]), cpu.TensorEquals(hostX, xValues[5])),
+                ("NotEquals scalar", engine.TensorNotEquals(x, xValues[5]), cpu.TensorNotEquals(hostX, xValues[5])),
+                ("GreaterThan scalar", engine.TensorGreaterThan(x, scalar), cpu.TensorGreaterThan(hostX, scalar)),
+                ("LessThan scalar", engine.TensorLessThan(x, scalar), cpu.TensorLessThan(hostX, scalar)),
+                ("Sign", engine.TensorSign(x), cpu.TensorSign(hostX)),
+                ("DivideScalar", engine.TensorDivideScalar(x, scalar), cpu.TensorDivideScalar(hostX, scalar)),
+            };
+            foreach (var (name, onDevice, onHost) in others)
+            {
+                Assert.True(gpu.IsTypedResident(onDevice), $"The {type} {name} was not left on the device.");
+                var deviceValues = onDevice.GetReadOnlyDataArray();
+                var hostValues = onHost.GetReadOnlyDataArray();
+                for (int i = 0; i < Large; i++)
+                    Assert.True(hostValues[i].Equals(deviceValues[i]), $"{type} {name} at {i} ({xValues[i]}, {yValues[i]}): CPU {hostValues[i]}, device {deviceValues[i]}.");
+            }
+
+            // Abs wraps on the device; the host's raises for the most negative value, so the expectation is spelled out.
+            var magnitudes = engine.TensorAbs(x);
+            Assert.True(gpu.IsTypedResident(magnitudes), $"The {type} Abs was not left on the device.");
+            var magnitudeValues = magnitudes.GetReadOnlyDataArray();
+            for (int i = 0; i < Large; i++)
+            {
+                long wide = Convert.ToInt64(xValues[i]);
+                Assert.True(narrow(wide < 0 ? unchecked(-wide) : wide).Equals(magnitudeValues[i]), $"{type} Abs at {i} of {xValues[i]}: device {magnitudeValues[i]}.");
+            }
         }
         finally
         {

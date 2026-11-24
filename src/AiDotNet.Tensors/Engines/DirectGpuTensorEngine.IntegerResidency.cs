@@ -26,6 +26,13 @@ public partial class DirectGpuTensorEngine
         nameof(TensorMultiply) => GpuIntegerBinaryOperation.Multiply,
         nameof(TensorMax) => GpuIntegerBinaryOperation.Max,
         nameof(TensorMin) => GpuIntegerBinaryOperation.Min,
+        // The device's remainder is the CPU engine's (zero for a zero divisor); where that one raises, the most
+        // negative value over -1, the device gives the 0 it stands for.
+        nameof(TensorRemainder) => GpuIntegerBinaryOperation.Remainder,
+        "TensorEquals" => GpuIntegerBinaryOperation.Equal,
+        "TensorNotEquals" => GpuIntegerBinaryOperation.NotEqual,
+        "TensorGreaterThan" => GpuIntegerBinaryOperation.Greater,
+        "TensorLessThan" => GpuIntegerBinaryOperation.Less,
         _ => null,
     };
 
@@ -177,8 +184,16 @@ public partial class DirectGpuTensorEngine
     /// <summary><c>-input</c> for an integer tensor on the device. Null when the CPU engine takes it.</summary>
     private Tensor<T>? TryUnaryIntegerAny<T>(Tensor<T> input, string callerName)
     {
-        if (callerName != nameof(TensorNegate)) return null;
-        const GpuIntegerUnaryOperation Operation = GpuIntegerUnaryOperation.Negate;
+        // Abs wraps on the device (the most negative value is its own), where the CPU engine raises for it.
+        GpuIntegerUnaryOperation Operation;
+        switch (callerName)
+        {
+            case nameof(TensorNegate): Operation = GpuIntegerUnaryOperation.Negate; break;
+            case nameof(TensorAbs): Operation = GpuIntegerUnaryOperation.Abs; break;
+            case nameof(TensorSign): Operation = GpuIntegerUnaryOperation.Sign; break;
+            default: return null;
+        }
+
         if (input is Tensor<int> ints)
             return TryMapInteger(ints, GpuElementType.Int32, callerName, (e, a, o, n) => e.UnaryInteger(Operation, a, o, n)) as Tensor<T>;
         if (input is Tensor<long> longs)
@@ -209,6 +224,21 @@ public partial class DirectGpuTensorEngine
             return TryMapInteger(bytes, GpuElementType.UInt8, callerName, (e, a, o, n) => e.ScalarInteger(operation, a, byteScalar, o, n)) as Tensor<T>;
         return null;
     }
+
+    /// <summary>
+    /// Whether dividing by <paramref name="scalar"/> on the device is the CPU engine's division for every element: not
+    /// by zero (which raises there), and for the 32- and 64-bit types not by -1 (which raises for the most negative
+    /// element; the narrower types wrap on both).
+    /// </summary>
+    private static bool IntegerDivisorMatchesHost<T>(T scalar) => scalar switch
+    {
+        int value => value != 0 && value != -1,
+        long value => value != 0 && value != -1,
+        short value => value != 0,
+        sbyte value => value != 0,
+        byte value => value != 0,
+        _ => false,
+    };
 
     private Tensor<T>? TryMapInteger<T>(Tensor<T> input, GpuElementType type, string callerName,
         Action<IGpuIntegerElementwise, IGpuBuffer, IGpuBuffer, int> launch)
