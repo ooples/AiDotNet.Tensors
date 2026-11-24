@@ -74,6 +74,16 @@ public static class AiDotNetEngine
     [ThreadStatic] private static bool t_completingDeferred;
 
     /// <summary>
+    /// Runs the calling execution context (the calling thread and the work it starts) on <paramref name="engine"/> until
+    /// the returned scope is disposed, while every other thread keeps the process-wide <see cref="Current"/>. For two
+    /// models on two devices in one process: a frozen teacher too large for the GPU served by the CPU engine from a
+    /// data-loader worker while the student trains on the GPU engine. Scopes nest; dispose them in reverse order.
+    /// </summary>
+    /// <param name="engine">The engine <see cref="Current"/> returns inside the scope.</param>
+    /// <returns>The scope; disposing it restores the engine the context saw before.</returns>
+    public static System.IDisposable UseInCurrentContext(IEngine engine) => PushThreadEngine(engine);
+
+    /// <summary>
     /// Makes <see cref="Current"/> return <paramref name="engine"/> in the calling execution context (the calling thread
     /// and work it starts), until the returned scope is disposed. Other threads keep seeing the process-wide engine. Scopes nest.
     /// </summary>

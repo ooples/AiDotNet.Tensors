@@ -1086,3 +1086,4 @@ static AiDotNet.Tensors.Engines.Compilation.LossScaleState.operator !=(AiDotNet.
 static AiDotNet.Tensors.Engines.Compilation.LossScaleState.operator ==(AiDotNet.Tensors.Engines.Compilation.LossScaleState left, AiDotNet.Tensors.Engines.Compilation.LossScaleState right) -> bool
 ~override AiDotNet.Tensors.Engines.Compilation.LossScaleState.Equals(object obj) -> bool
 ~override AiDotNet.Tensors.Engines.Compilation.LossScaleState.ToString() -> string
+static AiDotNet.Tensors.Engines.AiDotNetEngine.UseInCurrentContext(AiDotNet.Tensors.Engines.IEngine! engine) -> System.IDisposable!
