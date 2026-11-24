@@ -141,6 +141,7 @@ internal static class GpuLaunchProbe
     {
         // An empty upload moves nothing across the boundary (several backends return before copying).
         if (byteCount == 0) return;
+        if (_hostingDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
     }
@@ -153,6 +154,7 @@ internal static class GpuLaunchProbe
     /// <summary>The host blocked until the device drained its queue.</summary>
     public static void OnSynchronize(GpuBackendType backend)
     {
+        if (_hostingDepth > 0) return;
         if (_tuningDepth > 0) return;
         RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
     }
@@ -230,6 +232,23 @@ internal static class GpuLaunchProbe
         public void Dispose() => _tuningDepth--;
     }
 
+    // A test harness that runs another device's kernels over a host backend (the Dawn parity harness copies each
+    // operand down, runs the kernel's WGSL on Dawn and copies the result back) stands in for that device's own launch:
+    // inside a hosting scope its copies are the stand-in's, not the op's, and are not counted anywhere.
+    [System.ThreadStatic] private static int _hostingDepth;
+
+    /// <summary>Leaves this thread's transfers uncounted until disposed (a harness hosting another device's kernels).</summary>
+    internal static HostingAttribution HostingScope()
+    {
+        _hostingDepth++;
+        return default;
+    }
+
+    internal readonly struct HostingAttribution : System.IDisposable
+    {
+        public void Dispose() => _hostingDepth--;
+    }
+
     // GPU auto-detection runs once per process from whichever op first resolves AiDotNetEngine.Current, and its
     // known-answer probe (a small matmul read back) is the detection's, not that op's: inside a detection scope its
     // launches are not counted and its transfers count as one-time evidence, as a tuning scope's do.
@@ -258,6 +277,7 @@ internal static class GpuLaunchProbe
             throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");
         // An empty readback moves nothing (the byte-download paths return an empty array without a copy).
         if (byteCount == 0) return;
+        if (_hostingDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
         OnReadback(byteCount);
@@ -265,6 +285,7 @@ internal static class GpuLaunchProbe
 
     public static void OnReadback(long byteCount)
     {
+        if (_hostingDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         Interlocked.Increment(ref _readbacks);
         Interlocked.Add(ref _readbackBytes, byteCount);
@@ -334,6 +355,7 @@ internal static class GpuLaunchProbe
     /// <summary>Records one host-to-device transfer at a driver copy (every cuMemcpyHtoD / HtoDAsync).</summary>
     public static void OnUpload(long byteCount)
     {
+        if (_hostingDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         Interlocked.Increment(ref _uploads);
         Interlocked.Add(ref _uploadBytes, byteCount);
