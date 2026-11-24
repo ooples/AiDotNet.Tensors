@@ -1,4 +1,4 @@
-﻿// Copyright (c) CrowdTrainer LLC. All rights reserved.
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Direct CUDA backend for NVIDIA GPUs (Driver API + NVRTC + cuBLAS fallback).
 using System;
 using System.Collections.Concurrent;
@@ -253,6 +253,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // skinny_gemm_tn's per-tile arrival counters (zero between launches): its partials use Workspace, in the
         // same stream order, so the counters live beside it.
         public IGpuBuffer? SkinnyCounters;
+        // Autocast split-K partials and the ones vector that reduces them (CudaBackend.AutocastGemm), and partials
+        // outgrown while a captured graph may still replay into them.
+        public IGpuBuffer? SplitKPartials;
+        public IGpuBuffer? SplitKOnes;
+        public List<IGpuBuffer>? RetiredSplitKPartials;
     }
 
     // Per-handle cuBLAS workspace (PyTorch sets one the same way). 8 MiB covers the fp32 GEMM algorithms used here.
@@ -4510,6 +4515,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private unsafe void LaunchBiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
     {
         if (TryDeclaredBiasAdd(A, bias, C, M, N, relu)) return;
+        LaunchBiasAddReference(A, bias, C, M, N, relu);
+    }
+
+    private unsafe void LaunchBiasAddReference(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
+    {
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
@@ -20232,7 +20242,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _cudnnContext = null;
         }
 
-        DisposeAutocastGemmBuffers();
         if (_cublasLt is not null)
         {
             _cublasLt.Dispose();
@@ -20261,6 +20270,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 tc.Workspace = null;
                 tc.SkinnyCounters?.Dispose();
                 tc.SkinnyCounters = null;
+                DisposeSplitKBuffers(tc);
             }
 
             try { _threadCublas.Dispose(); } catch (ObjectDisposedException) { }

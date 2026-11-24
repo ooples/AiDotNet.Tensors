@@ -180,7 +180,21 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
                 if (loan.IsLent) (live ??= new()).Add(loan);
             }
         }
-        if (live is not null) foreach (var loan in live) MoveIdleLoan(loan);
+        // Every live loan is moved even when one cannot be: a loan left behind would keep reading memory the plan's
+        // next step overwrites.
+        List<Exception>? failures = null;
+        if (live is not null)
+            foreach (var loan in live)
+            {
+                try { MoveIdleLoan(loan); }
+                catch (Exception ex)
+                {
+                    (failures ??= new()).Add(ex);
+                }
+            }
+        if (failures is not null)
+            throw failures.Count == 1 ? failures[0] : new AggregateException(
+                "Some buffers borrowed from a compiled plan's idle step memory could not be moved.", failures);
         if (s_idleLoanDiag)
         {
             var c = IdleLoanCounters;
@@ -304,6 +318,9 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
     /// Moves a live loan to memory of its own: a fresh owned allocation, the contents copied on the compute stream (after
     /// every earlier use of the loan, before the lender's next write), and the borrower's address switched to it.
     /// </summary>
+    // The copy is queued on the backend's stream and the borrower switches to its own memory after it. A borrower is
+    // used between the lending plan's steps; a kernel another thread queues on it while the plan starts its next step
+    // (the only caller of a reclaim) races that step the same way as any buffer used by two threads at once.
     internal void MoveIdleLoan(IdleLoan loan)
     {
         if (!loan.IsLent) return;

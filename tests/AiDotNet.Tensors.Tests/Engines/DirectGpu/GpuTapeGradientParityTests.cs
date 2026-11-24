@@ -1145,6 +1145,7 @@ public class GpuTapeGradientParityTests : IDisposable
             var backend = gpu.GetBackend();
             Skip.If(backend is null, "No device backend.");
             Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend does not declare in-place row transforms.");
+            var inPlaceBackend = (IInPlaceRowTransformsBackend)backend!;
             int v = ChunkVocab, cells = rows * v;
             var rng = new Random(rows);
             var x = new float[cells];
@@ -1154,14 +1155,17 @@ public class GpuTapeGradientParityTests : IDisposable
             using var biasB = backend!.AllocateBuffer(bias);
             using var scaleB = backend.AllocateBuffer(new[] { 0.37f });
 
-            void Check(string op, Action<IGpuBuffer, IGpuBuffer> apply)
+            // The in-place entry point the fused cross-entropy calls against the same kernel run out of place. (The
+            // out-of-place Softmax and BiasAdd may take a declared program or a tuned slot, which can round the last
+            // bit differently; the in-place forms always run the reference kernels.)
+            void Check(string op, Action<IGpuBuffer, IGpuBuffer> apply, Action<IGpuBuffer> applyInPlace)
             {
                 using var input = backend.AllocateBuffer(x);
                 using var output = backend.AllocateBuffer(new float[cells]);
                 apply(input, output);
                 var expected = backend.DownloadBuffer(output);
                 using var inPlace = backend.AllocateBuffer(x);
-                apply(inPlace, inPlace);
+                applyInPlace(inPlace);
                 var got = backend.DownloadBuffer(inPlace);
                 int first = -1;
                 for (int i = 0; i < cells && first < 0; i++)
@@ -1169,10 +1173,13 @@ public class GpuTapeGradientParityTests : IDisposable
                 Assert.True(first < 0, first < 0 ? "" : $"{op} in place: [{first}] {got[first]:R} vs {expected[first]:R}");
             }
 
-            Check("BiasAdd", (a, c) => backend.BiasAdd(a, biasB, c, rows, v));
-            Check("Exp", (a, c) => backend.Exp(a, c, cells));
-            Check("Softmax", (a, c) => backend.Softmax(a, c, rows, v));
-            Check("BroadcastMultiplyLastAxis", (a, c) => backend.BroadcastMultiplyLastAxis(a, scaleB, c, cells, 1));
+            var cuda = backend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(cuda is null, "The reference-kernel hooks are CUDA's.");
+            Check("BiasAdd", (a, c) => cuda!.BiasAddReferenceForTest(a, biasB, c, rows, v), d => inPlaceBackend.BiasAddInPlace(d, biasB, rows, v));
+            Check("Exp", (a, c) => backend.Exp(a, c, cells), d => inPlaceBackend.ExpInPlace(d, cells));
+            Check("Softmax", (a, c) => cuda!.SoftmaxReferenceForTest(a, c, rows, v), d => inPlaceBackend.SoftmaxInPlace(d, rows, v));
+            Check("BroadcastMultiplyLastAxis", (a, c) => backend.BroadcastMultiplyLastAxis(a, scaleB, c, cells, 1),
+                d => inPlaceBackend.BroadcastMultiplyLastAxisInPlace(d, scaleB, cells, 1));
         }
     }
 

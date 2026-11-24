@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
@@ -60,10 +61,16 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     private bool UsesCublas => IsCublasAvailable && CudaDispatchPolicy.UseCublasForMatMul;
 
     // Matmul autocast (EnterGemmAutocast): the cuBLAS compute type every FP32 GEMM takes while a scope is open, 0 when
-    // none is. Instance state, not thread-local: a compiled step's ops may run on the BLAS pool's threads.
+    // none is. Instance state, not thread-local: a compiled step's ops may run on the BLAS pool's threads, so every
+    // thread's GEMMs on this backend take the open scope's type. The newest scope still open wins; scopes may close in
+    // any order (two threads' scopes overlapping), and the type returns to FP32 once the last one closes.
     private int _gemmAutocastComputeType;
+    private readonly List<GemmAutocastScope> _gemmAutocastScopes = new();
 
     private int GemmAutocastComputeType => Volatile.Read(ref _gemmAutocastComputeType);
+
+    /// <summary>Tests: the compute type GEMMs take now (0: FP32).</summary>
+    internal int GemmAutocastComputeTypeForTest => GemmAutocastComputeType;
 
     // An autocast scope is open (and cuBLAS serves GEMMs): the FP32-only generated and narrow GEMM kernels step aside so
     // every product reaches cuBLAS/cuBLASLt in the scope's compute type, as PyTorch's autocast sends matmuls to cuBLAS.
@@ -85,19 +92,29 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
             Gpu.PrecisionMode.BFloat16 => (int)CublasComputeType.Float32FastBF16,
             _ => throw new NotSupportedException($"Matmul autocast supports FP16 and BF16, not {precision}."),
         };
-        int previous = Interlocked.Exchange(ref _gemmAutocastComputeType, compute);
-        return new GemmAutocastScope(this, previous);
+        var scope = new GemmAutocastScope(this, compute);
+        lock (_gemmAutocastScopes)
+        {
+            _gemmAutocastScopes.Add(scope);
+            Volatile.Write(ref _gemmAutocastComputeType, compute);
+        }
+        return scope;
     }
 
     private sealed class GemmAutocastScope : IDisposable
     {
         private CudaBackend? _owner;
-        private readonly int _previous;
-        public GemmAutocastScope(CudaBackend owner, int previous) { _owner = owner; _previous = previous; }
+        internal readonly int Compute;
+        public GemmAutocastScope(CudaBackend owner, int compute) { _owner = owner; Compute = compute; }
         public void Dispose()
         {
-            if (Interlocked.Exchange(ref _owner, null) is { } owner)
-                Volatile.Write(ref owner._gemmAutocastComputeType, _previous);
+            if (Interlocked.Exchange(ref _owner, null) is not { } owner) return;
+            var scopes = owner._gemmAutocastScopes;
+            lock (scopes)
+            {
+                scopes.Remove(this);
+                Volatile.Write(ref owner._gemmAutocastComputeType, scopes.Count == 0 ? 0 : scopes[scopes.Count - 1].Compute);
+            }
         }
     }
 

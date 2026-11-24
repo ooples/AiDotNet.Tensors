@@ -6851,9 +6851,9 @@ public partial class DirectGpuTensorEngine
         using var _positions = positions;
         // In place, the block holds h_c·W, then the logits, then their exponentials; otherwise a second block takes the
         // GEMM's output and the exponentials. The values are the same either way.
-        bool inPlace = backend is DirectGpu.IInPlaceRowTransformsBackend;
+        var inPlace = backend as DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var workBlock = inPlace ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace is not null ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
         var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var ones = AllocateStreamOrderedScratch(backend, chunk);
@@ -6872,11 +6872,13 @@ public partial class DirectGpuTensorEngine
             backend.Copy(h, r0 * d, hChunk, 0, c * d);
             backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
             backend.Gemm(hChunk, w, work, c, vocab, d);                    // h_c·W
-            backend.BiasAdd(work, b, logits, c, vocab);                    // logits = h_c·W + b
+            if (inPlace is not null) inPlace.BiasAddInPlace(logits, b, c, vocab);   // logits = h_c·W + b
+            else backend.BiasAdd(work, b, logits, c, vocab);
             backend.MaxAxis(logits, rowStat, c, vocab);                    // m_r
             backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
             backend.Gather(logits, chunkPositions, picked, c, 1);          // shifted target logit
-            backend.Exp(logits, work, cv);
+            if (inPlace is not null) inPlace.ExpInPlace(logits, cv);
+            else backend.Exp(logits, work, cv);
             backend.SumAxis(work, rowStat, c, vocab);
             backend.Log(rowStat, rowStat, c);                              // shifted lse_r
             backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
@@ -6942,9 +6944,9 @@ public partial class DirectGpuTensorEngine
         // Stream-ordered scratch: still read by queued kernels when this returns.
         // In place, one block holds the logits, then the probabilities, then dLogits; otherwise the second block takes
         // the biased logits and dLogits. The values are the same either way.
-        bool inPlace = backend is DirectGpu.IInPlaceRowTransformsBackend;
+        var inPlace = backend as DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var workBlock = inPlace ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace is not null ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
         var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var dhChunk = needHidden ? AllocateStreamOrderedScratch(backend, chunk * d) : default;
@@ -6963,15 +6965,24 @@ public partial class DirectGpuTensorEngine
             backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
             backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
             backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
-            backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
-            backend.Softmax(work, logits, c, vocab);                             // probabilities
+            if (inPlace is not null)
+            {
+                inPlace.BiasAddInPlace(logits, bB.Buffer, c, vocab);             // + b
+                inPlace.SoftmaxInPlace(logits, c, vocab);                        // probabilities
+            }
+            else
+            {
+                backend.BiasAdd(logits, bB.Buffer, work, c, vocab);
+                backend.Softmax(work, logits, c, vocab);
+            }
             // - one-hot. Each row has one target position inside its own row, so the positions are distinct.
             if (backend is DirectGpu.IUniquePositionAddBackend unique)
                 unique.AddAtUniquePositions(minusOnes, chunkPositions, logits, c, cv);
             else
                 backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);
             backend.Scale(logits, logits, 1f / n, cv);                           // / N
-            backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            if (inPlace is not null) inPlace.BroadcastMultiplyLastAxisInPlace(logits, gB.Buffer, cv, 1);   // * gradOutput[0] = dLogits_c
+            else backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);
             if (chunkFlags is not null)
             {
                 // A row whose id was out of range gets NaN gradients, as its loss term is NaN.

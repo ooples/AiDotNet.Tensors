@@ -195,7 +195,6 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     // Idle step memory lent to the backend between captured steps (IIdleDeviceMemoryLender).
     private IIdleDeviceMemoryLender? _idleLender;
-    private IGpuBuffer[]? _idleBuffers;
 
     /// <summary>Bytes this plan lent after its last step, once an allocation asked for them (tests and diagnostics).</summary>
     internal long IdleLentBytesLastStep { get; private set; }
@@ -213,12 +212,11 @@ internal sealed partial class CompiledTrainingPlan<T>
         IdleLentBytesLastStep = 0;
         if (s_idleLendDiag)
             AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} enabled={LendIdleStepMemoryEnabled} graph={HasLiveStepGraph} " +
-                $"pool={_scratchPool is not null} forward_steps={_forwardSteps is not null} ");
+                $"pool={_scratchPool is not null} forward_steps={_forwardSteps is not null}");
         if (!LendIdleStepMemoryEnabled || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
             || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
             || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
             return;
-        _idleBuffers = null;
         _collectIdleStepMemory ??= CollectIdleStepMemory;
         lender.LendIdleOnDemand(this, _collectIdleStepMemory);
         _idleLender = lender;
@@ -227,8 +225,30 @@ internal sealed partial class CompiledTrainingPlan<T>
     private Func<IReadOnlyCollection<IGpuBuffer>?>? _collectIdleStepMemory;
 
     // The lender asks (an allocation between this plan's steps found nothing pooled). Rebuilt on every ask: what
-    // outlives a step (a rebased readout, a retained output) can change between steps.
+    // outlives a step (a rebased readout, a retained output) can change between steps. The ask runs on the allocating
+    // thread, under the lender's lock: it takes the plan's step lock without waiting (the plan's own thread may hold it
+    // while it changes what is protected) and lends nothing when that fails, or when collecting throws, rather than
+    // fail an unrelated allocation.
     private IReadOnlyCollection<IGpuBuffer>? CollectIdleStepMemory()
+    {
+        if (!System.Threading.Monitor.TryEnter(_stepSync)) return null;
+        try
+        {
+            if (_disposed) return null;
+            return CollectIdleStepMemoryCore();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            System.Threading.Monitor.Exit(_stepSync);
+        }
+    }
+
+    private IReadOnlyCollection<IGpuBuffer>? CollectIdleStepMemoryCore()
     {
         if (_scratchPool is not { } pool || _forwardSteps is null) return null;
         if (!BuildWorkspaceProtection())
@@ -241,7 +261,6 @@ internal sealed partial class CompiledTrainingPlan<T>
         var idle = new IGpuBuffer[_workspaceCandidates.Count];
         _workspaceCandidates.CopyTo(idle);
         _workspaceCandidates.Clear();
-        _idleBuffers = idle;
         long bytes = 0;
         foreach (var buffer in idle) bytes += buffer.SizeInBytes;
         IdleLentBytesLastStep = bytes;

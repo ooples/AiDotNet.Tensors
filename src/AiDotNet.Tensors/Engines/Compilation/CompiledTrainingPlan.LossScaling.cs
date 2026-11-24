@@ -30,6 +30,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             options.Validate();
             RequireDiscardingNonFinitePolicy(_nonFiniteGradientPolicy);
         }
+        if (initialState is { } given && (!(given.Scale > 0f) || float.IsInfinity(given.Scale)))
+            throw new ArgumentOutOfRangeException(nameof(initialState),
+                $"A loss scale state to resume from needs a finite positive scale, not {given.Scale}.");
         lock (_stepSync)
         {
             DisposeLossScaleDevice();
@@ -39,9 +42,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
                 BackoffFactor = options.BackoffFactor, GrowthInterval = options.GrowthInterval,
                 MinScale = options.MinScale, MaxScale = options.MaxScale, Dynamic = options.Dynamic,
             };
-            _lossScaleHost = initialState is { } s && s.Scale > 0f && !float.IsInfinity(s.Scale)
-                ? s
-                : new LossScaleState(options?.InitialScale ?? 1f, 0, 0, 0);
+            _lossScaleHost = initialState ?? new LossScaleState(options?.InitialScale ?? 1f, 0, 0, 0);
             // A step graph captured before this records the previous seed handling: capture again.
             if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
         }
@@ -190,6 +191,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         device.UnscaleAndUpdate(seed, _lossGradSeed.Length);
     }
 
+    /// <summary>
+    /// A captured step with a gradient exchange whose update runs outside the graph: the graph left the gradients scaled,
+    /// so they are unscaled (and the scale moved) here, after the exchange, from the reduced gradient every rank holds
+    /// alike. Without an exchange the graph already did it.
+    /// </summary>
+    private void UnscaleAfterExchange()
+    {
+        if (_gradientExchange is not null) UnscaleLossScaledGradients();
+    }
+
     // Set when a step unscaled on a device without a device scaler: the plan's finiteness guard decides that step, and
     // CompleteLossScaledStep updates the scale from its verdict after the optimizer update.
     private bool _lossScaleVerdictPending;
@@ -263,10 +274,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         MoveLossScaleToHost();
         float inverse = 1f / _lossScaleHost.Scale;
         bool nonFinite = false;
-        var seen = new HashSet<Tensor<T>>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // By the memory a gradient covers, as the device path dedupes by buffer: two tensors over the same elements
+        // (a tied weight's gradient, a view over a gradient's storage) are unscaled once.
+        var seen = new HashSet<(object Storage, int Offset, int Length)>(new StorageRangeComparer());
         foreach (var grad in ActiveOptimizerGradients())
         {
-            if (grad is null || grad.Length == 0 || !seen.Add(grad)) continue;
+            if (grad is null || grad.Length == 0 || !seen.Add((grad.StorageIdentity, grad.StorageOffset, grad.Length))) continue;
             var typed = (Tensor<float>)(object)grad;
             using (var lease = typed.LeaseWritable())
             {
@@ -282,5 +295,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             if (grad._gpuBuffer is not null) grad.IncrementVersion();
         }
         AdvanceHostLossScale(nonFinite);
+    }
+
+    private sealed class StorageRangeComparer : IEqualityComparer<(object Storage, int Offset, int Length)>
+    {
+        public bool Equals((object Storage, int Offset, int Length) x, (object Storage, int Offset, int Length) y)
+            => ReferenceEquals(x.Storage, y.Storage) && x.Offset == y.Offset && x.Length == y.Length;
+
+        public int GetHashCode((object Storage, int Offset, int Length) key)
+            => unchecked((System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(key.Storage) * 397) ^ key.Offset ^ (key.Length << 7));
     }
 }

@@ -74,6 +74,7 @@ public class DeviceTelemetryTests
     // nvidia-smi's memory.used is what a monitor's device memory figure is checked against. The driver's free-memory
     // query is not it under Windows' display driver model (about 1.2 GB off on an RTX 3080 during training): NVML's is.
     [SkippableFact]
+    [Trait("Category", "GPU")]
     public void Device_memory_in_use_is_the_figure_nvidia_smi_prints()
     {
         Skip.IfNot(TryCuda(out var gpu) && gpu is not null, "CUDA backend did not resolve.");
@@ -82,13 +83,17 @@ public class DeviceTelemetryTests
             var backend = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
             using var held = backend.AllocateBuffer(64 << 20);   // 256 MiB, so this process is on the device
             backend.Synchronize();
+            Skip.IfNot(TryNvidiaSmi(backend, out double smiBeforeMb, out double smiTotalMb), "nvidia-smi is not on PATH or did not answer.");
             bool read = GpuUtilization.TryReadDeviceMemory(backend, out long used, out long total);
             Skip.IfNot(read, "NVML is not installed with this driver.");
-            Skip.IfNot(TryNvidiaSmi(backend, out double smiUsedMb, out double smiTotalMb), "nvidia-smi is not on PATH.");
+            Skip.IfNot(TryNvidiaSmi(backend, out double smiAfterMb, out _), "nvidia-smi did not answer.");
             double usedMb = used / (1024.0 * 1024.0), totalMb = total / (1024.0 * 1024.0);
             Assert.Equal(smiTotalMb, totalMb, 0.5);
-            // Other processes can allocate between the two reads; 64 MiB of slack, far below the 1.2 GB it was off.
-            Assert.True(Math.Abs(usedMb - smiUsedMb) <= 64, $"NVML used {usedMb:F1} MiB, nvidia-smi {smiUsedMb} MiB");
+            // NVML is read between two nvidia-smi reads, so other processes' allocations meanwhile widen the bracket
+            // instead of failing the test; 64 MiB of slack on either side, far below the 1.2 GB it was off.
+            double low = Math.Min(smiBeforeMb, smiAfterMb) - 64, high = Math.Max(smiBeforeMb, smiAfterMb) + 64;
+            Assert.True(usedMb >= low && usedMb <= high,
+                $"NVML used {usedMb:F1} MiB, nvidia-smi {smiBeforeMb} then {smiAfterMb} MiB");
             Assert.True(used >= 256L << 20, $"used {used} does not cover this process's 256 MiB");
         }
     }
@@ -104,8 +109,14 @@ public class DeviceTelemetryTests
                 $"-i {uuid} --query-gpu=memory.used,memory.total --format=csv,noheader,nounits")
             { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
             using var smi = System.Diagnostics.Process.Start(info)!;
-            string line = smi.StandardOutput.ReadToEnd().Trim();
-            smi.WaitForExit();
+            var output = smi.StandardOutput.ReadToEndAsync();
+            // A stalled nvidia-smi skips the test instead of hanging the run.
+            if (!smi.WaitForExit(15000) || !output.Wait(5000))
+            {
+                try { smi.Kill(); } catch (InvalidOperationException) { }
+                return false;
+            }
+            string line = output.Result.Trim();
             var parts = line.Split(',');
             if (smi.ExitCode != 0 || parts.Length != 2) return false;
             usedMb = double.Parse(parts[0].Trim(), System.Globalization.CultureInfo.InvariantCulture);

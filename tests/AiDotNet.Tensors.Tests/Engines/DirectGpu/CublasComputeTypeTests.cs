@@ -57,9 +57,19 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         AiDotNetEngine.Current = engine;
         try
         {
-            var a = new Tensor<float>(new[] { m, k }, new Vector<float>(Data(m * k, 0.731, 0.2))).Gpu();
-            var b = new Tensor<float>(new[] { k, n }, new Vector<float>(Data(k * n, 0.293, 0.5))).Gpu();
-            var exact = engine.TensorMatMul(a, b).ToArray();
+            var hostA = Data(m * k, 0.731, 0.2);
+            var hostB = Data(k * n, 0.293, 0.5);
+            var a = new Tensor<float>(new[] { m, k }, new Vector<float>(hostA)).Gpu();
+            var b = new Tensor<float>(new[] { k, n }, new Vector<float>(hostB)).Gpu();
+            // The reference is the host product in double: a device FP32 GEMM may itself run TF32 on Ampere.
+            var exact = new double[m * n];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    double acc = 0;
+                    for (int t = 0; t < k; t++) acc += (double)hostA[i * k + t] * hostB[t * n + j];
+                    exact[i * n + j] = acc;
+                }
             double Error(PrecisionMode precision)
             {
                 float[] mixed;
@@ -77,6 +87,27 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         {
             AiDotNetEngine.Current = previous;
         }
+    }
+
+    // Scopes that close out of order (two threads' scopes overlapping) leave the newest open one in force and FP32 once
+    // all have closed: restoring each scope's predecessor left BF16 on for good after A(FP16) B(BF16) closed A then B.
+    [SkippableFact]
+    public void Autocast_scopes_closing_out_of_order_return_to_fp32()
+    {
+        Skip.If(!_fixture.IsAvailable, "No GPU device.");
+        Skip.IfNot(_fixture.Engine!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "CUDA only.");
+        var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)_fixture.Engine!.GetBackend()!;
+        var autocast = (AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend)cuda;
+        Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
+        var a = autocast.EnterGemmAutocast(PrecisionMode.Float16);
+        var b = autocast.EnterGemmAutocast(PrecisionMode.BFloat16);
+        Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+        a.Dispose();
+        Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+        b.Dispose();
+        Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
+        b.Dispose();   // twice is a no-op
+        Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
     }
 
     // Every autocast route (cuBLASLt, the classic GemmEx, the fixed-order split-K) computes

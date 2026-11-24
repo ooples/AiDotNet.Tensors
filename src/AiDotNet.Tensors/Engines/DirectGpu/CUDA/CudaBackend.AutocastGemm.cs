@@ -23,8 +23,6 @@ public sealed partial class CudaBackend
 
     private readonly Dictionary<AutocastGemmProblem, (AutocastGemmRoute Route, int Splits)> _autocastGemmRoutes = new();
     private readonly object _autocastGemmLock = new();
-    private IGpuBuffer? _splitKPartials;
-    private IGpuBuffer? _splitKOnes;
 
     // Split-K slices tried, and the bounds on the partial buffer and on when a reduction counts as long.
     private static readonly int[] s_splitKSlices = { 8, 16, 32 };
@@ -44,8 +42,11 @@ public sealed partial class CudaBackend
         lock (_autocastGemmLock) known = _autocastGemmRoutes.TryGetValue(problem, out route);
         if (!known)
         {
+            // A route chosen during a capture is the unmeasured fallback: kept for this call only, so the first
+            // uncaptured call measures.
+            bool capturing = IsStreamCapturing();
             route = ChooseAutocastGemmRoute(problem, a, b);
-            lock (_autocastGemmLock) _autocastGemmRoutes[problem] = route;
+            if (!capturing) lock (_autocastGemmLock) _autocastGemmRoutes[problem] = route;
         }
         switch (route.Route)
         {
@@ -176,43 +177,52 @@ public sealed partial class CudaBackend
         long strideB = p.TransB ? (long)kc * p.Ldb : kc;   // B is n x k (transposed) or k x n
         long outputs = (long)p.M * p.N;
         float alphaValue = alpha, zero = 0f, one = 1f, betaValue = beta;
-        if (CuBlasNative.cublasGemmStridedBatchedEx(_cublasHandle,
+        IntPtr handle = _cublasHandle;
+        var tc = _threadCublas!.Value!;
+        if (CuBlasNative.cublasGemmStridedBatchedEx(handle,
                 p.TransA ? CublasOperation.Transpose : CublasOperation.None,
                 p.TransB ? CublasOperation.Transpose : CublasOperation.None,
                 p.M, p.N, kc, (IntPtr)(&alphaValue), a, CuBlasNative.CUDA_R_32F, p.Lda, strideA,
                 b, CuBlasNative.CUDA_R_32F, p.Ldb, strideB, (IntPtr)(&zero),
-                _splitKPartials!.Handle, CuBlasNative.CUDA_R_32F, p.M, outputs, splits, p.Compute,
+                tc.SplitKPartials!.Handle, CuBlasNative.CUDA_R_32F, p.M, outputs, splits, p.Compute,
                 CuBlasNative.CUBLAS_GEMM_DEFAULT) != Engines.CublasStatus.Success)
             return false;
         // D = partials[outputs x splits] * ones[splits] + beta * D, in strict FP32 and a fixed order.
-        return CuBlasNative.cublasGemmEx(_cublasHandle, CublasOperation.None, CublasOperation.None,
-            checked((int)outputs), 1, splits, (IntPtr)(&one), _splitKPartials.Handle, CuBlasNative.CUDA_R_32F,
-            checked((int)outputs), _splitKOnes!.Handle, CuBlasNative.CUDA_R_32F, splits, (IntPtr)(&betaValue),
+        return CuBlasNative.cublasGemmEx(handle, CublasOperation.None, CublasOperation.None,
+            checked((int)outputs), 1, splits, (IntPtr)(&one), tc.SplitKPartials.Handle, CuBlasNative.CUDA_R_32F,
+            checked((int)outputs), tc.SplitKOnes!.Handle, CuBlasNative.CUDA_R_32F, splits, (IntPtr)(&betaValue),
             d, CuBlasNative.CUDA_R_32F, checked((int)outputs), CuBlasNative.CUBLAS_COMPUTE_32F_PEDANTIC,
             CuBlasNative.CUBLAS_GEMM_DEFAULT) == Engines.CublasStatus.Success;
     }
 
-    // The partial and ones buffers, grown outside a capture only (a capture cannot allocate).
+    // The calling thread's partial and ones buffers, grown outside a capture only (a capture cannot allocate). Per
+    // thread, beside the handle's workspace and in the same stream order: threads issuing split-K GEMMs at once (one
+    // capturing, one eager, on different streams) never share partials. A buffer outgrown is retired, not freed: a
+    // graph captured with it keeps its address and replays into it until the backend is disposed.
     private bool EnsureSplitKBuffers(in AutocastGemmProblem p, int splits)
     {
         long need = (long)splits * p.M * p.N;
-        lock (_autocastGemmLock)
+        if (!IsCublasAvailable || GemmLaunchStream != IntPtr.Zero) return false;   // a fan-out slice: no workspace either
+        _ = _cublasHandle;
+        if (_threadCublas?.Value is not { } tc) return false;
+        if (tc.SplitKOnes is null)
         {
-            if (_splitKOnes is null)
-            {
-                if (IsStreamCapturing()) return false;
-                var ones = new float[SplitKOnesLength];
-                for (int i = 0; i < ones.Length; i++) ones[i] = 1f;
-                _splitKOnes = AllocateBuffer(ones);
-            }
-            if (_splitKPartials is null || _splitKPartials.Size < need)
-            {
-                if (IsStreamCapturing()) return false;
-                _splitKPartials?.Dispose();
-                _splitKPartials = AllocateBuffer(checked((int)need));
-            }
-            return true;
+            if (IsStreamCapturing()) return false;
+            var ones = new float[SplitKOnesLength];
+            for (int i = 0; i < ones.Length; i++) ones[i] = 1f;
+            tc.SplitKOnes = AllocateBuffer(ones);
         }
+        if (tc.SplitKPartials is null || tc.SplitKPartials.Size < need)
+        {
+            if (IsStreamCapturing()) return false;
+            // Grown to a power of two (at most SplitKMaxPartialFloats) so a thread retires few buffers.
+            long size = 1;
+            while (size < need) size <<= 1;
+            size = Math.Min(size, Math.Max(need, SplitKMaxPartialFloats));
+            if (tc.SplitKPartials is not null) (tc.RetiredSplitKPartials ??= new List<IGpuBuffer>()).Add(tc.SplitKPartials);
+            tc.SplitKPartials = AllocateBuffer(checked((int)size));
+        }
+        return true;
     }
 
     /// <summary>Runs one route (0 cuBLASLt, 1 classic, 2 split-K over <paramref name="splits"/>) for tests.</summary>
@@ -233,14 +243,15 @@ public sealed partial class CudaBackend
         return ok;
     }
 
-    private void DisposeAutocastGemmBuffers()
+    // The thread's split-K buffers, with the cuBLAS handle they serve (the backend's Dispose).
+    private static void DisposeSplitKBuffers(ThreadCublas tc)
     {
-        lock (_autocastGemmLock)
-        {
-            _splitKPartials?.Dispose();
-            _splitKPartials = null;
-            _splitKOnes?.Dispose();
-            _splitKOnes = null;
-        }
+        tc.SplitKPartials?.Dispose();
+        tc.SplitKPartials = null;
+        tc.SplitKOnes?.Dispose();
+        tc.SplitKOnes = null;
+        if (tc.RetiredSplitKPartials is { } retired)
+            foreach (var buffer in retired) buffer.Dispose();
+        tc.RetiredSplitKPartials = null;
     }
 }

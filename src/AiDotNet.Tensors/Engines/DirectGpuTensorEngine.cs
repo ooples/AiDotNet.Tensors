@@ -29673,7 +29673,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     AliasDiag($"TensorTile-resident bail outer={outer} cols={cols} src=[{string.Join(",", tensor._shape)}]");
             }
         }
+        if (TryBroadcastTileOnDevice(tensor, multiples) is { } tiled) return tiled;
         return ((IEngine)this).TensorTile(tensor, multiples);
+    }
+
+    // A tile that only expands size-1 axes (TensorBroadcastTo's general case) on the device: one TileAxis per expanded
+    // axis, recorded as the Tile it is (its backward sums the copies on the device). The host tile downloaded the
+    // input; a lazy graph keeps the base's recorded node.
+    private Tensor<T>? TryBroadcastTileOnDevice<T>(Tensor<T>? tensor, int[]? multiples)
+    {
+        if (typeof(T) != typeof(float) || tensor is null || multiples is null || multiples.Length != tensor.Rank
+            || Compilation.GraphMode.IsActive || !TryGetBackend(out _))
+            return null;
+        bool expands = false;
+        for (int i = 0; i < multiples.Length; i++)
+        {
+            if (multiples[i] < 1 || (multiples[i] > 1 && tensor._shape[i] != 1)) return null;
+            expands |= multiples[i] > 1;
+        }
+        if (!expands) return null;
+        using var __gpuOp = EnterGpuOp();
+        Tensor<T> source = tensor, current = tensor;
+        int[] tiles = (int[])multiples.Clone();
+        for (int axis = 0; axis < multiples.Length; axis++)
+        {
+            if (multiples[axis] == 1) continue;
+            if (TryRepeatAxisOnDevice(current, multiples[axis], axis) is not { } expanded) return null;
+            current = expanded;
+        }
+        Autodiff.DifferentiableOps.RecordUnary("Tile", current, tensor, Autodiff.BackwardFunctions<T>.TileBackward);
+        Compilation.AutoTracer.RecordOp("Tile", current, eng => eng.TensorTile(source, tiles));
+        return current;
     }
 
     /// <summary>PR #638 A1: resident set-slice-along-axis (the SliceAxis backward scatters the grad into a fresh

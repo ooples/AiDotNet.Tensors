@@ -4801,9 +4801,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
                     ExchangeGradients(deviceAuthoritative: true);
+                    UnscaleAfterExchange();
                     RegularizeAndClipGradients();
                     CommitHostOptimizerGradients();
                     InvokeOptimizerUpdate();
+                    CompleteLossScaledStep();
                     return _lossOutput;
                 }
                 // REPLAY: SetInput copied THIS step's batch into the (host) input tensor, bumping its
@@ -4862,9 +4864,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     return _lossOutput;
                 }
                 ExchangeGradients(deviceAuthoritative: true);
+                UnscaleAfterExchange();
                 RegularizeAndClipGradients();
                 CommitHostOptimizerGradients();
                 InvokeOptimizerUpdate();
+                CompleteLossScaledStep();
                 return _lossOutput;
             }
         }
@@ -5274,7 +5278,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // the reduced gradient, which every rank holds alike (a rank that overflowed makes the sum non-finite), so
         // every rank skips or takes the step and moves its scale the same way (DDP's overflow consensus).
         if (split) return;
-        CaptureLossScaling();   // after the backward, before the captured clip and update
+        // With an exchange and the update outside the graph, the scaler runs uncaptured after the exchange
+        // (UnscaleAfterExchange) for the same reason; otherwise after the backward, before the captured clip and update.
+        if (_gradientExchange is null) CaptureLossScaling();
         CaptureUpdateGraphBody(parity);
     }
 
@@ -5525,9 +5531,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var bindings = new Dictionary<Engines.DirectGpu.IGpuBuffer, int>(
             ReferenceEqualityComparer<Engines.DirectGpu.IGpuBuffer>.Instance);
         var seen = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        // By the memory a binding views: a view wrapper over an output's buffer is another reader of it.
         void Count(Tensor<T>? t)
         {
-            if (t?._gpuBuffer is { } b && seen.Add(t)) bindings[b] = bindings.TryGetValue(b, out int n) ? n + 1 : 1;
+            if (t?._gpuBuffer is { } b && seen.Add(t))
+            {
+                var root = Engines.DirectGpu.GpuBufferViewRoot.Of(b);
+                bindings[root] = bindings.TryGetValue(root, out int n) ? n + 1 : 1;
+            }
         }
         foreach (var p in parameters) Count(p);
         foreach (var step in forwardSteps)
@@ -5539,7 +5550,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var output = step.OutputBuffer;
             if (output?._gpuBuffer is not { } buffer || ReferenceEquals(output, loss) || retainedOutputs.Contains(output)
-                || bindings[buffer] != 1)
+                || bindings[Engines.DirectGpu.GpuBufferViewRoot.Of(buffer)] != 1)
                 continue;
             gte.ReleaseTraceTimeDeviceValue(output);
         }
