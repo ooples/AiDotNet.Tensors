@@ -348,7 +348,9 @@ public class BufferSizeCapTests
     [Fact]
     public void IDirectGpuBackend_ExposesMaxBufferAllocBytes()
     {
-        var prop = typeof(IDirectGpuBackend).GetProperty("MaxBufferAllocBytes");
+        // The device facts live on IGpuDevice, which both the synchronous and the awaitable backends extend.
+        Assert.True(typeof(IGpuDevice).IsAssignableFrom(typeof(IDirectGpuBackend)));
+        var prop = typeof(IGpuDevice).GetProperty("MaxBufferAllocBytes");
         Assert.NotNull(prop);
         Assert.Equal(typeof(long), prop!.PropertyType);
         Assert.True(prop.CanRead);
