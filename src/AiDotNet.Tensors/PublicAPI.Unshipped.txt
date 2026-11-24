@@ -861,6 +861,7 @@ AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Elementwise.ScalarFloat64(AiDotNet
 AiDotNet.Tensors.Engines.DirectGpu.IGpuFloat64Elementwise.UnaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64UnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.ScalarFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64BinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, double scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend.UnaryFloat64(AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64UnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp.ChannelsLastConvolution = 23 -> AiDotNet.Tensors.Helpers.Autotune.TunedKernels.TunedKernelOp
 AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget
 const AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget.FractionEnvironmentVariable = "AIDOTNET_GPU_MEMORY_FRACTION" -> string!
 static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget.ClearLimit(string! device = "cuda:0") -> void

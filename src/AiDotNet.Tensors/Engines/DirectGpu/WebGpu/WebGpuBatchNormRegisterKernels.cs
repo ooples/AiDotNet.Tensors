@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 internal static class WebGpuBatchNormRegisterKernels
 {
     private const string Params = @"
-struct Params { batch: i32, channels: i32, spatial: i32, epsBits: i32, invCountBits: i32, mode: i32, pad0: i32, pad1: i32, }
+struct Params { batch: i32, channels: i32, spatial: i32, epsBits: i32, invCountBits: i32, mode: i32, slopeBits: i32, pad1: i32, }
 var<workgroup> sm: array<f32, 256>;
 
 fn group_sum(tid: u32, value: f32) -> f32 {
@@ -39,6 +39,7 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
     let n = pm.batch * pm.spatial;
     let eps = bitcast<f32>(pm.epsBits);
     let invCount = bitcast<f32>(pm.invCountBits);
+    let slope = bitcast<f32>(pm.slopeBits);
     var v: array<f32, KPT>;
     var s1 = 0.0;
     for (var k = 0; k < KPT; k = k + 1) {
@@ -70,7 +71,7 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
             let idx = (b * pm.channels + c) * pm.spatial + (e - b * pm.spatial);
             var y = fma(g, (v[k] - mean) * inv, bt);
             if ((pm.mode & 2) != 0) { y = y + res[idx]; }
-            if ((pm.mode & 1) != 0) { y = max(y, 0.0); }
+            if ((pm.mode & 1) != 0) { if ((pm.mode & 32) != 0) { if (!(y > 0.0)) { y = slope * y; } } else { y = max(y, 0.0); } }
             yout[idx] = y;
         }
     }
@@ -96,6 +97,7 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
     let n = pm.batch * pm.spatial;
     let eps = bitcast<f32>(pm.epsBits);
     let invCount = bitcast<f32>(pm.invCountBits);
+    let slope = bitcast<f32>(pm.slopeBits);
     let g = prm[c];
     let bt = prm[pm.channels + c];
     let mean = prm[2 * pm.channels + c];
@@ -115,9 +117,9 @@ fn NAME(@builtin(local_invocation_index) lidx: u32, @builtin(workgroup_id) wid: 
             var d = dyin[idx];
             if ((pm.mode & 8) != 0) { d = d + dy2[idx]; }
             if ((pm.mode & 4) != 0) {
-                if (!(fma(g, (x - mean) * inv, bt) > 0.0)) { d = 0.0; }
+                if (!(fma(g, (x - mean) * inv, bt) > 0.0)) { if ((pm.mode & 32) != 0) { d = d * slope; } else { d = 0.0; } }
             } else if ((pm.mode & 1) != 0) {
-                if (!(msk[idx] > 0.0)) { d = 0.0; }
+                if (!(msk[idx] > 0.0)) { if ((pm.mode & 32) != 0) { d = d * slope; } else { d = 0.0; } }
             }
             if ((pm.mode & 2) != 0) { dres[idx] = d; }
             xv[k] = x;

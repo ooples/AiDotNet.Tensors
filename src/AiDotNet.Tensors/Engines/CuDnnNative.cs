@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </list>
 /// <para><b>cuDNN Frontend Reference:</b> https://github.com/NVIDIA/cudnn-frontend</para>
 /// </remarks>
-public static class CuDnnNative
+public static partial class CuDnnNative
 {
     // cuDNN library name - try newer version first, fall back to older
     private const string CudnnLibrary = "cudnn64_9.dll";
@@ -1430,11 +1430,16 @@ public sealed class CuDnnFilterDescriptor : IDisposable
 
     /// <summary>Sets the descriptor for a 4D filter (K output channels, C input channels, H, W).</summary>
     public void Set4D(CuDnnNative.CudnnDataType dataType, int k, int c, int h, int w)
+        => Set4D(dataType, k, c, h, w, CuDnnNative.CudnnTensorFormat.NCHW);
+
+    /// <summary>As <see cref="Set4D(CuDnnNative.CudnnDataType, int, int, int, int)"/>, the filter stored in
+    /// <paramref name="format"/> (NHWC: [K, H, W, C]).</summary>
+    internal void Set4D(CuDnnNative.CudnnDataType dataType, int k, int c, int h, int w, CuDnnNative.CudnnTensorFormat format)
     {
         var status = CuDnnNative.cudnnSetFilter4dDescriptor(
             _descriptor,
             dataType,
-            CuDnnNative.CudnnTensorFormat.NCHW,
+            format,
             k, c, h, w);
         CuDnnContext.CheckStatus(status, "SetFilter4dDescriptor");
     }
@@ -1848,6 +1853,8 @@ public sealed partial class CuDnnConvolution : IDisposable
     private readonly List<(IntPtr Pointer, DevicePrimitives.DeviceMemoryHold Memory)> _retiredWorkspaces = new();
     private IntPtr _workspace;
     private ulong _workspaceSize;
+    // CudaBackend.CaptureEpoch when the live workspace was allocated.
+    private long _workspaceEpoch;
     private bool _disposed;
 
     /// <summary>Creates a new cuDNN convolution helper with shared context.</summary>
@@ -2020,6 +2027,21 @@ public sealed partial class CuDnnConvolution : IDisposable
         int dilationH = 1, int dilationW = 1,
         CuDnnNative.CudnnDataType dataType = CuDnnNative.CudnnDataType.Float,
         int algorithm = -1, CuDnnNative.CudnnMathType mathType = CuDnnNative.CudnnMathType.TensorOp)
+        => Conv2DForwardGpu(inputDevPtr, filterDevPtr, outputDevPtr, n, c, h, w, k, filterH, filterW, outputHeight,
+            outputWidth, padH, padW, strideH, strideW, dilationH, dilationW, dataType, algorithm, mathType, outputNhwc: false);
+
+    /// <summary>As the public overload; with <paramref name="outputNhwc"/> the result is written channels-last.</summary>
+    internal void Conv2DForwardGpu(
+        IntPtr inputDevPtr, IntPtr filterDevPtr, IntPtr outputDevPtr,
+        int n, int c, int h, int w,
+        int k, int filterH, int filterW,
+        int outputHeight, int outputWidth,
+        int padH, int padW,
+        int strideH, int strideW,
+        int dilationH, int dilationW,
+        CuDnnNative.CudnnDataType dataType,
+        int algorithm, CuDnnNative.CudnnMathType mathType,
+        bool outputNhwc)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CuDnnConvolution));
 
@@ -2049,7 +2071,12 @@ public sealed partial class CuDnnConvolution : IDisposable
                 $"cuDNN output shape {cudnnOutN}x{cudnnOutC}x{cudnnOutH}x{cudnnOutW} " +
                 $"disagrees with caller's expected {n}x{k}x{outputHeight}x{outputWidth}.");
 
-        outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        // outputNhwc: the result is written channels-last ([n, oh, ow, k]), which cuDNN's tensor-core kernels produce
+        // natively: no layout pass after them (the caller's epilogue changes the layout instead).
+        if (outputNhwc)
+            outputDesc.Set4D(CuDnnNative.CudnnTensorFormat.NHWC, dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
+        else
+            outputDesc.Set4D(dataType, cudnnOutN, cudnnOutC, cudnnOutH, cudnnOutW);
 
         // Algorithm selection: an explicit algorithm as asked; otherwise cuDNN's own heuristic choice for the shape and
         // math type (what PyTorch runs with cudnn.benchmark off), cached per shape. This is the convolution slots'
@@ -2059,7 +2086,8 @@ public sealed partial class CuDnnConvolution : IDisposable
         var algo = algorithm >= 0
             ? (CuDnnNative.CudnnConvolutionFwdAlgo)algorithm
             : HeuristicForwardAlgorithm(inputDesc.Handle, filterDesc.Handle, convDesc.Handle, outputDesc.Handle, mathType,
-                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, 1, (int)dataType, (int)mathType));
+                (n, c, h, w, k, filterH, filterW, padH, padW, strideH, strideW, dilationH, dilationW, 1,
+                    (int)dataType | (outputNhwc ? 1 << 16 : 0), (int)mathType));
         ulong workspaceSize;
         status = CuDnnNative.cudnnGetConvolutionForwardWorkspaceSize(
             _context.Handle, inputDesc.Handle, filterDesc.Handle,
@@ -2353,9 +2381,12 @@ public sealed partial class CuDnnConvolution : IDisposable
         result = CudaResult.Success;
         if (_workspaceSize >= requiredSize) return true;
 
-        // Grow at least twofold, so the retired workspaces below add up to less than the live one.
-        // A low-memory fallback must request only its required size.
-        ulong size = exactSize ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
+        // The old workspace is freed when no capture began since it was allocated (below); then the new one is the size
+        // required (a twofold growth had DCGAN hold 117 MB for a 61 MB need). Only when the old one must be retired does it
+        // grow at least twofold, so the retired workspaces add up to less than the live one. A low-memory fallback
+        // requests only its required size.
+        bool oldIsFreeable = _workspace == IntPtr.Zero || DirectGpu.CUDA.CudaBackend.CaptureEpoch == _workspaceEpoch;
+        ulong size = exactSize || oldIsFreeable ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
         // Past this process's GpuMemoryBudget a request is refused as the driver refuses one: out of memory.
         IntPtr grown = IntPtr.Zero;
         result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
@@ -2371,11 +2402,22 @@ public sealed partial class CuDnnConvolution : IDisposable
         }
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
-        // The old workspace is retired, not freed: a captured CUDA graph keeps the pointer of every convolution it
-        // recorded, so freeing it would have the graph's replays write into memory reused by something else. And a
-        // cuMemFree on a capturing thread is itself not permitted during the capture. It stays allocated, so it keeps
-        // its charge until Dispose frees it.
-        if (_workspace != IntPtr.Zero) _retiredWorkspaces.Add((_workspace, _workspaceMemory));
+        // Once a stream capture has begun since the old workspace was allocated, it is retired, not freed: a captured CUDA
+        // graph keeps the pointer of every convolution it recorded, so freeing it would have the graph's replays write
+        // into memory reused by something else, and a cuMemFree on a capturing thread is itself not permitted during the
+        // capture. It stays allocated, keeping its charge until Dispose frees it. With no capture since, no graph can name
+        // it: it is freed (cuMemFree waits for the work already queued that uses it). The workspace grows mostly while
+        // the autotuner times candidates, before any step is captured; retiring those sizes kept every one of them
+        // (a DCGAN step held 211 MiB of cuDNN workspaces, 102 MiB of them outgrown).
+        if (_workspace != IntPtr.Zero)
+        {
+            if (DirectGpu.CUDA.CudaBackend.CaptureEpoch == _workspaceEpoch
+                && CuBlasNative.cuMemFree(_workspace) == CudaResult.Success)
+                _workspaceMemory.OnFreed();
+            else
+                _retiredWorkspaces.Add((_workspace, _workspaceMemory));
+        }
+        _workspaceEpoch = DirectGpu.CUDA.CudaBackend.CaptureEpoch;
         _workspace = grown;
         _workspaceSize = size;
         _workspaceMemory = default;
@@ -2388,6 +2430,7 @@ public sealed partial class CuDnnConvolution : IDisposable
     {
         if (_disposed) return;
 
+        DisposeChannelsLastPlans();
         if (_workspace != IntPtr.Zero)
         {
             CuBlasNative.cuMemFree(_workspace);

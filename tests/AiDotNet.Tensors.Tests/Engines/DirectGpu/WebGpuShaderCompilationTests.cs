@@ -30,6 +30,7 @@ public sealed class WebGpuShaderCompilationTests
         "WebGpuConvDgradS2Kernels.Entry",     // the stride-2 dgrad kernels' shared entry-point header, closed by each body
         "WebGpuGroupedGemmKernels.ForwardSource",     // templates: SourceFor fills in the entry-point name
         "WebGpuGroupedGemmKernels.WeightGradSource",
+        "WebGpuFftKernels.SharedBatchedFftBody",   // SharedBatchedFft prefixes it with the WG and MAX_N constants
         "WebGpuMoeKernels.Entry",             // the fused MoE kernels' bodies; SourceFor prefixes each with its header
         "WebGpuMoeKernels.RouteBody",
         "WebGpuMoeKernels.SortBody",

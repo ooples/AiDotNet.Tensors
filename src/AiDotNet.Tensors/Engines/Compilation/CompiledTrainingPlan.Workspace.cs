@@ -32,6 +32,69 @@ internal sealed partial class CompiledTrainingPlan<T>
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
         && !engine.InferenceCaptureActive && !Gpu.AutocastScope.IsEnabled && Gpu.DeferredScope.Current?.IsRecording != true;
 
+    // The scratch bytes and buffer count this plan last offered to the engine's co-owned step scratch.
+    private long _publishedScratchBytes = -1;
+    private int _publishedScratchCount = -1;
+
+    /// <summary>
+    /// Whether this plan's step scratch may be co-owned with the engine's other plans (SharedStepScratch): a plan the
+    /// cross-plan workspace broker does not serve -- one that keeps stable pointers, captured or capturable -- whose
+    /// step-persistent buffers <see cref="TryProtectStepPersistentBuffers"/> can see.
+    /// </summary>
+    /// <remarks>An eager plan whose graph step was disabled explicitly is the broker's, even when autocast keeps the
+    /// broker from serving it this run: co-owning would bind its tensors to memory another plan writes, which the broker
+    /// prevents by detaching them (DetachCompiledWorkspaceTensor).</remarks>
+    private bool CanCoOwnStepScratch(DirectGpuTensorEngine engine) => SharedStepScratch.Enabled
+        && typeof(T) == typeof(float) && !_workspaceSharingBodyAllowed
+        && !(_workspaceExplicitGraphDisable && _graphStepDisabled)
+        && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null && _forwardSteps is not null
+        && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
+        && !engine.InferenceCaptureActive && Gpu.DeferredScope.Current?.IsRecording != true;
+
+    /// <summary>
+    /// After a whole executed run: offers this plan's step-transient scratch to the engine's other plans, when the pool
+    /// has changed since the last offer (the first runs allocate it; later runs reuse it).
+    /// </summary>
+    private void PublishStepScratch(DirectGpuTensorEngine engine, IDirectGpuBackend backend, StepScratchPool pool)
+    {
+        long bytes = pool.BufferBytes;
+        int count = pool.BufferCount;
+        if (bytes == _publishedScratchBytes && count == _publishedScratchCount) return;
+        _publishedScratchBytes = bytes;
+        _publishedScratchCount = count;
+        if (!TryProtectStepPersistentBuffers()) return;
+        var offer = new List<IGpuBuffer>();
+        foreach (var buffer in pool.AllBuffers()) if (IsStepTransient(buffer)) offer.Add(buffer);
+        engine.SharedStepScratch.Publish(pool, backend, offer);
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
+        {
+            long offered = 0;
+            foreach (var buffer in offer) offered += buffer.SizeInBytes;
+            var shared = engine.SharedStepScratch;
+            try
+            {
+                AiDotNetEngine.LogDiagnostic($"[PLAN-SHARED-SCRATCH] plan={_planId} pool_bytes={bytes} pool_buffers={count} " +
+                    $"offered_bytes={offered} offered_buffers={offer.Count} engine_shared={shared.Count} " +
+                    $"takes={shared.Takes} taken_bytes={shared.TakenBytes} revocations={shared.Revocations}");
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A diagnostic sink cannot undo the completed run.
+            }
+        }
+    }
+
+    private void ValidateTakenStepScratch(SharedStepScratch registry, StepScratchPool pool, bool completed)
+    {
+        var taken = pool.TakeTakenThisRun();
+        if (taken.Count == 0) return;
+        bool known = completed && TryProtectStepPersistentBuffers();
+        foreach (var buffer in taken)
+            if (!known || !IsStepTransient(buffer)) registry.Revoke(buffer, pool);
+        // The next offer must re-read the pool: what was revoked is no longer shared.
+        _publishedScratchBytes = -1;
+    }
+
     private void ReturnTransientWorkspace(DirectGpuTensorEngine engine, IDirectGpuBackend backend)
     {
         SharedWorkspaceBytesLastStep = 0;
@@ -39,6 +102,45 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (!_workspaceSharingBodyAllowed || !CanShareTransientWorkspace(engine) || _scratchPool is not { } pool) return;
         pool.WithdrawLent();
         if (pool.HasOutstandingWorkspaceLeases) return;
+        if (!TryProtectStepPersistentBuffers()) return;
+        pool.CollectTransferableForwardSlots(_forwardActions.Length, IsStepTransient, _workspaceCandidates);
+        if (_workspaceCandidates.Count == 0) return;
+        // Snapshot aliases before detaching one shared vector clears the binding visible through its siblings.
+        foreach (var tensor in _workspaceTensors)
+            if (!_workspaceProtectedStorage.Contains(tensor.StorageIdentity) && tensor._gpuBuffer is { } buffer
+                && _workspaceCandidates.Contains(GpuBufferViewRoot.Of(buffer))) _workspaceDetach.Add(tensor);
+        foreach (var tensor in _workspaceDetach) engine.DetachCompiledWorkspaceTensor(tensor);
+        var broker = engine.CompiledWorkspaceBroker;
+        SharedWorkspaceBytesLastStep = pool.TransferForwardSlots(_workspaceCandidates, backend, broker,
+            out int transferred);
+        SharedWorkspaceSlotsLastStep = transferred;
+        if (transferred > 0) _lendSchedule = null; // Cached schedules contain physical buffers, not logical slots.
+        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
+        {
+            var buckets = new SortedDictionary<int, int>();
+            foreach (var buffer in _workspaceCandidates)
+                buckets[buffer.Size] = buckets.TryGetValue(buffer.Size, out int count) ? count + 1 : 1;
+            try
+            {
+                AiDotNetEngine.LogDiagnostic($"[PLAN-WORKSPACE] plan={_planId} slots={transferred} bytes={SharedWorkspaceBytesLastStep} " +
+                $"broker_bytes={broker.RetainedBytes} reuse_count={broker.ReuseCount} reuse_bytes={broker.ReuseBytes} " +
+                $"buckets=[{string.Join(",", buckets)}]");
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A diagnostic sink cannot roll back the completed optimizer update.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records every device buffer something reads outside a step of this plan -- the parameters and their gradients,
+    /// the inputs, the loss and its seed, retained outputs, in-place state, optimizer and resident gradient buffers, and
+    /// any tensor a step saves that no forward step produces -- so that <see cref="IsStepTransient"/> accepts only
+    /// buffers whose values live within one step. False when a step saves state whose buffers cannot be seen.
+    /// </summary>
+    private bool TryProtectStepPersistentBuffers()
+    {
         _workspaceProtectedRoots.Clear();
         _workspaceProtectedHandles.Clear();
         _workspaceProtectedStorage.Clear();
@@ -77,6 +179,11 @@ internal sealed partial class CompiledTrainingPlan<T>
                 foreach (var item in nested) if (!InspectSaved(item)) return false;
                 return true;
             }
+            // A fused node's saved inner backward (ConvChannelEpilogueBackward keeps the convolution's): a static method
+            // captures nothing. A closure may hold buffers, so it stays opaque below.
+            if (saved is Delegate { Target: null }) return true;
+            // A channels-last fused node's layouts: its geometry, and the convolution input it reads in the backward.
+            if (saved is ChannelsLastSlot slot) return InspectSaved(slot.Input);
             // An opaque saved-state owner may hide native pointers. Refuse it rather than presume its buffers died.
             var type = saved.GetType();
             return type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
@@ -111,7 +218,7 @@ internal sealed partial class CompiledTrainingPlan<T>
                 if (!_workspaceProduced.Contains(input)) Protect(input);
             }
             if (step.SavedState is { } saved)
-                foreach (var item in saved) if (!InspectSaved(item)) return;
+                foreach (var item in saved) if (!InspectSaved(item)) return false;
         }
         // Owning tensor buffers are outside this loan contract even if a pool happens to name them.
         foreach (var tensor in _workspaceTensors)
@@ -121,39 +228,15 @@ internal sealed partial class CompiledTrainingPlan<T>
         // Storage identity still makes that sibling's native root observable through the view.
         foreach (var tensor in _workspaceTensors)
             if (_workspaceProtectedStorage.Contains(tensor.StorageIdentity)) ProtectBuffer(tensor._gpuBuffer);
-        bool Eligible(IGpuBuffer buffer)
-        {
-            var root = GpuBufferViewRoot.Of(buffer);
-            return ReferenceEquals(root, buffer) && buffer.Handle != IntPtr.Zero
-                && !_workspaceProtectedRoots.Contains(root) && !_workspaceProtectedHandles.Contains(root.Handle);
-        }
-        pool.CollectTransferableForwardSlots(_forwardActions.Length, Eligible, _workspaceCandidates);
-        if (_workspaceCandidates.Count == 0) return;
-        // Snapshot aliases before detaching one shared vector clears the binding visible through its siblings.
-        foreach (var tensor in _workspaceTensors)
-            if (!_workspaceProtectedStorage.Contains(tensor.StorageIdentity) && tensor._gpuBuffer is { } buffer
-                && _workspaceCandidates.Contains(GpuBufferViewRoot.Of(buffer))) _workspaceDetach.Add(tensor);
-        foreach (var tensor in _workspaceDetach) engine.DetachCompiledWorkspaceTensor(tensor);
-        var broker = engine.CompiledWorkspaceBroker;
-        SharedWorkspaceBytesLastStep = pool.TransferForwardSlots(_workspaceCandidates, backend, broker,
-            out int transferred);
-        SharedWorkspaceSlotsLastStep = transferred;
-        if (transferred > 0) _lendSchedule = null; // Cached schedules contain physical buffers, not logical slots.
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAD_POOL_DIAG") == "1")
-        {
-            var buckets = new SortedDictionary<int, int>();
-            foreach (var buffer in _workspaceCandidates)
-                buckets[buffer.Size] = buckets.TryGetValue(buffer.Size, out int count) ? count + 1 : 1;
-            try
-            {
-                AiDotNetEngine.LogDiagnostic($"[PLAN-WORKSPACE] plan={_planId} slots={transferred} bytes={SharedWorkspaceBytesLastStep} " +
-                $"broker_bytes={broker.RetainedBytes} reuse_count={broker.ReuseCount} reuse_bytes={broker.ReuseBytes} " +
-                $"buckets=[{string.Join(",", buckets)}]");
-            }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
-            {
-                // A diagnostic sink cannot roll back the completed optimizer update.
-            }
-        }
+        return true;
+    }
+
+    /// <summary>Whether <paramref name="buffer"/> holds only values one step writes and reads (after
+    /// <see cref="TryProtectStepPersistentBuffers"/>): a whole allocation no protected tensor is bound to.</summary>
+    private bool IsStepTransient(IGpuBuffer buffer)
+    {
+        var root = GpuBufferViewRoot.Of(buffer);
+        return ReferenceEquals(root, buffer) && buffer.Handle != IntPtr.Zero
+            && !_workspaceProtectedRoots.Contains(root) && !_workspaceProtectedHandles.Contains(root.Handle);
     }
 }

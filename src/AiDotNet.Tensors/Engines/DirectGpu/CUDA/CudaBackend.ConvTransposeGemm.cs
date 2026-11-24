@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 // per sample with N = L and the implicit-GEMM data-gradient engine tiles the output pixels, both of which leave most of
 // the tile idle at small L. Measured on the 64x64 DCGAN generator (RTX 1000 Ada, batch 16): the 4x4 -> 8x8
 // 512 -> 256 stage 345 -> 208 us, the 64 -> 3 RGB head 105 -> 94 us.
-public sealed partial class CudaBackend
+public sealed partial class CudaBackend : IConvTranspose2DBiasBackend
 {
     private IGpuBuffer? _convTransposeXt;
     private IGpuBuffer? _convTransposeCol;

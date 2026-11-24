@@ -95,9 +95,16 @@ public sealed class CudaKernelLookupIntegrityTests
         var type = typeof(AiDotNet.Tensors.Engines.DirectGpu.DeterministicNormKernels).Assembly.GetTypes()
             .FirstOrDefault(t => t.Name == className && t.Namespace is not null
                 && t.Namespace.StartsWith("AiDotNet.Tensors.Engines.DirectGpu.CUDA", StringComparison.Ordinal));
-        var method = type?.GetMethod("GetKernelNames", System.Reflection.BindingFlags.Public
-            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static, null, Type.EmptyTypes, null);
-        return method?.Invoke(null, null) as string[] ?? Array.Empty<string>();
+        const System.Reflection.BindingFlags Static = System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var method = type?.GetMethod("GetKernelNames", Static, null, Type.EmptyTypes, null);
+        if (method?.Invoke(null, null) is string[] names) return names;
+        // A module emitted once per element type (CudaFFTGenericKernels) registers each type's suffixed names.
+        var elementTyped = type?.GetMethod("GetKernelNames", Static, null,
+            new[] { typeof(AiDotNet.Tensors.Engines.DirectGpu.FftElementType) }, null);
+        if (elementTyped is null) return Array.Empty<string>();
+        return Enum.GetValues(typeof(AiDotNet.Tensors.Engines.DirectGpu.FftElementType)).Cast<object>()
+            .SelectMany(t => (string[])elementTyped.Invoke(null, new[] { t })!).ToArray();
     }
 
     // The suffixes a "prefix" + variant lookup can append, from the selector the backend calls; null for an unknown family.
@@ -107,6 +114,11 @@ public sealed class CudaKernelLookupIntegrityTests
             return Enumerable.Range(1, AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
                 .Select(AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.Variant)
                 .Distinct(StringComparer.Ordinal).ToList();
+        // A per-element-type module's entry point, selected by FftElementType.KernelSuffix() (_f32, _f16, _bf16).
+        if (prefix.StartsWith("fftg_", StringComparison.Ordinal))
+            return Enum.GetValues(typeof(AiDotNet.Tensors.Engines.DirectGpu.FftElementType))
+                .Cast<AiDotNet.Tensors.Engines.DirectGpu.FftElementType>()
+                .Select(AiDotNet.Tensors.Engines.DirectGpu.FftElementTypeExtensions.KernelSuffix).ToList();
         return null;
     }
 

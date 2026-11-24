@@ -1284,6 +1284,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override bool SupportsGpu => IsGpuAvailable;
 
+    internal override bool IsDeviceEngine => true;
+
     DirectGpuEngine? IEngine.DirectGpu => _directGpu;
 
     /// <summary>
@@ -6709,9 +6711,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // A buffer an earlier step's work is still queued against is released stream-ordered (the CUDA buffer frees
             // with cuMemFreeAsync on the compute stream; one a captured graph uses is held until that capture's graphs
             // end - CaptureMemoryPool). A second dispose of an already-released slot is the only failure to ignore.
-            StepScratchPool.Untrack(b);
             pool.Keys.Remove(b);
-            try { b.Dispose(); } catch (ObjectDisposedException) { }
+            if (!pool.ReleaseOwnership(b))   // false: no other plan co-owns it
+            {
+                try { b.Dispose(); } catch (ObjectDisposedException) { }
+            }
         }
         if (pool.Leases(key))
         {
@@ -6749,9 +6753,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return shared;
         }
 
-        var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
+        // First pass at this (action,local): record the stable buffer (possibly a co-owned one: the plan validates what it
+        // took after the run, see StepScratchPool.TakeTakenThisRun).
+        var nb = pool.AllocateNew(backend, length, fullyWritten);
         pool.Slots[key] = nb;
-        pool.Track(nb);
         pool.Keys[nb] = key;
         return nb;
     }
@@ -6761,7 +6766,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// allocation is unless the caller's next kernel writes all of it (<paramref name="fullyWritten"/>). The size class rounds up to eight steps per power of two (at most 12.5% over), so actions
     /// whose scratch differs slightly in size still share a buffer.
     /// </summary>
-    private IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
+    internal IGpuBuffer RentTransientScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
         // The caller gets exactly `length` elements: a slot is a size class larger, and an op that reads its buffer's
         // Size (a download into a host vector: StridedGather, GenerateDropoutMask) would otherwise return the slack.
@@ -6770,12 +6775,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool views = backend is IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
         long sizeClass = views ? TransientSizeClass(length) : length;
         var pool = CurrentScratchPool!;
+        if (views)
+        {
+            // One slot per local index, grown to the largest request any action makes there, handed out as an
+            // exact-length view. Keyed by size class too, each local index kept a buffer for every distinct operand size
+            // the plan's actions used there: a BF16 DCGAN step held 35 of them for its convolution operands alone
+            // (117 MB), where the largest is all one serial step ever uses at once.
+            var growKey = (pool.TransientLocal++, StepScratchPool.GrowableTransientClass);
+            if (!pool.Transient.TryGetValue(growKey, out var slot) || slot.Handle == System.IntPtr.Zero || slot.Size < length)
+            {
+                var old = slot is not null && slot.Handle != System.IntPtr.Zero ? slot : null;
+                slot = pool.AllocateNew(backend, checked((int)sizeClass), fullyWritten);
+                pool.Transient[growKey] = slot;
+                if (old is not null) pool.RetireTransient(old);
+            }
+            else if (!fullyWritten)
+            {
+                if (backend is IDeviceZeroFill zeroSlot) zeroSlot.ZeroBuffer(slot, length);
+                else backend.Fill(slot, 0f, length);
+            }
+            return slot.Size != length && backend is IGpuBufferViews exactSlot && exactSlot.TryCreateView(slot, 0, length) is { } slotView
+                ? slotView : slot;
+        }
         var key = (pool.TransientLocal++, sizeClass);
         if (!pool.Transient.TryGetValue(key, out var b) || b.Handle == System.IntPtr.Zero)
         {
-            b = backend.AllocateBuffer(checked((int)sizeClass));
+            b = pool.AllocateNew(backend, checked((int)sizeClass), fullyWritten);
             pool.Transient[key] = b;
-            pool.Track(b);
         }
         else if (!fullyWritten)
         {
@@ -7362,7 +7388,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryGroupNormSwishResidentInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || input.Rank < 2) return false;
         var arr = output.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return false;
@@ -7505,7 +7531,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryMultiplyScalarResidentInto<T>(Tensor<T> output, Tensor<T> a, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || a.Length != output.Length) return false;
         try
@@ -7533,7 +7559,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, string opName)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
         try
@@ -7555,7 +7581,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
         try
@@ -7584,7 +7610,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryEmbeddingFromFloatIndicesResidentInto<T>(Tensor<T> output, Tensor<T> embeddings, Tensor<T> floatIndices, int numIndices, int embeddingDim)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend) || !embeddings.IsContiguous || !floatIndices.IsContiguous) return false;
         if ((long)numIndices * embeddingDim != output.Length) return false;
         try
@@ -7664,7 +7690,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal Tensor<T>? TryEmbeddingBackwardResident<T>(Tensor<T> gradOutput, object lookupKey, int numIndices, int vocabSize, int embeddingDim, int[] tableShape)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return null;
         if (!TryGetBackend(out var backend) || !TryGetEmbeddingIndexBuffer(lookupKey, numIndices, out var idxBuf)) return null;
         if ((long)numIndices * embeddingDim != gradOutput.Length) return null;
         var grad = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
@@ -7733,7 +7759,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryBroadcastAddResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!ResidentStepActive || AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         Tensor<T> full, bias;
         if (a.Length == output.Length && b.Length > 0 && b.Length < a.Length) { full = a; bias = b; }
@@ -7947,7 +7973,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // GPU-RESIDENT compiled-step path (see TryRunBinaryInto): op into destination's stable buffer, no temp
         // alloc / no download — keeps the activation chain on-device for CUDA-graph capture.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled)
+        if (ResidentStepActive && !AutocastUsesTypedElementwise)
         {
             try
             {
@@ -8556,7 +8582,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // non-capturable inside CUDA-graph capture. Do it on-device via Conv2DBiasAdd (per-channel a += b) on
         // a's resident buffer (mutated in place; a stays bound). Gated on ResidentStepActive so non-capture
         // inference is unchanged. Mirrors the resident conv-bias TensorBroadcastAdd path.
-        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+        if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise
             && a.Rank == 4 && b.Rank == 4 && a.IsContiguous
             && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
@@ -8579,7 +8605,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // inference adds its output bias this way, which made the add 18% of a GPU ViT b32 forward.
         // Only where `a` already has a current device buffer (resolved without an upload or a download); a host tensor
         // keeps the host add.
-        if (typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && a.IsContiguous && !IsPartialView(a)
+        if (typeof(T) == typeof(float) && !AutocastUsesTypedElementwise && a.IsContiguous && !IsPartialView(a)
             && TryTrailingBroadcast(a, b, out int biasRows, out int biasCols) && TryGetBackend(out var beBias)
             && ResolveResidentBufferNoUpload(beBias, a, a.Length, includePersistentWeightCache: false) is { } aResident
             && aResident.Handle != System.IntPtr.Zero && aResident.Size >= a.Length)
@@ -8647,7 +8673,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal bool TryChannelBiasAddInPlace<T>(Tensor<T> tensor, Tensor<T> bias)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || tensor.Rank < 2 || tensor.Length == 0
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || tensor.Rank < 2 || tensor.Length == 0
             || !tensor.IsContiguous || IsPartialView(tensor) || bias.Rank != 1 || bias.Length != tensor._shape[1]
             || !TryGetBackend(out var backend))
             return false;
@@ -8664,7 +8690,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     private bool TryResidentActivationInPlace<T>(Tensor<T> tensor, bool capAtSix)
     {
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !tensor.IsContiguous || IsPartialView(tensor)
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !tensor.IsContiguous || IsPartialView(tensor)
             || !TryGetBackend(out var backend))
             return false;
         if (ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is not { } resident
@@ -8714,7 +8740,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
     {
         using var __gpuOp = EnterGpuOp();
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float))
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float))
         { AliasDiag($"{opName}-resident SKIP gate1 residentStep={ResidentStepActive} autocast={Gpu.AutocastScope.IsEnabled} T={typeof(T).Name}"); return false; }
         if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length)
         { AliasDiag($"{opName}-resident SKIP gate2 contig={input.IsContiguous} inLen={input.Length} outLen={output.Length}"); return false; }
@@ -9538,6 +9564,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static bool IsFloatConvertible<T>()
         => !(typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>));
 
+    /// <summary>
+    /// Whether an autocast scope routes elementwise, normalization, index and reduction ops through the GPU precision policy (typed FP16/FP8 kernels, and
+    /// the explicit FP32 plans of a nested Float32 scope such as FP32 gradient accumulation), which the resident FP32
+    /// fast paths must then leave alone. BFloat16 is the exception: it has no typed kernels for them (only its convolutions and GEMMs are typed), so under it
+    /// those ops run FP32 as everywhere else, and gating them off the resident paths sent a BF16 step's in-place
+    /// updates, divides and activations to host round trips (DCGAN BF16: about 20 device-to-host reads a step,
+    /// 111 ms against 12 ms in FP32).
+    /// </summary>
+    private static bool AutocastUsesTypedElementwise
+        => Gpu.AutocastScope.IsEnabled && Gpu.AutocastScope.ActivePrecision != Gpu.PrecisionMode.BFloat16;
+
     private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
         using var __gpuOp = EnterGpuOp();
@@ -9589,7 +9626,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // an FP16 activation buffer (!e.IsFp16) nor one shorter than the float length. Excluding it sent every
         // accumulation of an autocast training step to the host path below, whose download aborted whole-step capture
         // (CUDA 900): an FP16 transformer step ran eager at 13x its FP32 step time (#1549 head-to-head).
-        if ((!Gpu.AutocastScope.IsEnabled || InGradAccumulation) && typeof(T) == typeof(float)
+        if ((!AutocastUsesTypedElementwise || InGradAccumulation) && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && !IsPartialView(a) && !IsPartialView(b) && a.Length == b.Length
             // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
             // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
@@ -9731,7 +9768,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pre-pass binds, such as a BatchNorm running statistic) runs in place on that buffer and stays resident, as
         // TryRunBinaryInPlace does: the host path below uploaded it again and downloaded the result with a blocking
         // read on every call - three transfers per op, the larger part of a GPU ResNet training step.
-        if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
+        if (!AutocastUsesTypedElementwise && typeof(T) == typeof(float) && tensor.IsContiguous && !IsPartialView(tensor)
             && ResolveResidentBufferNoUpload(backend, tensor, tensor.Length, includePersistentWeightCache: false) is { } resident
             && resident.Handle != System.IntPtr.Zero && resident.Size >= tensor.Length)
         {
@@ -9757,7 +9794,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // TryCreateDeviceStateTensor binds its state - so every later in-place op on it takes the resident branch
         // above. The host path below uploaded it and downloaded the result every call: 40 blocking round trips a
         // step on ResNet-18.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && tensor is Tensor<float> floatTensor && tensor.IsContiguous
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && tensor is Tensor<float> floatTensor && tensor.IsContiguous
             && !IsPartialView(tensor) && tensor._gpuBuffer is null)
         {
             IGpuBuffer? state = null;
@@ -9842,7 +9879,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var __gpuOp = EnterGpuOp();
         bool isRecording = Gpu.DeferredScope.Current?.IsRecording == true;
         if (!isRecording && !tensor.IsGpuResident && !tensor.HasPendingGpuData && !IsDeviceAuthoritative(tensor)) return false;
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return false;
         if (!TryGetBackend(out var backend)) return false;
         // The kernel writes the tensor's device buffer in place, and a copy-on-write peer (CloneShared) shares that
         // buffer and its pending download: privatize first, as GpuOptimizer does before its in-place device update.
@@ -11822,20 +11859,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            // Execute GPU transposed convolution
-            backend.ConvTranspose2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
-                batch, inChannels, inHeight, inWidth,
-                outChannels, outHeight, outWidth,
-                kernelH, kernelW,
-                strideH, strideW, padH, padW,
-                outputPadH, outputPadW);
-
             int outputSize = batch * outChannels * outHeight * outWidth;
             int spatialSize = outHeight * outWidth;
-            if (bias != null)
+            if (typeof(T) == typeof(float) && TryAutocastConvTranspose2DForward(backend, inputBuffer.Buffer,
+                    kernelBuffer.Buffer, outputBuffer.Buffer, batch, inChannels, inHeight, inWidth, outChannels, outHeight,
+                    outWidth, kernelH, kernelW, strideH, strideW, padH, padW, out _))
             {
+                // Under FP16/BF16 autocast the transposed convolution ran in that precision; the bias follows in FP32.
+                if (bias != null)
+                {
+                    using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                }
+            }
+            else if (bias != null && backend is AiDotNet.Tensors.Engines.DirectGpu.IConvTranspose2DBiasBackend fusedBias)
+            {
+                // CUDA adds the bias inside the transposed convolution where its route allows (the overlap-add of the
+                // single-GEMM route): one write of the biased output instead of a second pass.
                 using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
-                backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                fusedBias.ConvTranspose2DBias(inputBuffer.Buffer, kernelBuffer.Buffer, biasBuffer.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth, kernelH, kernelW,
+                    strideH, strideW, padH, padW, outputPadH, outputPadW);
+            }
+            else
+            {
+                // Execute GPU transposed convolution
+                backend.ConvTranspose2D(inputBuffer.Buffer, kernelBuffer.Buffer, outputBuffer.Buffer,
+                    batch, inChannels, inHeight, inWidth,
+                    outChannels, outHeight, outWidth,
+                    kernelH, kernelW,
+                    strideH, strideW, padH, padW,
+                    outputPadH, outputPadW);
+                if (bias != null)
+                {
+                    using var biasBuffer = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
+                    backend.Conv2DBiasAdd(outputBuffer.Buffer, biasBuffer.Buffer, batch, outChannels, spatialSize);
+                }
             }
 
             if (activation != FusedActivationType.None)
@@ -17294,7 +17353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
 
                 // PR #638 A1: resident-step softmax backward into a resident-bound output (no temp/download).
-                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
                     && gradOutput.Length == output.Length)
                 {
                     var gR = ResolveResidentBufferNoUpload(backend, gradOutput, output.Length);
@@ -18764,15 +18823,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// output plus the batch mean and biased variance. Null -- nothing launched -- when the backend or shape does not
     /// take the register-resident kernel; the caller then runs BatchNorm and ReLU. Records nothing: the compiled plan's
     /// BatchNorm+ReLU fusion supplies the backward (<see cref="Autodiff.BackwardFunctions{T}.BatchNormReluBackward"/>).
+    /// With a <paramref name="leakySlope"/> (positive; NaN: ReLU) the activation is that LeakyReLU, bit-identical to
+    /// BatchNorm then LeakyReLU (the BatchNorm+LeakyReLU fusion's forward).
     /// </summary>
     internal Tensor<T>? TryBatchNormReluForward<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon,
-        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null)
+        out Tensor<T>? mean, out Tensor<T>? variance, Tensor<T>? residual = null, float leakySlope = float.NaN)
     {
         using var __gpuOp = EnterGpuOp();
         mean = null;
         variance = null;
+        bool leaky = !float.IsNaN(leakySlope);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || (leaky && (residual is not null || !(leakySlope > 0f)
+                || backend is not AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend))
             || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
             // Asked before anything is allocated: a compiled step keeps every buffer an action rents, so outputs rented
             // for a launch the backend then declined stayed as dead slots (an activation per fused node, every step).
@@ -18786,9 +18850,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var bufOut = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         var bufMean = AllocateFullyWrittenOutputBuffer(backend, channels);
         var bufVar = AllocateFullyWrittenOutputBuffer(backend, channels);
-        if (!varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
-                bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
-                residual: residual is null ? null : bufResidual.Buffer))
+        bool ran;
+        try
+        {
+            ran = (leaky
+                    ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluTraining(bufIn.Buffer,
+                        bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial,
+                        (float)epsilon, leakySlope)
+                    : varianceBackend.TryBatchNormTrainingWithVariance(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer,
+                        bufBeta.Buffer, bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon, relu: true,
+                        residual: residual is null ? null : bufResidual.Buffer));
+        }
+        catch
+        {
+            bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();   // a launch that threw leaves its outputs to no one
+            throw;
+        }
+        if (!ran)
         {
             bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             return null;
@@ -18835,11 +18913,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal (Tensor<T> GradInput, Tensor<T> GradGamma, Tensor<T> GradBeta, Tensor<T>? GradResidual)?
         TryBatchNormReluBackwardCore<T>(Tensor<T> gradOutput, Tensor<T> reluOutput, Tensor<T> input,
             Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, bool withResidual,
-            Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null, Tensor<T>? intoInput = null, bool addInput = false)
+            Tensor<T>? beta = null, Tensor<T>? gradOutput2 = null, Tensor<T>? intoInput = null, bool addInput = false,
+            float leakySlope = float.NaN)
     {
         using var __gpuOp = EnterGpuOp();
+        // leakySlope (positive; NaN: ReLU): the activation was that LeakyReLU, and reluOutput is its output.
+        bool leaky = !float.IsNaN(leakySlope);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
             || backend is not DirectGpu.IBatchNormVarianceBackend varianceBackend
+            || (leaky && (withResidual || !(leakySlope > 0f) || backend is not AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend))
             || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial)
             || !varianceBackend.AcceptsTrainingShape(batch, channels, spatial))
             return null;
@@ -18865,11 +18947,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufDg = AllocateFullyWrittenOutputBuffer(backend, channels);
         using var bufDb = AllocateFullyWrittenOutputBuffer(backend, channels);
         using var bufDr = withResidual ? AllocateFullyWrittenOutputBuffer(backend, input.Length) : default;
-        bool launched = varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer,
-            bufMean.Buffer, bufVar.Buffer, directTarget is { } dtLaunch ? dtLaunch.Buffer : bufDx.Buffer, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial,
-            (float)epsilon, reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
-            beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
-            gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null, accumulateGradInput: directTarget is not null && addInput);
+        var dxLaunch = directTarget is { } dtLaunch ? dtLaunch.Buffer : bufDx.Buffer;
+        bool launched = leaky
+            ? ((AiDotNet.Tensors.Engines.DirectGpu.IBatchNormLeakyReluBackend)backend).TryBatchNormLeakyReluBackward(bufDy.Buffer,
+                bufOut.Buffer, bufIn.Buffer, bufGamma.Buffer, beta is not null ? bufBeta.Buffer : null, bufMean.Buffer,
+                bufVar.Buffer, dxLaunch, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial, (float)epsilon, leakySlope,
+                gradOutput2 is not null ? bufDy2.Buffer : null, directTarget is not null && addInput)
+            : varianceBackend.TryBatchNormBackwardFromVariance(bufDy.Buffer, bufIn.Buffer, bufGamma.Buffer,
+                bufMean.Buffer, bufVar.Buffer, dxLaunch, bufDg.Buffer, bufDb.Buffer, batch, channels, spatial,
+                (float)epsilon, reluOutput: bufOut.Buffer, gradResidual: withResidual ? bufDr.Buffer : null,
+                beta: beta is not null && !withResidual ? bufBeta.Buffer : null,
+                gradOutput2: gradOutput2 is not null ? bufDy2.Buffer : null, accumulateGradInput: directTarget is not null && addInput);
         if (!launched)
         {
             return null;
@@ -20399,7 +20487,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // On the resident step (and so in capture) give the output its resident buffer, as the float-index gather does:
         // declining here sent the int-id gather to the host, which a captured graph cannot replay.
         var outBuf = output.TryGetGpuBuffer()
-            ?? (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled && output.IsContiguous
+            ?? (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise && output.IsContiguous
                 ? GetOrCreateResidentBuffer(backend, output, n * embeddingDim) : null);
         if (outBuf is null || tableBuf is null) return false;
         if ((long)n * embeddingDim > outBuf.Size) return false;
@@ -23902,7 +23990,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // BFloat16 operands: computed in FP32 on the device and stored as BFloat16.
         if (ShapesMatch(a.Shape._dims, b.Shape._dims) && TryBinaryNarrowFloatAny(a, b, callerName) is { } narrowResult)
             return narrowResult;
-        if (Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return null;
+        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float)) return null;
         if (!ShapesMatch(a.Shape._dims, b.Shape._dims) || a.Length != b.Length) return null;
         if (!TryGetBackend(out var backend)) return null;
 
@@ -23976,7 +24064,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool TryReluBackwardInto<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> into)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !ResidentStepActive) return false;
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !ResidentStepActive) return false;
         if (gradOutput.Length != input.Length || !gradOutput.IsContiguous || !input.IsContiguous) return false;
         if (!TryGetBackend(out var backend)) return false;
         int n = input.Length;
@@ -24618,7 +24706,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Only inside a resident step, as TensorMultiplyScalar's: eagerly, the resident output's host array was a
         // fresh allocation on every call (SwishBackward negates once per SiLU per step), where the deferred result
         // below allocates nothing on the host.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float))
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float))
         {
             using var __gpuOp = EnterGpuOp();
             if (s_graphCaptureDebugEnv
@@ -24783,7 +24871,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 // PR #638 A1: resident-step ReLU backward into a resident-bound output (no download), keeping the
                 // FFN fused-linear-relu backward's grad resident for capture.
-                if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+                if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
                     && gradOutput.Length == input.Length)
                 {
                     var gR = ResolveResidentBufferNoUpload(backend, gradOutput, gradOutput.Length);
@@ -25404,7 +25492,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
             return integerResult;
         }
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
         {
             float sf = scalar is float f0 ? f0 : Convert.ToSingle(scalar);
@@ -27176,7 +27264,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // capture. The eager path below uses FinishGpuOp, whose deferred materializer races activation-cache
         // eviction under capture (issue #226). Float, rank-4, no active tape (inference) — same kernel, so
         // numerically identical; tape training still records via the eager path below.
-        if (ResidentStepActive && !Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
+        // Under autocast the resident route runs the transposed convolution in the autocast precision (below).
+        if (ResidentStepActive && typeof(T) == typeof(float)
             && input.Rank == 4 && kernel.Rank == 4 && !IsTapeActive<T>()
             && input.IsContiguous && HasResidentReplayRoutes(backend) && backend is IGpuBatchExecution rbkT)
         {
@@ -27195,9 +27284,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (bufInR.Buffer.Handle != System.IntPtr.Zero && bufKR.Buffer.Handle != System.IntPtr.Zero
                     && outBufR.Handle != System.IntPtr.Zero && outBufR.Size >= outLenR)
                 {
-                    rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
-                        batchR, inChR, inHR, inWR, outChR, outHR, outWR,
-                        kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
+                    if (!TryAutocastConvTranspose2DForward(rbkT, bufInR.Buffer, bufKR.Buffer, outBufR, batchR, inChR, inHR,
+                            inWR, outChR, outHR, outWR, kHR, kWR, stride[0], stride[1], padding[0], padding[1], out _))
+                        rbkT.ConvTranspose2D(bufInR.Buffer, bufKR.Buffer, outBufR,
+                            batchR, inChR, inHR, inWR, outChR, outHR, outWR,
+                            kHR, kWR, stride[0], stride[1], padding[0], padding[1], outputPadding[0], outputPadding[1]);
                     ResidentSyncCheck("ConvTranspose2D");
                     BindResidentBuffer(outTR, outBufR, rbkT);
                     return outTR;
@@ -27218,10 +27309,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufK = GetOrAllocateBuffer(backend, kernel);
             var bufOut = AllocateOutputBuffer(backend, batch * outChannels * outH * outW);
-            backend.ConvTranspose2D(bufIn.Buffer, bufK.Buffer, bufOut.Buffer,
-                batch, inChannels, inH, inW, outChannels, outH, outW,
-                kH, kW, stride[0], stride[1], padding[0], padding[1],
-                outputPadding[0], outputPadding[1]);
+            // Under FP16/BF16 autocast the transposed convolution runs in that precision (its whole output written);
+            // the tape replays that precision in its backward.
+            AutocastConvRoute executedRoute = default;
+            bool autocastConv = typeof(T) == typeof(float) && input.Rank == 4 && kernel.Rank == 4
+                && TryAutocastConvTranspose2DForward(backend, bufIn.Buffer, bufK.Buffer, bufOut.Buffer, batch, inChannels,
+                    inH, inW, outChannels, outH, outW, kH, kW, stride[0], stride[1], padding[0], padding[1],
+                    out executedRoute);
+            if (!autocastConv)
+                backend.ConvTranspose2D(bufIn.Buffer, bufK.Buffer, bufOut.Buffer,
+                    batch, inChannels, inH, inW, outChannels, outH, outW,
+                    kH, kW, stride[0], stride[1], padding[0], padding[1],
+                    outputPadding[0], outputPadding[1]);
             var output = DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outH * outW,
                 new[] { batch, outChannels, outH, outW });
             // Record the autodiff op — WITHOUT this, the GPU path returns an
@@ -27232,9 +27331,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // dropped it (Softmax/Conv2D above record correctly — this was the
             // odd one out). Backward reuses ConvTranspose2DBackward, which reads
             // savedState[0]=stride, savedState[1]=padding.
+            // The precision the forward ran in rides along for the backward (BackwardFunctions reads stride and padding
+            // by index); a graph recording keeps the two-element state its fusion patterns match.
             Autodiff.DifferentiableOps.RecordBinary("ConvTranspose2D", output, input, kernel,
                 Autodiff.BackwardFunctions<T>.ConvTranspose2DBackward,
-                new object[] { (int[])stride.Clone(), (int[])padding.Clone() });
+                Compilation.GraphMode.IsActive
+                    ? new object[] { (int[])stride.Clone(), (int[])padding.Clone() }
+                    : new object[] { (int[])stride.Clone(), (int[])padding.Clone(),
+                        autocastConv ? new RecordedConvPrecision(executedRoute) : RecordedConvPrecision.Fp32 });
             return output;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("ConvTranspose2D", capabilityGap);
@@ -28606,7 +28710,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             float alphaFloat = ToFloatScalar(alpha);
             Tensor<T>? gpuOutput = null;
-            if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled)
+            if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise)
             {
                 var resident = CreateResidentOutput<T>(backend, tensor.Shape._dims);
                 if (TryUnaryResidentInto(resident, tensor,
@@ -28758,7 +28862,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // resident operand mid-capture. On the capture path, do it resident on-device via Conv2DBiasAdd
         // (copy a → out, then add bias per channel). Gated on ResidentStepActive so non-capture inference
         // is unchanged.
-        if (ResidentStepActive && typeof(T) == typeof(float) && !Gpu.AutocastScope.IsEnabled
+        if (ResidentStepActive && typeof(T) == typeof(float) && !AutocastUsesTypedElementwise
             && a.Rank == 4 && b.Rank == 4 && a.IsContiguous && b.IsContiguous
             && b.Shape._dims[0] == 1 && b.Shape._dims[2] == 1 && b.Shape._dims[3] == 1
             && a.Shape._dims[1] == b.Shape._dims[1]
@@ -30117,7 +30221,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"The accumulator must hold exactly one element; it holds {scalarAccumulator.Length}.",
                 nameof(scalarAccumulator));
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || AutocastUsesTypedElementwise || !TryGetBackend(out var backend))
             return false;
         if (tensor.Length == 0)
             return true;

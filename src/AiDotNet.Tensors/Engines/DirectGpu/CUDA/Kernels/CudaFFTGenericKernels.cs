@@ -30,6 +30,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         {
             "fftg_from_f32",
             "fftg_to_f32",
+            "fftg_transpose_from_f32",
+            "fftg_transpose_to_f32",
+            "fftg_channel_pad",
             "fftg_batched_bit_reverse",
             "fftg_batched_butterfly",
             "fftg_scale",
@@ -414,6 +417,9 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
     }
 }
 ";
+            // The mixed-precision convolution's layout kernels (transposing conversions, channel padding) live in an
+            // embedded source, out of the user-string heap (CS8103).
+            src += KernelSourceResources.Read("CudaMixedConvLayout.c").Replace("@SUFFIX@", suffix);
             return src;
         }
     }
