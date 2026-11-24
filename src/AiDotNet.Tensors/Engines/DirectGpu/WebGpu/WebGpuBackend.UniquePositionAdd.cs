@@ -1,3 +1,4 @@
+#if NET7_0_OR_GREATER
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
@@ -13,3 +14,4 @@ public sealed partial class WebGpuBackend : IUniquePositionAddBackend
         ScatterAdd(values, positionBits, destination, count, destinationSize);
     }
 }
+#endif
