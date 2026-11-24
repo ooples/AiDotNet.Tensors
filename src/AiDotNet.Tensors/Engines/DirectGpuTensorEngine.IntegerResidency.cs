@@ -301,7 +301,21 @@ public partial class DirectGpuTensorEngine
         return null;
     }
 
-    private bool TrySumInteger<T>(Tensor<T> tensor, GpuElementType type, out long sum)
+    /// <summary>
+    /// The smallest or largest element of an integer tensor whose values are on the device, found there, boxed. Null
+    /// when the CPU engine takes it.
+    /// </summary>
+    private object? TryExtremeIntegerAny<T>(Tensor<T> tensor, GpuIntegerReduction reduction)
+    {
+        if (tensor is Tensor<int> ints) return TrySumInteger(ints, GpuElementType.Int32, out long wide, reduction) ? (int)wide : null;
+        if (tensor is Tensor<long> longs) return TrySumInteger(longs, GpuElementType.Int64, out long wide, reduction) ? wide : null;
+        if (tensor is Tensor<short> shorts) return TrySumInteger(shorts, GpuElementType.Int16, out long wide, reduction) ? (short)wide : null;
+        if (tensor is Tensor<sbyte> sbytes) return TrySumInteger(sbytes, GpuElementType.Int8, out long wide, reduction) ? (sbyte)wide : null;
+        if (tensor is Tensor<byte> bytes) return TrySumInteger(bytes, GpuElementType.UInt8, out long wide, reduction) ? (byte)wide : null;
+        return null;
+    }
+
+    private bool TrySumInteger<T>(Tensor<T> tensor, GpuElementType type, out long sum, GpuIntegerReduction reduction = GpuIntegerReduction.Sum)
         where T : unmanaged
     {
         sum = 0;
@@ -316,7 +330,12 @@ public partial class DirectGpuTensorEngine
                 // Only a tensor already on the device is reduced there: uploading a host tensor to sum it costs more
                 // than the CPU engine's sum.
                 if (FindResident(tensor) is not { } resident || !ReferenceEquals(resident.Backend, backend)) return false;
-                sum = reductions.SumInteger(resident.Buffer, length);
+                sum = reduction switch
+                {
+                    GpuIntegerReduction.Min => reductions.MinInteger(resident.Buffer, length),
+                    GpuIntegerReduction.Max => reductions.MaxInteger(resident.Buffer, length),
+                    _ => reductions.SumInteger(resident.Buffer, length),
+                };
                 return true;
             }
         }

@@ -55,6 +55,17 @@ internal static class GpuInt32ShaderSource
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
+    /// <summary>The kernel stem of a reduction (<c>min</c> and <c>max</c> are the element-wise ones).</summary>
+    public static string Name(GpuIntegerReduction reduction) => reduction switch
+    {
+        GpuIntegerReduction.Sum => "sum",
+        GpuIntegerReduction.Min => "rmin",
+        GpuIntegerReduction.Max => "rmax",
+        _ => throw new ArgumentOutOfRangeException(nameof(reduction), reduction, "Unknown integer reduction."),
+    };
+
+    public static readonly GpuIntegerReduction[] Reductions = { GpuIntegerReduction.Sum, GpuIntegerReduction.Min, GpuIntegerReduction.Max };
+
     public static readonly GpuIntegerBinaryOperation[] BinaryOperations =
     {
         GpuIntegerBinaryOperation.Add, GpuIntegerBinaryOperation.Subtract, GpuIntegerBinaryOperation.Multiply,

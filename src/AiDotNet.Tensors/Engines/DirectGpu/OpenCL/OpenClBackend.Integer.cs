@@ -129,7 +129,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <inheritdoc/>
-        public long SumInteger(IGpuBuffer a, int size)
+        public long SumInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Sum, a, size);
+
+        /// <inheritdoc/>
+        public long MinInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Min, a, size);
+
+        /// <inheritdoc/>
+        public long MaxInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Max, a, size);
+
+        private long ReduceInteger(GpuIntegerReduction reduction, IGpuBuffer a, int size)
         {
             if (a is null) throw new ArgumentNullException(nameof(a));
             var type = a.ElementType;
@@ -137,9 +145,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException($"{nameof(SumInteger)} reduces integer buffers, got {type}.", nameof(a));
             if (size < 0 || size > a.Size)
                 throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) is outside the buffer's {a.Size} elements.");
-            var first = IntegerKernel(GpuIntegerKernelSource.Sum(type));
+            var first = IntegerKernel(GpuIntegerKernelSource.Reduce(reduction, type));
+            GpuIntegerLayout.RequireElements(reduction, size);
             if (size == 0) return 0;
-            var later = IntegerKernel(GpuIntegerKernelSource.Sum(GpuElementType.Int64));
+            var later = IntegerKernel(GpuIntegerKernelSource.Reduce(reduction, GpuElementType.Int64));
             int block = GpuIntegerKernelSource.SumBlock;
             int partials = GpuIntegerLayout.Blocks(size, block);
             // Two scratch buffers, alternated: a pass never reads the buffer it writes.

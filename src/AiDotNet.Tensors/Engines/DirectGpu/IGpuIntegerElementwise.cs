@@ -101,11 +101,41 @@ public interface IGpuIntegerReductions
     /// width as an unchecked host sum in that type is, and widened to <see cref="long"/>.
     /// </summary>
     long SumInteger(IGpuBuffer a, int size);
+
+    /// <summary>
+    /// The smallest of the first <paramref name="size"/> elements of <paramref name="a"/>, by the element type's own
+    /// order (signed, or unsigned for <see cref="GpuElementType.UInt8"/>). An empty range has none and is refused.
+    /// </summary>
+    long MinInteger(IGpuBuffer a, int size);
+
+    /// <summary>
+    /// The largest of the first <paramref name="size"/> elements of <paramref name="a"/>, by the element type's own
+    /// order. An empty range has none and is refused.
+    /// </summary>
+    long MaxInteger(IGpuBuffer a, int size);
+}
+
+/// <summary>A reduction of an integer buffer to one value, computed a block a pass.</summary>
+internal enum GpuIntegerReduction
+{
+    /// <summary>The wrapping sum.</summary>
+    Sum,
+    /// <summary>The smallest element.</summary>
+    Min,
+    /// <summary>The largest element.</summary>
+    Max,
 }
 
 /// <summary>What the integer kernels of every backend share.</summary>
 internal static class GpuIntegerLayout
 {
+    /// <summary>Refuses the empty range of a minimum or a maximum, which has no value.</summary>
+    public static void RequireElements(GpuIntegerReduction reduction, int size)
+    {
+        if (size == 0 && reduction != GpuIntegerReduction.Sum)
+            throw new System.ArgumentException($"An empty range has no {(reduction == GpuIntegerReduction.Min ? "minimum" : "maximum")}.", nameof(size));
+    }
+
     /// <summary>Whether <paramref name="type"/> is one the integer interfaces are about.</summary>
     public static bool IsIntegerOrBool(GpuElementType type)
         => type is GpuElementType.Int8 or GpuElementType.UInt8 or GpuElementType.Int16 or GpuElementType.Int32

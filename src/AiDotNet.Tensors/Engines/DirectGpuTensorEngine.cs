@@ -9995,6 +9995,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (TryExtremeIntegerAny(tensor, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerReduction.Max) is T integerExtreme)
+            return integerExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
@@ -10008,6 +10010,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (TryExtremeIntegerAny(tensor, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerReduction.Min) is T integerExtreme)
+            return integerExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 

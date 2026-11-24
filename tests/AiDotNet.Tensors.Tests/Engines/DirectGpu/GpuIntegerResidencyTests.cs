@@ -110,6 +110,12 @@ public class GpuIntegerResidencyTests
                     Assert.True(hostValues[i].Equals(deviceValues[i]), $"{type} {name} at {i} ({xValues[i]}, {yValues[i]}): CPU {hostValues[i]}, device {deviceValues[i]}.");
             }
 
+            Assert.Equal(cpu.TensorMaxValue(hostX), engine.TensorMaxValue(x));
+            Assert.Equal(cpu.TensorMinValue(hostX), engine.TensorMinValue(x));
+            var remainder = others[0];
+            Assert.Equal(cpu.TensorMaxValue(remainder.Host), engine.TensorMaxValue(remainder.Device));
+            Assert.Equal(cpu.TensorMinValue(remainder.Host), engine.TensorMinValue(remainder.Device));
+
             // Abs wraps on the device; the host's raises for the most negative value, so the expectation is spelled out.
             var magnitudes = engine.TensorAbs(x);
             Assert.True(gpu.IsTypedResident(magnitudes), $"The {type} Abs was not left on the device.");

@@ -87,6 +87,18 @@ internal static class GpuIntegerKernelSource
     /// </summary>
     public static string Sum(GpuElementType type) => "isum_" + Suffix(type);
 
+    /// <summary>
+    /// The kernel reducing blocks of <see cref="SumBlock"/> elements into 64-bit partials, with the arguments of
+    /// <see cref="Sum"/>; the partials of a minimum or maximum are reduced by the Int64 kernel of the same reduction.
+    /// </summary>
+    public static string Reduce(GpuIntegerReduction reduction, GpuElementType type) => reduction switch
+    {
+        GpuIntegerReduction.Sum => Sum(type),
+        GpuIntegerReduction.Min => "irmin_" + Suffix(type),
+        GpuIntegerReduction.Max => "irmax_" + Suffix(type),
+        _ => throw new ArgumentOutOfRangeException(nameof(reduction), reduction, "Unknown integer reduction."),
+    };
+
     /// <summary>Every kernel name of the program, in source order.</summary>
     public static IReadOnlyList<string> KernelNames => Names.Value;
 
@@ -119,7 +131,12 @@ internal static class GpuIntegerKernelSource
             }
 
             names.AddRange(UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)).Select(operation => Unary(operation, type)));
-            if (type != GpuElementType.Bool) names.Add(Sum(type));
+            if (type != GpuElementType.Bool)
+            {
+                names.Add(Sum(type));
+                names.Add(Reduce(GpuIntegerReduction.Min, type));
+                names.Add(Reduce(GpuIntegerReduction.Max, type));
+            }
         }
 
         GpuNarrowFloatKernelSource.AddNames(names);
@@ -217,6 +234,16 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
                 .Append("    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * ").Append(SumBlock)
                 .Append(";\n    const int last = (count - first > ").Append(SumBlock).Append(") ? first + ").Append(SumBlock)
                 .Append(" : count;\n    u64t s = 0;\n    for (int j = first; j < last; j++) s += (u64t)(i64t)a[j];\n    o[i] = (i64t)s;\n}\n");
+            // The extreme of a block, widened by the element's own signedness: a block is never empty.
+            foreach (var reduction in new[] { GpuIntegerReduction.Min, GpuIntegerReduction.Max })
+            {
+                source.Append("IK_KERNEL ").Append(Reduce(reduction, type))
+                    .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR i64t* o, const int count, const int blocks)\n{\n")
+                    .Append("    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * ").Append(SumBlock)
+                    .Append(";\n    const int last = (count - first > ").Append(SumBlock).Append(") ? first + ").Append(SumBlock)
+                    .Append(" : count;\n    i64t s = (i64t)a[first];\n    for (int j = first + 1; j < last; j++) { const i64t v = (i64t)a[j]; if (v ")
+                    .Append(reduction == GpuIntegerReduction.Min ? "<" : ">").Append(" s) s = v; }\n    o[i] = s;\n}\n");
+            }
         }
 
         // The 16-bit float kernels ride in the same program: one compile, one module.

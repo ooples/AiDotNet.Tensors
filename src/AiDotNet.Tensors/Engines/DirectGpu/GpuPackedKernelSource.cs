@@ -367,6 +367,41 @@ internal static class GpuPackedKernelSource
     /// The narrow types add into one word a block (the sum modulo 2^32, whose low bits are the sum in the type), so
     /// the partials are an Int32 buffer; Int64 adds into two words, and its partials are Int64 again.
     /// </summary>
+    public static GpuPackedKernel Reduce(GpuIntegerReduction reduction, GpuElementType type)
+    {
+        if (reduction == GpuIntegerReduction.Sum) return Sum(type);
+        RequireInteger(type);
+        if (type == GpuElementType.Bool) throw new ArgumentException("Bool has no minimum or maximum.", nameof(type));
+        bool smallest = reduction == GpuIntegerReduction.Min;
+        return Kernel("pk_" + GpuInt32ShaderSource.Name(reduction) + "_" + Suffix(type), 2, string.Empty, () =>
+        {
+            string head = "    uint first = gid * " + SumBlock + "u;\n    uint last = min(first + " + SumBlock + "u, pcount);\n";
+            if (type == GpuElementType.Int64)
+            {
+                // Replaced by an element that is below it (or above it): signed in the high word, unsigned in the low.
+                string better = smallest
+                    ? "(int(vh) < int(sh)) || ((vh == sh) && (vl < sl))"
+                    : "(int(vh) > int(sh)) || ((vh == sh) && (vl > sl))";
+                return head + "    uint sl = a[first * 2u];\n    uint sh = a[(first * 2u) + 1u];\n"
+                    + "    for (uint j = first + 1u; j < last; j++) {\n        uint vl = a[j * 2u];\n        uint vh = a[(j * 2u) + 1u];\n"
+                    + "        bool better = " + better + ";\n        if (better) {\n            sl = vl;\n            sh = vh;\n        }\n    }\n"
+                    + "    o[gid * 2u] = sl;\n    o[(gid * 2u) + 1u] = sh;\n";
+            }
+
+            // In unsigned order: a signed element with its sign bit flipped orders as its value does. The partial is
+            // the element itself, sign-extended into an Int32 word.
+            int lanes = Lanes(type);
+            int bits = 32 / lanes;
+            string mask = bits == 8 ? "0xFFu" : "0xFFFFu";
+            string shift = lanes == 4 ? "2u" : "1u";
+            string flip = type == GpuElementType.UInt8 ? "0u" : bits == 8 ? "0x80u" : "0x8000u";
+            string lane = "(((a[j >> " + shift + "] >> ((j & " + (lanes - 1) + "u) * " + bits + "u)) & " + mask + ") ^ " + flip + ")";
+            string result = type == GpuElementType.UInt8 ? "s" : "uint(" + Signed(type, "(s ^ " + flip + ")") + ")";
+            return head + "    uint j = first;\n    uint s = " + lane + ";\n    for (j = first + 1u; j < last; j++) {\n"
+                + "        s = " + (smallest ? "min" : "max") + "(s, " + lane + ");\n    }\n    o[gid] = " + result + ";\n";
+        });
+    }
+
     public static GpuPackedKernel Sum(GpuElementType type)
     {
         RequireInteger(type);
@@ -499,7 +534,12 @@ internal static class GpuPackedKernelSource
 
             all.AddRange(GpuInt32ShaderSource.UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type))
                 .Select(operation => Unary(operation, type)));
-            if (type != GpuElementType.Bool) all.Add(Sum(type));
+            if (type != GpuElementType.Bool)
+            {
+                all.Add(Sum(type));
+                all.Add(Reduce(GpuIntegerReduction.Min, type));
+                all.Add(Reduce(GpuIntegerReduction.Max, type));
+            }
         }
 
         foreach (var type in FloatTypes)

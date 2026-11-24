@@ -279,6 +279,44 @@ public abstract class GpuIntegerBackendContractTests
         Assert.True(ran > 0, "No element type ran.");
     }
 
+    // By the element type's own order: the values hold both extremes of every type, and a prefix must not read past
+    // itself (the extreme of the whole buffer usually lies outside a short prefix).
+    [SkippableFact]
+    public void Min_and_max_are_the_extremes_in_the_element_types_order()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var reductions = Reductions(backend);
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!reductions.SupportsIntegerReductions(type)) continue;
+            foreach (int size in Sizes)
+            {
+                var values = Values(type, size, 6);
+                using var a = Upload(backend, type, values);
+                foreach (int count in new[] { size, Math.Max(1, size / 2), 1 })
+                {
+                    long smallest = values[0], largest = values[0];
+                    for (int i = 1; i < count; i++)
+                    {
+                        smallest = Math.Min(smallest, values[i]);
+                        largest = Math.Max(largest, values[i]);
+                    }
+
+                    Assert.True(smallest == reductions.MinInteger(a, count), $"Min<{type}> of the first {count} of {size}: host {smallest}, device {reductions.MinInteger(a, count)}.");
+                    Assert.True(largest == reductions.MaxInteger(a, count), $"Max<{type}> of the first {count} of {size}: host {largest}, device {reductions.MaxInteger(a, count)}.");
+                }
+
+                Assert.Throws<ArgumentException>(() => reductions.MinInteger(a, 0));
+                Assert.Throws<ArgumentException>(() => reductions.MaxInteger(a, 0));
+                ran++;
+            }
+        }
+
+        Assert.True(ran > 0, "No element type ran.");
+    }
+
     // A device copy counts elements of the buffers' type. An 8- or 16-bit element shares a 4-byte word with its
     // neighbours on the word-addressed backends, so every offset within a word is tried, in both directions, and the
     // elements either side of the range must keep what they held.

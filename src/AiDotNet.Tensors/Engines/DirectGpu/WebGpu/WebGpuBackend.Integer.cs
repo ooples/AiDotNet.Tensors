@@ -105,12 +105,21 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
     }
 
     /// <inheritdoc/>
-    public long SumInteger(IGpuBuffer a, int size)
+    public long SumInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Sum, a, size);
+
+    /// <inheritdoc/>
+    public long MinInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Min, a, size);
+
+    /// <inheritdoc/>
+    public long MaxInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Max, a, size);
+
+    private long ReduceInteger(GpuIntegerReduction reduction, IGpuBuffer a, int size)
     {
-        if (!IsInt32(a)) return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
+        if (!IsInt32(a)) return GpuPackedCompute.Reduce(reduction, this, LaunchPacked, a, size, (partials, count) => ReduceInteger(reduction, partials, count));
         EnsureInitialized();
         GpuInt32ShaderSource.RequireSum(a, size);
-        string source = WebGpuInt32Kernels.SumBlocks;
+        string source = WebGpuInt32Kernels.ReduceBlocks(reduction);
+        GpuIntegerLayout.RequireElements(reduction, size);
         if (size == 0) return 0;
         int block = GpuInt32ShaderSource.SumBlock;
         int partials = GpuIntegerLayout.Blocks(size, block);
@@ -123,7 +132,7 @@ public sealed partial class WebGpuBackend : IGpuIntegerElementwise, IGpuIntegerR
         while (true)
         {
             int outputs = GpuIntegerLayout.Blocks(count, block);
-            Dispatch2BufferAsync("I32Sum", source, "main", current, target, Uniforms(outputs, count), outputs).GetAwaiter().GetResult();
+            Dispatch2BufferAsync("I32" + GpuInt32ShaderSource.Name(reduction), source, "main", current, target, Uniforms(outputs, count), outputs).GetAwaiter().GetResult();
             if (outputs == 1)
                 return BitConverter.ToInt32(DownloadByteBuffer(target, sizeof(int)), 0);
             current = target;
@@ -195,12 +204,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     /// <summary>Pass of a sum: <c>o[i]</c> is the wrapping sum of block <c>i</c> of the <c>p0</c> input elements.</summary>
-    public static string SumBlocks => Sources.GetOrAdd("sum", _ => OneIn + Entry + @"    let first = i * " + GpuInt32ShaderSource.SumBlock + @"u;
+    public static string ReduceBlocks(GpuIntegerReduction reduction) => Sources.GetOrAdd(GpuInt32ShaderSource.Name(reduction), _ => OneIn + Entry + @"    let first = i * " + GpuInt32ShaderSource.SumBlock + @"u;
     let last = min(first + " + GpuInt32ShaderSource.SumBlock + @"u, params.p0);
-    var s = 0u;
+" + (reduction == GpuIntegerReduction.Sum
+    ? @"    var s = 0u;
     for (var j = first; j < last; j++) { s += bitcast<u32>(a[j]); }
     o[i] = bitcast<i32>(s);
-}
+"
+    : @"    var s = a[first];
+    for (var j = first + 1u; j < last; j++) { s = " + (reduction == GpuIntegerReduction.Min ? "min" : "max") + @"(s, a[j]); }
+    o[i] = s;
+") + @"}
 ");
 }
 #endif
