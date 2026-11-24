@@ -227,6 +227,26 @@ public class GpuFloat64ResidencyTests : IDisposable
             double cpuTotal = cpu.TensorSum(expected);
             Assert.True(Math.Abs(total - cpuTotal) <= 1e-9 * Math.Abs(cpuTotal) + 1e-9, $"device {total:R}, cpu {cpuTotal:R}");
             Assert.Equal(new[] { Large }, quotient.Shape.ToArray());
+
+            // A NaN in a device tensor is its maximum and its minimum, on the device as on the CPU engine.
+            var holes = new double[Large];
+            holes[Large / 3] = double.NaN;
+            var withNaN = new Tensor<double>(holes, new[] { Large });
+            gpu.RegisterPersistentTensor(withNaN, PersistentTensorRole.Weights);
+            try
+            {
+                var onDevice = gpu.TensorAdd(x, withNaN);
+                Assert.True(gpuEngine.IsTypedResident(onDevice), "The tensor holding the NaN is not resident on the device.");
+                var onHost = cpu.TensorAdd(x, withNaN);
+                Assert.True(double.IsNaN(gpu.TensorMaxValue(onDevice)) && double.IsNaN(cpu.TensorMaxValue(onHost)),
+                    $"Max with a NaN: device {gpu.TensorMaxValue(onDevice):R}, cpu {cpu.TensorMaxValue(onHost):R}.");
+                Assert.True(double.IsNaN(gpu.TensorMinValue(onDevice)) && double.IsNaN(cpu.TensorMinValue(onHost)),
+                    $"Min with a NaN: device {gpu.TensorMinValue(onDevice):R}, cpu {cpu.TensorMinValue(onHost):R}.");
+            }
+            finally
+            {
+                gpu.UnregisterPersistentTensor(withNaN);
+            }
         }
         finally
         {
