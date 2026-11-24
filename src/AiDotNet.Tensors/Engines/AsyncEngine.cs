@@ -19,18 +19,22 @@ public static class AsyncEngine
         if (DirectGpu.WebGpu.WebGpuNativeBindings.IsWebGpuSupported())
         {
             var backend = new DirectGpu.WebGpu.WebGpuAwaitableBackend();
-            bool started;
+            // The backend is released on every path that does not hand it to an engine: a start that fails or throws,
+            // and an engine constructor that throws.
+            bool handedOver = false;
             try
             {
-                started = await backend.InitializeAsync().ConfigureAwait(false);
+                if (await backend.InitializeAsync().ConfigureAwait(false))
+                {
+                    var engine = new AwaitableGpuTensorEngine(backend, ownsBackend: true);
+                    handedOver = true;
+                    return engine;
+                }
             }
-            catch
+            finally
             {
-                backend.Dispose();
-                throw;
+                if (!handedOver) backend.Dispose();
             }
-            if (started) return new AwaitableGpuTensorEngine(backend, ownsBackend: true);
-            backend.Dispose();
         }
 #endif
         await Task.CompletedTask.ConfigureAwait(false);

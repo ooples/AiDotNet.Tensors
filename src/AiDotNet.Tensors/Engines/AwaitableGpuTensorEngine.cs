@@ -211,7 +211,11 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
         return true;
     }
 
-    private static float[] Floats<T>(Tensor<T> tensor) => (float[])(object)tensor.ToArray();
+    // The engine computes float tensors only; its entry points refuse any other element type before reaching here.
+    private static float[] Floats<T>(Tensor<T> tensor)
+        => tensor.ToArray() is float[] floats
+            ? floats
+            : throw new NotSupportedException($"The awaitable GPU engine computes float tensors, not {typeof(T).Name}.");
 
     // A pooled buffer can be longer than the tensor: keep the first size elements.
     private static Tensor<T> FromFloats<T>(float[] data, int size, int[] shape)
@@ -222,7 +226,9 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
             Array.Copy(data, exact, size);
             data = exact;
         }
-        return (Tensor<T>)(object)new Tensor<float>(data, shape);
+        return new Tensor<float>(data, shape) is Tensor<T> typed
+            ? typed
+            : throw new NotSupportedException($"The awaitable GPU engine computes float tensors, not {typeof(T).Name}.");
     }
 
     private void ThrowIfDisposed()
