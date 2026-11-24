@@ -13,6 +13,9 @@ public enum GpuNarrowFloatBinaryOperation
 
     /// <summary><c>a * b</c>.</summary>
     Multiply,
+
+    /// <summary><c>a / b</c>, rounded once into the storage type as the three above are.</summary>
+    Divide,
 }
 
 /// <summary>Element-wise operations on one 16-bit float buffer.</summary>
@@ -26,6 +29,24 @@ public enum GpuNarrowFloatUnaryOperation
 
     /// <summary>GELU in its tanh form, <c>0.5 a (1 + tanh(sqrt(2/pi) (a + 0.044715 a^3)))</c>.</summary>
     Gelu,
+
+    /// <summary><c>|a|</c>: the sign bit cleared.</summary>
+    Abs,
+
+    /// <summary><c>sqrt(a)</c>; a NaN for a negative operand, and the zero itself for a zero of either sign.</summary>
+    Sqrt,
+
+    /// <summary><c>e^a</c>.</summary>
+    Exp,
+
+    /// <summary>The natural logarithm; negative infinity at zero and a NaN for a negative operand.</summary>
+    Log,
+
+    /// <summary><c>tanh(a)</c>.</summary>
+    Tanh,
+
+    /// <summary>The logistic function <c>1 / (1 + e^-a)</c>.</summary>
+    Sigmoid,
 }
 
 /// <summary>
@@ -33,6 +54,12 @@ public enum GpuNarrowFloatUnaryOperation
 /// <see cref="GpuElementType.BFloat16"/>). Each element is widened to a 32-bit float, the operation is done there, and
 /// the result is rounded to the storage type to nearest, ties to even.
 /// </summary>
+/// <remarks>
+/// Add, subtract, multiply, divide, negate, abs and relu return the host's bits. Square root and the transcendental
+/// operations (exp, log, tanh, sigmoid, gelu) use the device's 32-bit functions, so they agree with the host to within
+/// two units in the last place of the storage type; their special values (NaN, the infinities, the zeros, an operand
+/// outside the domain) are decided on the bits and are the same on every device.
+/// </remarks>
 /// <remarks>
 /// The buffers hold <paramref name="type"/> elements; the output may be one of the operands. Which (operation, type)
 /// pairs a device has is asked per pair: a backend whose buffers are 4-byte words has the half kernels it always had

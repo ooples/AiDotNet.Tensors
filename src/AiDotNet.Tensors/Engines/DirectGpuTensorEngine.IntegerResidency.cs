@@ -55,6 +55,7 @@ public partial class DirectGpuTensorEngine
         nameof(TensorAdd) => GpuNarrowFloatBinaryOperation.Add,
         nameof(TensorSubtract) => GpuNarrowFloatBinaryOperation.Subtract,
         nameof(TensorMultiply) => GpuNarrowFloatBinaryOperation.Multiply,
+        nameof(TensorDivide) => GpuNarrowFloatBinaryOperation.Divide,
         _ => null,
     };
 
@@ -63,6 +64,12 @@ public partial class DirectGpuTensorEngine
         nameof(TensorNegate) => GpuNarrowFloatUnaryOperation.Negate,
         nameof(TensorReLU) => GpuNarrowFloatUnaryOperation.Relu,
         nameof(TensorGELU) => GpuNarrowFloatUnaryOperation.Gelu,
+        nameof(TensorAbs) => GpuNarrowFloatUnaryOperation.Abs,
+        nameof(TensorSqrt) => GpuNarrowFloatUnaryOperation.Sqrt,
+        nameof(TensorExp) => GpuNarrowFloatUnaryOperation.Exp,
+        nameof(TensorLog) => GpuNarrowFloatUnaryOperation.Log,
+        nameof(TensorTanh) => GpuNarrowFloatUnaryOperation.Tanh,
+        nameof(TensorSigmoid) or nameof(Sigmoid) => GpuNarrowFloatUnaryOperation.Sigmoid,
         _ => null,
     };
 
@@ -82,7 +89,7 @@ public partial class DirectGpuTensorEngine
                 : null) as Tensor<T>;
     }
 
-    /// <summary>Negate, ReLU or GELU of a BFloat16 tensor on the device. Null when the CPU engine takes it.</summary>
+    /// <summary>A unary operation of a BFloat16 tensor on the device. Null when the CPU engine takes it.</summary>
     private Tensor<T>? TryUnaryNarrowFloatAny<T>(Tensor<T> input, string callerName)
     {
         if (input is not Tensor<NumericOperations.BFloat16> values) return null;

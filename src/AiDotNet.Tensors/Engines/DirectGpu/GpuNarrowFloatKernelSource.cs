@@ -18,11 +18,26 @@ internal static class GpuNarrowFloatKernelSource
     private static readonly GpuNarrowFloatBinaryOperation[] BinaryOperations =
     {
         GpuNarrowFloatBinaryOperation.Add, GpuNarrowFloatBinaryOperation.Subtract, GpuNarrowFloatBinaryOperation.Multiply,
+        GpuNarrowFloatBinaryOperation.Divide,
     };
 
     private static readonly GpuNarrowFloatUnaryOperation[] UnaryOperations =
     {
         GpuNarrowFloatUnaryOperation.Negate, GpuNarrowFloatUnaryOperation.Relu, GpuNarrowFloatUnaryOperation.Gelu,
+        GpuNarrowFloatUnaryOperation.Abs, GpuNarrowFloatUnaryOperation.Sqrt, GpuNarrowFloatUnaryOperation.Exp,
+        GpuNarrowFloatUnaryOperation.Log, GpuNarrowFloatUnaryOperation.Tanh, GpuNarrowFloatUnaryOperation.Sigmoid,
+    };
+
+    // The operations computed by a 32-bit function of the widened operand, and that function.
+    private static string? FloatFunction(GpuNarrowFloatUnaryOperation operation) => operation switch
+    {
+        GpuNarrowFloatUnaryOperation.Gelu => "nf_gelu",
+        GpuNarrowFloatUnaryOperation.Sqrt => "NF_SQRT",
+        GpuNarrowFloatUnaryOperation.Exp => "NF_EXP",
+        GpuNarrowFloatUnaryOperation.Log => "NF_LOG",
+        GpuNarrowFloatUnaryOperation.Tanh => "NF_TANH",
+        GpuNarrowFloatUnaryOperation.Sigmoid => "nf_sigmoid",
+        _ => null,
     };
 
     public static string Suffix(GpuElementType type) => type switch
@@ -37,6 +52,7 @@ internal static class GpuNarrowFloatKernelSource
         GpuNarrowFloatBinaryOperation.Add => "nfadd_",
         GpuNarrowFloatBinaryOperation.Subtract => "nfsub_",
         GpuNarrowFloatBinaryOperation.Multiply => "nfmul_",
+        GpuNarrowFloatBinaryOperation.Divide => "nfdiv_",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
     } + Suffix(type);
 
@@ -45,6 +61,12 @@ internal static class GpuNarrowFloatKernelSource
         GpuNarrowFloatUnaryOperation.Negate => "nfneg_",
         GpuNarrowFloatUnaryOperation.Relu => "nfrelu_",
         GpuNarrowFloatUnaryOperation.Gelu => "nfgelu_",
+        GpuNarrowFloatUnaryOperation.Abs => "nfabs_",
+        GpuNarrowFloatUnaryOperation.Sqrt => "nfsqrt_",
+        GpuNarrowFloatUnaryOperation.Exp => "nfexp_",
+        GpuNarrowFloatUnaryOperation.Log => "nflog_",
+        GpuNarrowFloatUnaryOperation.Tanh => "nftanh_",
+        GpuNarrowFloatUnaryOperation.Sigmoid => "nfsig_",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
     } + Suffix(type);
 
@@ -64,6 +86,7 @@ internal static class GpuNarrowFloatKernelSource
     {
         GpuNarrowFloatBinaryOperation.Add => "+",
         GpuNarrowFloatBinaryOperation.Subtract => "-",
+        GpuNarrowFloatBinaryOperation.Divide => "/",
         _ => "*",
     };
 
@@ -77,6 +100,9 @@ typedef ushort u16t;
 #define NF_BITS(f) as_uint(f)
 #define NF_FLOAT(u) as_float(u)
 #define NF_TANH(x) tanh(x)
+#define NF_SQRT(x) sqrt(x)
+#define NF_EXP(x) exp(x)
+#define NF_LOG(x) log(x)
 "
             : @"
 typedef unsigned short u16t;
@@ -84,6 +110,9 @@ typedef unsigned short u16t;
 #define NF_BITS(f) __float_as_uint(f)
 #define NF_FLOAT(u) __uint_as_float(u)
 #define NF_TANH(x) tanhf(x)
+#define NF_SQRT(x) sqrtf(x)
+#define NF_EXP(x) expf(x)
+#define NF_LOG(x) logf(x)
 ");
         source.Append(@"
 NF_FN float nf_w_f16(u16t h)
@@ -139,6 +168,8 @@ NF_FN float nf_gelu(float x)
     if (z < -20.0f) z = -20.0f;
     return 0.5f * x * (1.0f + NF_TANH(z));
 }
+/* Below -80, e^-x overflows on its way to the quotient (a zero, where the result is e^x: 8e-40 at -90). */
+NF_FN float nf_sigmoid(float x) { return x < -80.0f ? NF_EXP(x) : 1.0f / (1.0f + NF_EXP(-x)); }
 ");
         foreach (var type in Types)
         {
@@ -159,9 +190,17 @@ NF_FN float nf_gelu(float x)
             source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Relu, type))
                 .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
                 .Append("    if (i < size) { const u16t h = a[i]; o[i] = ").Append(widen).Append("(h) > 0.0f ? h : (u16t)0; }\n}\n");
-            source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Gelu, type))
+            source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Abs, type))
                 .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
-                .Append("    if (i < size) o[i] = ").Append(narrow).Append("(nf_gelu(").Append(widen).Append("(a[i])));\n}\n");
+                .Append("    if (i < size) o[i] = (u16t)(a[i] & 0x7FFFu);\n}\n");
+            foreach (var operation in UnaryOperations)
+            {
+                if (FloatFunction(operation) is not { } function) continue;
+                source.Append("IK_KERNEL ").Append(Unary(operation, type))
+                    .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+                    .Append("    if (i < size) o[i] = ").Append(narrow).Append('(').Append(function).Append('(').Append(widen).Append("(a[i])));\n}\n");
+            }
+
             // One invocation per output element: a row of a against a column of b, accumulated in a float.
             source.Append("IK_KERNEL ").Append(MatrixMultiply(type))
                 .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* c, const int m, const int n, const int k)\n{\n")

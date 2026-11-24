@@ -362,6 +362,7 @@ internal static class GpuPackedKernelSource
             GpuNarrowFloatBinaryOperation.Add => "nfadd",
             GpuNarrowFloatBinaryOperation.Subtract => "nfsub",
             GpuNarrowFloatBinaryOperation.Multiply => "nfmul",
+            GpuNarrowFloatBinaryOperation.Divide => "nfdiv",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
         };
         string w = Widen(type), n = Narrow(type);
@@ -369,10 +370,28 @@ internal static class GpuPackedKernelSource
         {
             GpuNarrowFloatBinaryOperation.Add => n + "(pk_fadd(" + w + "(x), " + w + "(y)))",
             GpuNarrowFloatBinaryOperation.Subtract => n + "(pk_fadd(" + w + "(x), " + w + "(y) ^ 0x80000000u))",
+            GpuNarrowFloatBinaryOperation.Divide => n + "(pk_fdiv(" + w + "(x), " + w + "(y)))",
             _ => n + "(pk_fmul(" + w + "(x), " + w + "(y)))",
         };
         return Kernel("pk_" + stem + "_" + Suffix(type), 3, FloatLibrary, () => LaneBody(type, second: true, scalar: false, value));
     }
+
+    // A function of the widened operand's binary32 bits, its result narrowed into the type.
+    private static string OnBits(string function, GpuElementType type) => Narrow(type) + "(" + function + "(" + Widen(type) + "(x)))";
+
+    /// <summary>The 16-bit float operations, in the order their kernels are listed.</summary>
+    internal static readonly GpuNarrowFloatBinaryOperation[] FloatBinaryOperations =
+    {
+        GpuNarrowFloatBinaryOperation.Add, GpuNarrowFloatBinaryOperation.Subtract, GpuNarrowFloatBinaryOperation.Multiply,
+        GpuNarrowFloatBinaryOperation.Divide,
+    };
+
+    internal static readonly GpuNarrowFloatUnaryOperation[] FloatUnaryOperations =
+    {
+        GpuNarrowFloatUnaryOperation.Negate, GpuNarrowFloatUnaryOperation.Relu, GpuNarrowFloatUnaryOperation.Gelu,
+        GpuNarrowFloatUnaryOperation.Abs, GpuNarrowFloatUnaryOperation.Sqrt, GpuNarrowFloatUnaryOperation.Exp,
+        GpuNarrowFloatUnaryOperation.Log, GpuNarrowFloatUnaryOperation.Tanh, GpuNarrowFloatUnaryOperation.Sigmoid,
+    };
 
     /// <summary><c>o[i] = op a[i]</c> on 16-bit floats: buffers (a, o).</summary>
     public static GpuPackedKernel Unary(GpuNarrowFloatUnaryOperation operation, GpuElementType type)
@@ -383,6 +402,12 @@ internal static class GpuPackedKernelSource
             GpuNarrowFloatUnaryOperation.Negate => "nfneg",
             GpuNarrowFloatUnaryOperation.Relu => "nfrelu",
             GpuNarrowFloatUnaryOperation.Gelu => "nfgelu",
+            GpuNarrowFloatUnaryOperation.Abs => "nfabs",
+            GpuNarrowFloatUnaryOperation.Sqrt => "nfsqrt",
+            GpuNarrowFloatUnaryOperation.Exp => "nfexp",
+            GpuNarrowFloatUnaryOperation.Log => "nflog",
+            GpuNarrowFloatUnaryOperation.Tanh => "nftanh",
+            GpuNarrowFloatUnaryOperation.Sigmoid => "nfsig",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
         };
         // The largest pattern below the sign bit that is not a NaN: infinity.
@@ -391,6 +416,12 @@ internal static class GpuPackedKernelSource
         {
             GpuNarrowFloatUnaryOperation.Negate => "x ^ 0x8000u",
             GpuNarrowFloatUnaryOperation.Relu => "pk_relu(x, " + top + ")",
+            GpuNarrowFloatUnaryOperation.Abs => "x & 0x7FFFu",
+            GpuNarrowFloatUnaryOperation.Sqrt => OnBits("pk_usqrt", type),
+            GpuNarrowFloatUnaryOperation.Exp => OnBits("pk_uexp", type),
+            GpuNarrowFloatUnaryOperation.Log => OnBits("pk_ulog", type),
+            GpuNarrowFloatUnaryOperation.Tanh => OnBits("pk_utanh", type),
+            GpuNarrowFloatUnaryOperation.Sigmoid => OnBits("pk_usigmoid", type),
             _ => Narrow(type) + "(FBITS(pk_gelu(UFLOAT(" + Widen(type) + "(x)))))",
         };
         return Kernel("pk_" + stem + "_" + Suffix(type), 2, FloatLibrary, () => LaneBody(type, second: false, scalar: false, value));
@@ -439,12 +470,8 @@ internal static class GpuPackedKernelSource
 
         foreach (var type in FloatTypes)
         {
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Add, type));
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Subtract, type));
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Multiply, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Negate, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Relu, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Gelu, type));
+            foreach (var operation in FloatBinaryOperations) all.Add(Binary(operation, type));
+            foreach (var operation in FloatUnaryOperations) all.Add(Unary(operation, type));
             all.Add(MatrixMultiply(type));
         }
 

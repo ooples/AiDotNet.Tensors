@@ -155,6 +155,68 @@ public class GpuIntegerResidencyTests
     }
 
     [SkippableFact]
+    public void BFloat16_divide_and_functions_stay_on_the_device_and_equal_the_function_rounded_once()
+    {
+        const GpuElementType Type = GpuElementType.BFloat16;
+        Skip.If(AiDotNetEngine.Current is not DirectGpuTensorEngine, "No GPU engine on this host.");
+        var gpu = (DirectGpuTensorEngine)AiDotNetEngine.Current;
+        Skip.If(gpu.GetBackend() is not IGpuNarrowFloatElementwise narrow || gpu.GetBackend() is not { } held || !held.SupportsElementType(Type)
+            || !narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Divide, Type)
+            || !narrow.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Sigmoid, Type), "No device with BFloat16 kernels on this host.");
+        IEngine engine = gpu;
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve);
+
+        var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(37);
+        var xValues = new BFloat16[Large];
+        var yValues = new BFloat16[Large];
+        for (int i = 0; i < Large; i++)
+        {
+            xValues[i] = BFloat16.FromFloat((float)((random.NextDouble() - 0.5) * 8.0));
+            // Positive and away from zero: a divisor, and an operand of the root and the logarithm.
+            yValues[i] = BFloat16.FromFloat((float)(0.25 + random.NextDouble() * 6.0));
+        }
+
+        var x = new Tensor<BFloat16>((BFloat16[])xValues.Clone(), new[] { Large });
+        var y = new Tensor<BFloat16>((BFloat16[])yValues.Clone(), new[] { Large });
+        gpu.RegisterPersistentTensor(x, PersistentTensorRole.Weights);
+        gpu.RegisterPersistentTensor(y, PersistentTensorRole.Weights);
+        try
+        {
+            var results = new (string Name, Tensor<BFloat16> Result, Func<double, double, double> Function, bool Exact)[]
+            {
+                ("Divide", engine.TensorDivide(x, y), (a, b) => (float)a / (float)b, true),
+                ("Abs", engine.TensorAbs(x), (a, _) => Math.Abs(a), true),
+                ("Sqrt", engine.TensorSqrt(y), (_, b) => Math.Sqrt(b), false),
+                ("Exp", engine.TensorExp(x), (a, _) => Math.Exp(a), false),
+                ("Log", engine.TensorLog(y), (_, b) => Math.Log(b), false),
+                ("Tanh", engine.TensorTanh(x), (a, _) => Math.Tanh(a), false),
+                ("Sigmoid", engine.TensorSigmoid(x), (a, _) => 1.0 / (1.0 + Math.Exp(-a)), false),
+            };
+            foreach (var (name, result, function, exact) in results)
+            {
+                Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");
+                var values = result.GetReadOnlyDataArray();
+                for (int i = 0; i < Large; i++)
+                {
+                    float expected = (float)function((float)xValues[i], (float)yValues[i]);
+                    float got = (float)values[i];
+                    if (exact)
+                        Assert.True(BFloat16.FromFloat(expected).RawValue == values[i].RawValue,
+                            $"{name} at {i} of ({(float)xValues[i]:R}, {(float)yValues[i]:R}): expected {expected:R}, device {got:R}.");
+                    else
+                        // Two units in BFloat16's last place (7 significand bits).
+                        Assert.True(Math.Abs(expected - got) <= 1e-6f + Math.Abs(expected) / 64f,
+                            $"{name} at {i} of ({(float)xValues[i]:R}, {(float)yValues[i]:R}): expected {expected:R}, device {got:R}.");
+                }
+            }
+        }
+        finally
+        {
+            gpu.ClearTypedResidents();
+        }
+    }
+
+    [SkippableFact]
     public void BFloat16_chain_stays_on_the_device_and_equals_the_cpu_engine()
     {
         const GpuElementType Type = GpuElementType.BFloat16;

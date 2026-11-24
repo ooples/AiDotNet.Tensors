@@ -973,6 +973,13 @@ AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Gelu = 2 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Negate = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Relu = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation.Divide = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Abs = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Sqrt = 4 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Exp = 5 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Log = 6 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Tanh = 7 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation.Sigmoid = 8 -> AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.BinaryNarrowFloat(AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.MatrixMultiplyNarrowFloat(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! c, int m, int n, int k) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SupportsNarrowFloatBinary(AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
