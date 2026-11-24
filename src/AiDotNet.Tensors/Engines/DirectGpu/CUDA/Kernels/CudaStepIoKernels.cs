@@ -120,6 +120,14 @@ struct StepIoResults
     float loss[2][64];          // the loss values, per slot
 };
 
+// One thread, ahead of the captured update: a nonzero flag (the fused cross-entropy's out-of-range label count) poisons
+// the guard the gradients' sum of squares accumulates onto, so the update kernels skip the step and the epilogue does
+// not count it, as for a learning-rate table fault.
+extern ""C"" __global__ __launch_bounds__(32) void step_io_gate_update(const float* __restrict__ flag, double* __restrict__ guard)
+{
+    if (threadIdx.x == 0 && flag[0] != 0.0f) *guard = __longlong_as_double(0x7ff8000000000000LL);
+}
+
 // One warp. guard: the gradients' double sum of squares on the device (0: no captured optimizer); reset to zero after
 // it is read, for the next replay's reduction to accumulate onto. One system fence: lane 0's, after the warp barrier
 // that orders every lane's loss writes before it (fences are cumulative), between all of the replay's results and
@@ -151,5 +159,5 @@ extern ""C"" __global__ __launch_bounds__(32) void step_io_epilogue(
 }
 ";
 
-    public static string[] GetKernelNames() => new[] { "step_io_prologue", "step_io_epilogue" };
+    public static string[] GetKernelNames() => new[] { "step_io_prologue", "step_io_epilogue", "step_io_gate_update" };
 }

@@ -987,7 +987,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     if (s > 0) Feed(s, bad: false);
                     plan.Step();
                 }
-                if (capture) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                if (capture)
+                {
+                    AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                    // The update runs inside the graph, so the bad label must be stopped by the captured update's gate.
+                    Assert.NotNull(typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan));
+                }
                 var beforeBad = parameters.Select(p => p.ToArray()).ToArray();
                 int acceptedBefore = ((CompiledTrainingPlan<float>)plan).OptimizerStep;
                 Feed(Steps, bad: true);
@@ -1006,6 +1012,88 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     Assert.True(!float.IsNaN(loss) && !float.IsInfinity(loss), $"step {s} loss {loss}");
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// A step whose loss is a fused cross-entropy captures its optimizer update (clip included) with the step, as any
+    /// other step does: the update reads the cross-entropy's device label-error word as a gate, so a bad label still
+    /// applies nothing (A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers). It used to keep
+    /// the update out of the graph, run after every replay with a blocking label read before it.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, 0.0)]
+    [InlineData(true, 0.0)]
+    [InlineData(true, 0.5)]
+    public void A_fused_cross_entropy_step_captures_its_update_and_trains_like_the_eager_step(bool residentLabels, double clip)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only.");
+            (double[] Losses, float[][] Weights, bool UpdateCaptured, int OptimizerStep) Run(bool capture)
+            {
+                const int vocab = 24;
+                var labels = new Tensor<int>([Batch]);
+                var x = Rand([Batch, Inputs], 1, 1f);
+                var w = Rand([Inputs, Inputs], 4, 0.3f);
+                var head = Rand([Inputs, vocab], 5, 0.3f);
+                var bias = Rand([vocab], 6, 0.1f);
+                var parameters = new[] { w, head, bias };
+                foreach (var t in parameters) t.Gpu();
+                void Feed(int step)
+                {
+                    var rng = new Random(900 + step);
+                    for (int i = 0; i < Batch; i++) labels.SetFlat(i, rng.Next(vocab));
+                    labels.MarkModified();
+                }
+                Feed(0);
+                if (residentLabels) labels.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(parameters))
+                {
+                    var h = gpu.TensorTanh(gpu.TensorMatMul(x, w));
+                    gpu.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+                    plan = scope.CompileTraining(parameters);
+                }
+                using (plan)
+                {
+                    var concrete = (CompiledTrainingPlan<float>)plan;
+                    if (!capture) concrete.DisableGraphStep();
+                    plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 1e-2f, weightDecay: 0.1f);
+                    if (clip > 0) concrete.SetMaxGradNorm(clip);
+                    var losses = new double[Steps];
+                    for (int s = 0; s < Steps; s++)
+                    {
+                        if (s > 0) Feed(s);
+                        losses[s] = plan.Step().ToArray()[0];
+                    }
+                    if (capture) AssertGraphCaptured(concrete);
+                    bool updateCaptured = typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete) is not null;
+                    return (losses, parameters.Select(p => p.ToArray()).ToArray(), updateCaptured, concrete.OptimizerStep);
+                }
+            }
+
+            var eager = Run(capture: false);
+            var captured = Run(capture: true);
+            double worst = 0;
+            for (int p = 0; p < eager.Weights.Length; p++)
+                for (int i = 0; i < eager.Weights[p].Length; i++)
+                    worst = Math.Max(worst, Math.Abs(eager.Weights[p][i] - captured.Weights[p][i]));
+            _output.WriteLine($"update captured {captured.UpdateCaptured}, optimizer steps {captured.OptimizerStep}/{eager.OptimizerStep}, "
+                + $"max |w_captured - w_eager| {worst:G3}, losses eager {string.Join(" ", eager.Losses.Select(l => l.ToString("G6")))}");
+            Assert.True(captured.UpdateCaptured, "the fused cross-entropy step's update was not captured into the graph");
+            Assert.Equal(Steps, captured.OptimizerStep);
+            Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            // The labels are redrawn every step, so the loss need not fall; the update must still move the weights.
+            Assert.True(eager.Weights[0].Zip(Rand([Inputs, Inputs], 4, 0.3f).ToArray(), (a, b) => Math.Abs(a - b)).Max() > 1e-2,
+                "the eager reference did not move the weights");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            Assert.True(worst <= 1e-5, $"captured weights differ from eager by {worst}");
         }
     }
 

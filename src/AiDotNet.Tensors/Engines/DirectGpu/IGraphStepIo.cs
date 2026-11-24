@@ -159,6 +159,13 @@ internal interface IGraphStepIo : IDisposable
     /// </summary>
     void CaptureGlobalNormClip(float maxNorm, Gpu.NonFiniteGradientPolicy policy);
 
+    /// <summary>
+    /// Records, inside the capture and ahead of the update, a gate: when <paramref name="flag"/>'s first float is nonzero
+    /// at replay time the step's update is discarded, as for non-finite gradients (the applied count does not advance
+    /// and the replay's sum of squares reads non-finite). Requires <see cref="PrepareOptimizer"/>.
+    /// </summary>
+    void CaptureUpdateGate(IGpuBuffer flag);
+
     /// <summary>As <see cref="CaptureSgdUpdate"/> for Adam (or AdamW when <paramref name="decoupled"/>), fp32 moments.</summary>
     void CaptureAdamUpdate(bool decoupled, System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,
         System.Collections.Generic.IReadOnlyList<IGpuBuffer> gradients, System.Collections.Generic.IReadOnlyList<IGpuBuffer> firstMoments,

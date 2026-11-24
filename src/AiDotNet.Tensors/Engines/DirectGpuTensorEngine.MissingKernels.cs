@@ -7112,6 +7112,12 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>The label-error word if a device-id fused cross-entropy has created it, else null (never allocates).</summary>
+    internal IGpuBuffer? ExistingFusedCeLabelErrorWord
+    {
+        get { lock (_fusedCeLabelErrorLock) return _fusedCeLabelError; }
+    }
+
     /// <summary>
     /// True (and the word cleared) when a device-id fused cross-entropy saw an out-of-range id since the word was last
     /// cleared. One blocking 4-byte read; a compiled plan calls it when it discards a step as non-finite.

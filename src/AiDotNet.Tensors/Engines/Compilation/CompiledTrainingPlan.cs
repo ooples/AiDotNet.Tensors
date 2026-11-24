@@ -8692,8 +8692,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             double clipNorm = _maxGradNorm;
             var clipPolicy = _nonFiniteGradientPolicy;
             if ((optType != OptimizerType.SGD && optType != OptimizerType.Adam && optType != OptimizerType.AdamW)
-                || _usesFusedCe || paramCount == 0 || !_l2Regularization.Equals(0f))
+                || paramCount == 0 || !_l2Regularization.Equals(0f))
                 return null;
+            // A fused cross-entropy flags out-of-range device labels in a word on the device (the uncaptured update
+            // validates it on the host before it writes). The captured update reads that word as a gate, so a step with
+            // a bad label applies nothing, and the host check after the step still throws for it. The word exists once
+            // the resident pre-pass has run the fused cross-entropy; without it the update stays uncaptured.
+            Engines.DirectGpu.IGpuBuffer? labelGate = null;
+            if (_usesFusedCe)
+            {
+                labelGate = _engine.As<Engines.DirectGpuTensorEngine>()?.ExistingFusedCeLabelErrorWord;
+                if (labelGate is null) return null;
+            }
             if (clipNorm > 0.0 && (typeof(T) != typeof(float) || clipNorm > float.MaxValue
                     || clipPolicy == Engines.Gpu.NonFiniteGradientPolicy.Error))
                 return null;
@@ -8719,13 +8729,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (adam) { capM.Add(gpuM[p]!); capV.Add(gpuV[p]!); }
             }
             // The ping-pong update prepares its own tables (PrepareSgdPingPong), not the gradient table the clip reads.
-            var pingPong = !adam && clipNorm <= 0.0 ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
+            // (Not under a label gate: the ping-pong launch takes its own finiteness reduction.)
+            var pingPong = !adam && clipNorm <= 0.0 && labelGate is null ? TryAllocatePingPongBuffers(capParams, capSizes, owner) : null;
             // The eager clip's kernels (TryClipGradientsGlobalL2Gpu) over the step I/O's own gradient table and scratch,
             // minus its host bookkeeping: the captured update's guard measures the clipped gradients, which are
             // non-finite exactly when the originals were unless the policy zeroed their non-finite elements (then the
             // repaired gradients are what it should measure, as the eager path does).
             var captured = new CapturedOptimizer(lrSchedule, io =>
             {
+                if (labelGate is not null) io.CaptureUpdateGate(labelGate);
                 if (clipNorm > 0.0) io.CaptureGlobalNormClip((float)clipNorm, clipPolicy);
                 if (adam) io.CaptureAdamUpdate(optType == OptimizerType.AdamW, capParams, capGrads, capM, capV, capSizes, b1, b2, epsVal, wd);
                 else if (pingPong is not null) io.CaptureSgdPingPongUpdate(0, (float)wd);

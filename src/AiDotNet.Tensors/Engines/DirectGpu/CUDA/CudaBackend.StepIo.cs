@@ -389,6 +389,17 @@ public sealed partial class CudaBackend
 
         public IGpuBuffer? GlobalNormRecord => _clipRecord;
 
+        public void CaptureUpdateGate(IGpuBuffer flag)
+        {
+            if (_guard is null) throw new InvalidOperationException("PrepareOptimizer was not called before the capture.");
+            if (!_backend._kernelCache.TryGetValue("step_io_gate_update", out var gate))
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_gate_update");
+            IntPtr flagPtr = flag.Handle, guardPtr = _guard.Handle;
+            void** args = stackalloc void*[2];
+            args[0] = &flagPtr; args[1] = &guardPtr;
+            _backend.LaunchKernel(gate, 1, 32, args);
+        }
+
         public void PrepareGlobalNormClip()
         {
             if (_gradientTable is not { } table)
