@@ -148,6 +148,15 @@ public class SharedStepScratchTrainingTests : IDisposable
         if (gpu is null) return;
         using (gpu)
         {
+            // The 16-bit convolutions are cuDNN's (compute capability 7.0+, 8.0+ for BF16). Without that route autocast
+            // keeps convolutions in FP32 by design, so the mixed-precision case would be the FP32 case again.
+            if (autocast is { } precision)
+            {
+                bool route;
+                using (new AutocastScope(precision))
+                    route = DirectGpuTensorEngine.AutocastConvRouteAvailableForTest(gpu.GetBackend()!);
+                Skip.IfNot(route, $"No {precision} convolution route on this machine (cuDNN not loadable, or below its compute-capability floor).");
+            }
             Train(gpu, share: false, autocast);   // tunes the kernels both runs below then pick alike
             var isolated = Train(gpu, share: false, autocast);
             var shared = Train(gpu, share: true, autocast);

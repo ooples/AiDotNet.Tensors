@@ -633,7 +633,28 @@ public class TorchModelOpsOpenClTests : TorchModelOpsGpuTestsBase, IClassFixture
 [Collection("VulkanGlobalState")]
 public class TorchModelOpsVulkanTests : TorchModelOpsGpuTestsBase, IClassFixture<VulkanTensorEngineTestFixture>
 {
-    public TorchModelOpsVulkanTests(VulkanTensorEngineTestFixture fixture) : base(fixture) { }
+    private readonly VulkanTensorEngineTestFixture _vulkan;
+
+    public TorchModelOpsVulkanTests(VulkanTensorEngineTestFixture fixture) : base(fixture) => _vulkan = fixture;
+
+    // The backend measures its double kernels once, from whichever op first asks for double support -- a float
+    // matmul's precision plan included. That known-answer readback was charged to the op: ComposedOps' first matmul
+    // "read 112 B back to the host" inside its residency scope.
+    [SkippableFact]
+    public void Double_support_probe_is_not_charged_to_the_op_that_triggers_it()
+    {
+        Skip.IfNot(_vulkan.IsAvailable, "Vulkan backend not available.");
+        var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+        bool before = backend.SupportsFloat64MatrixMultiply;
+        backend.ResetFloat64ProbeForTest();
+        bool after;
+        GpuResidencyScope scope;
+        using (scope = GpuResidencyScope.Begin(captureOperations: true))
+            after = backend.SupportsFloat64MatrixMultiply;
+        Assert.Equal(before, after);
+        Assert.Equal(0, scope.Downloads);
+        Assert.Equal(0, scope.Uploads);
+    }
 }
 
 [Collection("DirectGpuSerial")]

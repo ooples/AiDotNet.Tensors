@@ -39,6 +39,12 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     private readonly object _subnormalProbeLock = new object();
     private bool? _keepsSubnormals;
 
+    /// <summary>Tests: forgets the measured answer, so the next question about double support measures again.</summary>
+    internal void ResetFloat64ProbeForTest()
+    {
+        lock (_subnormalProbeLock) _keepsSubnormals = null;
+    }
+
     private bool KeepsSubnormals()
     {
         if (_keepsSubnormals is bool known) return known;
@@ -46,6 +52,10 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
         {
             if (_keepsSubnormals is bool settled) return settled;
             bool kept;
+            // The probe is the backend's own one-time known-answer check, made from whichever op first asks for double
+            // support (a float matmul's precision plan included): its launches and readbacks are detection evidence,
+            // not that op's, so a residency scope around the op does not see a device-to-host copy it did not make.
+            using var detection = GpuLaunchProbe.DetectionScope();
             try
             {
                 kept = MeasureSubnormals();
