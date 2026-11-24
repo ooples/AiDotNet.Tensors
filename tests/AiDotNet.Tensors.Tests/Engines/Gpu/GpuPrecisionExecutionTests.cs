@@ -266,9 +266,39 @@ public sealed class GpuPrecisionExecutionTests
 
     private sealed class ExecutablePrecisionBackend : DelegatingGpuBackend,
         IGpuPrecisionBackend,
-        IGpuHalfPrecisionBackend,
-        IGpuFp16ElementwiseBackend
+        IGpuHalfFusedKernels,
+        IGpuNarrowFloatElementwise,
+        IGpuNarrowFloatMatrixMultiply
     {
+        // The typed interfaces the engine dispatches half work through, over this double's half kernels below.
+        public bool SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
+            => type == GpuElementType.Float16 && operation == GpuNarrowFloatBinaryOperation.Add;
+
+        public bool SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation operation, GpuElementType type)
+            => type == GpuElementType.Float16 && operation is GpuNarrowFloatUnaryOperation.Relu or GpuNarrowFloatUnaryOperation.Gelu;
+
+        public bool SupportsNarrowFloatMatrixMultiply(GpuElementType type) => type == GpuElementType.Float16;
+
+        public void BinaryNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer b,
+            IGpuBuffer output, int size)
+        {
+            Assert.True(SupportsNarrowFloatBinary(operation, type));
+            Fp16Add(a, b, output, size);
+        }
+
+        public void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
+        {
+            Assert.True(SupportsNarrowFloatUnary(operation, type));
+            if (operation == GpuNarrowFloatUnaryOperation.Relu) Fp16Relu(a, output, size);
+            else Fp16Gelu(a, output, size);
+        }
+
+        public void MatrixMultiplyNarrowFloat(GpuElementType type, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k)
+        {
+            Assert.Equal(GpuElementType.Float16, type);
+            Hgemm(a, b, c, m, n, k);
+        }
+
         internal ExecutablePrecisionBackend(IDirectGpuBackend inner) : base(inner) { }
 
         internal int Fp32GemmCalls { get; private set; }

@@ -653,8 +653,8 @@ public abstract class FusedElementwiseBackendTestsBase
     {
         using var lease = Create(_name, out var backend);
         Skip.If(backend is null, _name + " is not available on this machine.");
-        var half = backend as IGpuHalfPrecisionBackend;
-        Skip.If(half is null || !half.SupportsHgemm, _name + " has no half-precision GEMM.");
+        var half = backend as IGpuHalfFusedKernels;
+        Skip.If(half is null || !half.HasHgemm(), _name + " has no half-precision GEMM.");
         const int M = 19, K = 23, N = 17;   // not multiples of a tile
         float[] Inputs(int seed, int count)
         {

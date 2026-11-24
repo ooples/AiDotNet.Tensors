@@ -1725,6 +1725,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
         {
+            GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.OpenCl);
             return openClBuffer.Download();
@@ -1734,6 +1735,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
             if (destination is null) throw new ArgumentNullException(nameof(destination));
+            GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             if (openClBuffer.Handle == IntPtr.Zero)
                 throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its download.");
@@ -1795,19 +1797,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
-            var srcHandle = ((DirectOpenClGpuBuffer)source).Buffer.Handle;
-            var destHandle = ((DirectOpenClGpuBuffer)destination).Buffer.Handle;
-
-            // Offsets and size in bytes
-            var srcOffsetBytes = new UIntPtr((ulong)srcOffset * sizeof(float));
-            var destOffsetBytes = new UIntPtr((ulong)destOffset * sizeof(float));
-            var sizeBytes = new UIntPtr((ulong)size * sizeof(float));
+            // Offsets and size count elements of the buffers' type (a double copy moves eight bytes an element).
+            ulong width = (ulong)GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
+            var (srcMemory, srcHandle) = CopyOperand(source, nameof(source));
+            var (destMemory, destHandle) = CopyOperand(destination, nameof(destination));
+            var srcOffsetBytes = new UIntPtr((ulong)srcOffset * width);
+            var destOffsetBytes = new UIntPtr((ulong)destOffset * width);
+            var sizeBytes = new UIntPtr((ulong)size * width);
 
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work (keeps data on device)
             int err = EnqueueTrackedCopy(
                 _context.CommandQueue,
-                ((DirectOpenClGpuBuffer)source).Buffer,
-                ((DirectOpenClGpuBuffer)destination).Buffer,
+                srcMemory,
+                destMemory,
                 srcHandle,
                 destHandle,
                 srcOffsetBytes,
@@ -1818,10 +1820,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException($"OpenCL copy failed: {err}");
         }
 
+        // The memory object and handle of a copy operand: a float-pool buffer, or a byte allocation holding typed
+        // elements (double, half, the narrow integers).
+        private static (IDirectOpenClMemoryObject Memory, IntPtr Handle) CopyOperand(IGpuBuffer buffer, string name)
+            => buffer switch
+            {
+                DirectOpenClGpuBuffer floats => (floats.Buffer, floats.Buffer.Handle),
+                DirectOpenClGpuByteBuffer bytes => (bytes.Buffer, bytes.Buffer.Handle),
+                null => throw new ArgumentNullException(name),
+                _ => throw new ArgumentException($"A {buffer.GetType().Name} is not an OpenCL buffer.", name),
+            };
+
         private static int EnqueueTrackedCopy(
             IntPtr commandQueue,
-            DirectOpenClBuffer source,
-            DirectOpenClBuffer destination,
+            IDirectOpenClMemoryObject source,
+            IDirectOpenClMemoryObject destination,
             IntPtr sourceHandle,
             IntPtr destinationHandle,
             UIntPtr sourceOffset,
@@ -12900,8 +12913,9 @@ KERNEL VARIANTS (A/B testing):
         public void CopyBuffer(IGpuBuffer src, IGpuBuffer dst, int size)
         {
             if (_context == null) return;
-            var srcBuf = ((DirectOpenClGpuBuffer)src).Buffer;
-            var dstBuf = ((DirectOpenClGpuBuffer)dst).Buffer;
+            ulong width = (ulong)GpuCopyLayout.CheckedElementBytes(src, 0, dst, 0, size, nameof(CopyBuffer));
+            var (srcBuf, srcHandle) = CopyOperand(src, nameof(src));
+            var (dstBuf, dstHandle) = CopyOperand(dst, nameof(dst));
 
             // Use EnqueueCopyBuffer for device-to-device copy
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
@@ -12909,11 +12923,11 @@ KERNEL VARIANTS (A/B testing):
                 _context.CommandQueue,
                 srcBuf,
                 dstBuf,
-                srcBuf.Handle,
-                dstBuf.Handle,
+                srcHandle,
+                dstHandle,
                 UIntPtr.Zero,
                 UIntPtr.Zero,
-                (UIntPtr)(size * sizeof(float)));
+                (UIntPtr)((ulong)size * width));
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to copy OpenCL buffer: {err}");
@@ -14748,6 +14762,7 @@ KERNEL VARIANTS (A/B testing):
             // throw "Collection was modified" if we enumerated the live view.
             // Snapshotting decouples iteration from any such mutation, then we
             // clear the originals once.
+            ReleaseIntegerKernels();
             var kernels = new DirectOpenClKernel[_kernelCache.Count];
             _kernelCache.Values.CopyTo(kernels, 0);
             foreach (var kernel in kernels)

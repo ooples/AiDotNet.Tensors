@@ -65,8 +65,24 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         }
     }
 
-    /// <inheritdoc/>
+    /// <summary>Whether the device is initialized. The asynchronous members need only this.</summary>
     public bool IsAvailable => _initialized && !_disposed;
+
+    // IDirectGpuBackend is the synchronous surface: each of its members waits for the device's submission before it
+    // returns. Where that wait cannot finish (a browser's single thread, see
+    // WebGpuNativeBindings.CompletesSynchronously) the interface reports the backend unavailable, so an engine given
+    // this backend keeps its work on the CPU instead of blocking the page. The asynchronous members stay usable.
+    bool IGpuDevice.IsAvailable => SynchronousRouteAvailable;
+
+    private bool SynchronousRouteAvailable => IsAvailable && WebGpuNativeBindings.CompletesSynchronously;
+
+    // For the synchronous entry points that would otherwise block on a submission that cannot finish here.
+    private void RequireSynchronousRoute()
+    {
+        if (!WebGpuNativeBindings.CompletesSynchronously)
+            throw new GpuCapabilityUnavailableException(
+                "WebGPU in a browser has no synchronous dispatch: the wait would block the thread the device completes on. Use the asynchronous members.");
+    }
 
     /// <inheritdoc/>
     public string BackendName => "WebGPU";
@@ -211,10 +227,11 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new zero-initialized GPU buffer.</returns>
     /// <inheritdoc/>
-    // Not yet: this backend serves every buffer from 4-byte float allocations, so only the 4-byte types have storage.
-    // WGSL has no 64-bit float at all.
+    // Every buffer is a 4-byte-word allocation. Doubles are held two words each, low word first: WGSL has no 64-bit
+    // float, and the double kernels compute on the words in integer arithmetic (WebGpuBackend.Float64). The narrower
+    // types have no storage here yet.
     public bool SupportsElementType(GpuElementType type)
-        => type is GpuElementType.Float32 or GpuElementType.Int32;
+        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64;
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);

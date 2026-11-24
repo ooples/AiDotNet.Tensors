@@ -39,7 +39,9 @@ public enum GpuFloat64UnaryOperation
 /// <summary>
 /// Element-wise arithmetic computed in double precision on the device, over <see cref="GpuElementType.Float64"/>
 /// buffers. The arithmetic operations, negation, absolute value, square root and ReLU are single correctly rounded
-/// IEEE operations per element, so their results equal the host's bit for bit; the exponential, logarithm, hyperbolic
+/// IEEE operations per element, so their results equal the host's bit for bit, except that a NaN result is only
+/// required to be a NaN: its sign and payload may differ from the host's (a backend may return one canonical NaN); the
+/// exponential, logarithm, hyperbolic
 /// tangent and sigmoid are the device's double library functions, accurate to a few units in the last place.
 /// <see cref="SupportsFloat64Elementwise"/> says whether this device computes in double.
 /// </summary>
@@ -66,4 +68,15 @@ public interface IGpuFloat64Elementwise
     /// <paramref name="output"/>, which may be <paramref name="a"/>.
     /// </summary>
     void ScalarFloat64(GpuFloat64BinaryOperation operation, IGpuBuffer a, double scalar, IGpuBuffer output, int size);
+}
+
+/// <summary>
+/// Implemented by a backend that can lose single double-precision unary kernels while the rest of
+/// <see cref="IGpuFloat64Elementwise"/> stays available (Metal compiles exp, log, tanh and the logistic as a separate
+/// library). The engine asks before it prepares device operands for such an operation, so a known gap costs no upload.
+/// </summary>
+internal interface IGpuFloat64UnaryAvailability
+{
+    /// <summary>Whether <paramref name="operation"/> can run on this device now.</summary>
+    bool SupportsFloat64Unary(GpuFloat64UnaryOperation operation);
 }

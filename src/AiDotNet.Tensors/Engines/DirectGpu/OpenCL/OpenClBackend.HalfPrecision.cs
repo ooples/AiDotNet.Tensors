@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// IGpuHalfPrecisionBackend implementation for the OpenCL backend (issue #560):
+// IGpuHalfFusedKernels implementation for the OpenCL backend (issue #560):
 // FP16 GEMM so MatrixMultiply<Half> runs on the GPU instead of dropping to a
 // scalar CPU fallback.
 
@@ -10,13 +10,13 @@ using AiDotNet.Tensors.Engines.Gpu;
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
     /// <summary>
-    /// Half-precision GEMM dispatch for the <see cref="IGpuHalfPrecisionBackend"/>
+    /// Half-precision GEMM dispatch for the <see cref="IGpuHalfFusedKernels"/>
     /// capability interface. Mirrors the CUDA backend's contract so the
     /// backend-agnostic <c>DirectGpuTensorEngine.MatrixMultiply</c> FP16 path
     /// (issue #560) lights up on OpenCL devices — AMD, Intel, and NVIDIA — with
     /// no extra dispatch logic in the engine.
     /// </summary>
-    public sealed partial class OpenClBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
+    public sealed partial class OpenClBackend : IGpuHalfFusedKernels, IFp16ConvBatchedGemmBackend
     {
         private readonly object _halfGemmLock = new();
         private bool _halfGemmKernelsTried;

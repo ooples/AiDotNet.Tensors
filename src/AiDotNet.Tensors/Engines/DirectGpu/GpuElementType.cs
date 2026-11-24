@@ -152,6 +152,82 @@ internal static class GpuBufferTyping
     }
 }
 
+/// <summary>
+/// The precondition of every float transfer: it moves <c>Size * 4</c> bytes and reads them as 32-bit words.
+/// </summary>
+internal static class GpuFloatLayout
+{
+    /// <summary>
+    /// Refuses a buffer whose elements are not 4-byte words. A float read of a <see cref="GpuElementType.Float64"/>
+    /// buffer would return half of its bytes as unrelated floats, and one of a narrower type (or of raw bytes) would
+    /// read past the allocation; the typed transfers (<see cref="GpuTypedBufferExtensions"/>) are the way to read those.
+    /// </summary>
+    public static void Require(IGpuBuffer buffer, string operation)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        var type = buffer.ElementType;
+        if (type is GpuElementType.Float32 or GpuElementType.Int32) return;
+        throw new InvalidOperationException(type == GpuElementType.Unspecified
+            ? $"{operation} reads 32-bit words, but the buffer holds {buffer.SizeInBytes} raw bytes; read it with DownloadByteBuffer."
+            : $"{operation} reads 32-bit words, but the buffer holds {buffer.Size} {type} elements; read it with the typed DownloadBuffer<T>.");
+    }
+}
+
+/// <summary>The unit a device-to-device copy counts in.</summary>
+internal static class GpuCopyLayout
+{
+    /// <summary>
+    /// Bytes per element of a copy from <paramref name="source"/> to <paramref name="destination"/>: the copy's
+    /// offsets and length count elements of the buffers' type, so a <see cref="GpuElementType.Float64"/> copy moves
+    /// eight bytes an element (it moved four, half the data). Raw bytes (<see cref="GpuElementType.Unspecified"/>) keep
+    /// the 4-byte unit their callers have always counted in. Buffers whose elements differ in width are refused: the
+    /// count would mean different things on each side.
+    /// </summary>
+    public static int ElementBytes(IGpuBuffer source, IGpuBuffer destination, string operation)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        int from = Width(source.ElementType), to = Width(destination.ElementType);
+        if (from != to)
+            throw new InvalidOperationException(
+                $"{operation} cannot copy {source.ElementType} elements ({from} bytes) into a {destination.ElementType} buffer ({to} bytes).");
+        return from;
+    }
+
+    /// <summary>
+    /// <see cref="ElementBytes"/>, after checking that <paramref name="count"/> elements from each offset lie inside
+    /// both buffers: inside the elements a typed buffer declares, and inside the allocation of any buffer. A copy is a
+    /// raw device memcpy or an unchecked kernel, which would otherwise read or write past either.
+    /// </summary>
+    public static int CheckedElementBytes(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset,
+        int count, string operation)
+    {
+        int width = ElementBytes(source, destination, operation);
+        if (count < 0) throw new ArgumentOutOfRangeException(nameof(count), count, $"{operation}: the element count must be non-negative.");
+        if (sourceOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(sourceOffset), sourceOffset, $"{operation}: the source offset must be non-negative.");
+        if (destinationOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(destinationOffset), destinationOffset, $"{operation}: the destination offset must be non-negative.");
+        // A typed buffer may sit in a larger allocation (a pooled or rounded one): its declared elements are the range.
+        if (source.ElementType != GpuElementType.Unspecified && (long)sourceOffset + count > source.Size)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements from offset {sourceOffset} run past the source's {source.Size} elements.");
+        if (destination.ElementType != GpuElementType.Unspecified && (long)destinationOffset + count > destination.Size)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements from offset {destinationOffset} run past the destination's {destination.Size} elements.");
+        if (((long)sourceOffset + count) * width > source.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements of {width} bytes from offset {sourceOffset} run past the source's {source.SizeInBytes} bytes.");
+        if (((long)destinationOffset + count) * width > destination.SizeInBytes)
+            throw new ArgumentOutOfRangeException(nameof(count), count,
+                $"{operation}: {count} elements of {width} bytes from offset {destinationOffset} run past the destination's {destination.SizeInBytes} bytes.");
+        return width;
+    }
+
+    private static int Width(GpuElementType type)
+        => type == GpuElementType.Unspecified ? sizeof(float) : GpuElementTypes.SizeInBytes(type);
+}
+
 /// <summary>A byte allocation that can be declared a buffer of typed elements.</summary>
 internal interface IElementTypedByteBuffer
 {

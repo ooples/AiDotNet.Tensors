@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// core <c>IEngine</c> downcast to this interface (<c>engine is IInferenceGraphCaptureEngine cap</c>)
 /// to reach the capture surface without a concrete-type cast.
 /// <para>
-/// Kept off the base engine interface — like <see cref="IGpuHalfPrecisionBackend"/> — because only the
+/// Kept off the base engine interface — like <see cref="IGpuHalfFusedKernels"/> — because only the
 /// CUDA-backed <c>DirectGpuTensorEngine</c> ships graph capture; making it a base member would force
 /// every CPU/other-backend engine to implement no-ops or throw <c>NotSupportedException</c>.
 /// </para>

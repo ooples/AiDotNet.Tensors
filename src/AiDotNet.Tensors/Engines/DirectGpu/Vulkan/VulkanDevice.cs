@@ -589,6 +589,11 @@ public sealed unsafe partial class VulkanDevice : IDisposable
     /// double-precision parity kernels need for their infinity and NaN results.</summary>
     public bool SignedZeroInfNanPreserveFloat64 { get; private set; }
 
+    /// <summary>True when shaders may request DenormPreserve for 64-bit floats (float controls). Without it Vulkan lets a
+    /// double operation flush a subnormal result to zero (2^-1022 * 0.5 may give 0), so the double kernels, which must
+    /// equal the host's IEEE results, are offered only where it holds.</summary>
+    internal bool DenormPreserveFloat64 { get; private set; }
+
     /// <summary>Whether 32-bit float buffer atomic add (VK_EXT_shader_atomic_float) was enabled.</summary>
     public bool BufferFloat32AtomicAddEnabled { get; private set; }
 
@@ -716,10 +721,14 @@ public sealed unsafe partial class VulkanDevice : IDisposable
                 VulkanNativeBindings.vkGetPhysicalDeviceProperties2(_physicalDevice, &properties2);
                 SignedZeroInfNanPreserveFloat64 = _shaderFloat64
                     && floatControls.Bits[VkPhysicalDeviceFloatControlsProperties.SignedZeroInfNanPreserveFloat64] != 0;
-                if (SignedZeroInfNanPreserveFloat64 && !floatControlsCore) extensionNames.Add(FloatControlsExtension);
+                DenormPreserveFloat64 = _shaderFloat64
+                    && floatControls.Bits[VkPhysicalDeviceFloatControlsProperties.DenormPreserveFloat64] != 0;
+                if ((SignedZeroInfNanPreserveFloat64 || DenormPreserveFloat64) && !floatControlsCore)
+                    extensionNames.Add(FloatControlsExtension);
             }
         }
         VulkanTorchParityElementwiseKernels.PreserveDoubleSpecials = SignedZeroInfNanPreserveFloat64;
+        VulkanTorchParityElementwiseKernels.PreserveDoubleDenormals = DenormPreserveFloat64;
 
         var nameBytes = new byte[extensionNames.Count][];
         for (int i = 0; i < nameBytes.Length; i++) nameBytes[i] = Encoding.UTF8.GetBytes(extensionNames[i] + "\0");

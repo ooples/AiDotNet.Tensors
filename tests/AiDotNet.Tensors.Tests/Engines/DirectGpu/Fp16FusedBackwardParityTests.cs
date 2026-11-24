@@ -1,6 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Correctness tests for the multi-backend fused FP16 matmul BACKWARD (#633):
-// IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused computes both gradients of
+// IGpuHalfFusedKernels.MatMulBackwardFp16Fused computes both gradients of
 // C[M,N] = A[M,K]·B[K,N] — gradA[M,K] = gradC·Bᵀ and gradB[K,N] = Aᵀ·gradC — in
 // two FP16-in/FP32-accumulate GEMMs with no materialized transpose. These tests
 // validate the GENERALIZATION off CUDA onto every backend by checking each
@@ -21,7 +21,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Validates <see cref="IGpuHalfPrecisionBackend.MatMulBackwardFp16Fused"/> on every GPU backend that ships it.
+/// Validates <see cref="IGpuHalfFusedKernels.MatMulBackwardFp16Fused"/> on every GPU backend that ships it.
 /// Each test instantiates one backend, skips when its fused backward is unavailable on this system (unless
 /// <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c>, which turns the skip into a loud failure), and compares the fused
 /// gradients to a CPU oracle computed from FP16-rounded inputs. This box (AMD RDNA1) runs OpenCL + Vulkan;
@@ -41,7 +41,7 @@ public sealed class Fp16FusedBackwardParityTests
     /// must NOT be disposed. <paramref name="dispose"/> is the correct teardown for the acquired backend (a no-op
     /// for the Vulkan singleton). Returns null when the backend's fused FP16 backward is unavailable here.
     /// </summary>
-    private static (IGpuHalfPrecisionBackend? half, IDirectGpuBackend? backend, Action dispose, Exception? error) TryCreate(BackendKind kind)
+    private static (IGpuHalfFusedKernels? half, IDirectGpuBackend? backend, Action dispose, Exception? error) TryCreate(BackendKind kind)
     {
         try
         {
@@ -50,7 +50,7 @@ public sealed class Fp16FusedBackwardParityTests
                 case BackendKind.OpenCL:
                 {
                     var b = new OpenClBackend();
-                    if (b is IGpuHalfPrecisionBackend half && b.IsAvailable && half.SupportsFp16FusedBackward)
+                    if (b is IGpuHalfFusedKernels half && b.IsAvailable && half.SupportsFp16FusedBackward)
                         return (half, b, b.Dispose, null);
                     Exception? initializationException = b.InitializationException;
                     b.Dispose();
@@ -59,8 +59,8 @@ public sealed class Fp16FusedBackwardParityTests
                 case BackendKind.Vulkan:
                 {
                     var b = VulkanBackend.Instance;
-                    if (b.Initialize() && ((IGpuHalfPrecisionBackend)b).SupportsFp16FusedBackward)
-                        return ((IGpuHalfPrecisionBackend)b, b, () => { }, null); // singleton: do not dispose
+                    if (b.Initialize() && ((IGpuHalfFusedKernels)b).SupportsFp16FusedBackward)
+                        return ((IGpuHalfFusedKernels)b, b, () => { }, null); // singleton: do not dispose
                     return (null, null, () => { }, null);
                 }
                 default:

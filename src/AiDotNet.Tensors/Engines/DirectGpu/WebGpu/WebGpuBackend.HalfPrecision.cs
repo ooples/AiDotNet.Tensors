@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// IGpuHalfPrecisionBackend implementation for the WebGPU backend (issue #560):
+// IGpuHalfFusedKernels implementation for the WebGPU backend (issue #560):
 // FP16 GEMM so MatrixMultiply<Half> runs on the GPU instead of dropping to a
 // scalar CPU fallback.
 
@@ -13,7 +13,7 @@ using AiDotNet.Tensors.Engines.Gpu;
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 /// <summary>
-/// Half-precision GEMM dispatch for the <see cref="IGpuHalfPrecisionBackend"/>
+/// Half-precision GEMM dispatch for the <see cref="IGpuHalfFusedKernels"/>
 /// capability interface, so the backend-agnostic
 /// <c>DirectGpuTensorEngine.MatrixMultiply</c> FP16 path (issue #560) runs on
 /// WebGPU devices instead of falling back to the scalar CPU loop.
@@ -29,7 +29,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// kernel is needed because the data is already f32.
 /// </para>
 /// </summary>
-public sealed partial class WebGpuBackend : IGpuHalfPrecisionBackend, IFp16ConvBatchedGemmBackend
+public sealed partial class WebGpuBackend : IGpuHalfFusedKernels, IFp16ConvBatchedGemmBackend
 {
     /// <inheritdoc/>
     /// <remarks>

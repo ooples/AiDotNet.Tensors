@@ -555,10 +555,11 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// Allocates a zero-initialized GPU buffer.
     /// </summary>
     /// <inheritdoc/>
-    // Not yet: this backend serves every buffer from 4-byte float allocations, so only the 4-byte types have storage.
-    // MSL has no 64-bit float at all.
+    // Every buffer is a 4-byte-word allocation. Doubles are held two words each, low word first: MSL has no 64-bit
+    // float, and the double kernels compute on the words in integer arithmetic (MetalBackend.Float64). The narrower
+    // types have no storage here yet.
     public bool SupportsElementType(GpuElementType type)
-        => type is GpuElementType.Float32 or GpuElementType.Int32;
+        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64;
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
@@ -595,6 +596,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
         }
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Metal);
 
         var result = new float[buffer.Size];
@@ -615,6 +617,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
         }
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         if (metalBuffer.Handle == IntPtr.Zero && metalBuffer.Size > 0)
             throw new ObjectDisposedException(nameof(buffer));
         if (destination.Length < metalBuffer.Size)
@@ -695,6 +698,21 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         {
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
         }
+
+        // Offsets and size count elements of the buffers' type. The float kernel below moves one 4-byte word an
+        // element; a buffer of doubles (two words each) is copied by the word kernel, its range checked in doubles.
+        // Only 4- and 8-byte elements have a copy here: a narrower element counted as a double would address twice
+        // the bytes the range check allowed.
+        int elementBytes = GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
+        if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
+            throw new NotSupportedException($"{nameof(Copy)} on Metal copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
+        if (elementBytes == sizeof(double))
+        {
+            if (size > 0) CopyFloat64(srcBuffer, srcOffset, destBuffer, destOffset, size);
+            return;
+        }
+
+        if (size == 0) return;
 
         // Use element-wise copy kernel
         var pipeline = GetPipeline("ElementWise", _elementWiseLibrary, "copy_buffer");

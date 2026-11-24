@@ -1,6 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // Tests for the real Vulkan GPU GEMM (replacing the CPU download/loop/upload
-// fallback) and the FP16 IGpuHalfPrecisionBackend path (issue #560).
+// fallback) and the FP16 IGpuHalfFusedKernels path (issue #560).
 
 // System.Half / BitConverter.Int16BitsToHalf (the FP16 oracle) are .NET 6+.
 #if NET6_0_OR_GREATER
@@ -17,7 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// Verifies the Vulkan GPU GEMM on real hardware: the FP32 path (now a GLSL
 /// compute shader, previously a CPU fallback) and the FP16 mixed-precision path
-/// (<see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> / <see cref="IGpuHalfPrecisionBackend.Hgemm"/>).
+/// (<see cref="IGpuHalfFusedKernels.GemmFp16In32fOut"/> / <see cref="IGpuHalfFusedKernels.Hgemm"/>).
 /// <para>
 /// The FP16 oracle downloads the packed-FP16 operands and decodes each half with
 /// <see cref="BitConverter.Int16BitsToHalf"/> — the same IEEE binary16 decode the
@@ -239,7 +239,7 @@ public sealed class VulkanGemmTests
         var expected = CpuReference(aTrunc, bTrunc, m, n, k);
 
         using var cBuf = _backend.AllocateBuffer(m * n);
-        ((IGpuHalfPrecisionBackend)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+        ((IGpuHalfFusedKernels)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
         var actual = _backend.DownloadBuffer(cBuf);
 
         AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
@@ -251,7 +251,7 @@ public sealed class VulkanGemmTests
         Skip.If(!EnsureReady(needFp16: true), $"Vulkan FP16 GEMM not available on this system. {VulkanBackend.Instance.InitializationFailure}");
 
         using var dummy = _backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)_backend;
+        var half = (IGpuHalfFusedKernels)_backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

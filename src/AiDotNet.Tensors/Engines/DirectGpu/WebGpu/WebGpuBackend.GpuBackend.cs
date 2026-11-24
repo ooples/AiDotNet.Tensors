@@ -45,6 +45,7 @@ public sealed partial class WebGpuBackend
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
         EnsureInitialized();
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         var result = DownloadBufferData(buffer);
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
         return result;
@@ -64,6 +65,7 @@ public sealed partial class WebGpuBackend
         EnsureInitialized();
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (destination is null) throw new ArgumentNullException(nameof(destination));
+        GpuFloatLayout.Require(buffer, nameof(DownloadBuffer));
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
         if (buffer.Size == 0) return;
@@ -102,28 +104,22 @@ public sealed partial class WebGpuBackend
             wb.CopyBytesFrom(data);
     }
 
-    public void Copy(IGpuBuffer source, IGpuBuffer destination, int size)
-    {
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            0, 0, 0
-        };
-        Dispatch2BufferAsync("CopyOps", WebGpuKernels.CopyOpsSource, "copy_simple",
-            source, destination, uniforms, size).GetAwaiter().GetResult();
-    }
+    public void Copy(IGpuBuffer source, IGpuBuffer destination, int size) => Copy(source, 0, destination, 0, size);
 
+    // Offsets and length count elements of the buffers' type. Every element is moved as its 4-byte words, read and
+    // written as integers: a float load and store need not keep a NaN's bits, and an Int32 from -1 down to -8388607
+    // is a NaN pattern. Only 4- and 8-byte elements have a copy here: a narrower element counted in words would
+    // address more bytes than the range check allowed.
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
-        var uniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(length),
-            BitConverter.Int32BitsToSingle(sourceOffset),
-            BitConverter.Int32BitsToSingle(destinationOffset),
-            0
-        };
-        Dispatch2BufferAsync("CopyOps", WebGpuKernels.CopyOpsSource, "copy_offset",
-            source, destination, uniforms, length).GetAwaiter().GetResult();
+        EnsureInitialized();
+        RequireSynchronousRoute();
+        int elementBytes = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
+        if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
+            throw new NotSupportedException($"{nameof(Copy)} on WebGPU copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
+        if (length == 0) return;
+        int words = elementBytes / sizeof(float);
+        CopyWordRange(source, checked(sourceOffset * words), destination, checked(destinationOffset * words), checked(length * words));
     }
 
     // This backend serves byte buffers from its float allocations; the tag says the bytes are raw, not floats.

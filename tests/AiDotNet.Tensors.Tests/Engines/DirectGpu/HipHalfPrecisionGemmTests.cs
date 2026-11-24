@@ -1,5 +1,5 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
-// Correctness tests for the HIP/ROCm IGpuHalfPrecisionBackend implementation
+// Correctness tests for the HIP/ROCm IGpuHalfFusedKernels implementation
 // (issue #560): FP16 GEMM (C = A·B) on AMD GPUs instead of a scalar CPU fallback.
 
 // System.Half (the FP16 oracle) only exists on .NET 5+, and the FP16 GPU path is
@@ -15,8 +15,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
-/// Exercises <see cref="IGpuHalfPrecisionBackend.GemmFp16In32fOut"/> and
-/// <see cref="IGpuHalfPrecisionBackend.Hgemm"/> on the HIP backend against a CPU
+/// Exercises <see cref="IGpuHalfFusedKernels.GemmFp16In32fOut"/> and
+/// <see cref="IGpuHalfFusedKernels.Hgemm"/> on the HIP backend against a CPU
 /// reference computed from the SAME FP16-rounded inputs, so the only residual
 /// error is FP32 accumulation order. Honors <c>AIDOTNET_REQUIRE_GPU_TESTS=1</c>
 /// (throws instead of skipping when a GPU is required) per the no-silent-pass
@@ -121,7 +121,7 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
         using var cBuf = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            ((IGpuHalfFusedKernels)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
             var actual = Backend.DownloadBuffer(cBuf);
             AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
         }
@@ -147,7 +147,7 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
         using var cFp32 = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            ((IGpuHalfFusedKernels)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
             Backend.ConvertToFp32(cFp16, cFp32, m * n);
             var actual = Backend.DownloadBuffer(cFp32);
             AssertClose(expected, actual, absTol: 5e-2, relTol: 3e-2);
@@ -165,7 +165,7 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
         Skip.If(!EnsureReady(), "HIP FP16 GEMM not available on this system.");
 
         using var dummy = Backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)Backend;
+        var half = (IGpuHalfFusedKernels)Backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

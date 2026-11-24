@@ -79,7 +79,7 @@ public sealed class Fp16ConvBatchedGemmBackendTests
 
         try
         {
-            bool ready = backend is IGpuHalfPrecisionBackend { SupportsHgemm: true };
+            bool ready = backend is IGpuHalfFusedKernels fused && fused.HasHgemm();
             if (!ready && RequireGpu())
                 throw new InvalidOperationException($"GPU tests were required but the {backendName} FP16 GEMM was unavailable.");
             Skip.IfNot(ready, $"{backendName} FP16 GEMM not available on this system " +
