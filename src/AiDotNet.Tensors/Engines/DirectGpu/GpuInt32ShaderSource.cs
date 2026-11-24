@@ -36,6 +36,12 @@ internal static class GpuInt32ShaderSource
         GpuIntegerBinaryOperation.And => "and",
         GpuIntegerBinaryOperation.Or => "or",
         GpuIntegerBinaryOperation.Xor => "xor",
+        GpuIntegerBinaryOperation.Divide => "div",
+        GpuIntegerBinaryOperation.Remainder => "rem",
+        GpuIntegerBinaryOperation.Equal => "eq",
+        GpuIntegerBinaryOperation.NotEqual => "ne",
+        GpuIntegerBinaryOperation.Greater => "gt",
+        GpuIntegerBinaryOperation.Less => "lt",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -44,6 +50,8 @@ internal static class GpuInt32ShaderSource
     {
         GpuIntegerUnaryOperation.Negate => "neg",
         GpuIntegerUnaryOperation.Not => "not",
+        GpuIntegerUnaryOperation.Abs => "abs",
+        GpuIntegerUnaryOperation.Sign => "sign",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -51,10 +59,15 @@ internal static class GpuInt32ShaderSource
     {
         GpuIntegerBinaryOperation.Add, GpuIntegerBinaryOperation.Subtract, GpuIntegerBinaryOperation.Multiply,
         GpuIntegerBinaryOperation.Min, GpuIntegerBinaryOperation.Max, GpuIntegerBinaryOperation.And,
-        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor,
+        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor, GpuIntegerBinaryOperation.Divide,
+        GpuIntegerBinaryOperation.Remainder, GpuIntegerBinaryOperation.Equal, GpuIntegerBinaryOperation.NotEqual,
+        GpuIntegerBinaryOperation.Greater, GpuIntegerBinaryOperation.Less,
     };
 
-    public static readonly GpuIntegerUnaryOperation[] UnaryOperations = { GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not };
+    public static readonly GpuIntegerUnaryOperation[] UnaryOperations = 
+    {
+        GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not, GpuIntegerUnaryOperation.Abs, GpuIntegerUnaryOperation.Sign,
+    };
 
     // WGSL defines i32 arithmetic as wrapping. GLSL and MSL leave signed overflow to the compiler, so there the
     // wrapping operations are computed on the unsigned bits.
@@ -64,6 +77,31 @@ internal static class GpuInt32ShaderSource
             : "int(uint(" + left + ") " + symbol + " uint(" + right + "))";
 
     /// <summary><c>x op y</c>.</summary>
+    private static string Flag(GpuInt32ShaderDialect dialect, string condition)
+        => (dialect == GpuInt32ShaderDialect.Wgsl ? "i32(" : "int(") + condition + ")";
+
+    // `whenTrue` where `condition` holds, else `whenFalse`. WGSL has no conditional operator; its select evaluates
+    // both, which is why the operands below are made safe to evaluate either way.
+    private static string Choose(GpuInt32ShaderDialect dialect, string condition, string whenTrue, string whenFalse)
+        => dialect == GpuInt32ShaderDialect.Wgsl
+            ? "select(" + whenFalse + ", " + whenTrue + ", " + condition + ")"
+            : "((" + condition + ") ? " + whenTrue + " : " + whenFalse + ")";
+
+    // The quotient rounded toward zero, or its remainder, of `x` and `y`: on the magnitudes as unsigned values, where
+    // every dialect defines the division (signed division of negative operands is not defined by GLSL, and the most
+    // negative value over -1 by none of them), then signed. The divisor is never zero where the division is evaluated.
+    private static string Quotient(GpuInt32ShaderDialect dialect, bool remainder)
+    {
+        string u = dialect == GpuInt32ShaderDialect.Wgsl ? "u32(" : "uint(";
+        string i = dialect == GpuInt32ShaderDialect.Wgsl ? "i32(" : "int(";
+        string ax = Choose(dialect, "x < 0", "(0u - " + u + "x))", u + "x)");
+        string ay = "max(" + Choose(dialect, "y < 0", "(0u - " + u + "y))", u + "y)") + ", 1u)";
+        string magnitude = "(" + ax + (remainder ? " % " : " / ") + ay + ")";
+        string negative = remainder ? "x < 0" : "(x < 0) != (y < 0)";
+        string signed = i + Choose(dialect, negative, "(0u - " + magnitude + ")", magnitude) + ")";
+        return Choose(dialect, "y == 0", "0", signed);
+    }
+
     public static string Expression(GpuIntegerBinaryOperation operation, GpuInt32ShaderDialect dialect) => operation switch
     {
         GpuIntegerBinaryOperation.Add => Wrapping(dialect, "+", "x", "y"),
@@ -74,6 +112,12 @@ internal static class GpuInt32ShaderSource
         GpuIntegerBinaryOperation.And => "x & y",
         GpuIntegerBinaryOperation.Or => "x | y",
         GpuIntegerBinaryOperation.Xor => "x ^ y",
+        GpuIntegerBinaryOperation.Divide => Quotient(dialect, remainder: false),
+        GpuIntegerBinaryOperation.Remainder => Quotient(dialect, remainder: true),
+        GpuIntegerBinaryOperation.Equal => Flag(dialect, "x == y"),
+        GpuIntegerBinaryOperation.NotEqual => Flag(dialect, "x != y"),
+        GpuIntegerBinaryOperation.Greater => Flag(dialect, "x > y"),
+        GpuIntegerBinaryOperation.Less => Flag(dialect, "x < y"),
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -82,6 +126,9 @@ internal static class GpuInt32ShaderSource
     {
         GpuIntegerUnaryOperation.Negate => dialect == GpuInt32ShaderDialect.Wgsl ? "-x" : "int(0u - uint(x))",
         GpuIntegerUnaryOperation.Not => "~x",
+        // WGSL defines abs of the most negative i32 as itself; the others get it from the unsigned negation.
+        GpuIntegerUnaryOperation.Abs => dialect == GpuInt32ShaderDialect.Wgsl ? "abs(x)" : "((x < 0) ? int(0u - uint(x)) : x)",
+        GpuIntegerUnaryOperation.Sign => Flag(dialect, "x > 0") + " - " + Flag(dialect, "x < 0"),
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 

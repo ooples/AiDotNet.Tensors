@@ -924,9 +924,17 @@ AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Multiply = 2 -> AiD
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Or = 6 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Subtract = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Xor = 7 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Divide = 8 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Remainder = 9 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Equal = 10 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.NotEqual = 11 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Greater = 12 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Less = 13 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Negate = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Not = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Abs = 2 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
+AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation.Sign = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerUnaryOperation
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.BinaryInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! b, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.ScalarInteger(AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, long scalar, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
 AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend.SumInteger(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> long

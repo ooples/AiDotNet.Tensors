@@ -197,6 +197,13 @@ internal static class GpuPackedKernelSource
         return "(int(" + operand + " << " + up + ") >> " + up + ")";
     }
 
+    // The element as a 32-bit two's complement word.
+    private static string Word(GpuElementType type, string operand)
+        => type == GpuElementType.UInt8 ? operand : "uint(" + Signed(type, operand) + ")";
+
+    private static bool UsesLibrary(GpuIntegerBinaryOperation operation, GpuElementType type)
+        => type == GpuElementType.Int64 || operation is GpuIntegerBinaryOperation.Divide or GpuIntegerBinaryOperation.Remainder;
+
     private static string LaneValue(GpuIntegerBinaryOperation operation, GpuElementType type)
     {
         if (type == GpuElementType.Bool)
@@ -226,6 +233,13 @@ internal static class GpuPackedKernelSource
             GpuIntegerBinaryOperation.And => "x & y",
             GpuIntegerBinaryOperation.Or => "x | y",
             GpuIntegerBinaryOperation.Xor => "x ^ y",
+            // Sign-extended to 32 bits, so the library divides two's complement words; an unsigned element is its own.
+            GpuIntegerBinaryOperation.Divide => "pk_sdiv(" + Word(type, "x") + ", " + Word(type, "y") + ")",
+            GpuIntegerBinaryOperation.Remainder => "pk_srem(" + Word(type, "x") + ", " + Word(type, "y") + ")",
+            GpuIntegerBinaryOperation.Equal => "uint(x == y)",
+            GpuIntegerBinaryOperation.NotEqual => "uint(x != y)",
+            GpuIntegerBinaryOperation.Greater => signed ? "uint(" + Signed(type, "x") + " > " + Signed(type, "y") + ")" : "uint(x > y)",
+            GpuIntegerBinaryOperation.Less => signed ? "uint(" + Signed(type, "x") + " < " + Signed(type, "y") + ")" : "uint(x < y)",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
         };
     }
@@ -242,8 +256,41 @@ internal static class GpuPackedKernelSource
         GpuIntegerBinaryOperation.And => "    rl = xl & yl;\n    rh = xh & yh;\n",
         GpuIntegerBinaryOperation.Or => "    rl = xl | yl;\n    rh = xh | yh;\n",
         GpuIntegerBinaryOperation.Xor => "    rl = xl ^ yl;\n    rh = xh ^ yh;\n",
+        GpuIntegerBinaryOperation.Divide => WideDivide + WideSigned("ql", "qh", "nx != ny"),
+        GpuIntegerBinaryOperation.Remainder => WideDivide + WideSigned("ml", "mh", "nx != 0u"),
+        GpuIntegerBinaryOperation.Equal => WideFlag("(xl == yl) && (xh == yh)"),
+        GpuIntegerBinaryOperation.NotEqual => WideFlag("(xl != yl) || (xh != yh)"),
+        GpuIntegerBinaryOperation.Greater => WideFlag(WideGreater),
+        GpuIntegerBinaryOperation.Less => WideFlag(WideLess),
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
+
+    private const string WideLess = "(int(xh) < int(yh)) || ((xh == yh) && (xl < yl))";
+
+    private const string WideGreater = "(int(xh) > int(yh)) || ((xh == yh) && (xl > yl))";
+
+    // Shift-and-subtract division of the 64-bit magnitudes, a quotient bit a step: (ql, qh) the quotient and (ml, mh)
+    // the remainder, both zero for a zero divisor. The magnitude of the most negative value is 2^63, which fits.
+    private const string WideDivide =
+        "    uint nx = xh >> 31u;\n    uint ny = yh >> 31u;\n    uint al = xl;\n    uint ah = xh;\n"
+        + "    if (nx != 0u) {\n        al = 0u - xl;\n        ah = (~xh) + uint(xl == 0u);\n    }\n"
+        + "    uint bl = yl;\n    uint bh = yh;\n"
+        + "    if (ny != 0u) {\n        bl = 0u - yl;\n        bh = (~yh) + uint(yl == 0u);\n    }\n"
+        + "    uint ql = 0u;\n    uint qh = 0u;\n    uint ml = 0u;\n    uint mh = 0u;\n"
+        + "    if ((bl | bh) != 0u) {\n        for (uint step = 0u; step < 64u; step++) {\n"
+        + "            mh = (mh << 1u) | (ml >> 31u);\n            ml = (ml << 1u) | (ah >> 31u);\n"
+        + "            ah = (ah << 1u) | (al >> 31u);\n            al = al << 1u;\n"
+        + "            qh = (qh << 1u) | (ql >> 31u);\n            ql = ql << 1u;\n"
+        + "            bool ge = (mh > bh) || ((mh == bh) && (ml >= bl));\n"
+        + "            if (ge) {\n                uint borrow = uint(ml < bl);\n                ml = ml - bl;\n"
+        + "                mh = (mh - bh) - borrow;\n                ql = ql | 1u;\n            }\n        }\n    }\n";
+
+    // (rl, rh) = (l, h), negated where `negative` holds.
+    private static string WideSigned(string l, string h, string negative)
+        => "    rl = " + l + ";\n    rh = " + h + ";\n    if (" + negative + ") {\n        rl = 0u - " + l + ";\n        rh = (~" + h
+            + ") + uint(" + l + " == 0u);\n    }\n";
+
+    private static string WideFlag(string condition) => "    rl = uint(" + condition + ");\n    rh = 0u;\n";
 
     private const string WideHead = "    uint xl = a[gid * 2u];\n    uint xh = a[(gid * 2u) + 1u];\n";
 
@@ -257,7 +304,7 @@ internal static class GpuPackedKernelSource
         RequireInteger(type);
         if (!GpuIntegerLayout.Defined(operation, type))
             throw new ArgumentException($"{operation} is not defined on {type}.", nameof(operation));
-        return Kernel("pk_" + Stem(operation) + "_" + Suffix(type), 3, type == GpuElementType.Int64 ? IntegerLibrary : string.Empty,
+        return Kernel("pk_" + Stem(operation) + "_" + Suffix(type), 3, UsesLibrary(operation, type) ? IntegerLibrary : string.Empty,
             () => type == GpuElementType.Int64
                 ? WideHead + "    uint yl = b[gid * 2u];\n    uint yh = b[(gid * 2u) + 1u];\n" + WideResult + WideStatements(operation) + WideTail
                 : LaneBody(type, second: true, scalar: false, LaneValue(operation, type)));
@@ -269,7 +316,7 @@ internal static class GpuPackedKernelSource
         RequireInteger(type);
         if (!GpuIntegerLayout.Defined(operation, type))
             throw new ArgumentException($"{operation} is not defined on {type}.", nameof(operation));
-        return Kernel("pk_" + Stem(operation) + "_s_" + Suffix(type), 2, type == GpuElementType.Int64 ? IntegerLibrary : string.Empty,
+        return Kernel("pk_" + Stem(operation) + "_s_" + Suffix(type), 2, UsesLibrary(operation, type) ? IntegerLibrary : string.Empty,
             () => type == GpuElementType.Int64
                 ? WideHead + "    uint yl = pb;\n    uint yh = pc;\n" + WideResult + WideStatements(operation) + WideTail
                 : LaneBody(type, second: false, scalar: true, LaneValue(operation, type)));
@@ -281,18 +328,36 @@ internal static class GpuPackedKernelSource
         RequireInteger(type);
         if (!GpuIntegerLayout.Defined(operation, type))
             throw new ArgumentException($"{operation} is not defined on {type}.", nameof(operation));
-        return Kernel("pk_" + Stem(operation) + "_" + Suffix(type), 2, string.Empty, () =>
+        bool library = operation == GpuIntegerUnaryOperation.Abs && type != GpuElementType.Int64 && type != GpuElementType.UInt8;
+        return Kernel("pk_" + Stem(operation) + "_" + Suffix(type), 2, library ? IntegerLibrary : string.Empty, () =>
         {
             if (type == GpuElementType.Int64)
             {
-                string statements = operation == GpuIntegerUnaryOperation.Negate
-                    ? "    rl = 0u - xl;\n    rh = (~xh) + uint(xl == 0u);\n"
-                    : "    rl = ~xl;\n    rh = ~xh;\n";
+                string statements = operation switch
+                {
+                    GpuIntegerUnaryOperation.Negate => "    rl = 0u - xl;\n    rh = (~xh) + uint(xl == 0u);\n",
+                    GpuIntegerUnaryOperation.Abs => WideSigned("xl", "xh", "(xh >> 31u) != 0u"),
+                    // All ones for a negative value, else whether it is not zero.
+                    GpuIntegerUnaryOperation.Sign => "    rl = uint((xl | xh) != 0u);\n    rh = 0u;\n"
+                        + "    if ((xh >> 31u) != 0u) {\n        rl = 0xFFFFFFFFu;\n        rh = 0xFFFFFFFFu;\n    }\n",
+                    _ => "    rl = ~xl;\n    rh = ~xh;\n",
+                };
                 return WideHead + WideResult + statements + WideTail;
             }
 
-            string value = type == GpuElementType.Bool ? "uint(x == 0u)"
-                : operation == GpuIntegerUnaryOperation.Negate ? "0u - x" : "~x";
+            bool signed = type != GpuElementType.UInt8;
+            string value = type == GpuElementType.Bool ? "uint(x == 0u)" : operation switch
+            {
+                GpuIntegerUnaryOperation.Negate => "0u - x",
+                GpuIntegerUnaryOperation.Abs => signed ? "pk_abs(" + Word(type, "x") + ")" : "x",
+                // On the element's own sign bit: 1 for a value that is not zero, less 2 for a negative one (all ones,
+                // -1 in the element once it is placed). One compiler (Vulkan, AMD) answered a sign-extended
+                // comparison with zero as though the element could not be negative.
+                GpuIntegerUnaryOperation.Sign => signed
+                    ? "uint(x != 0u) - (2u * ((x >> " + (type == GpuElementType.Int8 ? "7u" : "15u") + ") & 1u))"
+                    : "uint(x != 0u)",
+                _ => "~x",
+            };
             return LaneBody(type, second: false, scalar: false, value);
         });
     }

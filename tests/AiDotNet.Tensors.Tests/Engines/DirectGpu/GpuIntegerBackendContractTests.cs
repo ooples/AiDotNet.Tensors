@@ -113,6 +113,14 @@ public abstract class GpuIntegerBackendContractTests
             GpuIntegerBinaryOperation.Max => Math.Max(x, y),
             GpuIntegerBinaryOperation.And => x & y,
             GpuIntegerBinaryOperation.Or => x | y,
+            // Defined everywhere: a zero divisor gives 0, and over -1 the quotient is the wrapping negation (the host
+            // operators raise for both in 64 bits).
+            GpuIntegerBinaryOperation.Divide => y == 0 ? 0 : y == -1 ? unchecked(-x) : x / y,
+            GpuIntegerBinaryOperation.Remainder => y == 0 || y == -1 ? 0 : x % y,
+            GpuIntegerBinaryOperation.Equal => x == y ? 1 : 0,
+            GpuIntegerBinaryOperation.NotEqual => x != y ? 1 : 0,
+            GpuIntegerBinaryOperation.Greater => x > y ? 1 : 0,
+            GpuIntegerBinaryOperation.Less => x < y ? 1 : 0,
             _ => x ^ y,
         };
         return GpuIntegerLayout.Wrap(wide, type);
@@ -120,7 +128,14 @@ public abstract class GpuIntegerBackendContractTests
 
     private static long Host(GpuIntegerUnaryOperation operation, GpuElementType type, long x)
         => type == GpuElementType.Bool ? (x == 0 ? 1 : 0)
-            : GpuIntegerLayout.Wrap(operation == GpuIntegerUnaryOperation.Negate ? unchecked(-x) : ~x, type);
+            : GpuIntegerLayout.Wrap(operation switch
+            {
+                GpuIntegerUnaryOperation.Negate => unchecked(-x),
+                // The most negative value is its own absolute value, as it is its own negation.
+                GpuIntegerUnaryOperation.Abs => x < 0 ? unchecked(-x) : x,
+                GpuIntegerUnaryOperation.Sign => Math.Sign(x),
+                _ => ~x,
+            }, type);
 
     private static readonly GpuElementType[] Types =
     {
@@ -158,6 +173,12 @@ public abstract class GpuIntegerBackendContractTests
     [InlineData(GpuIntegerBinaryOperation.And)]
     [InlineData(GpuIntegerBinaryOperation.Or)]
     [InlineData(GpuIntegerBinaryOperation.Xor)]
+    [InlineData(GpuIntegerBinaryOperation.Divide)]
+    [InlineData(GpuIntegerBinaryOperation.Remainder)]
+    [InlineData(GpuIntegerBinaryOperation.Equal)]
+    [InlineData(GpuIntegerBinaryOperation.NotEqual)]
+    [InlineData(GpuIntegerBinaryOperation.Greater)]
+    [InlineData(GpuIntegerBinaryOperation.Less)]
     public void Binary_and_scalar_kernels_equal_the_host(GpuIntegerBinaryOperation operation)
     {
         var backend = Device();
@@ -201,6 +222,8 @@ public abstract class GpuIntegerBackendContractTests
     [SkippableTheory]
     [InlineData(GpuIntegerUnaryOperation.Negate)]
     [InlineData(GpuIntegerUnaryOperation.Not)]
+    [InlineData(GpuIntegerUnaryOperation.Abs)]
+    [InlineData(GpuIntegerUnaryOperation.Sign)]
     public void Unary_kernels_equal_the_host(GpuIntegerUnaryOperation operation)
     {
         var backend = Device();

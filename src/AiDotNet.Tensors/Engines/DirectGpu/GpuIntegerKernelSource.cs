@@ -54,6 +54,12 @@ internal static class GpuIntegerKernelSource
         GpuIntegerBinaryOperation.And => "iand",
         GpuIntegerBinaryOperation.Or => "ior",
         GpuIntegerBinaryOperation.Xor => "ixor",
+        GpuIntegerBinaryOperation.Divide => "idiv",
+        GpuIntegerBinaryOperation.Remainder => "irem",
+        GpuIntegerBinaryOperation.Equal => "ieq",
+        GpuIntegerBinaryOperation.NotEqual => "ine",
+        GpuIntegerBinaryOperation.Greater => "igt",
+        GpuIntegerBinaryOperation.Less => "ilt",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -61,6 +67,8 @@ internal static class GpuIntegerKernelSource
     {
         GpuIntegerUnaryOperation.Negate => "ineg",
         GpuIntegerUnaryOperation.Not => "inot",
+        GpuIntegerUnaryOperation.Abs => "iabs",
+        GpuIntegerUnaryOperation.Sign => "isign",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -89,10 +97,15 @@ internal static class GpuIntegerKernelSource
     {
         GpuIntegerBinaryOperation.Add, GpuIntegerBinaryOperation.Subtract, GpuIntegerBinaryOperation.Multiply,
         GpuIntegerBinaryOperation.Min, GpuIntegerBinaryOperation.Max, GpuIntegerBinaryOperation.And,
-        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor,
+        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor, GpuIntegerBinaryOperation.Divide,
+        GpuIntegerBinaryOperation.Remainder, GpuIntegerBinaryOperation.Equal, GpuIntegerBinaryOperation.NotEqual,
+        GpuIntegerBinaryOperation.Greater, GpuIntegerBinaryOperation.Less,
     };
 
-    private static readonly GpuIntegerUnaryOperation[] UnaryOperations = { GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not };
+    private static readonly GpuIntegerUnaryOperation[] UnaryOperations = 
+    {
+        GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not, GpuIntegerUnaryOperation.Abs, GpuIntegerUnaryOperation.Sign,
+    };
 
     private static List<string> BuildNames()
     {
@@ -123,6 +136,14 @@ internal static class GpuIntegerKernelSource
         GpuIntegerBinaryOperation.And => logical ? "(x != 0) && (y != 0)" : "x & y",
         GpuIntegerBinaryOperation.Or => logical ? "(x != 0) || (y != 0)" : "x | y",
         GpuIntegerBinaryOperation.Xor => logical ? "(x != 0) != (y != 0)" : "x ^ y",
+        // C leaves a zero divisor and the most negative value over -1 undefined: both are decided before the
+        // division, whose divisor is never zero. Over -1 the quotient is the wrapping negation.
+        GpuIntegerBinaryOperation.Divide => "y == 0 ? 0 : (y == -1 ? (W)0 - (W)x : x / (y == 0 ? 1 : y))",
+        GpuIntegerBinaryOperation.Remainder => "(y == 0 || y == -1) ? 0 : x % (y == 0 ? 1 : y)",
+        GpuIntegerBinaryOperation.Equal => "x == y",
+        GpuIntegerBinaryOperation.NotEqual => "x != y",
+        GpuIntegerBinaryOperation.Greater => "x > y",
+        GpuIntegerBinaryOperation.Less => "x < y",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -176,7 +197,13 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
 
             foreach (var operation in UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)))
             {
-                string expression = operation == GpuIntegerUnaryOperation.Negate ? "(" + w + ")0 - (" + w + ")x" : logical ? "x == 0" : "~x";
+                string expression = operation switch
+                {
+                    GpuIntegerUnaryOperation.Negate => "(" + w + ")0 - (" + w + ")x",
+                    GpuIntegerUnaryOperation.Abs => "x < 0 ? (" + w + ")0 - (" + w + ")x : (" + w + ")x",
+                    GpuIntegerUnaryOperation.Sign => "(x > 0) - (x < 0)",
+                    _ => logical ? "x == 0" : "~x",
+                };
                 source.Append("IK_KERNEL ").Append(Unary(operation, type))
                     .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR ").Append(t)
                     .Append("* o, const int size)\n{\n    const int i = IK_GID;\n    if (i < size) { const ").Append(t)

@@ -21,6 +21,24 @@ public enum GpuIntegerBinaryOperation
     Or,
     /// <summary>Bitwise exclusive or; the logical exclusive or of two <see cref="GpuElementType.Bool"/> elements.</summary>
     Xor,
+    /// <summary>
+    /// <c>a[i] / b[i]</c> rounded toward zero. Defined everywhere, as a device cannot raise: a zero divisor gives 0,
+    /// and the most negative value divided by -1 wraps to itself.
+    /// </summary>
+    Divide,
+    /// <summary>
+    /// The remainder of the division rounded toward zero (the sign of <c>a[i]</c>, as the host's <c>%</c>); a zero
+    /// divisor gives 0.
+    /// </summary>
+    Remainder,
+    /// <summary>1 where <c>a[i] == b[i]</c>, otherwise 0, in the element type.</summary>
+    Equal,
+    /// <summary>1 where <c>a[i] != b[i]</c>, otherwise 0, in the element type.</summary>
+    NotEqual,
+    /// <summary>1 where <c>a[i] &gt; b[i]</c>, otherwise 0, in the element type.</summary>
+    Greater,
+    /// <summary>1 where <c>a[i] &lt; b[i]</c>, otherwise 0, in the element type.</summary>
+    Less,
 }
 
 /// <summary>An element-wise operation over one integer or <see cref="GpuElementType.Bool"/> buffer.</summary>
@@ -30,6 +48,10 @@ public enum GpuIntegerUnaryOperation
     Negate,
     /// <summary>Bitwise complement; the logical negation of a <see cref="GpuElementType.Bool"/> element.</summary>
     Not,
+    /// <summary><c>|x|</c>, wrapping in the element type (the most negative value is its own absolute value).</summary>
+    Abs,
+    /// <summary>-1, 0 or 1 by the sign of <c>x</c>.</summary>
+    Sign,
 }
 
 /// <summary>
