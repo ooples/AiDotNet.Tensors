@@ -1640,7 +1640,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     c.x = xf_maxf(a.x, b.x); c.y = xf_maxf(a.y, b.y); c.z = xf_maxf(a.z, b.z); c.w = xf_maxf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
-";
+" + KernelSourceResources.Read("CudaChannelEpilogue.c");
         }
 
         public static string[] GetKernelNames()
@@ -1757,6 +1757,12 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "bias_add",
                 "bias_add_out",
                 "conv2d_bias_add",
+                "conv_epilogue_nhwc_nchw",
+                "channel_epilogue_fwd",
+                "channel_epilogue_bwd",
+                "channel_epilogue_flat_fwd",
+                "channel_epilogue_flat_bwd",
+                "layout_transpose_tiles",
                 "conv2d_bias_add_out",
                 // Vectorized (float4) unary
                 "relu_vec4",

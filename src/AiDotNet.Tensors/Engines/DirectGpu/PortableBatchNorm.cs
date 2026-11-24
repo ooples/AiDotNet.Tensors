@@ -18,11 +18,17 @@ internal static class PortableBatchNorm
     // Every API's guaranteed 1-D grid; past it (more channels) the caller's composed path runs.
     private const int MaxGroups = 65535;
 
-    private static int[] Ints(int batch, int channels, int spatial, float epsilon, long count, int mode) => new[]
+    // Mode bit 32 (with the ReLU bit): the activation is a LeakyReLU of `slope` (positive).
+    private const int LeakyMode = 32;
+
+    private static int[] Ints(int batch, int channels, int spatial, float epsilon, long count, int mode, float slope = 0f) => new[]
     {
         batch, channels, spatial, SingleToInt32BitsCompat(epsilon),
-        SingleToInt32BitsCompat((float)(1.0 / count)), mode,
+        SingleToInt32BitsCompat((float)(1.0 / count)), mode, SingleToInt32BitsCompat(slope),
     };
+
+    // A LeakyReLU slope the kernels take: positive and finite (the backward's mask is the output's sign).
+    internal static bool IsLeakySlope(float slope) => slope > 0f && !float.IsInfinity(slope);
 
 #if !NETCOREAPP
     // BitConverter.SingleToInt32Bits is unavailable on net471; reinterpret the bits via a pointer there.
@@ -40,8 +46,12 @@ internal static class PortableBatchNorm
 
     internal static bool TryForward(IDirectGpuBackend backend, Launcher launch, IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
-        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual, bool unpacked = false)
+        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual, bool unpacked = false,
+        float leakySlope = float.NaN)
     {
+        bool leaky = !float.IsNaN(leakySlope);
+        if (leaky && (!relu || residual is not null || !IsLeakySlope(leakySlope))) return false;
+        float slope = leaky ? leakySlope : 0f;
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
         if (k == 0 || batch <= 0 || spatial <= 0 || channels <= 0 || channels > MaxGroups || n > int.MaxValue
@@ -49,12 +59,12 @@ internal static class PortableBatchNorm
             || saveMean.Size < channels || saveVariance.Size < channels
             || (residual is not null && (!relu || residual.Size < n)))
             return false;
-        int mode = (relu ? 1 : 0) | (residual is not null ? 2 : 0);
+        int mode = (relu ? 1 : 0) | (residual is not null ? 2 : 0) | (leaky ? LeakyMode : 0);
         if (unpacked)
         {
             launch(BatchNormRegisterKernelTemplate.ForwardUnpackedName(k), channels,
                 new[] { input, residual ?? input, output, gamma, beta, saveMean, saveVariance },
-                Ints(batch, channels, spatial, epsilon, count, mode));
+                Ints(batch, channels, spatial, epsilon, count, mode, slope));
             return true;
         }
         using var prm = backend.AllocateBuffer(2 * channels);
@@ -62,7 +72,7 @@ internal static class PortableBatchNorm
         backend.Copy(gamma, 0, prm, 0, channels);
         backend.Copy(beta, 0, prm, channels, channels);
         launch(BatchNormRegisterKernelTemplate.ForwardName(k), channels,
-            new[] { input, residual ?? input, output, prm, stats }, Ints(batch, channels, spatial, epsilon, count, mode));
+            new[] { input, residual ?? input, output, prm, stats }, Ints(batch, channels, spatial, epsilon, count, mode, slope));
         backend.Copy(stats, 0, saveMean, 0, channels);
         backend.Copy(stats, channels, saveVariance, 0, channels);
         return true;
@@ -73,8 +83,12 @@ internal static class PortableBatchNorm
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput,
         IGpuBuffer? gradResidual, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool canRebuildMask = true, bool unpacked = false,
-        bool accumulateGradInput = false)
+        bool accumulateGradInput = false, float leakySlope = float.NaN)
     {
+        // leakySlope: the activation was a LeakyReLU of that slope and reluOutput is its output (no residual).
+        bool leaky = !float.IsNaN(leakySlope);
+        if (leaky && (reluOutput is null || gradResidual is not null || !IsLeakySlope(leakySlope))) return false;
+        float slope = leaky ? leakySlope : 0f;
         long count = (long)batch * spatial, n = count * channels;
         int k = BatchNormRegisterKernelTemplate.VariantFor(count);
         if (k == 0 || batch <= 0 || spatial <= 0 || channels <= 0 || channels > MaxGroups || n > int.MaxValue
@@ -90,7 +104,7 @@ internal static class PortableBatchNorm
         if (unpacked)
         {
             int unpackedMode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
-                               | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0);
+                               | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0) | (leaky ? LeakyMode : 0);
             // A placeholder for an absent residual gradient: the kernel writes it only under mode bit 1.
             IGpuBuffer? absentResidual = null;
             IGpuBuffer residualBinding = gradResidual ?? (absentResidual = backend.AllocateBuffer(1));
@@ -99,7 +113,7 @@ internal static class PortableBatchNorm
                 launch(BatchNormRegisterKernelTemplate.BackwardUnpackedName(k), channels,
                     new[] { gradOutput, rebuildMask ? input : reluOutput ?? input, residualBinding, input, gamma, beta ?? gamma,
                         saveMean, saveVariance, gradInput, gradGamma, gradBeta, gradOutput2 ?? gradOutput },
-                    Ints(batch, channels, spatial, epsilon, count, unpackedMode));
+                    Ints(batch, channels, spatial, epsilon, count, unpackedMode, slope));
             }
             return true;
         }
@@ -111,11 +125,11 @@ internal static class PortableBatchNorm
         backend.Copy(saveMean, 0, prm, 2 * channels, channels);
         backend.Copy(saveVariance, 0, prm, 3 * channels, channels);
         int mode = (reluOutput is not null ? 1 : 0) | (gradResidual is not null ? 2 : 0) | (rebuildMask ? 4 : 0)
-                   | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0);
+                   | (gradOutput2 is not null ? 8 : 0) | (accumulateGradInput ? 16 : 0) | (leaky ? LeakyMode : 0);
         var mask = rebuildMask ? input : reluOutput ?? input;
         launch(BatchNormRegisterKernelTemplate.BackwardName(k), channels,
             new[] { gradOutput, mask, gradResidual ?? noResidual!, input, prm, gradInput, dprm, gradOutput2 ?? gradOutput },
-            Ints(batch, channels, spatial, epsilon, count, mode));
+            Ints(batch, channels, spatial, epsilon, count, mode, slope));
         backend.Copy(dprm, 0, gradGamma, 0, channels);
         backend.Copy(dprm, channels, gradBeta, 0, channels);
         return true;

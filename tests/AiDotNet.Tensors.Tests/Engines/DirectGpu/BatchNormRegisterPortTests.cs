@@ -11,8 +11,8 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// The register-resident training BatchNorm (<see cref="IBatchNormVarianceBackend"/>) on each non-CUDA backend
 /// (<see cref="PortableBatchNorm"/>, #1489), against a CPU BatchNorm accumulated in double: every forward form (plain,
-/// +ReLU, +residual+ReLU) and backward form (plain, ReLU mask read, ReLU mask rebuilt from x, +residual, a second output
-/// gradient summed in), over slices that take each per-thread variant. The ReLU masks of the reference are the GPU
+/// +ReLU, +residual+ReLU, +LeakyReLU) and backward form (plain, ReLU or LeakyReLU mask read, mask rebuilt from x,
+/// +residual, a second output gradient summed in), over slices that take each per-thread variant. The ReLU masks of the reference are the GPU
 /// forward's own (its output > 0), so the rebuilt mask must reproduce the read one exactly.
 /// </summary>
 [Collection("DirectGpuSerial")]
@@ -93,9 +93,9 @@ public class BatchNormRegisterPortTests
         Skip.IfNot(backend.IsAvailable, "CUDA backend did not initialize.");
         long before = System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches);
         Check(backend, batch, channels, spatial, xScale, xOffset);
-        // 3 forwards + 10 backwards (plain x2, relu read x2, relu rebuilt x3, add+relu x3, each form also accumulating),
-        // every one through the split kernels.
-        Assert.Equal(13, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
+        // 4 forwards + 14 backwards (plain x2, relu read x2, relu rebuilt x3, add+relu x3, leaky read x2, leaky rebuilt x2,
+        // each form also accumulating), every one through the split kernels.
+        Assert.Equal(18, System.Threading.Interlocked.Read(ref AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend.BatchNormSplitLaunches) - before);
     }
 
     [SkippableTheory]
@@ -147,6 +147,7 @@ public class BatchNormRegisterPortTests
     private void Check(IDirectGpuBackend backend, int batch, int channels, int spatial, double xScale = 2.0, double xOffset = 0.3)
     {
         var bn = Assert.IsAssignableFrom<IBatchNormVarianceBackend>(backend);
+        var leakyBn = Assert.IsAssignableFrom<IBatchNormLeakyReluBackend>(backend);
         int n = batch * channels * spatial;
         var x = Random(n, 1, xScale, xOffset);
         var residual = Random(n, 2, 1.0, 0.0);
@@ -183,6 +184,7 @@ public class BatchNormRegisterPortTests
             Compare($"fwd {form} var {label}", refVar, backend.DownloadBuffer(bvar));
             Compare($"fwd {form} y {label}", ForwardReference(x, withResidual ? residual : null, relu, gamma, beta, refMean, refVar,
                 batch, channels, spatial), y);
+            AssertNoLeakyOnDisallowedForms();
             if (!relu)
             {
                 RunBackward("bwd plain", reluOutput: null, residualGrad: false, rebuild: false, second: false, mask: null);
@@ -207,6 +209,54 @@ public class BatchNormRegisterPortTests
                 RunBackward("bwd relu rebuilt +dy2 +acc", by, residualGrad: false, rebuild: true, second: true, mask,
                     accumulate: true);
             }
+        }
+
+        // BatchNorm -> LeakyReLU(0.2): the forward, then the backward with dY scaled by the slope where the LeakyReLU
+        // output is not positive, its mask read from that output or rebuilt from x.
+        {
+            const float slope = 0.2f;
+            Assert.True(leakyBn.TryBatchNormLeakyReluTraining(bx, by, bg, bb, bmean, bvar, batch, channels, spatial, Epsilon,
+                slope), $"the leaky forward refused {label}");
+            backend.Synchronize();
+            var y = backend.DownloadBuffer(by);
+            Compare($"fwd leaky mean {label}", refMean, backend.DownloadBuffer(bmean));
+            Compare($"fwd leaky var {label}", refVar, backend.DownloadBuffer(bvar));
+            Compare($"fwd leaky y {label}", ForwardReference(x, null, relu: true, gamma, beta, refMean, refVar, batch, channels,
+                spatial, slope), y);
+            var mask = new bool[n];
+            for (int i = 0; i < n; i++) mask[i] = y[i] > 0f;
+            Assert.Contains(false, mask);
+            Assert.Contains(true, mask);
+            RunLeakyBackward("bwd leaky read", rebuild: false, second: false, accumulate: false);
+            RunLeakyBackward("bwd leaky rebuilt +dy2", rebuild: true, second: true, accumulate: false);
+            RunLeakyBackward("bwd leaky read +acc", rebuild: false, second: false, accumulate: true);
+            RunLeakyBackward("bwd leaky rebuilt +acc", rebuild: true, second: false, accumulate: true);
+
+            void RunLeakyBackward(string form, bool rebuild, bool second, bool accumulate)
+            {
+                if (accumulate) backend.Copy(bprior, bdx, n);
+                else backend.Fill(bdx, float.NaN, n);
+                backend.Fill(bdg, float.NaN, channels);
+                backend.Fill(bdb, float.NaN, channels);
+                Assert.True(leakyBn.TryBatchNormLeakyReluBackward(bdy, by, bx, bg, rebuild ? bb : null, bmean, bvar, bdx, bdg,
+                    bdb, batch, channels, spatial, Epsilon, slope, second ? bdy2 : null, accumulate),
+                    $"the backward refused {form} {label}");
+                backend.Synchronize();
+                var (dx, dgamma, dbeta, _) = BackwardReference(x, dy, second ? dy2 : null, mask, gamma, refMean, refVar,
+                    batch, channels, spatial, slope);
+                if (accumulate) for (int i = 0; i < n; i++) dx[i] += priorDx[i];
+                Compare($"{form} dX {label}", dx, backend.DownloadBuffer(bdx));
+                Compare($"{form} dGamma {label}", dgamma, backend.DownloadBuffer(bdg));
+                Compare($"{form} dBeta {label}", dbeta, backend.DownloadBuffer(bdb));
+            }
+        }
+
+        // A slope the kernels do not take (the mask is the output's sign only for a positive slope) launches nothing.
+        void AssertNoLeakyOnDisallowedForms()
+        {
+            foreach (float bad in new[] { 0f, -0.1f, float.NaN, float.PositiveInfinity })
+                Assert.False(leakyBn.TryBatchNormLeakyReluTraining(bx, bdr, bg, bb, bmean, bvar, batch, channels, spatial,
+                    Epsilon, bad), $"the leaky forward took slope {bad}");
         }
 
         // accumulate: the input gradient is added to what the destination holds (an accumulator with this step's
@@ -253,7 +303,7 @@ public class BatchNormRegisterPortTests
     }
 
     private static double[] ForwardReference(float[] x, float[]? residual, bool relu, float[] gamma, float[] beta, double[] mean,
-        double[] variance, int batch, int channels, int spatial)
+        double[] variance, int batch, int channels, int spatial, double slope = 0.0)
     {
         var y = new double[x.Length];
         for (int b = 0; b < batch; b++)
@@ -265,7 +315,7 @@ public class BatchNormRegisterPortTests
                     int idx = (b * channels + c) * spatial + i;
                     double v = gamma[c] * (x[idx] - mean[c]) * inv + beta[c];
                     if (residual is not null) v += residual[idx];
-                    if (relu && v < 0) v = 0;
+                    if (relu && v < 0) v *= slope;
                     y[idx] = v;
                 }
             }
@@ -273,14 +323,15 @@ public class BatchNormRegisterPortTests
     }
 
     private static (double[] Dx, double[] DGamma, double[] DBeta, double[] DRes) BackwardReference(float[] x, float[] dy,
-        float[]? dy2, bool[]? mask, float[] gamma, double[] mean, double[] variance, int batch, int channels, int spatial)
+        float[]? dy2, bool[]? mask, float[] gamma, double[] mean, double[] variance, int batch, int channels, int spatial,
+        double slope = 0.0)
     {
         int n = x.Length, count = batch * spatial;
         var d = new double[n];
         for (int i = 0; i < n; i++)
         {
             double v = dy2 is null ? dy[i] : (double)(dy[i] + dy2[i]);   // the kernels sum the two in float
-            d[i] = mask is null || mask[i] ? v : 0.0;
+            d[i] = mask is null || mask[i] ? v : (double)(float)(v * slope);   // the kernels scale in float
         }
         var dx = new double[n];
         var dgamma = new double[channels];

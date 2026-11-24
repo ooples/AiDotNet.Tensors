@@ -64,6 +64,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual bool SupportsGpu => false;
 
+    /// <summary>Whether this engine is a device engine (<see cref="DirectGpuTensorEngine"/>), GPU found or not: its
+    /// tensors may live on the device, so the host-only fused kernels here step aside for the primitive chain.</summary>
+    internal virtual bool IsDeviceEngine => false;
+
     /// <inheritdoc/>
     public DirectGpu.DirectGpuEngine? DirectGpu => null;
 
@@ -17012,6 +17016,32 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 #endif
+            // A short reduction per input pixel (an RGB stem: 48 = 3 x 4 x 4 taps per output channel) with an image per
+            // worker: the per-image transposed-conv route (one sequential GEMM of the weight against dy_b, then the
+            // overlap-add gather). The batched col2im route took 84-165 ms for DCGAN's batch-128 stem.
+            // Not at stride 1 where the small-output kernel takes this gradient as a forward convolution (one to three
+            // input channels over at least 64 multiplies each): that kernel is the route for it at any worker count,
+            // and this gate, which depends on the worker count, must not take the shape from it on a small machine.
+            bool smallOutputKernelTakesIt = false;
+#if NET5_0_OR_GREATER
+            smallOutputKernelTakesIt = strideH == 1 && strideW == 1
+                && Simd.SmallOutConv.Applies(outChannels, inChannels, kernelHeight, kernelWidth, 1, 1, dilationH, dilationW,
+                    kernelHeight - 1 - padH, kernelWidth - 1 - padW);
+#endif
+            if (!smallOutputKernelTakesIt && dilationH == 1 && dilationW == 1 && gradOutput.IsContiguous && kernel.IsContiguous
+                && Helpers.Im2ColHelper.ConvTransposePerImage(batch, outputHeight * outputWidth, inChannels * kernelHeight * kernelWidth))
+            {
+                var gArrP = gradOutput.GetCpuBackingForStridedRead(out int gOffP) as float[];
+                var kArrP = kernel.GetCpuBackingForStridedRead(out int kOffP) as float[];
+                var dArrP = dest.GetCpuBackingForContiguousWrite(out int dOffP) as float[];
+                if (gArrP is not null && kArrP is not null && dArrP is not null)
+                {
+                    Helpers.Im2ColHelper.ConvTranspose2DPerImageGemm(gArrP, kArrP, dArrP, batch, outChannels,
+                        outputHeight, outputWidth, inChannels, kernelHeight, kernelWidth, strideH, strideW, padH, padW,
+                        height, width, gOffP, kOffP, dOffP, accumulate);
+                    return;
+                }
+            }
             if (TryShortWaveInputGradient((Tensor<float>)(object)dest, (Tensor<float>)(object)gradOutput,
                 (Tensor<float>)(object)kernel, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
                 strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, accumulate))
@@ -17718,7 +17748,6 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var inputF = (float[])(object)input.GetFlattenedData();
             int inputSliceSize = inChannels * height * width;
@@ -17740,6 +17769,25 @@ public partial class CpuEngine : ITensorLevelEngine
             // CI thread cap, dominated by this op). At batch==1 there is no cross-batch
             // stacking, so the buffers are the same size the fallback already rents — the
             // 64 MB element bound only needs to gate genuine multi-batch stacking.
+            if (UseChunkedWeightGradient(batch, colH, outChannels, colW))
+            {
+                var chunkPool = System.Buffers.ArrayPool<float>.Shared;
+                var gradKernelTC = chunkPool.Rent(colH * outChannels);
+                try
+                {
+                    ConvWeightGradientChunked(inputF, gradOutputF, gradKernelTC, batch, inChannels, height, width,
+                        outChannels, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                    var chunkedResult = TensorAllocator.RentUninitialized<float>(kernelShape);
+                    TransposeFloatRowMajor(gradKernelTC, chunkedResult.GetDataArrayUnmarked(), colH, outChannels);
+                    return (Tensor<T>)(object)chunkedResult;
+                }
+                finally
+                {
+                    chunkPool.Return(gradKernelTC);
+                }
+            }
+
             long kConcatElemsF = (long)colH * batch * colW;
             // Aligned with ConvScratchPool's 32M-float (128 MB) pooling cap (see Conv2DBackwardInput).
             const long MaxKConcatElemsF = 32L * 1024 * 1024; // 128 MB of floats (was 16M)
@@ -17789,9 +17837,11 @@ public partial class CpuEngine : ITensorLevelEngine
                         im2colAll, 0, batchColW, false,
                         gradOutAllT, 0, outChannels, false,
                         gradKernelT, 0, outChannels);
-                    TransposeFloatRowMajor(gradKernelT, gradKernelF, colH, outChannels);
-
-                    return RentFloatResult<T>(kernelShape, gradKernelF);
+                    // Every element is written by the transpose, so the result is rented uninitialized: a fresh array
+                    // per call (up to 8 MB for a DCGAN layer) was most of a CPU training step's remaining allocation.
+                    var gradKernelResult = TensorAllocator.RentUninitialized<float>(kernelShape);
+                    TransposeFloatRowMajor(gradKernelT, gradKernelResult.GetDataArrayUnmarked(), colH, outChannels);
+                    return (Tensor<T>)(object)gradKernelResult;
                 }
                 finally
                 {
@@ -17803,6 +17853,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Parallel across batches — each batch accumulates into a local gradKernel,
             // merged after. This avoids lock contention on the shared accumulator.
+            var gradKernelF = CpuStorageAllocationDiagnostics.NewNumericArray<float>(outChannels * colH, "numeric.conv_output_or_scratch");
             var perBatchGrads = new float[batch][];
             var kPool = System.Buffers.ArrayPool<float>.Shared;
             CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
@@ -18224,6 +18275,36 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 #endif
+            if (UseChunkedWeightGradient(batch, inChannels * kernelHeight * kernelWidth, outChannels, outputHeight * outputWidth))
+            {
+                int colHC = inChannels * kernelHeight * kernelWidth;
+                var chunkPool = System.Buffers.ArrayPool<float>.Shared;
+                var gradKernelTC = chunkPool.Rent(colHC * outChannels);
+                try
+                {
+                    ConvWeightGradientChunked((float[])(object)input.GetFlattenedData(),
+                        (float[])(object)gradOutput.GetFlattenedData(), gradKernelTC, batch, inChannels, height, width,
+                        outChannels, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW,
+                        outputHeight, outputWidth);
+                    // [colH, outC] -> dest [outC, colH]: at most 64K elements.
+                    var chunkDest = (float[])(object)dest._storage.GetDataArray();
+                    int chunkDestOff = dest._storageOffset;
+                    for (int oc = 0; oc < outChannels; oc++)
+                    {
+                        int row = chunkDestOff + oc * colHC;
+                        for (int r = 0; r < colHC; r++)
+                        {
+                            float value = gradKernelTC[r * outChannels + oc];
+                            chunkDest[row + r] = accumulate ? chunkDest[row + r] + value : value;
+                        }
+                    }
+                }
+                finally
+                {
+                    chunkPool.Return(gradKernelTC);
+                }
+                return;
+            }
             if (UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels))
             {
                 Conv2DBackwardKernelBatchedFloat(

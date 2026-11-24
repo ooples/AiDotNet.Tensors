@@ -633,6 +633,13 @@ internal static class WinogradF23KernelTemplate
             WinogradKernelDialect.Glsl => "intBitsToFloat(",
             WinogradKernelDialect.Metal => "as_type<float>(",
             _ => "__int_as_float(",
+        })
+        .Replace("FBITS(", dialect switch
+        {
+            WinogradKernelDialect.OpenCl => "as_int(",
+            WinogradKernelDialect.Glsl => "floatBitsToInt(",
+            WinogradKernelDialect.Metal => "as_type<int>(",
+            _ => "__float_as_int(",
         });
 
     /// <summary>

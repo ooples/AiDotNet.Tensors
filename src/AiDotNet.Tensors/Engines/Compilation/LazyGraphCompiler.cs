@@ -20,6 +20,7 @@ internal sealed class LazyGraphCompiler
         _passes = new List<ILazyGraphOptimizationPass>
         {
             new CpuFusionPass(forTraining, observableOutputs),
+            new ChannelsLastLayoutPass(observableOutputs),
             new DeadCodeEliminationPass(),
             new OperationReorderingPass(),
             new MemoryPlanningPass()

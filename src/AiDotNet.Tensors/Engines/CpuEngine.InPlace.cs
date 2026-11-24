@@ -135,7 +135,7 @@ public partial class CpuEngine
         if (GraphMode.IsActive && GraphMode.Current is not null) return false;
         if (IsRecordingInPlace<U>()) return false;
         // A GPU engine keeps its own tensors on the device: its in-place ops run as kernels there.
-        if (this is DirectGpuTensorEngine gpu && gpu.SupportsGpu) return false;
+        if (IsDeviceEngine && SupportsGpu) return false;
         if (!tensor.IsContiguous || tensor.IsGpuResident) return false;
         if (scalar is null && (typeof(U) == typeof(float) ? floatKernel is null : doubleKernel is null)) return false;
 

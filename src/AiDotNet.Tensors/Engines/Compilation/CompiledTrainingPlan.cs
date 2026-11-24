@@ -1758,6 +1758,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
         _stepGraphExecOdd = IntPtr.Zero;
+        // No graph of this plan names a scratch buffer now: transient slots grown while one could are freed.
+        if (_scratchPool is { } graphPool) graphPool.GraphsHoldBuffers = false;
         _scratchPinsAtCapture = -1;
         _graphStepCalls = 0;
         DisposeStepIo();   // before the rollback below, which may read the loss
@@ -4629,6 +4631,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb
             && RetireGraphIfEngineShared(gte))
         {
+            // Another plan revoked memory this plan's graph names (it keeps a value there past its step): re-record.
+            if (_scratchPool?.TakeRevoked() == true && HasLiveStepGraph) InvalidateCapturedStepGraph();
             _graphStepCalls++;
             if (_graphStepCalls > GraphWarmupSteps)
             {
@@ -4707,6 +4711,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // Trace every device allocation that fires INSIDE the capture (AIDOTNET_GPU_CAPTURE_TRACE=1):
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
                         // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
+                        // From here a graph may name the pool's buffers: a transient slot that grows keeps its old one.
+                        if (_scratchPool is { } capturePool) capturePool.GraphsHoldBuffers = true;
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureStepGraphBody(cb, parity: 0));
                         StepGraphNodeCounts = exec != IntPtr.Zero ? cb.LastCaptureNodeCounts : null;
@@ -5816,6 +5822,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var outerScratchPool = redirectEngine is not null
             ? Engines.DirectGpuTensorEngine.EnterScratchPool(_scratchPool ??= redirectEngine.CreateScratchPool())
             : null;
+        // Nested inside another plan's step: memory co-owned with other plans could hold that step's live values.
+        if (outerScratchPool is not null && _scratchPool is { } nestedPool && !nestedPool.NeverCoOwn) nestedPool.LeaveSharing();
         // Backward outputs are leased for their action, with or without graph capture: a captured graph replays the
         // reuse its recording run made, in stream order (a pin seen after it re-captures; see _scratchPinsAtCapture).
         // Kept per output instead, a CUDA step held the sum of its backward outputs (DDPM: ~2.8 GB of 9.8 GB).
@@ -5826,6 +5834,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _workspaceSharingBodyAllowed = redirectEngine is not null && CanShareTransientWorkspace(redirectEngine);
             leasingPool.WorkspaceBroker = _workspaceSharingBodyAllowed
                 ? redirectEngine!.CompiledWorkspaceBroker : null;
+            // A plan that keeps stable pointers co-owns step scratch with the engine's other plans instead. It takes
+            // only on a run that executes: the run that takes must also prove what it took transient (below).
+            leasingPool.Shared = executed && redirectEngine is not null && CanCoOwnStepScratch(redirectEngine)
+                ? redirectEngine.SharedStepScratch : null;
         }
         bool outerTrackAdoptions = Autodiff.DifferentiableOps.TrackAdoptedAccumulators;
         if (leaseBackwardOutputs) Autodiff.DifferentiableOps.TrackAdoptedAccumulators = true;
@@ -5842,7 +5854,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 redirectEngine.EndScratchAction();   // a body that threw leaves its last action's leases out
                 redirectEngine.FirstWriteRedirects = null;
-                if (_scratchPool is { } finishedPool) finishedPool.WorkspaceBroker = null;
+                if (_scratchPool is { } finishedPool)
+                {
+                    finishedPool.WorkspaceBroker = null;
+                    // What this run took from other plans must hold nothing read after the step; what does (a slot
+                    // that became the loss or a retained output), or anything a body that threw took, is revoked from
+                    // them before any of them steps again (steps run one at a time per engine).
+                    if (finishedPool.Shared is { } registry) ValidateTakenStepScratch(registry, finishedPool, completed);
+                    // Offered only after a whole executed run: a capture records, and a body that threw left its
+                    // buffers' roles unknown.
+                    if (executed && completed && finishedPool.Shared is not null && CanCoOwnStepScratch(redirectEngine))
+                        PublishStepScratch(redirectEngine, backend, finishedPool);
+                    finishedPool.Shared = null;
+                }
 
                 Engines.DirectGpuTensorEngine.RestoreScratchPool(outerScratchPool);
             }
@@ -10652,6 +10676,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             t_gradPlaceholders = null;
             t_gradAliasTargets = null;
             t_privateGradientHostOwnership = false;
+            t_hostScratch = null;
             t_requestedInputGradientLeaves = null;
             t_requestedInputGradientSteps = null;
         }
@@ -11131,9 +11156,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Before any forward or backward specialization captures an array; tensors a fusion builder above captured are
         // excluded. AIDOTNET_COMPILED_FORWARD_POOL=0 turns it off.
         int pooledForwardOutputs = 0;
-        if (dataReplay is null && (typeof(T) == typeof(float) || typeof(T) == typeof(double)) && !useGradPool && !preferGenericForGpu
-            && !engine.SupportsGpu
-            && Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_FORWARD_POOL") != "0")
+        // A CPU plan compiled inside a HostStepScratchGroup co-owns its step-transient arrays with the group's other plans.
+        // Same eligibility as forward-output pooling: the host arrays the plan's actions read are the ones bound here.
+        bool hostArraysPoolable = dataReplay is null && (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            && !useGradPool && !preferGenericForGpu && !engine.SupportsGpu;
+        object? hostScratchOwner = null;
+        if (hostArraysPoolable && HostStepScratchGroup.Current is { } hostGroup)
+        {
+            hostScratchOwner = new object();
+            t_hostScratch = (hostGroup, hostScratchOwner);
+        }
+        var pooledForwardTenants = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (hostArraysPoolable)
         {
             var fusedAway = new HashSet<int>(fusedStepIndices);
             fusedAway.UnionWith(skippableReduceSumIndices);
@@ -11141,8 +11175,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             fusedAway.UnionWith(consumedBySlicePrefix);
             fusedAway.UnionWith(analyticForwardSpecs.Keys);
             fusedAway.UnionWith(slicePrefixForwardSpecs.Keys);
-            pooledForwardOutputs = PoolForwardOnlyOutputs(forwardSteps, parameters, explicitLoss, fusedAway,
-                consumedByConvEpilogue, convEpilogueChains, retainedOutputs);
+            if (Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_FORWARD_POOL") != "0")
+                pooledForwardOutputs = PoolForwardOnlyOutputs(forwardSteps, parameters, explicitLoss, fusedAway,
+                    consumedByConvEpilogue, convEpilogueChains, retainedOutputs, pooledForwardTenants);
+            if (t_hostScratch is { } shared)
+                ShareForwardOutputsWithGroup(forwardSteps, parameters, explicitLoss ?? recordedLastOutput, fusedAway,
+                    convEpilogueDeadInternals, retainedOutputs, pooledForwardTenants, shared.Group, shared.Owner);
         }
 
         // Track GCHandles for cleanup on Dispose
@@ -11856,6 +11894,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : null;
 
             plan._pooledForwardOutputs = pooledForwardOutputs;
+            plan._hostScratchOwner = hostScratchOwner;
             // Activation checkpoint segments the trace marked: released after their forward, recomputed in the backward.
             var spanUnsafe = retainedOutputs;
             if (BuildCheckpointSchedule(forwardSteps, genericActionOfStep, forwardActions.Length, actionCoverage,
@@ -11891,6 +11930,96 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
     }
 
+    // A step-transient host array of exactly length elements: from the plan's HostStepScratchGroup when it joins one,
+    // else a fresh one.
+    private static T[] NewHostScratchArray(int length)
+        => t_hostScratch is { } shared ? shared.Group.Take<T>(length, shared.Owner) : new T[length];
+
+    /// <summary>
+    /// Binds each step-transient forward output of a CPU plan to an array of its <see cref="HostStepScratchGroup"/>, which
+    /// the group's other plans co-own: the outputs every step writes before anything reads them, and that nothing reads
+    /// after the step. Excluded, as in <see cref="PoolForwardOnlyOutputs"/>: parameters, the loss, retained outputs,
+    /// in-place outputs and second writers, saved state, outputs a fused or specialized action covers, a fused convolution
+    /// chain's dead internals, views and shared storage, and small outputs. Outputs already pooled within the plan keep
+    /// their arrays (from the group too).
+    /// Runs before any action captures an array, so the actions read the bound arrays.
+    /// </summary>
+    private static int ShareForwardOutputsWithGroup(List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters,
+        Tensor<T>? lossTarget, HashSet<int> fusedAway, List<Tensor<T>> deadChainInternals,
+        HashSet<Tensor<T>> retainedOutputs, HashSet<Tensor<T>> alreadyPooled, HostStepScratchGroup group, object owner)
+    {
+        const int MinSharedLength = 1 << 16;
+        var comparer = ReferenceEqualityComparer<Tensor<T>>.Instance;
+        var unsafeTensors = new HashSet<Tensor<T>>(parameters, comparer);
+        // A fused convolution chain's internals nothing reads lose their storage once the plan is built
+        // (ReleaseFusedChainInternals); the chain's other outputs its convolution's action writes every step.
+        unsafeTensors.UnionWith(deadChainInternals);
+        unsafeTensors.UnionWith(retainedOutputs);
+        if (lossTarget is not null) unsafeTensors.Add(lossTarget);
+        if (forwardSteps.Count > 0) unsafeTensors.Add(forwardSteps[forwardSteps.Count - 1].OutputBuffer);
+        var producers = new Dictionary<Tensor<T>, int>(comparer);
+        var storageUsers = new Dictionary<object, int>(ReferenceEqualityComparer<object>.Instance);
+        var seen = new HashSet<Tensor<T>>(comparer);
+        void Count(Tensor<T> t)
+        {
+            if (seen.Add(t)) storageUsers[t._storage] = storageUsers.TryGetValue(t._storage, out int u) ? u + 1 : 1;
+        }
+        void MarkSaved(object? saved)
+        {
+            if (saved is Tensor<T> tensor) unsafeTensors.Add(tensor);
+            else if (saved is object[] nested) foreach (var item in nested) MarkSaved(item);
+        }
+        foreach (var p in parameters) Count(p);
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            var step = forwardSteps[i];
+            Count(step.OutputBuffer);
+            if (producers.ContainsKey(step.OutputBuffer)) unsafeTensors.Add(step.OutputBuffer);   // a second writer
+            else producers[step.OutputBuffer] = i;
+            foreach (var input in step.Inputs.Where(x => x is not null))
+            {
+                Count(input);
+                if (ReferenceEquals(input, step.OutputBuffer)) unsafeTensors.Add(input);   // written in place
+            }
+            if (step.SavedState is { } saved) foreach (var item in saved) MarkSaved(item);
+        }
+
+        var candidates = producers
+            .Where(produced => !fusedAway.Contains(produced.Value))
+            .Select(produced => produced.Key)
+            .Where(output => !unsafeTensors.Contains(output) && !alreadyPooled.Contains(output)
+                && output.Length >= MinSharedLength && output.IsContiguous && !output.IsView && output._storageOffset == 0
+                && storageUsers[output._storage] == 1)
+            .OrderByDescending(output => output.Length)
+            .ToList();
+        // Every array this plan's tensors already back: a group array one of them uses (one the plan adopted, or traced
+        // into from a pool another plan's trace also drew on) must not back a second tensor of the plan.
+        var inUse = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        foreach (var tensor in seen)
+            if (tensor.GetLiveBackingArrayIdentityOrNull() is { } backing) inUse.Add(backing);
+        int shared = 0;
+        foreach (var output in candidates)
+        {
+            // An output already holding an array of its exact length keeps it when no other plan's fits, and offers it
+            // to the others: binding it to a new array would leave the traced one for the collector (a DCGAN plan's
+            // ~150 MB, still resident at the step's peak).
+            var own = output.GetLiveBackingArrayIdentityOrNull();
+            bool exactOwn = own is not null && own.Length == output.Length;
+            if (group.TryTakeShared<T>(output.Length, owner, out var array, inUse))
+            {
+                using (var view = Tensor<T>.FromMemory(new Memory<T>(array, 0, output.Length), (int[])output._shape.Clone()))
+                    output.RebindStorageFrom(view);
+                inUse.Add(array);
+                shared++;
+            }
+            else if (exactOwn)
+            {
+                group.Adopt(own!, owner);
+            }
+        }
+        return shared;
+    }
+
     /// <summary>
     /// Forward-output pooling. A step output that no backward reads is needed only from the step that writes it to its
     /// last forward reader, as PyTorch frees such an intermediate once it is consumed. Those outputs share arrays when
@@ -11906,7 +12035,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private static int PoolForwardOnlyOutputs(List<CompiledStep<T>> forwardSteps, Tensor<T>[] parameters,
         Tensor<T>? explicitLoss, HashSet<int> fusedAway, HashSet<int> consumedByConvEpilogue,
-        Dictionary<int, int[]> convEpilogueChains, HashSet<Tensor<T>> retainedOutputs)
+        Dictionary<int, int[]> convEpilogueChains, HashSet<Tensor<T>> retainedOutputs, HashSet<Tensor<T>> pooledTenants)
     {
         const int MinPooledLength = 1 << 16;
         int n = forwardSteps.Count;
@@ -12000,12 +12129,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var arrayOf = AssignPooledArrays(order, start.ToArray(), end.ToArray(), tenants, out var capacity);
         if (capacity.Count == tenants.Count) return 0;   // nothing shares an array
         var arrays = new T[capacity.Count][];
-        for (int b = 0; b < arrays.Length; b++) arrays[b] = new T[capacity[b]];
+        for (int b = 0; b < arrays.Length; b++) arrays[b] = NewHostScratchArray(capacity[b]);
         foreach (int t in order)
         {
             var output = tenants[t];
             using (var view = Tensor<T>.FromMemory(new Memory<T>(arrays[arrayOf[t]], 0, output.Length), (int[])output._shape.Clone()))
                 output.RebindStorageFrom(view);
+            pooledTenants.Add(output);
         }
         return tenants.Count;
     }
@@ -12150,7 +12280,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var privateOwners = t_privateGradientHostOwnership ? new ResultBufferOwner?[arrays.Length] : null;
             for (int b = 0; b < arrays.Length; b++)
             {
-                arrays[b] = new T[capacity[b]];
+                // A tenant is re-zeroed at its first write each step (the schedule below), so a co-owned array's contents
+                // from another plan's step are never read. Private ownership is tracked only on a GPU engine, which never
+                // joins a host scratch group.
+                arrays[b] = privateOwners is null ? NewHostScratchArray(capacity[b]) : new T[capacity[b]];
                 if (privateOwners is not null) privateOwners[b] = ResultBufferTracker.TrackFreshPrivateArray(arrays[b], 0);
             }
             foreach (int g in tenants)
@@ -12401,6 +12534,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // Set only while a plan's backward is being built on this thread.
     [ThreadStatic] private static HashSet<Tensor<T>>? t_gradPlaceholders;
     [ThreadStatic] private static bool t_privateGradientHostOwnership;
+
+    // The group a CPU plan being compiled on this thread takes its step-transient arrays from, and the token that owns
+    // them for the plan's lifetime (HostStepScratchGroup). Null outside a compile, or when the plan does not join one.
+    [ThreadStatic] private static (HostStepScratchGroup Group, object Owner)? t_hostScratch;
+
+    // Keeps this plan's claim on its HostStepScratchGroup arrays alive exactly as long as the plan.
+    private object? _hostScratchOwner;
 
 
     // The alias views among the gradients (AliasReshapeViewGradients' device aliases) and the gradient each views, while
@@ -17388,6 +17528,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool accumBias = gradWriterCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
             // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
             bool needInputGrad = requiresGrad.Contains(x);
+            // A frozen kernel (a GAN discriminator read by the generator's step) needs no weight gradient either.
+            bool needKernelGrad = requiresGrad.Contains(kernel);
             var xShape = (int[])x._shape.Clone();
             var kShape = (int[])kernel._shape.Clone();
             var convOutF = (Tensor<float>)(object)convOut;
@@ -17437,8 +17579,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (needInputGrad)
                         cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
                             capStride, capPadding, capDilation, accumX);
-                    cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
-                        capStride, capPadding, capDilation, accumKernel);
+                    if (needKernelGrad)
+                        cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
+                            capStride, capPadding, capDilation, accumKernel);
                 }
                 else
                 {
@@ -17447,7 +17590,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         + eng.GetType().Name + ".");
                 }
                 if (needInputGrad) x.Grad = gradX;
-                kernel.Grad = gradKernel;
+                if (needKernelGrad) kernel.Grad = gradKernel;
                 bias.Grad = gradBias;
             };
             consumed.Add(convIdx);

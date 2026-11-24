@@ -2146,6 +2146,154 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Backward of a training BatchNorm whose output feeds a LeakyReLU of positive slope -- fused by the compiled plan
+    /// (<see cref="Compilation.BatchNormLeakyReluFusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is
+    /// the LeakyReLU's output; savedState = mean, variance, epsilon, whether the forward ran the kernel, slope. One launch
+    /// where the backend takes it, else LeakyReluBackward (on the output: the same sign as its input) and
+    /// BatchNormBackward.
+    /// </summary>
+    internal static void BatchNormLeakyReluBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var mean = (Tensor<T>)savedState[0];
+        var variance = (Tensor<T>)savedState[1];
+        var epsilon = (double)savedState[2];
+        var slope = (double)savedState[4];
+        Tensor<T> gradInput, gradGamma, gradBeta;
+        var parked = TakeParkedGradient(engine, output);
+        Tensor<T>? intoInput = null;
+        bool addInput = false;
+        if (engine.TryGet<DirectGpuTensorEngine>(out var gpu) && !DifferentiableOps.IsRecording<T>() && !Compilation.GraphMode.IsActive)
+            intoInput = DifferentiableOps.PeekDirectDeviceGradTarget(grads, inputs[0], engine, out addInput);
+        if (gpu is not null
+            && gpu.TryBatchNormReluBackwardCore(gradOutput, output, inputs[0], inputs[1], mean, variance, epsilon, false,
+                MaskFromInput(savedState) ? inputs[2] : null, parked, intoInput, addInput, (float)slope) is { } fused)
+        {
+            if (intoInput is not null && ReferenceEquals(fused.GradInput, intoInput))
+            {
+                DifferentiableOps.CommitDirectGradWrite(grads, inputs[0], intoInput);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], fused.GradGamma, engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], fused.GradBeta, engine);
+                return;
+            }
+            gradInput = fused.GradInput;
+            gradGamma = fused.GradGamma;
+            gradBeta = fused.GradBeta;
+        }
+        else
+        {
+            if (parked is not null) gradOutput = AddParked(engine, gradOutput, parked);
+            var scaled = engine.LeakyReluBackward(gradOutput, output, slope);
+            gradInput = engine.BatchNormBackward(scaled, inputs[0], inputs[1], mean, variance, epsilon,
+                out gradGamma, out gradBeta);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradInput, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradGamma, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBeta, engine);
+    }
+
+    /// <summary>
+    /// Backward of a convolution whose channel bias feeds a training BatchNorm + activation, the bias folded into the
+    /// BatchNorm by the compiled plan (<see cref="Compilation.ConvBiasBatchNormFusionPattern"/>). inputs = x, kernel, bias,
+    /// gamma, beta; savedState = the convolution's backward and saved state, the BatchNorm + activation's backward and saved
+    /// state, and z, the bias-free convolution output the BatchNorm normalized. The BatchNorm + activation backward gives
+    /// z's gradient, the convolution's backward takes it to x and the kernel, and the bias gets its exact gradient, zero:
+    /// the per-channel sum of a training BatchNorm's input gradient vanishes.
+    /// </summary>
+    internal static void ConvBiasBatchNormBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (typeof(T) == typeof(float) && savedState.Length > 5
+            && savedState[5] is Compilation.ChannelsLastSlot { Any: true } channelsLast)
+        {
+            Compilation.ChannelsLastBackward.ConvBiasBatchNorm((Tensor<float>)(object)gradOutput,
+                (Tensor<float>[])(object)inputs, (Tensor<float>)(object)output, savedState, channelsLast, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads);
+            return;
+        }
+        var convBackward = (BackwardFunction<T>)savedState[0];
+        var convSaved = (object[])savedState[1];
+        var innerBackward = (BackwardFunction<T>)savedState[2];
+        var innerSaved = (object[])savedState[3];
+        var z = (Tensor<T>)savedState[4];
+        innerBackward(gradOutput, new[] { z, inputs[3], inputs[4] }, output, innerSaved, engine, grads);
+        if (grads.TryGetValue(z, out var gradZ))
+        {
+            grads.Remove(z);
+            convBackward(gradZ, new[] { inputs[0], inputs[1] }, z, convSaved, engine, grads);
+        }
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.TensorZerosLike(inputs[2]), engine);
+    }
+
+    /// <summary>
+    /// Backward of a convolution and its per-channel epilogue fused by the compiled plan
+    /// (<see cref="Compilation.ConvChannelEpilogueFusionPattern"/>): y = act(((z + bias) * scale) + shift), z the
+    /// convolution's output. inputs = x, kernel, then the bias, scale and shift that are present (their indices in
+    /// savedState); savedState = the convolution's backward and saved state, z, the activation code, its slope and the
+    /// three indices (-1: absent). One pass gives z's gradient act'(y) * dy * scale where no epilogue parameter needs its
+    /// own; the scale's and shift's gradients (the sum of the pre-activation gradient times the scaled input, and of the
+    /// pre-activation gradient) and the bias's (the sum of z's gradient) are reduced per channel only where required.
+    /// </summary>
+    internal static void ConvChannelEpilogueBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (typeof(T) == typeof(float) && savedState.Length > 8
+            && savedState[8] is Compilation.ChannelsLastSlot { Any: true } channelsLast)
+        {
+            Compilation.ChannelsLastBackward.ConvChannelEpilogue((Tensor<float>)(object)gradOutput,
+                (Tensor<float>[])(object)inputs, (Tensor<float>)(object)output, savedState, channelsLast, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads);
+            return;
+        }
+        var convBackward = (BackwardFunction<T>)savedState[0];
+        var convSaved = (object[])savedState[1];
+        var z = (Tensor<T>)savedState[2];
+        int activation = (int)savedState[3];
+        double slope = (double)savedState[4];
+        int biasIndex = (int)savedState[5], scaleIndex = (int)savedState[6], shiftIndex = (int)savedState[7];
+        var bias = biasIndex >= 0 ? inputs[biasIndex] : null;
+        var scale = scaleIndex >= 0 ? inputs[scaleIndex] : null;
+        var shift = shiftIndex >= 0 ? inputs[shiftIndex] : null;
+        bool scaleGrad = scale is not null && DifferentiableOps.IsGradientRequired(scale);
+        bool shiftGrad = shift is not null && DifferentiableOps.IsGradientRequired(shift);
+        var channelAxes = new[] { 0, 2, 3 };
+
+        Tensor<T>? gradZ = null;
+        // One pass to z's gradient when no epilogue parameter needs the pre-activation gradient itself.
+        if (typeof(T) == typeof(float) && !scaleGrad && !shiftGrad && engine.TryGet<DirectGpuTensorEngine>(out var gpu))
+            gradZ = (Tensor<T>?)(object?)gpu.TryChannelEpilogueBackward((Tensor<float>)(object)gradOutput,
+                (Tensor<float>)(object)output, (Tensor<float>?)(object?)scale, activation, (float)slope);
+        if (gradZ is null)
+        {
+            var gradPre = activation == Engines.DirectGpu.ChannelEpilogueActivation.Relu
+                ? engine.ReluBackward(gradOutput, output)
+                : activation == Engines.DirectGpu.ChannelEpilogueActivation.LeakyRelu
+                    ? engine.LeakyReluBackward(gradOutput, output, slope)
+                    : gradOutput;
+            if (shiftGrad)
+                DifferentiableOps.AccumulateGrad(grads, shift!,
+                    engine.Reshape(engine.ReduceSum(gradPre, channelAxes, keepDims: false), shift!._shape), engine);
+            if (scaleGrad)
+            {
+                var scaledInput = bias is null ? z : engine.TensorChannelBiasAdd(z, bias);
+                DifferentiableOps.AccumulateGrad(grads, scale!,
+                    engine.Reshape(engine.ReduceSum(engine.TensorMultiply(gradPre, scaledInput), channelAxes, keepDims: false),
+                        scale!._shape), engine);
+            }
+            gradZ = scale is null ? gradPre
+                : engine.TryGet<CpuEngine>(out var host) ? host.TensorBroadcastMultiply(gradPre, scale)
+                : throw new System.NotSupportedException("ConvChannelEpilogue backward needs a CpuEngine-derived engine.");
+        }
+        if (bias is not null && DifferentiableOps.IsGradientRequired(bias))
+            DifferentiableOps.AccumulateGrad(grads, bias, engine.ReduceSum(gradZ, channelAxes, keepDims: false), engine);
+        convBackward(gradZ, new[] { inputs[0], inputs[1] }, z, convSaved, engine, grads);
+    }
+
+    /// <summary>
     /// Backward of a training BatchNorm whose output feeds a ReLU6 -- fused by the compiled plan
     /// (<see cref="Compilation.BatchNormRelu6FusionPattern"/>). inputs = x, gamma, beta; <paramref name="output"/> is the
     /// ReLU6's output. Its mask comes from the output: 0 &lt; ReLU6(z) &lt; 6 exactly when 0 &lt; z &lt; 6, so the
@@ -3948,12 +4096,30 @@ internal static partial class BackwardFunctions<T>
     }
 
     /// <summary>ConvTranspose2D backward</summary>
+    /// <summary>
+    /// The backward of <c>FusedConvTranspose2DBias</c> (ConvTransposeBiasFusionPattern): convTranspose2d(x, k) + b[c]. The
+    /// bias gradient is the output gradient summed over batch and space; x and k take the transposed convolution's own
+    /// backward with the same output gradient (the bias add passes it through).
+    /// </summary>
+    internal static void FusedConvTranspose2DBiasBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (DifferentiableOps.IsGradientRequired(inputs[2]))
+            DifferentiableOps.AccumulateGrad(grads, inputs[2],
+                engine.ReduceSum(gradOutput, new[] { 0, 2, 3 }, keepDims: false), engine);
+        ConvTranspose2DBackward(gradOutput, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
+    }
+
     internal static void ConvTranspose2DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int[] stride = (int[])savedState[0];
         int[] padding = (int[])savedState[1];
+        // The forward's autocast precision (recorded by the GPU engine's eager path; a compiled step's backward runs in
+        // the step's own scope).
+        using var precision = DirectGpuTensorEngine.PushBackwardConvPrecision(savedState, engine);
 
         var outputPadding2D = TransposedConvOutputPadding(gradOutput._shape, inputs[0]._shape, inputs[1]._shape, stride, padding);
         if (CreatesGraph && ConvTranspose2DBackwardCreateGraph(gradOutput, inputs, output, savedState, engine, grads, stride, padding, outputPadding2D))
