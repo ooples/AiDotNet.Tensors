@@ -815,7 +815,10 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
     }
 
-    private static IDirectGpuBackend RequireReady(
+    // AIDOTNET_REQUIRE_GPU_TESTS=1 means the lane's device tests must not skip silently. A lane has one device (POCL has
+    // OpenCL only), so the requirement fails a run in which no backend at all came up; a backend this machine does not
+    // have, next to one it does, is a skip.
+    private IDirectGpuBackend RequireReady(
         BackendKind kind,
         AcquiredBackend acquired,
         bool requiresGlslCompiler = false)
@@ -834,9 +837,9 @@ public sealed class CompressedMomentGpuOptimizerTests :
         if (acquired.Backend is not null)
             return acquired.Backend;
 
-        if (RequireGpu)
+        if (RequireGpu && !_backends.AnyAvailable())
             throw new InvalidOperationException(
-                $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the {kind} optimizer backend was unavailable.",
+                $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but no optimizer backend was available ({kind} asked).",
                 acquired.Error);
 
         Skip.If(true, $"{kind} backend unavailable on this system.");
@@ -1111,6 +1114,14 @@ public sealed class CompressedMomentGpuOptimizerTests :
         }
 
         internal AcquiredBackend Get(BackendKind kind) => GetOrCreate(kind);
+
+        /// <summary>True when at least one backend kind came up on this machine.</summary>
+        internal bool AnyAvailable()
+        {
+            foreach (BackendKind kind in Enum.GetValues(typeof(BackendKind)))
+                if (GetOrCreate(kind).Backend is not null) return true;
+            return false;
+        }
 
         public void Dispose()
         {

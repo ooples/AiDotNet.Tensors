@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
 // #1489: the register-resident training BatchNorm (IBatchNormVarianceBackend) on WebGPU, through PortableBatchNorm and
 // the WGSL restatement of BatchNormRegisterKernelTemplate (WebGpuBatchNormRegisterKernels), built on first need.
-public sealed partial class WebGpuBackend : IBatchNormVarianceBackend
+public sealed partial class WebGpuBackend : IBatchNormVarianceBackend, IBatchNormLeakyReluBackend
 {
     private const string BatchNormRegisterModulePrefix = "BatchNormRegister_";
     private bool? _batchNormRegisterReady;
@@ -45,7 +45,7 @@ public sealed partial class WebGpuBackend : IBatchNormVarianceBackend
 
     private void LaunchBatchNormRegister(string kernelName, int groups, IGpuBuffer[] buffers, int[] ints)
     {
-        // The uniform struct holds the six ints (bit-cast) and two words of padding.
+        // The uniform struct holds the seven ints (bit-cast) and a word of padding.
         var uniforms = new float[8];
         for (int i = 0; i < ints.Length; i++) uniforms[i] = BitConverter.Int32BitsToSingle(ints[i]);
         DispatchNBufferAsync(BatchNormRegisterModulePrefix + kernelName, WebGpuBatchNormRegisterKernels.SourceFor(kernelName),
@@ -68,5 +68,19 @@ public sealed partial class WebGpuBackend : IBatchNormVarianceBackend
         => BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
             saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, reluOutput,
             gradResidual, beta, gradOutput2, canRebuildMask: false, accumulateGradInput: accumulateGradInput);   // WGSL's fma need not round once: read the mask
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluTraining(IGpuBuffer input, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels,
+        int spatial, float epsilon, float slope)
+        => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryForward(this, LaunchBatchNormRegister, input, output, gamma, beta,
+            saveMean, saveVariance, batch, channels, spatial, epsilon, true, null, leakySlope: slope);
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer leakyOutput,
+        IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer? beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int channels, int spatial,
+        float epsilon, float slope, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        => PortableBatchNorm.IsLeakySlope(slope) && BatchNormRegisterReady && PortableBatchNorm.TryBackward(this, LaunchBatchNormRegister, gradOutput, input, gamma,
+            saveMean, saveVariance, gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, leakyOutput,
+            null, beta, gradOutput2, canRebuildMask: false, accumulateGradInput: accumulateGradInput, leakySlope: slope);
 }
 #endif

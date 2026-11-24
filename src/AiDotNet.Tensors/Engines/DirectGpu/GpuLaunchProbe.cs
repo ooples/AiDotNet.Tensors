@@ -140,7 +140,7 @@ internal static class GpuLaunchProbe
     public static void OnUpload(long byteCount, GpuBackendType backend)
     {
         // An empty upload moves nothing across the boundary (several backends return before copying).
-        if (byteCount == 0) return;
+        if (byteCount == 0 || _harnessDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
     }
@@ -153,7 +153,7 @@ internal static class GpuLaunchProbe
     /// <summary>The host blocked until the device drained its queue.</summary>
     public static void OnSynchronize(GpuBackendType backend)
     {
-        if (_tuningDepth > 0) return;
+        if (_tuningDepth > 0 || _harnessDepth > 0) return;
         RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
     }
 
@@ -252,12 +252,29 @@ internal static class GpuLaunchProbe
         }
     }
 
+    // Transfers a test harness makes to run a kernel on another device (the Dawn parity launcher moves each operand from
+    // its host backend to Dawn and back): a real backend of that device makes none, so they are not the op's and count
+    // nowhere.
+    [System.ThreadStatic] private static int _harnessDepth;
+
+    /// <summary>Leaves this thread's transfers uncounted until disposed (an emulating test harness's operand moves).</summary>
+    internal static HarnessAttribution HarnessScope()
+    {
+        _harnessDepth++;
+        return default;
+    }
+
+    internal readonly struct HarnessAttribution : System.IDisposable
+    {
+        public void Dispose() => _harnessDepth--;
+    }
+
     public static void OnReadback(long byteCount, GpuBackendType backend)
     {
         if (byteCount < 0)
             throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");
         // An empty readback moves nothing (the byte-download paths return an empty array without a copy).
-        if (byteCount == 0) return;
+        if (byteCount == 0 || _harnessDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
         OnReadback(byteCount);
@@ -265,6 +282,7 @@ internal static class GpuLaunchProbe
 
     public static void OnReadback(long byteCount)
     {
+        if (_harnessDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningReadbacks); return; }
         Interlocked.Increment(ref _readbacks);
         Interlocked.Add(ref _readbackBytes, byteCount);
@@ -334,6 +352,7 @@ internal static class GpuLaunchProbe
     /// <summary>Records one host-to-device transfer at a driver copy (every cuMemcpyHtoD / HtoDAsync).</summary>
     public static void OnUpload(long byteCount)
     {
+        if (_harnessDepth > 0) return;
         if (_tuningDepth > 0) { Interlocked.Increment(ref _tuningUploads); return; }
         Interlocked.Increment(ref _uploads);
         Interlocked.Add(ref _uploadBytes, byteCount);

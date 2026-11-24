@@ -145,13 +145,16 @@ internal static class BatchNormFusionMatch
     /// The fused node: ReLU(BN(x) [+ residual]) into <paramref name="output"/>, refreshing the BatchNorm's saved mean and
     /// variance (its backward reads them) and the absorbed statistic nodes' outputs every replay. With
     /// <paramref name="capAtSix"/> the activation is ReLU6, which the register-resident kernels do not take: BN then ReLU6,
-    /// with the BatchNorm output a temporary of the node rather than a tensor the step keeps for the backward.
+    /// with the BatchNorm output a temporary of the node rather than a tensor the step keeps for the backward. With
+    /// <paramref name="leakySlope"/> (positive, no residual) the activation is that LeakyReLU, which the register-resident
+    /// kernels take too; the slope is saved for the backward.
     /// </summary>
     internal static LazyNode<float> BuildFusedNode(LazyNode<float> bn, Tensor<float> x, Tensor<float> gamma,
         Tensor<float> beta, Tensor<float>? residual, Tensor<float> output, List<LazyNode<float>> statistics,
         Tensor<float> mean, Tensor<float> variance, double epsilon, string opName, BackwardFunction<float> backward,
-        bool capAtSix = false)
+        bool capAtSix = false, double? leakySlope = null)
     {
+        float slope = leakySlope is { } ls ? (float)ls : float.NaN;
         var statisticOutputs = new (Tensor<float> Output, Tensor<float> Source)[statistics.Count];
         for (int s = 0; s < statistics.Count; s++)
             statisticOutputs[s] = (statistics[s].Output, statistics[s].OpName == "BatchNormBatchMean" ? mean : variance);
@@ -166,7 +169,7 @@ internal static class BatchNormFusionMatch
                 Tensor<float> fusedOutput, freshMean, freshVar;
                 Tensor<float>? kernelOutput = null, kernelMean = null, kernelVar = null;
                 // CPU: BatchNorm and ReLU written straight into the plan's output, the BatchNorm output never stored.
-                if (!capAtSix && residual is null && eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu
+                if (!capAtSix && leakySlope is null && residual is null && eng.TryGet<CpuEngine>(out var cpu) && !eng.SupportsGpu
                     && cpu.TryBatchNormReluTrainingInto(x, gamma, beta, epsilon, result, mean, variance))
                 {
                     forwardUsedKernel[0] = false;
@@ -175,7 +178,8 @@ internal static class BatchNormFusionMatch
                     return;
                 }
                 if (!capAtSix && eng.TryGet<DirectGpuTensorEngine>(out var gpu))
-                    kernelOutput = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out kernelMean, out kernelVar, residual);
+                    kernelOutput = gpu.TryBatchNormReluForward(x, gamma, beta, epsilon, out kernelMean, out kernelVar, residual,
+                        slope);
                 forwardUsedKernel[0] = kernelOutput is not null && kernelMean is not null && kernelVar is not null;
                 if (kernelOutput is not null && kernelMean is not null && kernelVar is not null)
                 {
@@ -195,7 +199,12 @@ internal static class BatchNormFusionMatch
                     // The activation runs in place on the normalized values where the device can: a compiled step keeps one
                     // buffer per output an action allocates, so a second output would hold the BatchNorm values all step
                     // (DenseNet-121's first two blocks, past the register kernel's channel size: 0.8 GB).
-                    if (eng.TryGet<DirectGpuTensorEngine>(out var device)
+                    if (leakySlope is not null)
+                    {
+                        fusedOutput = eng.LeakyReLU(normalized, slope);
+                        Helpers.TensorAllocator.Return(normalized);
+                    }
+                    else if (eng.TryGet<DirectGpuTensorEngine>(out var device)
                         && (capAtSix ? device.TryReLU6InPlace(normalized) : device.TryReLUInPlace(normalized)))
                     {
                         fusedOutput = normalized;
@@ -221,7 +230,9 @@ internal static class BatchNormFusionMatch
                     Helpers.TensorAllocator.Return(freshVar);
                 }
             },
-            backward, new object[] { mean, variance, epsilon, forwardUsedKernel })
+            backward, leakySlope is { } savedSlope
+                ? new object[] { mean, variance, epsilon, forwardUsedKernel, savedSlope }
+                : new object[] { mean, variance, epsilon, forwardUsedKernel })
         {
             RecordingEngine = bn.RecordingEngine,
         };

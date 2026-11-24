@@ -18,6 +18,14 @@ public sealed partial class CudaBackend : IDeviceMemoryPressure
         SynchronizeOwnStreams("stream sync (tests)");
     }
 
+    /// <summary>Tests: the stream-ordered pool's (backing, used) bytes, as the budget's growth bound reads them.</summary>
+    internal (long Reserved, long Used) StreamOrderedPoolBytesForTests()
+    {
+        if (_asyncMemPool == IntPtr.Zero) return (0, 0);
+        var pool = SamplePool(_asyncMemPool);
+        return (pool.Reserved + pool.Unreported, pool.Used);
+    }
+
     int IDeviceMemoryPressure.ReleaseCachedBuffers()
     {
         if (!IsAvailable || IsCapturingOnThisThread) return 0;
@@ -35,7 +43,7 @@ public sealed partial class CudaBackend : IDeviceMemoryPressure
             SynchronizeOwnStreams("stream sync (release cached device memory)");
             using (PushContext())
             {
-                var status = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0); // lgtm[cs/call-to-unmanaged-code] CUDA memory pools have no managed API.
+                var status = TrimPool(_asyncMemPool);
                 if (status != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
                         $"[CudaBackend] cuMemPoolTrimTo failed while releasing cached device memory: {status}.");

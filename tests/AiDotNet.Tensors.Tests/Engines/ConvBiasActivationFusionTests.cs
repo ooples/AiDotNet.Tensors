@@ -495,6 +495,57 @@ public class ConvBiasActivationFusionTests
         }
     }
 
+    /// <summary>
+    /// A frozen conv kernel (a GAN discriminator read by the generator's step) is no parameter, so the fused
+    /// conv/bias/ReLU backward must skip its weight gradient (DCGAN's generator step computed all three of the
+    /// discriminator's) and still give the trained parameters the unfused plan's exact gradients.
+    /// </summary>
+    [Fact]
+    public void FrozenKernelGetsNoWeightGradientThroughFusedChain()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        var prior = Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION");
+        try
+        {
+            float[][] Run(bool fusion, out Tensor<float>? frozenGrad)
+            {
+                var net = new Net();
+                var trained = new[] { net.K1, net.B1, net.B2, net.W };
+                Environment.SetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION", fusion ? null : "0");
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    net.Forward(new CpuEngine(), sharedBias: false, secondRelu: true);
+                    plan = scope.CompileTraining(trained);
+                }
+                Environment.SetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION", prior);
+                try
+                {
+                    plan.Step();
+                    plan.Step();
+                    frozenGrad = net.K2.Grad;
+                    return Array.ConvertAll(plan.Gradients, g => g.AsSpan().ToArray());
+                }
+                finally
+                {
+                    plan.Dispose();
+                }
+            }
+            var unfused = Run(fusion: false, out _);
+            var fused = Run(fusion: true, out var frozen);
+            Assert.Null(frozen);
+            Assert.Equal(unfused.Length, fused.Length);
+            for (int p = 0; p < unfused.Length; p++)
+                AssertBitEqual(unfused[p], fused[p], $"trained parameter {p}");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION", prior);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
     /// <summary>The fused plan also matches the eager tape (so the comparison above is not two wrong plans).</summary>
     [Fact]
     public void FusedPlanMatchesTape()

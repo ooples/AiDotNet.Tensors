@@ -62,11 +62,20 @@ fn NAME(@builtin(global_invocation_id) gidv: vec3<u32>) {
 }
 ";
 
+    // The overlap-add plus a per-output-channel bias (ConvTransposeGemmKernelTemplate.OverlapAddBias), added after the
+    // taps.
+    private static readonly string OverlapAddBiasSource = OverlapAddSource
+        .Replace("@group(0) @binding(2) var<uniform> pm: Params;",
+            "@group(0) @binding(2) var<storage, read> bias: array<f32>;\n@group(0) @binding(3) var<uniform> pm: Params;")
+        .Replace("dst[pm.dstOffset + gid] = sum;", "dst[pm.dstOffset + gid] = sum + bias[c];");
+
     private static readonly Dictionary<string, string> Sources = new()
     {
         [ConvTransposeGemmKernelTemplate.Regroup] = RegroupSource.Replace("NAME", ConvTransposeGemmKernelTemplate.Regroup),
         [ConvTransposeGemmKernelTemplate.OverlapAdd] =
             OverlapAddSource.Replace("NAME", ConvTransposeGemmKernelTemplate.OverlapAdd),
+        [ConvTransposeGemmKernelTemplate.OverlapAddBias] =
+            OverlapAddBiasSource.Replace("NAME", ConvTransposeGemmKernelTemplate.OverlapAddBias),
     };
 
     /// <summary>The WGSL module of one <see cref="ConvTransposeGemmKernelTemplate"/> kernel.</summary>

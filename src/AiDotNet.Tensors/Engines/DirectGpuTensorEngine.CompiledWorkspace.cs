@@ -58,6 +58,9 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>Step scratch this engine's compiled plans co-own (see <see cref="SharedStepScratch"/>).</summary>
+    internal SharedStepScratch SharedStepScratch { get; } = new();
+
     // Only called for private, dead compiled intermediates while their scratch owner still owns the native buffer.
     // Reuse never materializes host data; a stale internal read fails rather than reading another plan's new value.
     internal void DetachCompiledWorkspaceTensor<T>(Tensor<T> tensor)

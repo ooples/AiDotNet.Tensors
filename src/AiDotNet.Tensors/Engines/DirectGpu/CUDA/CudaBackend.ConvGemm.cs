@@ -21,10 +21,9 @@ public sealed partial class CudaBackend
 
     private IGpuBuffer? TryConvScratch(ref IGpuBuffer? slot, long floats)
     {
-        // Grown only outside a capture (shapes are fixed per plan, so the eager warmup steps size it); a captured
-        // graph bakes the pointer, so it must stay the same buffer afterwards. Null when it cannot be sized (too large
-        // for one buffer, or undersized during a capture, where allocating would abort it): the caller falls through
-        // to the direct kernel, as it does when the ones-vector cannot be built.
+        // Grown only outside a capture (allocating inside one would abort it). Null when it cannot be sized (too large
+        // for one buffer, or undersized during a capture): the caller falls through to the direct kernel, as it does
+        // when the ones-vector cannot be built.
         if (slot is null || slot.Size < floats)
         {
             if (floats > int.MaxValue || IsStreamCapturing())
@@ -37,11 +36,45 @@ public sealed partial class CudaBackend
             lock (_tuneEventLock)
             {
                 if (slot is not null) NoteTunedWorkspaceReleased();   // a held timing graph may read the old one
-                slot?.Dispose();
-                slot = AllocateBuffer((int)floats);
+                ReplaceScratch(ref slot, (int)floats);
             }
         }
         return slot;
+    }
+
+    // Bumped as each stream capture begins (CudaBackend.Graph): a scratch buffer allocated before the current value may
+    // be baked into a captured graph.
+    private long _captureGeneration;
+
+    // Stream captures begun in this process, on any backend: a device buffer allocated after the last one began cannot be
+    // baked into any captured graph yet, so it may be freed when it is replaced (the cuDNN workspace).
+    private static long s_captureEpoch;
+
+    /// <summary>The number of stream captures begun in this process.</summary>
+    internal static long CaptureEpoch => System.Threading.Interlocked.Read(ref s_captureEpoch);
+
+    // Scratch buffers a captured graph may still replay into: kept until the backend is disposed instead of returned to
+    // the pool, where another tensor could take the memory the graph writes. Shapes are fixed per plan, but one plan's
+    // eager warm-up can grow a scratch after another plan captured it (a GAN's two networks, each its own plan).
+    private readonly System.Collections.Generic.List<IGpuBuffer> _retiredScratch = new();
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IGpuBuffer, object> _scratchGeneration = new();
+
+    /// <summary>Scratch buffers kept alive for graphs that may replay into them (tests).</summary>
+    internal int RetiredScratchCount { get { lock (_retiredScratch) return _retiredScratch.Count; } }
+
+    /// <summary>Replaces a grow-only scratch buffer by one of <paramref name="floats"/>: the old one is freed, or retired
+    /// when a capture began after it was allocated.</summary>
+    private void ReplaceScratch(ref IGpuBuffer? slot, int floats)
+    {
+        if (slot is { } old)
+        {
+            long now = System.Threading.Interlocked.Read(ref _captureGeneration);
+            bool mayBeCaptured = !_scratchGeneration.TryGetValue(old, out var born) || (long)born != now;
+            if (mayBeCaptured) lock (_retiredScratch) _retiredScratch.Add(old);
+            else old.Dispose();
+        }
+        slot = AllocateBuffer(floats);
+        _scratchGeneration.Add(slot, System.Threading.Interlocked.Read(ref _captureGeneration));
     }
 
     // Every slot TryConvScratch owns. The backend's Dispose releases them before the buffer pool goes, so the
@@ -55,7 +88,19 @@ public sealed partial class CudaBackend
             slot = null;
         }
 
+        lock (_retiredScratch)
+        {
+            foreach (var retired in _retiredScratch) retired.Dispose();
+            _retiredScratch.Clear();
+        }
+        Release(ref _convNhwcScratch);
+        Release(ref _channelsLastScratchA);
+        Release(ref _channelsLastScratchB);
+        Release(ref _channelsLastScratchC);
+        Release(ref _channelsLastScratchD);
         Release(ref _convColScratch);
+        Release(ref _convOnes);
+        _convOnesLength = 0;
         Release(ref _convTransposeXt);
         Release(ref _convTransposeCol);
         Release(ref _convDgradPartials);
@@ -333,11 +378,15 @@ public sealed partial class CudaBackend
         if (_convOnes is null || _convOnesLength < batch)
         {
             if (IsStreamCapturing()) return false;
-            if (_convOnes is not null) NoteTunedWorkspaceReleased();
-            _convOnes?.Dispose();
-            _convOnes = AllocateBuffer(batch);
-            Fill(_convOnes, 1f, batch);
-            _convOnesLength = batch;
+            // As TryConvScratch: a captured step graph or a held timing graph may name the old ones vector, so it is
+            // retired rather than freed, under the timing lock.
+            lock (_tuneEventLock)
+            {
+                if (_convOnes is not null) NoteTunedWorkspaceReleased();
+                ReplaceScratch(ref _convOnes, batch);
+                Fill(_convOnes!, 1f, batch);
+                _convOnesLength = batch;
+            }
         }
 
         LaunchIm2Col(input, col, batch, inChannels, inHeight, inWidth, kernelH, kernelW,
@@ -354,7 +403,7 @@ public sealed partial class CudaBackend
         int n2 = outChannels * P;
         BlasSgemm(
             CublasOperation.None, CublasOperation.None, n2, 1, batch,
-            ref one, partials.Handle, n2, _convOnes.Handle, batch,
+            ref one, partials.Handle, n2, _convOnes!.Handle, batch,
             ref zero, gradKernel.Handle, n2, "cublasSgemm(conv dW batch sum)");
         return true;
     }

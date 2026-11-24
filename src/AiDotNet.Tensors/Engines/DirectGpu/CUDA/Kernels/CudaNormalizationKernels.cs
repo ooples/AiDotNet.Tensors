@@ -206,13 +206,30 @@ __device__ __forceinline__ float bn_affine(float v, float mean, float inv, float
     return __fmaf_rn(g, (v - mean) * inv, bt);
 }
 
+// The activation after the BatchNorm: ReLU, or with LEAKY a LeakyReLU of positive slope, written as the leaky_relu
+// kernel's own expression (z > 0 ? z : slope * z) so the fused output is bit-identical to BatchNorm then LeakyReLU.
+template <bool LEAKY>
+__device__ __forceinline__ float bn_act(float z, float slope)
+{
+    return LEAKY ? (z > 0.0f ? z : slope * z) : fmaxf(z, 0.0f);
+}
+
+// The activation's backward factor applied to dy where the activation's input (or, for a positive slope, its output:
+// the sign is kept) is not positive: 0 for ReLU, slope for LeakyReLU -- leaky_relu_backward's dy * (z > 0 ? 1 : slope).
+template <bool LEAKY>
+__device__ __forceinline__ float bn_act_grad(bool positive, float dy, float slope)
+{
+    return positive ? dy : (LEAKY ? dy * slope : 0.0f);
+}
+
 // RES: a residual is added before the ReLU (BatchNorm -> add -> ReLU, a residual block's tail).
-template <int K4, bool RELU, bool RES>
+// LEAKY (with RELU, not RES): the activation is a LeakyReLU of the given slope.
+template <int K4, bool RELU, bool RES, bool LEAKY = false>
 __device__ __forceinline__ void bn_fwd_reg(const float* __restrict__ input, const float* __restrict__ residual,
     float* __restrict__ output,
     const float* __restrict__ gamma, const float* __restrict__ beta,
     float* __restrict__ saveMean, float* __restrict__ saveVar,
-    int batch, int channels, int spatial, float epsilon)
+    int batch, int channels, int spatial, float epsilon, float slope = 0.0f)
 {
     __shared__ float red[32];
     const int c = blockIdx.x, tid = threadIdx.x, s4 = spatial >> 2, n4 = batch * s4;
@@ -261,7 +278,11 @@ __device__ __forceinline__ void bn_fwd_reg(const float* __restrict__ input, cons
                 float4 r = reinterpret_cast<const float4*>(residual + ((long long)b * channels + c) * spatial)[q - b * s4];
                 y.x += r.x; y.y += r.y; y.z += r.z; y.w += r.w;
             }
-            if (RELU) { y.x = fmaxf(y.x, 0.0f); y.y = fmaxf(y.y, 0.0f); y.z = fmaxf(y.z, 0.0f); y.w = fmaxf(y.w, 0.0f); }
+            if (RELU)
+            {
+                y.x = bn_act<LEAKY>(y.x, slope); y.y = bn_act<LEAKY>(y.y, slope);
+                y.z = bn_act<LEAKY>(y.z, slope); y.w = bn_act<LEAKY>(y.w, slope);
+            }
             reinterpret_cast<float4*>(output + ((long long)b * channels + c) * spatial)[q - b * s4] = y;
         }
     }
@@ -272,12 +293,14 @@ __device__ __forceinline__ void bn_fwd_reg(const float* __restrict__ input, cons
 // RES: the forward added a residual before the ReLU; the residual's gradient is the masked dY, written to gradResidual.
 // MASK (RELU without RES): reluOutput is beta instead, and the mask is rebuilt from x, which this kernel reads anyway:
 // ReLU(z) > 0 exactly when z = bn_affine(x) > 0, the forward's own value, so it skips reading the ReLU output.
-template <int K4, bool RELU, bool RES, bool MASK = false>
+// LEAKY: the activation was a LeakyReLU of positive slope; dy is scaled by the slope instead of zeroed.
+template <int K4, bool RELU, bool RES, bool MASK = false, bool LEAKY = false>
 __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput, const float* __restrict__ reluOutput,
     float* __restrict__ gradResidual, const float* __restrict__ input,
     const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveVar,
     float* __restrict__ gradInput, float* __restrict__ gradGamma, float* __restrict__ gradBeta,
-    int batch, int channels, int spatial, float epsilon, const float* __restrict__ gradOutput2, int accumulate)
+    int batch, int channels, int spatial, float epsilon, const float* __restrict__ gradOutput2, int accumulate,
+    float slope = 0.0f)
 {
     __shared__ float red[32];
     const int c = blockIdx.x, tid = threadIdx.x, s4 = spatial >> 2, n4 = batch * s4;
@@ -304,16 +327,16 @@ __device__ __forceinline__ void bn_bwd_reg(const float* __restrict__ gradOutput,
             if (MASK)
             {
                 const float gm = gamma[c], bt = reluOutput[c];
-                dy[k].x = bn_affine(x[k].x, mean, inv, gm, bt) > 0.0f ? dy[k].x : 0.0f;
-                dy[k].y = bn_affine(x[k].y, mean, inv, gm, bt) > 0.0f ? dy[k].y : 0.0f;
-                dy[k].z = bn_affine(x[k].z, mean, inv, gm, bt) > 0.0f ? dy[k].z : 0.0f;
-                dy[k].w = bn_affine(x[k].w, mean, inv, gm, bt) > 0.0f ? dy[k].w : 0.0f;
+                dy[k].x = bn_act_grad<LEAKY>(bn_affine(x[k].x, mean, inv, gm, bt) > 0.0f, dy[k].x, slope);
+                dy[k].y = bn_act_grad<LEAKY>(bn_affine(x[k].y, mean, inv, gm, bt) > 0.0f, dy[k].y, slope);
+                dy[k].z = bn_act_grad<LEAKY>(bn_affine(x[k].z, mean, inv, gm, bt) > 0.0f, dy[k].z, slope);
+                dy[k].w = bn_act_grad<LEAKY>(bn_affine(x[k].w, mean, inv, gm, bt) > 0.0f, dy[k].w, slope);
             }
             else if (RELU)
             {
                 float4 o = reinterpret_cast<const float4*>(reluOutput + row)[q - b * s4];
-                dy[k].x = o.x > 0.0f ? dy[k].x : 0.0f; dy[k].y = o.y > 0.0f ? dy[k].y : 0.0f;
-                dy[k].z = o.z > 0.0f ? dy[k].z : 0.0f; dy[k].w = o.w > 0.0f ? dy[k].w : 0.0f;
+                dy[k].x = bn_act_grad<LEAKY>(o.x > 0.0f, dy[k].x, slope); dy[k].y = bn_act_grad<LEAKY>(o.y > 0.0f, dy[k].y, slope);
+                dy[k].z = bn_act_grad<LEAKY>(o.z > 0.0f, dy[k].z, slope); dy[k].w = bn_act_grad<LEAKY>(o.w > 0.0f, dy[k].w, slope);
             }
             if (RES) reinterpret_cast<float4*>(gradResidual + row)[q - b * s4] = dy[k];
             sdy += (dy[k].x + dy[k].y) + (dy[k].z + dy[k].w);
@@ -377,6 +400,30 @@ BN_REG_MASK_ENTRY(1)
 BN_REG_MASK_ENTRY(2)
 BN_REG_MASK_ENTRY(4)
 BN_REG_MASK_ENTRY(8)
+// BatchNorm -> LeakyReLU(slope > 0): the forward, the backward masked by the LeakyReLU output's sign, and the backward
+// with that mask rebuilt from x (its reluOutput argument is beta). Each takes the slope last.
+#define BN_REG_LEAKY_ENTRY(K4) \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_fwd_leaky_reg##K4(const float* input, \
+    const float* residual, float* output, const float* gamma, const float* beta, float* saveMean, float* saveVar, \
+    int batch, int channels, int spatial, float epsilon, float slope) \
+{ bn_fwd_reg<K4, true, false, true>(input, residual, output, gamma, beta, saveMean, saveVar, batch, channels, spatial, \
+    epsilon, slope); } \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd_leaky_reg##K4(const float* gradOutput, \
+    const float* leakyOutput, float* gradResidual, const float* input, const float* gamma, const float* saveMean, \
+    const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, int batch, int channels, int spatial, \
+    float epsilon, const float* gradOutput2, int accumulate, float slope) \
+{ bn_bwd_reg<K4, true, false, false, true>(gradOutput, leakyOutput, gradResidual, input, gamma, saveMean, saveVar, \
+    gradInput, gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2, accumulate, slope); } \
+extern ""C"" __global__ __launch_bounds__(256) void batchnorm_bwd_leakymask_reg##K4(const float* gradOutput, \
+    const float* beta, float* gradResidual, const float* input, const float* gamma, const float* saveMean, \
+    const float* saveVar, float* gradInput, float* gradGamma, float* gradBeta, int batch, int channels, int spatial, \
+    float epsilon, const float* gradOutput2, int accumulate, float slope) \
+{ bn_bwd_reg<K4, true, false, true, true>(gradOutput, beta, gradResidual, input, gamma, saveMean, saveVar, gradInput, \
+    gradGamma, gradBeta, batch, channels, spatial, epsilon, gradOutput2, accumulate, slope); }
+BN_REG_LEAKY_ENTRY(1)
+BN_REG_LEAKY_ENTRY(2)
+BN_REG_LEAKY_ENTRY(4)
+BN_REG_LEAKY_ENTRY(8)
 BN_REG_ENTRY(1, true, true, _addrelu)
 BN_REG_ENTRY(2, true, true, _addrelu)
 BN_REG_ENTRY(4, true, true, _addrelu)
@@ -448,11 +495,11 @@ __device__ __forceinline__ void bn_split_merge(const float* __restrict__ partial
     __syncthreads();
 }
 
-template <bool RELU, bool RES>
+template <bool RELU, bool RES, bool LEAKY = false>
 __device__ __forceinline__ void bn_fwd_split_apply(const float* __restrict__ input, const float* __restrict__ residual,
     float* __restrict__ output, const float* __restrict__ gamma, const float* __restrict__ beta,
     float* __restrict__ saveMean, float* __restrict__ saveVar, const float* __restrict__ partials,
-    int batch, int channels, int spatial, float epsilon, int splits)
+    int batch, int channels, int spatial, float epsilon, int splits, float slope = 0.0f)
 {
     __shared__ double stats[3];
     const int c = blockIdx.x;
@@ -480,16 +527,21 @@ __device__ __forceinline__ void bn_fwd_split_apply(const float* __restrict__ inp
             const float4 r = reinterpret_cast<const float4*>(residual + row)[q - b * s4];
             y.x += r.x; y.y += r.y; y.z += r.z; y.w += r.w;
         }
-        if (RELU) { y.x = fmaxf(y.x, 0.0f); y.y = fmaxf(y.y, 0.0f); y.z = fmaxf(y.z, 0.0f); y.w = fmaxf(y.w, 0.0f); }
+        if (RELU)
+        {
+            y.x = bn_act<LEAKY>(y.x, slope); y.y = bn_act<LEAKY>(y.y, slope);
+            y.z = bn_act<LEAKY>(y.z, slope); y.w = bn_act<LEAKY>(y.w, slope);
+        }
         reinterpret_cast<float4*>(output + row)[q - b * s4] = y;
     }
 }
 
 // MODE 0: no mask; 1: masked where maskSource (the ReLU output) is not positive; 2: masked where the rebuilt
 // pre-activation bn_affine(x) is not positive (maskSource is beta). The masked, summed output gradient of element q.
-template <int MODE>
+template <int MODE, bool LEAKY = false>
 __device__ __forceinline__ float4 bn_split_dy(const float* __restrict__ gradOutput, const float* __restrict__ gradOutput2,
-    const float* __restrict__ maskSource, long long row, int q, float4 x, float mean, float inv, float g, int c)
+    const float* __restrict__ maskSource, long long row, int q, float4 x, float mean, float inv, float g, int c,
+    float slope = 0.0f)
 {
     float4 dy = reinterpret_cast<const float4*>(gradOutput + row)[q];
     if (gradOutput2 != nullptr)
@@ -500,25 +552,25 @@ __device__ __forceinline__ float4 bn_split_dy(const float* __restrict__ gradOutp
     if (MODE == 1)
     {
         const float4 o = reinterpret_cast<const float4*>(maskSource + row)[q];
-        dy.x = o.x > 0.0f ? dy.x : 0.0f; dy.y = o.y > 0.0f ? dy.y : 0.0f;
-        dy.z = o.z > 0.0f ? dy.z : 0.0f; dy.w = o.w > 0.0f ? dy.w : 0.0f;
+        dy.x = bn_act_grad<LEAKY>(o.x > 0.0f, dy.x, slope); dy.y = bn_act_grad<LEAKY>(o.y > 0.0f, dy.y, slope);
+        dy.z = bn_act_grad<LEAKY>(o.z > 0.0f, dy.z, slope); dy.w = bn_act_grad<LEAKY>(o.w > 0.0f, dy.w, slope);
     }
     else if (MODE == 2)
     {
         const float bt = maskSource[c];
-        dy.x = bn_affine(x.x, mean, inv, g, bt) > 0.0f ? dy.x : 0.0f;
-        dy.y = bn_affine(x.y, mean, inv, g, bt) > 0.0f ? dy.y : 0.0f;
-        dy.z = bn_affine(x.z, mean, inv, g, bt) > 0.0f ? dy.z : 0.0f;
-        dy.w = bn_affine(x.w, mean, inv, g, bt) > 0.0f ? dy.w : 0.0f;
+        dy.x = bn_act_grad<LEAKY>(bn_affine(x.x, mean, inv, g, bt) > 0.0f, dy.x, slope);
+        dy.y = bn_act_grad<LEAKY>(bn_affine(x.y, mean, inv, g, bt) > 0.0f, dy.y, slope);
+        dy.z = bn_act_grad<LEAKY>(bn_affine(x.z, mean, inv, g, bt) > 0.0f, dy.z, slope);
+        dy.w = bn_act_grad<LEAKY>(bn_affine(x.w, mean, inv, g, bt) > 0.0f, dy.w, slope);
     }
     return dy;
 }
 
-template <int MODE>
+template <int MODE, bool LEAKY = false>
 __device__ __forceinline__ void bn_bwd_split_reduce(const float* __restrict__ gradOutput,
     const float* __restrict__ maskSource, const float* __restrict__ gradOutput2, const float* __restrict__ input,
     const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveVar,
-    float* __restrict__ partials, int batch, int channels, int spatial, float epsilon, int splits)
+    float* __restrict__ partials, int batch, int channels, int spatial, float epsilon, int splits, float slope = 0.0f)
 {
     __shared__ float red[32];
     const int c = blockIdx.x;
@@ -531,7 +583,8 @@ __device__ __forceinline__ void bn_bwd_split_reduce(const float* __restrict__ gr
         const int b = q / s4;
         const long long row = ((long long)b * channels + c) * spatial;
         const float4 x = reinterpret_cast<const float4*>(input + row)[q - b * s4];
-        const float4 dy = bn_split_dy<MODE>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv, g, c);
+        const float4 dy = bn_split_dy<MODE, LEAKY>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv,
+            g, c, slope);
         sdy += (dy.x + dy.y) + (dy.z + dy.w);
         sdyx += (dy.x * ((x.x - mean) * inv) + dy.y * ((x.y - mean) * inv))
               + (dy.z * ((x.z - mean) * inv) + dy.w * ((x.w - mean) * inv));
@@ -545,13 +598,13 @@ __device__ __forceinline__ void bn_bwd_split_reduce(const float* __restrict__ gr
     }
 }
 
-template <int MODE, bool RES>
+template <int MODE, bool RES, bool LEAKY = false>
 __device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gradOutput,
     const float* __restrict__ maskSource, const float* __restrict__ gradOutput2, float* __restrict__ gradResidual,
     const float* __restrict__ input, const float* __restrict__ gamma, const float* __restrict__ saveMean,
     const float* __restrict__ saveVar, float* __restrict__ gradInput, float* __restrict__ gradGamma,
     float* __restrict__ gradBeta, const float* __restrict__ partials, int batch, int channels, int spatial,
-    float epsilon, int splits, int accumulate)
+    float epsilon, int splits, int accumulate, float slope = 0.0f)
 {
     __shared__ double sums[3];
     const int c = blockIdx.x;
@@ -568,7 +621,8 @@ __device__ __forceinline__ void bn_bwd_split_apply(const float* __restrict__ gra
         const int b = q / s4;
         const long long row = ((long long)b * channels + c) * spatial;
         const float4 x = reinterpret_cast<const float4*>(input + row)[q - b * s4];
-        const float4 dy = bn_split_dy<MODE>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv, g, c);
+        const float4 dy = bn_split_dy<MODE, LEAKY>(gradOutput, gradOutput2, maskSource, row, q - b * s4, x, mean, inv,
+            g, c, slope);
         if (RES) reinterpret_cast<float4*>(gradResidual + row)[q - b * s4] = dy;
         float4 r;
         r.x = inv * (dy.x * g - invN * (sumDxhat + ((x.x - mean) * inv) * sumDxhatXhat));
@@ -1378,7 +1432,7 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
     float v = g * (expf(logits[i] - rowStats[row]) * rowStats[rows + row] - target[i]);
     gradLogits[i] = add ? gradLogits[i] + v : v;
 }
-";
+" + KernelSourceResources.Read("CudaBatchNormChannels.c");
         }
 
         public static string[] GetKernelNames()
@@ -1398,7 +1452,15 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax_xent_backward(
                 "batchnorm_bwd_split_reduce", "batchnorm_bwd_split_apply",
                 "batchnorm_bwd_relu_split_reduce", "batchnorm_bwd_relu_split_apply",
                 "batchnorm_bwd_relumask_split_reduce", "batchnorm_bwd_relumask_split_apply",
+                "batchnorm_fwd_leaky_reg1", "batchnorm_fwd_leaky_reg2", "batchnorm_fwd_leaky_reg4", "batchnorm_fwd_leaky_reg8",
+                "batchnorm_bwd_leaky_reg1", "batchnorm_bwd_leaky_reg2", "batchnorm_bwd_leaky_reg4", "batchnorm_bwd_leaky_reg8",
+                "batchnorm_bwd_leakymask_reg1", "batchnorm_bwd_leakymask_reg2", "batchnorm_bwd_leakymask_reg4",
+                "batchnorm_bwd_leakymask_reg8",
+                "batchnorm_fwd_leaky_split", "batchnorm_bwd_leaky_split_reduce", "batchnorm_bwd_leaky_split_apply",
+                "batchnorm_bwd_leakymask_split_reduce", "batchnorm_bwd_leakymask_split_apply",
                 "batchnorm_bwd_addrelu_split_reduce", "batchnorm_bwd_addrelu_split_apply",
+                "batchnorm_nhwc_stats", "batchnorm_nhwc_finalize", "batchnorm_nhwc_apply",
+                "batchnorm_nhwc_bwd_reduce", "batchnorm_nhwc_bwd_finalize", "batchnorm_nhwc_bwd_apply",
                 "layernorm_forward",
                 "layernorm_backward",
                 "layernorm_grad_params",

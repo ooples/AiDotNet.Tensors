@@ -19,7 +19,7 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorSoftmaxCrossEntropy<T>(Tensor<T> logits, Tensor<T> target)
     {
         ValidateSoftmaxCrossEntropy(logits, target);
-        if (typeof(T) != typeof(float) || this is DirectGpuTensorEngine || logits.Length == 0
+        if (typeof(T) != typeof(float) || IsDeviceEngine || logits.Length == 0
             || IsDeviceResident(logits) || IsDeviceResident(target))
             return SoftmaxCrossEntropyDecomposed(logits, target);
 

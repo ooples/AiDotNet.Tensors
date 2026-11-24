@@ -2,7 +2,7 @@
 using System;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IBatchNormVarianceBackend
+public sealed partial class CudaBackend : IBatchNormVarianceBackend, IBatchNormLeakyReluBackend
 {
     private const int BatchNormRegisterMaxFloat4PerThread = 8;
     private const int BatchNormRegisterThreads = 256;
@@ -60,8 +60,7 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         if (_batchNormSplitPartials is { } held && held.Size >= floats) return held;
         if (IsStreamCapturing()) return null;
         int size = Math.Max(floats, _batchNormSplitPartials is null ? floats : (int)Math.Min(int.MaxValue, 2L * _batchNormSplitPartials.Size));
-        _batchNormSplitPartials?.Dispose();
-        _batchNormSplitPartials = AllocateBuffer(size);
+        ReplaceScratch(ref _batchNormSplitPartials, size);   // retired, not freed, if a captured graph may hold it
         return _batchNormSplitPartials;
     }
 
@@ -76,10 +75,12 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
 
     private unsafe bool TryBatchNormSplitForward(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels, int spatial, float epsilon, bool relu,
-        IGpuBuffer? residual)
+        IGpuBuffer? residual, float leakySlope = float.NaN)
     {
         int splits = BatchNormSplitCount(batch, channels, spatial);
-        string name = residual is not null ? "batchnorm_fwd_addrelu_split" : relu ? "batchnorm_fwd_relu_split" : "batchnorm_fwd_split";
+        bool leaky = !float.IsNaN(leakySlope);
+        string name = leaky ? "batchnorm_fwd_leaky_split" : residual is not null ? "batchnorm_fwd_addrelu_split"
+            : relu ? "batchnorm_fwd_relu_split" : "batchnorm_fwd_split";
         if (splits == 0 || !_kernelCache.TryGetValue("batchnorm_split_stats", out var stats)
             || !_kernelCache.TryGetValue(name, out var apply))
             return false;
@@ -90,13 +91,13 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
             IntPtr pi = input.Handle, pr = residual?.Handle ?? IntPtr.Zero, po = output.Handle, pg = gamma.Handle,
                 pb = beta.Handle, pm = saveMean.Handle, pv = saveVariance.Handle, pp = partials.Handle;
             int b = batch, c = channels, s = spatial, n = splits;
-            float eps = epsilon;
+            float eps = epsilon, slope = leakySlope;
             void** statArgs = stackalloc void*[6];
             statArgs[0] = &pi; statArgs[1] = &pp; statArgs[2] = &b; statArgs[3] = &c; statArgs[4] = &s; statArgs[5] = &n;
             LaunchKernel2D(stats, (uint)channels, (uint)splits, 1, 256, 1, statArgs);
-            void** args = stackalloc void*[13];
+            void** args = stackalloc void*[14];
             args[0] = &pi; args[1] = &pr; args[2] = &po; args[3] = &pg; args[4] = &pb; args[5] = &pm; args[6] = &pv;
-            args[7] = &pp; args[8] = &b; args[9] = &c; args[10] = &s; args[11] = &eps; args[12] = &n;
+            args[7] = &pp; args[8] = &b; args[9] = &c; args[10] = &s; args[11] = &eps; args[12] = &n; args[13] = &slope;
             LaunchKernel2D(apply, (uint)channels, (uint)splits, 1, 256, 1, args);
         }
         System.Threading.Interlocked.Increment(ref BatchNormSplitLaunches);
@@ -106,10 +107,13 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
     private unsafe bool TryBatchNormSplitBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
         IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta,
         int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual,
-        bool rebuildMask, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        bool rebuildMask, IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput,
+        float leakySlope = float.NaN)
     {
         int splits = BatchNormSplitCount(batch, channels, spatial);
+        bool leaky = !float.IsNaN(leakySlope);
         string prefix = gradResidual is not null ? "batchnorm_bwd_addrelu_split" : reluOutput is null ? "batchnorm_bwd_split"
+            : leaky ? (rebuildMask ? "batchnorm_bwd_leakymask_split" : "batchnorm_bwd_leaky_split")
             : rebuildMask ? "batchnorm_bwd_relumask_split" : "batchnorm_bwd_relu_split";
         if (splits == 0 || !_kernelCache.TryGetValue(prefix + "_reduce", out var reduce)
             || !_kernelCache.TryGetValue(prefix + "_apply", out var apply))
@@ -123,16 +127,16 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
                 pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle, pdx = gradInput.Handle,
                 pdg = gradGamma.Handle, pdb = gradBeta.Handle, pp = partials.Handle;
             int b = batch, c = channels, s = spatial, n = splits, acc = accumulateGradInput ? 1 : 0;
-            float eps = epsilon;
-            void** reduceArgs = stackalloc void*[13];
+            float eps = epsilon, slope = leakySlope;
+            void** reduceArgs = stackalloc void*[14];
             reduceArgs[0] = &pdy; reduceArgs[1] = &pms; reduceArgs[2] = &pdy2; reduceArgs[3] = &px; reduceArgs[4] = &pg;
             reduceArgs[5] = &pm; reduceArgs[6] = &pv; reduceArgs[7] = &pp; reduceArgs[8] = &b; reduceArgs[9] = &c;
-            reduceArgs[10] = &s; reduceArgs[11] = &eps; reduceArgs[12] = &n;
+            reduceArgs[10] = &s; reduceArgs[11] = &eps; reduceArgs[12] = &n; reduceArgs[13] = &slope;
             LaunchKernel2D(reduce, (uint)channels, (uint)splits, 1, 256, 1, reduceArgs);
-            void** args = stackalloc void*[18];
+            void** args = stackalloc void*[19];
             args[0] = &pdy; args[1] = &pms; args[2] = &pdy2; args[3] = &pgr; args[4] = &px; args[5] = &pg; args[6] = &pm;
             args[7] = &pv; args[8] = &pdx; args[9] = &pdg; args[10] = &pdb; args[11] = &pp; args[12] = &b; args[13] = &c;
-            args[14] = &s; args[15] = &eps; args[16] = &n; args[17] = &acc;
+            args[14] = &s; args[15] = &eps; args[16] = &n; args[17] = &acc; args[18] = &slope;
             LaunchKernel2D(apply, (uint)channels, (uint)splits, 1, 256, 1, args);
         }
         System.Threading.Interlocked.Increment(ref BatchNormSplitLaunches);
@@ -140,18 +144,44 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         return true;
     }
 
-    unsafe bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
+    bool IBatchNormVarianceBackend.TryBatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
         IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
         int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual)
+        => BatchNormTrainingWithVariance(input, output, gamma, beta, saveMean, saveVariance, batch, channels, spatial,
+            epsilon, relu, residual, float.NaN);
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluTraining(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma,
+        IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance, int batch, int channels, int spatial,
+        float epsilon, float slope)
+        => slope > 0f && !float.IsInfinity(slope)
+           && BatchNormTrainingWithVariance(input, output, gamma, beta, saveMean, saveVariance, batch, channels, spatial,
+               epsilon, true, null, slope);
+
+    bool IBatchNormLeakyReluBackend.TryBatchNormLeakyReluBackward(IGpuBuffer gradOutput, IGpuBuffer leakyOutput,
+        IGpuBuffer input, IGpuBuffer gamma, IGpuBuffer? beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
+        IGpuBuffer gradInput, IGpuBuffer gradGamma, IGpuBuffer gradBeta, int batch, int channels, int spatial,
+        float epsilon, float slope, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        => slope > 0f && !float.IsInfinity(slope)
+           && BatchNormBackwardFromVariance(gradOutput, input, gamma, saveMean, saveVariance, gradInput, gradGamma,
+               gradBeta, batch, channels, spatial, epsilon, leakyOutput, null, beta, gradOutput2, accumulateGradInput,
+               slope);
+
+    // leakySlope NaN: ReLU (relu) or none; otherwise BatchNorm -> LeakyReLU of that slope (relu true, no residual).
+    private unsafe bool BatchNormTrainingWithVariance(IGpuBuffer input, IGpuBuffer output,
+        IGpuBuffer gamma, IGpuBuffer beta, IGpuBuffer saveMean, IGpuBuffer saveVariance,
+        int batch, int channels, int spatial, float epsilon, bool relu, IGpuBuffer? residual, float leakySlope)
     {
+        bool leaky = !float.IsNaN(leakySlope);
+        if (leaky && (!relu || residual is not null)) return false;
         int k4 = BatchNormRegisterVariant(batch, spatial, out int threads);
         long n = (long)batch * channels * spatial;
         if (k4 == 0 && channels > 0 && IsAvailable && input.Size >= n && output.Size >= n && gamma.Size >= channels
             && beta.Size >= channels && saveMean.Size >= channels && saveVariance.Size >= channels
             && (residual is null || (relu && residual.Size >= n)))
             return TryBatchNormSplitForward(input, output, gamma, beta, saveMean, saveVariance, batch, channels, spatial,
-                epsilon, relu, residual);
-        string name = residual is not null ? "batchnorm_fwd_addrelu_reg" : relu ? "batchnorm_fwd_relu_reg" : "batchnorm_fwd_reg";
+                epsilon, relu, residual, leakySlope);
+        string name = leaky ? "batchnorm_fwd_leaky_reg" : residual is not null ? "batchnorm_fwd_addrelu_reg"
+            : relu ? "batchnorm_fwd_relu_reg" : "batchnorm_fwd_reg";
         if (k4 == 0 || channels <= 0 || !IsAvailable || input.Size < n || output.Size < n || gamma.Size < channels
             || beta.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
             || (residual is not null && (!relu || residual.Size < n))
@@ -162,10 +192,10 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         IntPtr pi = input.Handle, po = output.Handle, pg = gamma.Handle, pb = beta.Handle, pm = saveMean.Handle,
             pv = saveVariance.Handle;
         int b = batch, c = channels, s = spatial;
-        float eps = epsilon;
-        void** args = stackalloc void*[11];
+        float eps = epsilon, slope = leakySlope;
+        void** args = stackalloc void*[12];
         args[0] = &pi; args[1] = &pr; args[2] = &po; args[3] = &pg; args[4] = &pb; args[5] = &pm; args[6] = &pv;
-        args[7] = &b; args[8] = &c; args[9] = &s; args[10] = &eps;
+        args[7] = &b; args[8] = &c; args[9] = &s; args[10] = &eps; args[11] = &slope;   // the slope: leaky entries only
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         return true;
     }
@@ -186,8 +216,10 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
     private unsafe bool BatchNormBackwardFromVariance(IGpuBuffer gradOutput, IGpuBuffer input,
         IGpuBuffer gamma, IGpuBuffer saveMean, IGpuBuffer saveVariance, IGpuBuffer gradInput, IGpuBuffer gradGamma,
         IGpuBuffer gradBeta, int batch, int channels, int spatial, float epsilon, IGpuBuffer? reluOutput, IGpuBuffer? gradResidual,
-        IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput)
+        IGpuBuffer? beta, IGpuBuffer? gradOutput2, bool accumulateGradInput, float leakySlope = float.NaN)
     {
+        bool leaky = !float.IsNaN(leakySlope);
+        if (leaky && (reluOutput is null || gradResidual is not null)) return false;
         // BN -> ReLU without a residual: rebuild the mask from x (one activation read fewer) when beta is supplied.
         bool rebuildMask = s_batchNormMaskFromInput && reluOutput is not null && gradResidual is null && beta is not null
                            && beta.Size >= channels;
@@ -200,14 +232,16 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
             && (gradResidual is null || (reluOutput is not null && gradResidual.Size >= n)))
             return TryBatchNormSplitBackward(gradOutput, input, gamma, saveMean, saveVariance, gradInput, gradGamma,
                 gradBeta, batch, channels, spatial, epsilon, reluOutput, gradResidual, rebuildMask, beta, gradOutput2,
-                accumulateGradInput);
+                accumulateGradInput, leakySlope);
         if (k4 == 0 || channels <= 0 || !IsAvailable || gradOutput.Size < n || input.Size < n || gradInput.Size < n
             || gamma.Size < channels || saveMean.Size < channels || saveVariance.Size < channels
             || gradGamma.Size < channels || gradBeta.Size < channels || (reluOutput is not null && reluOutput.Size < n)
             || (gradOutput2 is not null && gradOutput2.Size < n)
             || (gradResidual is not null && (reluOutput is null || gradResidual.Size < n))
             || !_kernelCache.TryGetValue((gradResidual is not null ? "batchnorm_bwd_addrelu_reg"
-                : reluOutput is null ? "batchnorm_bwd_reg" : rebuildMask ? "batchnorm_bwd_relumask_reg" : "batchnorm_bwd_relu_reg") + k4,
+                : reluOutput is null ? "batchnorm_bwd_reg"
+                : leaky ? (rebuildMask ? "batchnorm_bwd_leakymask_reg" : "batchnorm_bwd_leaky_reg")
+                : rebuildMask ? "batchnorm_bwd_relumask_reg" : "batchnorm_bwd_relu_reg") + k4,
                 out var kernel))
             return false;
         using var _ = PushContext();
@@ -215,12 +249,12 @@ public sealed partial class CudaBackend : IBatchNormVarianceBackend
         IntPtr pdy = gradOutput.Handle, px = input.Handle, pg = gamma.Handle, pm = saveMean.Handle, pv = saveVariance.Handle,
             pdx = gradInput.Handle, pdg = gradGamma.Handle, pdb = gradBeta.Handle;
         int b = batch, c = channels, s = spatial, acc = accumulateGradInput ? 1 : 0;
-        float eps = epsilon;
+        float eps = epsilon, slope = leakySlope;
         IntPtr pdy2 = gradOutput2?.Handle ?? IntPtr.Zero;
-        void** args = stackalloc void*[16];
+        void** args = stackalloc void*[17];
         args[0] = &pdy; args[1] = &pro; args[2] = &pgr; args[3] = &px; args[4] = &pg; args[5] = &pm; args[6] = &pv;
         args[7] = &pdx; args[8] = &pdg; args[9] = &pdb; args[10] = &b; args[11] = &c; args[12] = &s; args[13] = &eps;
-        args[14] = &pdy2; args[15] = &acc;
+        args[14] = &pdy2; args[15] = &acc; args[16] = &slope;   // the slope: leaky entries only
         LaunchKernel(kernel, (uint)channels, (uint)threads, args);
         if (rebuildMask) System.Threading.Interlocked.Increment(ref BatchNormMaskFromInputLaunches);
         return true;

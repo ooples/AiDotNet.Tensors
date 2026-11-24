@@ -15,6 +15,13 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (step.OpType is OpType.Conv2D or OpType.GroupedConv2D) return true;
         if (step.OpType == OpType.ConvTranspose2D)
             return step.BackwardFn == BackwardFunctions<T>.ConvTranspose2DBackward;
+        // A transposed convolution with its bias fused (ConvTransposeBiasFusionPattern): kernel at slot 1 like the
+        // unfused op, saved state (stride, padding).
+        if (step.OpType == OpType.Unknown && step.OpName == "FusedConvTranspose2DBias")
+            return step.Inputs.Length == 3
+                && step.BackwardFn == BackwardFunctions<T>.FusedConvTranspose2DBiasBackward
+                && step.SavedState is { Length: 2 } transposed && transposed[0] is int[] { Length: 2 }
+                && transposed[1] is int[] { Length: 2 };
         // The graph optimizer represents this known convolution epilogue as a
         // custom node. Match its VJP and state contract as well as its name.
         return step.OpType == OpType.Unknown && step.OpName == "FusedConv2DBias"

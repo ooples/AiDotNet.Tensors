@@ -11,11 +11,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// the channel's whole slice in registers, so the forward reads x once and the backward reads x and dY once each. Each
 /// kernel takes a mode word, so one compiled kernel covers every fused form of the CUDA family:
 /// <list type="bullet">
-/// <item>forward: bit 0 ReLU, bit 1 a residual added before it;</item>
+/// <item>forward: bit 0 ReLU, bit 1 a residual added before it, bit 5 (with bit 0, no residual) the ReLU a LeakyReLU of
+/// slope <c>slopeBits</c> (float bits; positive);</item>
 /// <item>backward: bit 0 dY masked where the ReLU output is not positive, bit 1 the masked dY also written as the
 /// residual's gradient, bit 2 the mask rebuilt from x instead of read (the forward's own value, same fma), bit 3 a second
 /// output gradient summed into dY as it loads (gradOutput + gradOutput2), bit 4 the input gradient added to the
-/// destination's contents instead of overwriting them (an accumulator that already holds this step's gradient).</item>
+/// destination's contents instead of overwriting them (an accumulator that already holds this step's gradient), bit 5
+/// (with bit 0) dY scaled by the LeakyReLU slope where the mask is off instead of zeroed.</item>
 /// </list>
 /// The mask rebuild (backward bit 2) is exact only where the forward and the backward round z = fma(gamma, x-hat, beta)
 /// the same: OpenCL, Metal and HIP define fma as one correctly rounded operation, GLSL does under <c>precise</c> (which the
@@ -50,7 +52,7 @@ internal static class BatchNormRegisterKernelTemplate
         return 0;
     }
 
-    private static readonly string[] Ints = { "batch", "channels", "spatial", "epsBits", "invCountBits", "mode" };
+    private static readonly string[] Ints = { "batch", "channels", "spatial", "epsBits", "invCountBits", "mode", "slopeBits" };
 
     // The group's sum of `value` into float `result` (every thread), through sm[256]: a fixed tree, so one device sums
     // a channel the same way every time.
@@ -69,7 +71,7 @@ internal static class BatchNormRegisterKernelTemplate
     private const string Prologue = @"
     int tid = lid, c = grp;
     int n = batch * spatial;
-    float eps = IBITS(epsBits), invCount = IBITS(invCountBits);
+    float eps = IBITS(epsBits), invCount = IBITS(invCountBits), slope = IBITS(slopeBits);
 ";
 
     private static string ForwardBody(int k) => (Prologue + @"
@@ -109,7 +111,7 @@ internal static class BatchNormRegisterKernelTemplate
             int idx = (b * channels + c) * spatial + (e - b * spatial);
             PRECISE float y = FMA(g, (v[k] - mean) * inv, bt);
             if ((mode & 2) != 0) y += res[idx];
-            if ((mode & 1) != 0) y = FMAX(y, 0.0f);
+            if ((mode & 1) != 0) y = (mode & 32) != 0 ? (y > 0.0f ? y : slope * y) : FMAX(y, 0.0f);
             yout[idx] = y;
         }
     }
@@ -136,9 +138,9 @@ internal static class BatchNormRegisterKernelTemplate
             if ((mode & 4) != 0)
             {
                 PRECISE float z = FMA(g, (x - mean) * inv, bt);   // the forward's y before its ReLU, rounded the same
-                if (!(z > 0.0f)) d = 0.0f;
+                if (!(z > 0.0f)) d = (mode & 32) != 0 ? d * slope : 0.0f;
             }
-            else if ((mode & 1) != 0) { if (!(msk[idx] > 0.0f)) d = 0.0f; }
+            else if ((mode & 1) != 0) { if (!(msk[idx] > 0.0f)) d = (mode & 32) != 0 ? d * slope : 0.0f; }
             if ((mode & 2) != 0) dres[idx] = d;
             xv[k] = x;
             dv[k] = d;

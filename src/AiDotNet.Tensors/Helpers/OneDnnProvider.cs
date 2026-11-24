@@ -144,9 +144,12 @@ internal static class OneDnnProvider
         if (_resolverRegistered) return;
         _resolverRegistered = true;
 
+        // Through the shared registry, never SetDllImportResolver directly: .NET takes one resolver per assembly, so a
+        // direct registration here, made first by a CPU convolution, left the registry's dispatcher uninstalled and every
+        // later cuBLAS load fell through to the build-time name (cublas64_12), absent on a CUDA 13 machine.
         try
         {
-            NativeLibrary.SetDllImportResolver(typeof(OneDnnProvider).Assembly, (libraryName, assembly, searchPath) =>
+            AiDotNet.Tensors.Engines.NativeLibraryResolverRegistry.Register((libraryName, assembly, searchPath) =>
             {
                 if (libraryName != "dnnl")
                     return IntPtr.Zero;

@@ -2084,7 +2084,60 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     Assert.Equal(5, mask.Length);
                     gpu.SetCurrentScratchAction(-1);
                     Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
-                    Assert.Equal(afterOne + 1, Slots());
+                    // A CUDA slot is one per local index, grown to the largest request: the mask's 5 elements are a view
+                    // of the slot the distances used, not a new size class.
+                    Assert.Equal(afterOne, Slots());
+                }
+            }
+            finally
+            {
+                gpu.ResumeActivationEviction();
+                DirectGpuTensorEngine.RestoreScratchPool(outerPool);
+                pool.Release();
+            }
+        }
+    }
+
+    /// <summary>
+    /// A transient slot is one buffer per local index, grown to the largest request any action makes there (DCGAN's BF16
+    /// step held 35 size-class buffers for its convolution operands). Each caller still gets exactly its length. A slot
+    /// that outgrows its buffer frees the old one while no captured graph of the plan can name it, and keeps it until the
+    /// graphs are destroyed otherwise.
+    /// </summary>
+    [SkippableFact]
+    public void Transient_slot_grows_to_the_largest_request_and_retires_the_old_buffer_safely()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            var backend = gpu.GetBackend()!;
+            Skip.IfNot(backend is AiDotNet.Tensors.Engines.DirectGpu.IGpuBufferViews { ViewsAreFreeAtAnyOffset: true },
+                "The backend keys transient scratch by exact length.");
+            var pool = gpu.CreateScratchPool();
+            var outerPool = DirectGpuTensorEngine.EnterScratchPool(pool);
+            gpu.SuspendActivationEviction();
+            try
+            {
+                using (gpu.EnterCompiledCapturePath())
+                {
+                    int[] lengths = { 100, 5000, 300, 50000 };
+                    for (int action = 0; action < lengths.Length; action++)
+                    {
+                        gpu.SetCurrentScratchAction(action);
+                        // The last request comes while a graph may name the pool's buffers.
+                        if (action == lengths.Length - 1) pool.GraphsHoldBuffers = true;
+                        var buffer = gpu.RentTransientScratch(backend, lengths[action]);
+                        Assert.Equal(lengths[action], buffer.Size);
+                        Assert.Single(pool.Transient);
+                        foreach (var slot in pool.Transient.Values) Assert.True(slot.Size >= lengths[action]);
+                        // Outgrown with no graph: the 100-element buffer was freed, not kept.
+                        if (action < lengths.Length - 1) Assert.Equal(0, pool.RetiredTransientCount);
+                    }
+                    gpu.SetCurrentScratchAction(-1);
+                    Assert.Equal(1, pool.RetiredTransientCount);   // the 5000-element buffer a graph could name
+                    pool.GraphsHoldBuffers = false;                 // the plan destroyed its graphs
+                    Assert.Equal(0, pool.RetiredTransientCount);
                 }
             }
             finally

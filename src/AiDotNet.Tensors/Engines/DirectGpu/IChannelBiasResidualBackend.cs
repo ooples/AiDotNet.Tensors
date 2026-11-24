@@ -24,8 +24,8 @@ internal static class ChannelBiasResidualGeometry
         if (writeActivation)
         {
             if (!ChannelBiasLeakyGeometry.TryCount(input, bias, activated, batch, channels, spatial, alpha, out _)) return false;
-            var activatedRoot = GpuBufferViewRoot.Of(activated);
-            if (SameRoot(activatedRoot, residualRoot) || SameRoot(activatedRoot, outputRoot)) return false;
+            if (GpuBufferViewRoot.SameAllocation(activated, residual) || GpuBufferViewRoot.SameAllocation(activated, output))
+                return false;
         }
         count = total;
         return true;
