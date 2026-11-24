@@ -109,13 +109,52 @@ public sealed class AwaitableGpuTensorEngineHostBackendTests
         var backend = new HostAwaitableBackend();
         using var engine = new AwaitableGpuTensorEngine(backend);
         var a = Values(1, 4);
-        using (new GradientTape<float>())
+        var b = Values(2, 4);
+        var cpu = new CpuEngine();
+        float[] gradient;
+        using (var tape = new GradientTape<float>())
         {
-            AssertClose(new CpuEngine().TensorExp(a), await engine.TensorExpAsync(a));
-            AssertClose(new CpuEngine().TensorMultiply(a, a), await engine.TensorMultiplyAsync(a, a));
+            AssertClose(cpu.TensorExp(a), await engine.TensorExpAsync(a));
+            var product = await engine.TensorMultiplyAsync(a, b);
+            AssertClose(cpu.TensorMultiply(a, b), product);
+            // Recorded, not only computed: the gradient of sum(a * b) with respect to a is b.
+            gradient = tape.ComputeGradients(cpu.ReduceSum(product, null), new[] { a })[a].ToArray();
         }
 
+        Assert.Equal(b.ToArray(), gradient);
         Assert.Equal(0, backend.Kernels);
+    }
+
+    [Fact]
+    public async Task In_anomaly_mode_the_cpu_computes_so_a_division_by_zero_is_the_cpus_infinity()
+    {
+        // The backend answers a division by zero with a finite value, as a device is free to.
+        var backend = new HostAwaitableBackend { DivisionByZeroResult = 0f };
+        using var engine = new AwaitableGpuTensorEngine(backend);
+        var one = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        var zero = new Tensor<float>(new[] { 0f, 4f }, new[] { 2 });
+
+        Assert.Equal(new[] { 0f, 0.5f }, (await engine.TensorDivideAsync(one, zero)).ToArray());
+        Assert.Equal(1, backend.Kernels);
+        using (new AnomalyModeScope())
+        {
+            Assert.Equal(new[] { float.PositiveInfinity, 0.5f }, (await engine.TensorDivideAsync(one, zero)).ToArray());
+        }
+
+        Assert.Equal(1, backend.Kernels);
+    }
+
+    [Fact]
+    public async Task A_product_too_large_for_a_device_buffer_never_reaches_the_backend()
+    {
+        // 65537 x 65537 elements: m * n wraps to 131073 as an int, which would size the output for a far smaller product.
+        var backend = new HostAwaitableBackend();
+        using var engine = new AwaitableGpuTensorEngine(backend);
+        var column = new Tensor<float>(new float[65537], new[] { 65537, 1 });
+        var row = new Tensor<float>(new float[65537], new[] { 1, 65537 });
+        await Assert.ThrowsAnyAsync<Exception>(() => engine.TensorMatMulAsync(column, row).AsTask());
+        Assert.Equal(0, backend.Kernels);
+        Assert.Equal(0, backend.Allocations);
     }
 
     [Fact]
@@ -226,6 +265,9 @@ internal sealed class HostAwaitableBackend : IAwaitableGpuBackend
     /// <summary>Every kernel throws this instead of computing.</summary>
     public Exception? Failure { get; set; }
 
+    /// <summary>What a division by zero yields, when set: a device may leave it indeterminate.</summary>
+    public float? DivisionByZeroResult { get; set; }
+
     /// <summary>Extra elements a download returns past the buffer's size, as a pooled buffer has.</summary>
     public int DownloadPadding { get; set; }
 
@@ -304,7 +346,7 @@ internal sealed class HostAwaitableBackend : IAwaitableGpuBackend
     public Task AddAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Binary(A, B, C, size, (x, y) => x + y);
     public Task SubtractAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Binary(A, B, C, size, (x, y) => x - y);
     public Task MultiplyAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Binary(A, B, C, size, (x, y) => x * y);
-    public Task DivideAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Binary(A, B, C, size, (x, y) => x / y);
+    public Task DivideAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int size) => Binary(A, B, C, size, (x, y) => y == 0f && DivisionByZeroResult is { } indeterminate ? indeterminate : x / y);
     public Task ExpAsync(IGpuBuffer A, IGpuBuffer B, int size) => Unary(A, B, size, MathF.Exp);
     public Task LogAsync(IGpuBuffer A, IGpuBuffer B, int size) => Unary(A, B, size, MathF.Log);
     public Task SqrtAsync(IGpuBuffer A, IGpuBuffer B, int size) => Unary(A, B, size, MathF.Sqrt);

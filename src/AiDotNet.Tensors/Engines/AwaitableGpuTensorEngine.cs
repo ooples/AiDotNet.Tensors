@@ -103,7 +103,10 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
         var left = a.Shape.ToArray();
         var right = b.Shape.ToArray();
         if (typeof(T) != typeof(float) || RecordsOnThisThread<T>() || left.Length != 2 || right.Length != 2
-            || left[1] != right[0] || left[0] == 0 || left[1] == 0 || right[1] == 0)
+            || left[1] != right[0] || left[0] == 0 || left[1] == 0 || right[1] == 0
+            // A product whose element count does not fit an int has no device buffer (m * n would wrap to a small
+            // one, undersized for the kernel): the CPU engine answers for it, as for every other shape it owns.
+            || (long)left[0] * right[1] > int.MaxValue)
             return _cpu.TensorMatMulAsync(a, b, cancellationToken);
         return MatMulOnDevice(a, b, left[0], right[1], left[1], cancellationToken);
     }
@@ -199,9 +202,11 @@ public sealed class AwaitableGpuTensorEngine : IAsyncEngine, IDisposable
         return FromFloats<T>(result, size, shape);
     }
 
-    // Recording state is thread-local; see the remarks.
+    // Recording state is thread-local; see the remarks. Anomaly mode is too, and takes the CPU as the synchronous engine
+    // does: a device may leave a float division by zero indeterminate, and the detector exists to report the CPU's Inf.
     private static bool RecordsOnThisThread<T>()
-        => Autodiff.GradientTape<T>.Current is not null || Compilation.GraphMode.Current is not null;
+        => Autodiff.GradientTape<T>.Current is not null || Compilation.GraphMode.Current is not null
+           || Autodiff.AnomalyModeScope.IsActive;
 
     private static bool SameShape(int[] left, int[] right)
     {

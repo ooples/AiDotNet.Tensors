@@ -17,8 +17,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// through the page's event loop, on the same thread that would be waiting.
 /// </para>
 /// <para>
-/// Everything here is safe to call on any thread, including a browser's only thread: nothing waits for the device.
-/// Writing host data into a buffer queues the copy, which the device orders before any later operation.
+/// On an <see cref="IAwaitableGpuBackend"/> everything here is safe to call on any thread, including a browser's only
+/// thread: nothing waits for the device, and writing host data into a buffer queues the copy, which the device orders
+/// before any later operation. A synchronous backend gives no such guarantee: its upload may wait for the device (CUDA
+/// synchronizes its stream when it has no staging buffer for the copy).
 /// </para>
 /// </remarks>
 public interface IGpuDevice : IDisposable
