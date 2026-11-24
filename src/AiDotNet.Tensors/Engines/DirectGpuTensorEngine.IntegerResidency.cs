@@ -299,6 +299,18 @@ public partial class DirectGpuTensorEngine
             return TryMapInteger(shorts, GpuElementType.Int16, callerName, (e, a, o, n) => LaunchIntegerUnary(e, Operation, GpuElementType.Int16, a, o, n)) as Tensor<T>;
         if (input is Tensor<sbyte> sbytes)
             return TryMapInteger(sbytes, GpuElementType.Int8, callerName, (e, a, o, n) => LaunchIntegerUnary(e, Operation, GpuElementType.Int8, a, o, n)) as Tensor<T>;
+        // An unsigned element is its own absolute value, its sign is whether it is not zero, and its negation is its
+        // product with the type's all-ones value (the two's complement the CPU engine's wrapping cast gives).
+        if (input is Tensor<byte> bytes)
+            return TryMapInteger(bytes, GpuElementType.UInt8, callerName, (e, a, o, n) =>
+            {
+                switch (Operation)
+                {
+                    case GpuIntegerUnaryOperation.Abs: e.ScalarInteger(GpuIntegerBinaryOperation.Add, a, 0, o, n); break;
+                    case GpuIntegerUnaryOperation.Sign: e.ScalarInteger(GpuIntegerBinaryOperation.NotEqual, a, 0, o, n); break;
+                    default: e.ScalarInteger(GpuIntegerBinaryOperation.Multiply, a, byte.MaxValue, o, n); break;
+                }
+            }) as Tensor<T>;
         return null;
     }
 

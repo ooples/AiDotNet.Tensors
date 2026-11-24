@@ -119,19 +119,21 @@ public class GpuIntegerResidencyTests
             // Divide, divide by -1 and the absolute value run on the device behind a check of the operands there,
             // because the CPU engine raises for a zero divisor and for the most negative value. First with operands
             // it does not raise for: the results stay on the device and equal the CPU engine's.
-            long lowest = type switch
+            // Null for the unsigned type, which has no value whose negation overflows.
+            long? lowest = type switch
             {
                 GpuElementType.Int8 => sbyte.MinValue,
                 GpuElementType.Int16 => short.MinValue,
                 GpuElementType.Int32 => int.MinValue,
-                _ => long.MinValue,
+                GpuElementType.Int64 => long.MinValue,
+                _ => null,
             };
             var safeValues = Array.ConvertAll(xValues, v => Convert.ToInt64(v) == lowest ? narrow(1) : v);
             var divisorValues = Array.ConvertAll(yValues, v => Convert.ToInt64(v) == 0 ? narrow(3) : v);
             var zeroDivisorValues = (T[])divisorValues.Clone();
             zeroDivisorValues[Large / 2] = narrow(0);
             var lowestValues = (T[])safeValues.Clone();
-            lowestValues[7] = narrow(lowest);
+            lowestValues[7] = narrow(lowest ?? 0);
             var minusOneValues = (T[])divisorValues.Clone();
             minusOneValues[7] = narrow(-1);
             Tensor<T> Resident(T[] values) => new Tensor<T>((T[])values.Clone(), new[] { Large });
@@ -166,8 +168,12 @@ public class GpuIntegerResidencyTests
                 Assert.Throws<DivideByZeroException>(() => engine.TensorDivide(safe, zeroDivisor));
                 Assert.Throws<DivideByZeroException>(() => cpu.TensorDivide(Resident(safeValues), Resident(zeroDivisorValues)));
                 Assert.Throws<DivideByZeroException>(() => engine.TensorDivideScalar(safe, narrow(0)));
-                Assert.Throws<OverflowException>(() => engine.TensorAbs(withLowest));
-                Assert.Throws<OverflowException>(() => cpu.TensorAbs(Resident(lowestValues)));
+                if (lowest is not null)
+                {
+                    Assert.Throws<OverflowException>(() => engine.TensorAbs(withLowest));
+                    Assert.Throws<OverflowException>(() => cpu.TensorAbs(Resident(lowestValues)));
+                }
+
                 if (type is GpuElementType.Int32 or GpuElementType.Int64)
                 {
                     Assert.Throws<OverflowException>(() => engine.TensorDivide(withLowest, withMinusOne));
@@ -213,6 +219,10 @@ public class GpuIntegerResidencyTests
     [SkippableFact]
     public void Int8_chain_stays_on_the_device_under_a_preserving_policy()
         => RunChain(GpuElementType.Int8, v => unchecked((sbyte)v), (sbyte)-13, explicitPreserve: true);
+
+    [SkippableFact]
+    public void UInt8_chain_stays_on_the_device_under_a_preserving_policy()
+        => RunChain(GpuElementType.UInt8, v => unchecked((byte)v), (byte)13, explicitPreserve: true);
 
     [SkippableFact]
     public void Plain_host_operands_stay_on_the_cpu_and_a_host_write_invalidates_the_device_copy()
