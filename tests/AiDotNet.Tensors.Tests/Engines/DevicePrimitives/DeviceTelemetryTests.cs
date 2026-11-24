@@ -71,6 +71,50 @@ public class DeviceTelemetryTests
         }
     }
 
+    // nvidia-smi's memory.used is what a monitor's device memory figure is checked against. The driver's free-memory
+    // query is not it under Windows' display driver model (about 1.2 GB off on an RTX 3080 during training): NVML's is.
+    [SkippableFact]
+    public void Device_memory_in_use_is_the_figure_nvidia_smi_prints()
+    {
+        Skip.IfNot(TryCuda(out var gpu) && gpu is not null, "CUDA backend did not resolve.");
+        using (gpu)
+        {
+            var backend = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
+            using var held = backend.AllocateBuffer(64 << 20);   // 256 MiB, so this process is on the device
+            backend.Synchronize();
+            bool read = GpuUtilization.TryReadDeviceMemory(backend, out long used, out long total);
+            Skip.IfNot(read, "NVML is not installed with this driver.");
+            Skip.IfNot(TryNvidiaSmi(backend, out double smiUsedMb, out double smiTotalMb), "nvidia-smi is not on PATH.");
+            double usedMb = used / (1024.0 * 1024.0), totalMb = total / (1024.0 * 1024.0);
+            Assert.Equal(smiTotalMb, totalMb, 0.5);
+            // Other processes can allocate between the two reads; 64 MiB of slack, far below the 1.2 GB it was off.
+            Assert.True(Math.Abs(usedMb - smiUsedMb) <= 64, $"NVML used {usedMb:F1} MiB, nvidia-smi {smiUsedMb} MiB");
+            Assert.True(used >= 256L << 20, $"used {used} does not cover this process's 256 MiB");
+        }
+    }
+
+    private static bool TryNvidiaSmi(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend backend, out double usedMb, out double totalMb)
+    {
+        usedMb = totalMb = 0;
+        string? uuid = backend.DeviceUuidForTests;
+        if (uuid is null) return false;
+        try
+        {
+            var info = new System.Diagnostics.ProcessStartInfo("nvidia-smi",
+                $"-i {uuid} --query-gpu=memory.used,memory.total --format=csv,noheader,nounits")
+            { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+            using var smi = System.Diagnostics.Process.Start(info)!;
+            string line = smi.StandardOutput.ReadToEnd().Trim();
+            smi.WaitForExit();
+            var parts = line.Split(',');
+            if (smi.ExitCode != 0 || parts.Length != 2) return false;
+            usedMb = double.Parse(parts[0].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            totalMb = double.Parse(parts[1].Trim(), System.Globalization.CultureInfo.InvariantCulture);
+            return true;
+        }
+        catch (System.ComponentModel.Win32Exception) { return false; }
+    }
+
     // loss = sum(p^2): the gradient is 2p, so the pre-clip norm is 2 ||p||. A learning rate of 0 keeps p, so every step
     // has that norm: through the warmup steps and the captured replays alike, and on the host plan.
     private static void AssertPlanReportsItsClipNorm(IEngine engine)

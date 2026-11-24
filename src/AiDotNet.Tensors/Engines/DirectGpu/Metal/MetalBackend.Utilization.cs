@@ -9,4 +9,10 @@ public sealed partial class MetalBackend : IDeviceUtilization
         gpuPercent = memoryPercent = 0;
         return false;
     }
+
+    bool IDeviceUtilization.TryGetDeviceMemoryInUse(out long usedBytes, out long totalBytes)
+    {
+        usedBytes = totalBytes = 0;
+        return false;
+    }
 }

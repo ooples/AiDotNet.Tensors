@@ -1039,5 +1039,6 @@ AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanGradientNorm.GradientN
 AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlanGradientNorm.TryGetLastGradientNorm(out double norm) -> bool
 AiDotNet.Tensors.Engines.DevicePrimitives.GpuUtilization
 static AiDotNet.Tensors.Engines.DevicePrimitives.GpuUtilization.TryRead(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, out int gpuPercent, out int memoryPercent) -> bool
+static AiDotNet.Tensors.Engines.DevicePrimitives.GpuUtilization.TryReadDeviceMemory(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, out long usedBytes, out long totalBytes) -> bool
 static AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.TryGetDeviceMemory(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, out long freeBytes, out long totalBytes) -> bool
 AiDotNet.Tensors.LinearAlgebra.StreamingTensorPool.ReservedBytes.get -> long

@@ -12,9 +12,23 @@ public sealed partial class CudaBackend : IDeviceUtilization
     bool IDeviceUtilization.TryGetDeviceUtilization(out int gpuPercent, out int memoryPercent)
     {
         gpuPercent = memoryPercent = 0;
+        return HasNvmlDevice() && NvmlNative.TryGetUtilization(_nvmlDevice, out gpuPercent, out memoryPercent);
+    }
+
+    bool IDeviceUtilization.TryGetDeviceMemoryInUse(out long usedBytes, out long totalBytes)
+    {
+        usedBytes = totalBytes = 0;
+        return HasNvmlDevice() && NvmlNative.TryGetMemory(_nvmlDevice, out usedBytes, out totalBytes);
+    }
+
+    /// <summary>This backend's device UUID ("GPU-..."), or null (tests that query nvidia-smi for the same device).</summary>
+    internal string? DeviceUuidForTests => TryDeviceUuid(out string uuid) ? uuid : null;
+
+    private bool HasNvmlDevice()
+    {
         if (_nvmlState == 0)
             _nvmlState = TryDeviceUuid(out string uuid) && NvmlNative.TryGetDevice(uuid, out _nvmlDevice) ? 1 : -1;
-        return _nvmlState > 0 && NvmlNative.TryGetUtilization(_nvmlDevice, out gpuPercent, out memoryPercent);
+        return _nvmlState > 0;
     }
 
     // "GPU-" and the 16 UUID bytes as 8-4-4-4-12 hex digits, the form nvidia-smi and NVML use.

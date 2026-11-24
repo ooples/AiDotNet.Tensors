@@ -18,8 +18,35 @@ internal static class NvmlNative
         public uint Memory;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NvmlMemory
+    {
+        public ulong Total;
+        public ulong Free;
+        public ulong Used;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NvmlMemoryV2
+    {
+        public uint Version;
+        public ulong Total;
+        public ulong Reserved;
+        public ulong Free;
+        public ulong Used;
+    }
+
+    // NVML_STRUCT_VERSION(Memory, 2): the struct size with the version in the top byte.
+    private static readonly uint s_memoryV2Version = (uint)Marshal.SizeOf<NvmlMemoryV2>() | (2u << 24);
+
     private static class Windows
     {
+        [DllImport("nvml", EntryPoint = "nvmlDeviceGetMemoryInfo")]
+        public static extern int MemoryInfo(IntPtr device, out NvmlMemory memory);
+
+        [DllImport("nvml", EntryPoint = "nvmlDeviceGetMemoryInfo_v2")]
+        public static extern int MemoryInfoV2(IntPtr device, ref NvmlMemoryV2 memory);
+
         [DllImport("nvml", EntryPoint = "nvmlInit_v2")]
         public static extern int Init();
 
@@ -32,6 +59,12 @@ internal static class NvmlNative
 
     private static class Linux
     {
+        [DllImport("libnvidia-ml.so.1", EntryPoint = "nvmlDeviceGetMemoryInfo")]
+        public static extern int MemoryInfo(IntPtr device, out NvmlMemory memory);
+
+        [DllImport("libnvidia-ml.so.1", EntryPoint = "nvmlDeviceGetMemoryInfo_v2")]
+        public static extern int MemoryInfoV2(IntPtr device, ref NvmlMemoryV2 memory);
+
         [DllImport("libnvidia-ml.so.1", EntryPoint = "nvmlInit_v2")]
         public static extern int Init();
 
@@ -69,6 +102,35 @@ internal static class NvmlNative
             if (status != 0) return false;
             gpuPercent = (int)rates.Gpu;
             memoryPercent = (int)rates.Memory;
+            return true;
+        }
+        catch (Exception ex) when (IsLoadFailure(ex)) { return false; }
+    }
+
+    /// <summary>
+    /// The device's memory in use by every process and its total, in bytes, as <c>nvidia-smi</c> prints them
+    /// (memory.used and memory.total). NVML's version 2 query leaves the driver's own reservation out of "used", as
+    /// nvidia-smi does; a driver without it answers the version 1 figure.
+    /// </summary>
+    internal static bool TryGetMemory(IntPtr device, out long usedBytes, out long totalBytes)
+    {
+        usedBytes = totalBytes = 0;
+        try
+        {
+            var v2 = new NvmlMemoryV2 { Version = s_memoryV2Version };
+            int status;
+            try { status = s_windows ? Windows.MemoryInfoV2(device, ref v2) : Linux.MemoryInfoV2(device, ref v2); }
+            catch (EntryPointNotFoundException) { status = -1; }
+            if (status == 0)
+            {
+                usedBytes = (long)v2.Used;
+                totalBytes = (long)v2.Total;
+                return true;
+            }
+            NvmlMemory v1;
+            if ((s_windows ? Windows.MemoryInfo(device, out v1) : Linux.MemoryInfo(device, out v1)) != 0) return false;
+            usedBytes = (long)v1.Used;
+            totalBytes = (long)v1.Total;
             return true;
         }
         catch (Exception ex) when (IsLoadFailure(ex)) { return false; }

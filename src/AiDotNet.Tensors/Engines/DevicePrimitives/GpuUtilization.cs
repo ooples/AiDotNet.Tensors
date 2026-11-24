@@ -23,4 +23,18 @@ public static class GpuUtilization
         gpuPercent = memoryPercent = 0;
         return backend is IDeviceUtilization utilization && utilization.TryGetDeviceUtilization(out gpuPercent, out memoryPercent);
     }
+
+    /// <summary>
+    /// Reads <paramref name="backend"/>'s device memory in use by every process and its total, in bytes, as the
+    /// management library reports them: on CUDA, NVML (the memory.used and memory.total <c>nvidia-smi</c> prints).
+    /// The driver's free-memory query (<see cref="GpuMemoryStats.TryGetDeviceMemory"/>) is not that figure: under
+    /// Windows' display driver model it answers this process's budget, about 1.2 GB off nvidia-smi on an RTX 3080.
+    /// False when the platform exposes no counter (every backend but CUDA) or NVML is not installed.
+    /// </summary>
+    public static bool TryReadDeviceMemory(IDirectGpuBackend backend, out long usedBytes, out long totalBytes)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        usedBytes = totalBytes = 0;
+        return backend is IDeviceUtilization utilization && utilization.TryGetDeviceMemoryInUse(out usedBytes, out totalBytes);
+    }
 }
