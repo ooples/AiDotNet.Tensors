@@ -2361,6 +2361,12 @@ public sealed partial class CuDnnConvolution : IDisposable
 
     /// <summary>The device's memory counters, which count the workspace (PyTorch counts cuDNN's as allocated).</summary>
     internal DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
+
+    /// <summary>The release the device's budget runs before refusing workspace growth: the owning backend's, which
+    /// frees pooled and unreachable memory as a driver out-of-memory does (and nothing inside a stream capture).</summary>
+    internal Action? BudgetReclaim { get; set; }
+
+    private bool WithinBudget(ulong bytes) => MemoryAccount is not { } account || account.TryAdmit((long)bytes, BudgetReclaim, out _);
     private DevicePrimitives.DeviceMemoryHold _workspaceMemory;
 
     private void EnsureWorkspaceUnlocked(ulong requiredSize, bool exactSize = false)
@@ -2381,13 +2387,19 @@ public sealed partial class CuDnnConvolution : IDisposable
         // requests only its required size.
         bool oldIsFreeable = _workspace == IntPtr.Zero || DirectGpu.CUDA.CudaBackend.CaptureEpoch == _workspaceEpoch;
         ulong size = exactSize || oldIsFreeable ? requiredSize : Math.Max(requiredSize, _workspaceSize * 2);
-        result = CuBlasNative.cuMemAlloc(out IntPtr grown, size);
+        // Past this process's GpuMemoryBudget a request is refused as the driver refuses one: out of memory.
+        IntPtr grown = IntPtr.Zero;
+        result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
         if (result == CudaResult.OutOfMemory && size > requiredSize)
         {
             size = requiredSize;
-            result = CuBlasNative.cuMemAlloc(out grown, size);
+            result = WithinBudget(size) ? CuBlasNative.cuMemAlloc(out grown, size) : CudaResult.OutOfMemory;
         }
-        if (result != CudaResult.Success) return false;
+        if (result != CudaResult.Success)
+        {
+            DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
+            return false;
+        }
         DirectGpu.BufferAllocationDiagnostics.RecordCudnnWorkspaceAllocation((long)size);
 
         // Once a stream capture has begun since the old workspace was allocated, it is retired, not freed: a captured CUDA
@@ -2410,6 +2422,7 @@ public sealed partial class CuDnnConvolution : IDisposable
         _workspaceSize = size;
         _workspaceMemory = default;
         _workspaceMemory.OnAllocated(MemoryAccount, (long)size);
+        DevicePrimitives.DeviceMemoryAccount.SettleAdmission();
         return true;
     }
 

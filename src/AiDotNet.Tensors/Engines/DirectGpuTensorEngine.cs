@@ -912,6 +912,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // backing-array → element count: presence marks the tensor's resident buffer as holding FP16 (count halfs).
     private readonly System.Collections.Concurrent.ConcurrentDictionary<object, int> _fp16ResidentArrays = new();
 
+    // The same tag for every engine in the process. Tensor.Contiguous() asks the CURRENT engine to permute a view on
+    // the device, and that engine need not be the one that bound the FP16 buffer: sharing its backend (Vulkan's is one
+    // per process) it found the buffer and permuted the half words as floats. Weak, so a tag never keeps an array alive.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> s_fp16TaggedArrays = new();
+
+    private static bool IsFp16TaggedByAnyEngine<T>(Tensor<T> t)
+    {
+        if (!Fp16ActEnabled) return false;
+        var arr = t.GetBackingArrayForCacheLookupUnsafe();
+        return arr is not null && s_fp16TaggedArrays.TryGetValue(arr, out _);
+    }
+
     /// <summary>Mark a tensor GPU-resident on an FP16 buffer (count halfs): tags the backing array FP16 and
     /// registers a downconvert (FP16→FP32) host materializer so CPU reads stay correct.</summary>
     internal void BindResidentBufferFp16<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, int elementCount)
@@ -920,6 +932,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return;
         _fp16ResidentArrays[arr] = elementCount;
+        s_fp16TaggedArrays.GetValue(arr, static _ => new object());
         var capBuf = buf; var capBackend = backend; var capCount = elementCount;
         Helpers.HostSync.Register(arr, a =>
         {
@@ -963,6 +976,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!ResidentStepActive && t._gpuBufferVersion != t.GpuCacheVersion)
         {
             _fp16ResidentArrays.TryRemove(arr, out _);
+            s_fp16TaggedArrays.Remove(arr);
             count = 0;
             return null;
         }
@@ -1862,6 +1876,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         result = null!;
         if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
         if (backend is IGpuGraphCapture cuda && cuda.IsStreamCapturing()) return false;
+        // The device copy of an FP16-resident tensor holds halves: the host path reads it through its materializer.
+        if (IsFp16TaggedByAnyEngine(view)) return false;
         if (!TryPermuteViewOnDevice(backend, view, out var permuted)) return false;
         result = DeferTensorResult<T>(backend, permuted.Buffer, view.Length, view.Shape.ToArray());
         return true;
@@ -2168,7 +2184,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // A strided view of an FP16-resident tensor shares its backing array, and the device copy behind that array
         // holds FP16 bits: the device view paths below would permute or slice them as FP32. Contiguous() reads the view
         // through the FP16 -> FP32 host materializer instead.
-        bool fp16View = isView && IsFp16Resident(tensor);
+        bool fp16View = isView && (IsFp16Resident(tensor) || IsFp16TaggedByAnyEngine(tensor));
         // A non-contiguous tensor (or one with a nonzero storage offset) is a STRIDED VIEW: it shares
         // its source's backing array, and any GPU buffer cached against that array holds the SOURCE's
         // contiguous layout — NOT the view's permuted/sliced layout. The fast paths below all key off
@@ -6914,7 +6930,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
         // #3 FP16-act: this array now holds FP32 — drop any stale FP16 tag (a pooled array reused FP16→FP32).
-        if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
+        if (Fp16ActEnabled)
+        {
+            _fp16ResidentArrays.TryRemove(arr, out _);
+            s_fp16TaggedArrays.Remove(arr);
+        }
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
         if (!isDeviceModified)
         {

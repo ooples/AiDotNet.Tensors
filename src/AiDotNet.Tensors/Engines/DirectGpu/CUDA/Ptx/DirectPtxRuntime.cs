@@ -263,7 +263,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     {
         if (bytes == 0) throw new ArgumentOutOfRangeException(nameof(bytes));
         using var _ = Enter();
-        Check(CudaNativeBindings.cuMemAlloc(out IntPtr pointer, checked((ulong)bytes)), "cuMemAlloc");
+        Check(CudaAccountedMemory.Alloc(out IntPtr pointer, checked((ulong)bytes)), "cuMemAlloc");
         return new DirectPtxBuffer(this, pointer, bytes);
     }
 
@@ -863,7 +863,7 @@ internal sealed class DirectPtxBuffer : IDisposable
     {
         if (_pointer == IntPtr.Zero) return;
         using var _ = _runtime.Enter();
-        DirectPtxRuntime.Check(CudaNativeBindings.cuMemFree(_pointer), "cuMemFree");
+        DirectPtxRuntime.Check(CudaAccountedMemory.Free(_pointer), "cuMemFree");
         _pointer = IntPtr.Zero;
         _runtime.UntrackResource(this);
     }

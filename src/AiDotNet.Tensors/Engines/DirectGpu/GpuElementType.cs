@@ -226,6 +226,25 @@ internal static class GpuCopyLayout
 
     private static int Width(GpuElementType type)
         => type == GpuElementType.Unspecified ? sizeof(float) : GpuElementTypes.SizeInBytes(type);
+
+    /// <summary>Whether two ranges of <paramref name="bytes"/> bytes, at the given byte positions of one allocation, share a byte.</summary>
+    public static bool Overlaps(long sourceByte, long destinationByte, long bytes)
+        => bytes > 0 && sourceByte < destinationByte + bytes && destinationByte < sourceByte + bytes;
+
+    /// <summary>
+    /// A copy whose ranges overlap inside one allocation, done through a scratch buffer: a device copy of overlapping
+    /// ranges is refused (OpenCL) or undefined (CUDA, HIP, Vulkan), and the destination must get what the source held
+    /// before the copy.
+    /// </summary>
+    public static void ThroughScratch(IDirectGpuBackend backend, IGpuBuffer source, int sourceOffset, IGpuBuffer destination,
+        int destinationOffset, int count)
+    {
+        using var scratch = source.ElementType == GpuElementType.Unspecified
+            ? backend.AllocateByteBuffer(checked(count * sizeof(float)))
+            : backend.AllocateBuffer(count, source.ElementType);
+        backend.Copy(source, sourceOffset, scratch, 0, count);
+        backend.Copy(scratch, 0, destination, destinationOffset, count);
+    }
 }
 
 /// <summary>A byte allocation that can be declared a buffer of typed elements.</summary>
