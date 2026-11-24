@@ -138,4 +138,75 @@ public class GradientExchangeSplitStepTests
                 "training must move the weights");
         }
     }
+    /// <summary>
+    /// Loss scaling under an exchange (DDP + mixed precision): a peer that overflowed makes the reduced gradient
+    /// non-finite on every rank, and every rank must skip that step and back its scale off. The overflow check therefore
+    /// runs on the exchanged gradient, in the update graph; checked on the local gradient before the exchange (the
+    /// backward graph), this rank would see finite values, take the step on the non-finite sum, and leave the ranks'
+    /// scales and weights apart.
+    /// </summary>
+    [SkippableFact]
+    public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
+            const int overflowStep = 6, steps = 9;   // past the 3 warm-up steps and the capture: a graph replay
+            var xs = Values(Batch * In, 1, 2f);
+            var ts = Values(Batch * Out, 2, 2f);
+            var x = Rows(xs, In, 0, Batch);
+            var t = Rows(ts, Out, 0, Batch);
+            var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Values(In * Out, 5, 0.4f)));
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var d = gpu.TensorSubtract(gpu.TensorMatMul(x, w), t);
+                gpu.TensorMultiplyScalar(gpu.ReduceSum(gpu.TensorMultiply(d, d), null), 1f / Batch);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            var backend = gpu.GetBackend()!;
+            var weightsAtExchange = new List<float[]>();
+            int step = 0;
+            using (plan)
+            {
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+                var scaled = (ICompiledTrainingPlanLossScaling)plan;
+                scaled.ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f, GrowthInterval = 1000 });
+                compiled.SetGradientExchange(exchange =>
+                {
+                    var buffer = w.TryGetGpuBuffer() ?? throw new InvalidOperationException("w is not on the device");
+                    var weights = new float[buffer.Size];
+                    backend.DownloadBuffer(buffer, weights);
+                    weightsAtExchange.Add(weights.Take(In * Out).ToArray());
+                    if (++step != overflowStep) return;
+                    // The peer's half overflowed: the sum this rank receives is infinite in one element.
+                    var g = new float[exchange.TotalLength];
+                    exchange.Read(g);
+                    g[3] = float.PositiveInfinity;
+                    exchange.Write(g);
+                });
+                for (int s = 0; s < steps; s++) plan.Step();
+                var state = Assert.NotNull(scaled.ReadLossScaleState());
+                Console.WriteLine($"scale={state.Scale} overflowSteps={state.OverflowSteps} steps={state.Steps} "
+                    + $"updateGraphLaunches={compiled.UpdateGraphReplayCount} split={compiled.HasSplitStepGraph}");
+                Assert.True(compiled.HasSplitStepGraph, "the step did not capture as a backward graph and an update graph");
+                Assert.Equal(steps - 3, compiled.UpdateGraphReplayCount);
+                // The overflowed step changed nothing, the steps around it trained, and the scale backed off once.
+                Assert.Equal(weightsAtExchange[overflowStep - 1], weightsAtExchange[overflowStep]);
+                Assert.NotEqual(weightsAtExchange[overflowStep - 2], weightsAtExchange[overflowStep - 1]);
+                Assert.NotEqual(weightsAtExchange[overflowStep], weightsAtExchange[overflowStep + 1]);
+                Assert.All(w.ToArray(), v => Assert.True(float.IsFinite(v), "a non-finite update reached the weights"));
+                Assert.Equal(1, state.OverflowSteps);
+                Assert.Equal(512f, state.Scale);
+            }
+        }
+    }
 }

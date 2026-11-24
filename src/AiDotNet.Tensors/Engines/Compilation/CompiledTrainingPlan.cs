@@ -4713,7 +4713,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         if (exec != IntPtr.Zero && _gradientExchange is not null && _capturedOptimizer is not null && _stepIo is not null)
                         {
                             using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("UpdateGraphCapture"))
-                                _updateGraphExec = gte.CaptureGraphWithIndexBindings(cb, () => CaptureUpdateGraphBody(parity: 0));
+                                _updateGraphExec = gte.CaptureGraphWithIndexBindings(cb, () =>
+                                {
+                                    CaptureLossScaling();
+                                    CaptureUpdateGraphBody(parity: 0);
+                                });
                             if (_updateGraphExec == IntPtr.Zero)
                             {
                                 gte.DestroyGpuGraph(exec);
@@ -5266,8 +5270,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         _stepIo?.CapturePrologue(parity);
         RunGpuStepBodyForCapture((Engines.DirectGpu.IDirectGpuBackend)cb);
-        CaptureLossScaling();   // after the backward, before the captured clip and update
+        // Split, the loss scaler's unscale and finiteness check run in the update graph, after the exchange: they see
+        // the reduced gradient, which every rank holds alike (a rank that overflowed makes the sum non-finite), so
+        // every rank skips or takes the step and moves its scale the same way (DDP's overflow consensus).
         if (split) return;
+        CaptureLossScaling();   // after the backward, before the captured clip and update
         CaptureUpdateGraphBody(parity);
     }
 
