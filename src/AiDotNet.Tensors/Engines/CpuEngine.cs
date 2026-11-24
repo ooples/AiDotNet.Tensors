@@ -43857,13 +43857,15 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor; var cm = mask; var cv = value;
-                var maskData = mask.GetFlattenedData();
                 var maskShape = (int[])mask._shape.Clone();
                 double fillValue = MathHelper.GetNumericOperations<T>().ToDouble(value);
+                // The backward reads the same mask the forward fills with (the live tensor, not a snapshot taken at
+                // trace time): a plan replays both every step, and a mask the caller rewrote between steps must move
+                // the forward and the gradient alike. A snapshot kept the traced mask's gradient after a rewrite.
                 return scope.RecordUnary(LazyNodeType.TensorMaskedFill, "TensorMaskedFill", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MaskedFillBackward,
-                    new object[] { (bool[])maskData.Clone(), maskShape, fillValue });
+                    new object[] { cm, maskShape, fillValue });
             }
         }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }

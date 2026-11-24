@@ -29436,7 +29436,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
-            using var bufMask = GetOrAllocateBuffer(backend, mask);
+            // A host-only mask (a layer's causal mask) reads its cached device copy: uploading it per call is a
+            // synchronous copy that aborts a step capture, into a buffer the captured graph would outlive.
+            using var bufMask = IsHostOnlyMask(mask)
+                ? new OwnedBuffer(GetHostMaskDeviceCopy(backend, mask), ownsBuffer: false)
+                : GetOrAllocateBuffer(backend, mask);
             var output = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(),
                 result => backend.MaskedFillKernel(bufIn.Buffer, bufMask.Buffer, result,
                     Convert.ToSingle(value), tensor.Length));
