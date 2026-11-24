@@ -29279,7 +29279,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
         using var __gpuOp = EnterGpuOp();
-        if (scalar is not null && IntegerDivisorMatchesHost(scalar)
+        if (scalar is not null && IsIntegerDivisor(scalar)
             && TryScalarIntegerAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuIntegerBinaryOperation.Divide, nameof(TensorDivideScalar)) is { } integerResult)
         {
             Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", integerResult, tensor,

@@ -116,14 +116,78 @@ public class GpuIntegerResidencyTests
             Assert.Equal(cpu.TensorMaxValue(remainder.Host), engine.TensorMaxValue(remainder.Device));
             Assert.Equal(cpu.TensorMinValue(remainder.Host), engine.TensorMinValue(remainder.Device));
 
-            // Abs wraps on the device; the host's raises for the most negative value, so the expectation is spelled out.
-            var magnitudes = engine.TensorAbs(x);
-            Assert.True(gpu.IsTypedResident(magnitudes), $"The {type} Abs was not left on the device.");
-            var magnitudeValues = magnitudes.GetReadOnlyDataArray();
-            for (int i = 0; i < Large; i++)
+            // Divide, divide by -1 and the absolute value run on the device behind a check of the operands there,
+            // because the CPU engine raises for a zero divisor and for the most negative value. First with operands
+            // it does not raise for: the results stay on the device and equal the CPU engine's.
+            long lowest = type switch
             {
-                long wide = Convert.ToInt64(xValues[i]);
-                Assert.True(narrow(wide < 0 ? unchecked(-wide) : wide).Equals(magnitudeValues[i]), $"{type} Abs at {i} of {xValues[i]}: device {magnitudeValues[i]}.");
+                GpuElementType.Int8 => sbyte.MinValue,
+                GpuElementType.Int16 => short.MinValue,
+                GpuElementType.Int32 => int.MinValue,
+                _ => long.MinValue,
+            };
+            var safeValues = Array.ConvertAll(xValues, v => Convert.ToInt64(v) == lowest ? narrow(1) : v);
+            var divisorValues = Array.ConvertAll(yValues, v => Convert.ToInt64(v) == 0 ? narrow(3) : v);
+            var zeroDivisorValues = (T[])divisorValues.Clone();
+            zeroDivisorValues[Large / 2] = narrow(0);
+            var lowestValues = (T[])safeValues.Clone();
+            lowestValues[7] = narrow(lowest);
+            var minusOneValues = (T[])divisorValues.Clone();
+            minusOneValues[7] = narrow(-1);
+            Tensor<T> Resident(T[] values) => new Tensor<T>((T[])values.Clone(), new[] { Large });
+            var safe = Resident(safeValues);
+            var divisor = Resident(divisorValues);
+            var zeroDivisor = Resident(zeroDivisorValues);
+            var withLowest = Resident(lowestValues);
+            var withMinusOne = Resident(minusOneValues);
+            var registered = new[] { safe, divisor, zeroDivisor, withLowest, withMinusOne };
+            foreach (var tensor in registered) gpu.RegisterPersistentTensor(tensor, PersistentTensorRole.Weights);
+            try
+            {
+                var hostSafe = Resident(safeValues);
+                var hostDivisor = Resident(divisorValues);
+                var guarded = new (string Name, Tensor<T> Device, Tensor<T> Host)[]
+                {
+                    ("Divide", engine.TensorDivide(safe, divisor), cpu.TensorDivide(hostSafe, hostDivisor)),
+                    ("Divide by -1", engine.TensorDivideScalar(safe, narrow(-1)), cpu.TensorDivideScalar(hostSafe, narrow(-1))),
+                    ("Abs", engine.TensorAbs(safe), cpu.TensorAbs(hostSafe)),
+                };
+                foreach (var (name, onDevice, onHost) in guarded)
+                {
+                    Assert.True(gpu.IsTypedResident(onDevice), $"The {type} {name} was not left on the device.");
+                    var deviceValues = onDevice.GetReadOnlyDataArray();
+                    var hostValues = onHost.GetReadOnlyDataArray();
+                    for (int i = 0; i < Large; i++)
+                        Assert.True(hostValues[i].Equals(deviceValues[i]), $"{type} {name} at {i} ({safeValues[i]}, {divisorValues[i]}): CPU {hostValues[i]}, device {deviceValues[i]}.");
+                }
+
+                // Then with one operand it does raise for, in the middle of a resident tensor: the engine raises what
+                // the CPU engine raises, whichever of them holds the tensor.
+                Assert.Throws<DivideByZeroException>(() => engine.TensorDivide(safe, zeroDivisor));
+                Assert.Throws<DivideByZeroException>(() => cpu.TensorDivide(Resident(safeValues), Resident(zeroDivisorValues)));
+                Assert.Throws<DivideByZeroException>(() => engine.TensorDivideScalar(safe, narrow(0)));
+                Assert.Throws<OverflowException>(() => engine.TensorAbs(withLowest));
+                Assert.Throws<OverflowException>(() => cpu.TensorAbs(Resident(lowestValues)));
+                if (type is GpuElementType.Int32 or GpuElementType.Int64)
+                {
+                    Assert.Throws<OverflowException>(() => engine.TensorDivide(withLowest, withMinusOne));
+                    Assert.Throws<OverflowException>(() => cpu.TensorDivide(Resident(lowestValues), Resident(minusOneValues)));
+                    Assert.Throws<OverflowException>(() => engine.TensorRemainder(withLowest, withMinusOne));
+                    Assert.Throws<OverflowException>(() => cpu.TensorRemainder(Resident(lowestValues), Resident(minusOneValues)));
+                    Assert.Throws<OverflowException>(() => engine.TensorDivideScalar(withLowest, narrow(-1)));
+                    Assert.Throws<OverflowException>(() => cpu.TensorDivideScalar(Resident(lowestValues), narrow(-1)));
+                }
+                else
+                {
+                    // The narrower types divide in 32 bits and wrap: no exception on either engine, and the same values.
+                    var wrapped = engine.TensorDivide(withLowest, withMinusOne);
+                    Assert.True(gpu.IsTypedResident(wrapped), $"The {type} divide of the most negative value was not left on the device.");
+                    Assert.Equal(cpu.TensorDivide(Resident(lowestValues), Resident(minusOneValues)).GetReadOnlyDataArray(), wrapped.GetReadOnlyDataArray());
+                }
+            }
+            finally
+            {
+                foreach (var tensor in registered) gpu.UnregisterPersistentTensor(tensor);
             }
         }
         finally
