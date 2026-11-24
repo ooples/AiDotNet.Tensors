@@ -197,13 +197,16 @@ internal sealed partial class CompiledTrainingPlan<T>
     private IIdleDeviceMemoryLender? _idleLender;
     private IGpuBuffer[]? _idleBuffers;
 
-    /// <summary>Bytes this plan lent after its last step (tests and diagnostics).</summary>
+    /// <summary>Bytes this plan lent after its last step, once an allocation asked for them (tests and diagnostics).</summary>
     internal long IdleLentBytesLastStep { get; private set; }
 
     /// <summary>
     /// After a captured step: lends the step buffers nothing reads before the next replay writes them to the backend,
     /// so validation and eager inference between steps allocate from them instead of growing the device footprint.
     /// They come back (moving whatever still uses them) when the next step begins (<see cref="ReclaimIdleStepMemory"/>).
+    /// They are found only when an allocation between steps needs memory the backend's pool cannot serve: finding them
+    /// walks every step of the plan (about 2 ms a step for a 16-layer LM), host time that was spent after every step,
+    /// while the device waited, even when nothing allocated before the next one.
     /// </summary>
     private void LendIdleStepMemory()
     {
@@ -215,24 +218,34 @@ internal sealed partial class CompiledTrainingPlan<T>
             || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
             || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
             return;
-        // Rebuilt every step: what outlives a step (a rebased readout, a retained output) can change between steps.
         _idleBuffers = null;
+        _collectIdleStepMemory ??= CollectIdleStepMemory;
+        lender.LendIdleOnDemand(this, _collectIdleStepMemory);
+        _idleLender = lender;
+    }
+
+    private Func<IReadOnlyCollection<IGpuBuffer>?>? _collectIdleStepMemory;
+
+    // The lender asks (an allocation between this plan's steps found nothing pooled). Rebuilt on every ask: what
+    // outlives a step (a rebased readout, a retained output) can change between steps.
+    private IReadOnlyCollection<IGpuBuffer>? CollectIdleStepMemory()
+    {
+        if (_scratchPool is not { } pool || _forwardSteps is null) return null;
         if (!BuildWorkspaceProtection())
         {
             if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: an opaque saved state {_workspaceOpaqueSavedType}");
-            return;
+            return null;
         }
         _workspaceCandidates.Clear();
         pool.CollectIdleBetweenRuns(_forwardActions.Length, IsUnprotectedRoot, _workspaceCandidates);
-        _idleBuffers = new IGpuBuffer[_workspaceCandidates.Count];
-        _workspaceCandidates.CopyTo(_idleBuffers);
+        var idle = new IGpuBuffer[_workspaceCandidates.Count];
+        _workspaceCandidates.CopyTo(idle);
         _workspaceCandidates.Clear();
-        if (_idleBuffers.Length == 0) return;
-        lender.LendIdle(this, _idleBuffers);
-        _idleLender = lender;
+        _idleBuffers = idle;
         long bytes = 0;
-        foreach (var buffer in _idleBuffers) bytes += buffer.SizeInBytes;
+        foreach (var buffer in idle) bytes += buffer.SizeInBytes;
         IdleLentBytesLastStep = bytes;
+        return idle;
     }
 
     /// <summary>Takes back the memory <see cref="LendIdleStepMemory"/> lent: before a step, an invalidation or disposal.</summary>

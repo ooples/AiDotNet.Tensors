@@ -27,6 +27,13 @@ internal interface IIdleDeviceMemoryLender
     /// </summary>
     void LendIdle(object owner, IReadOnlyCollection<IGpuBuffer> buffers);
 
+    /// <summary>
+    /// As <see cref="LendIdle"/>, but the buffers are only collected (<paramref name="collect"/>, on the allocating
+    /// thread) when an allocation first needs memory the backend's pool cannot serve; null lends nothing. Finding a
+    /// plan's idle buffers walks its whole step, so a plan whose steps nothing allocates between pays nothing.
+    /// </summary>
+    void LendIdleOnDemand(object owner, System.Func<IReadOnlyCollection<IGpuBuffer>?> collect);
+
     /// <summary>Takes back everything <paramref name="owner"/> lent, moving any allocation still using it.</summary>
     void ReclaimIdle(object owner);
 }

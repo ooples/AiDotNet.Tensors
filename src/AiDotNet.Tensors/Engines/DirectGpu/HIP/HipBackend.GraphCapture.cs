@@ -45,6 +45,13 @@ public sealed partial class HipBackend : IIdleDeviceMemoryLender
         if (buffers is null) throw new System.ArgumentNullException(nameof(buffers));
     }
 
+    void IIdleDeviceMemoryLender.LendIdleOnDemand(object owner,
+        System.Func<System.Collections.Generic.IReadOnlyCollection<IGpuBuffer>?> collect)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+        if (collect is null) throw new System.ArgumentNullException(nameof(collect));
+    }
+
     void IIdleDeviceMemoryLender.ReclaimIdle(object owner)
     {
         if (owner is null) throw new System.ArgumentNullException(nameof(owner));

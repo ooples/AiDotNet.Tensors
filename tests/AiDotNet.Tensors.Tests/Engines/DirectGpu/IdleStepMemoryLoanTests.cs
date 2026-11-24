@@ -234,12 +234,66 @@ public class IdleStepMemoryLoanTests
                 run.Validation.Add(engine.ReduceSum(engine.TensorMultiply(vy, vy), null).ToArray());
                 kept = vh;
                 keptValues = vh.ToArray();
+                // Lent on demand: what the plan lent is known once validation has asked for it.
+                run.LentBytes = Math.Max(run.LentBytes, ((CompiledTrainingPlan<float>)plan).IdleLentBytesLastStep);
             }
             foreach (var p in parameters) run.Parameters = run.Parameters.Concat(p.ToArray()).ToArray();
         }
         run.Replays = CompiledTrainingPlan<float>.GraphReplayCount - replaysBefore;
         run.Loans = backend.IdleLoanCounters.Loans - loansBefore;
         return run;
+    }
+
+    // Finding a plan's idle step memory walks every step of the plan: about 2 ms of host time after each step of a
+    // 16-layer LM, spent while the device waited for the next launch, though nothing allocated between its steps. It is
+    // found only when an allocation between steps needs memory the pool cannot serve.
+    [SkippableFact]
+    public void IdleStepMemory_IsFoundOnlyWhenAnAllocationBetweenStepsAsksForIt()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
+            var backend = (CudaBackend)gpu.GetBackend()!;
+            var x = Filled(new[] { 256, 256 }, 1, 1f);
+            var w1 = Filled(new[] { 256, 512 }, 3, 0.05f);
+            var w2 = Filled(new[] { 512, 256 }, 4, 0.05f);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                var h = gpu.ReLU(gpu.TensorMatMul(x, w1));
+                var y = gpu.TensorMatMul(h, w2);
+                gpu.ReduceSum(gpu.TensorMultiply(y, y), null);
+                plan = scope.CompileTraining(new[] { w1, w2 });
+            }
+            using (plan)
+            {
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-4f);
+                long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
+                for (int s = 0; s < 6; s++)
+                {
+                    plan.Step();
+                    Assert.Equal(0, compiled.IdleLentBytesLastStep);   // nothing asked: nothing was walked
+                }
+                Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore, "the plan never replayed");
+                // A size nothing in the pool serves: it asks, and borrows the plan's idle memory.
+                long loansBefore = backend.IdleLoanCounters.Loans;
+                using (var odd = backend.AllocateBuffer(12_345))
+                {
+                    Assert.True(compiled.IdleLentBytesLastStep > 0, "an allocation the pool could not serve found no idle memory");
+                    Assert.Equal(loansBefore + 1, backend.IdleLoanCounters.Loans);
+                }
+                plan.Step();
+                Assert.Equal(0, compiled.IdleLentBytesLastStep);
+            }
+        }
     }
 
     [SkippableFact]

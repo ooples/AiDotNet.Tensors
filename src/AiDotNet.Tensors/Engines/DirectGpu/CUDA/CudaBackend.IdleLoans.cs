@@ -20,11 +20,15 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
 {
     void IIdleDeviceMemoryLender.LendIdle(object owner, IReadOnlyCollection<IGpuBuffer> buffers) => LendIdle(owner, buffers);
     void IIdleDeviceMemoryLender.ReclaimIdle(object owner) => ReclaimIdle(owner);
+    void IIdleDeviceMemoryLender.LendIdleOnDemand(object owner, Func<IReadOnlyCollection<IGpuBuffer>?> collect)
+        => LendIdleOnDemand(owner, collect);
 
     private const long IdleLoanAlignment = 256;
     private readonly object _idleLock = new();
     private readonly List<IdleRegion> _idleRegions = new();
     private readonly List<IdleLoan> _idleLoans = new();
+    // Owners that lent on demand and whose buffers are not collected yet.
+    private readonly List<(object Owner, Func<IReadOnlyCollection<IGpuBuffer>?> Collect)> _idlePending = new();
     private int _idleSuspended;
     [ThreadStatic] private static int t_noIdleLoan;
 
@@ -113,21 +117,41 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
         if (buffers is null) throw new ArgumentNullException(nameof(buffers));
         ReclaimIdle(owner);
         using var _ = PushContext();
-        lock (_idleLock)
+        lock (_idleLock) AddIdleRegionsLocked(owner, buffers);
+    }
+
+    private void LendIdleOnDemand(object owner, Func<IReadOnlyCollection<IGpuBuffer>?> collect)
+    {
+        if (owner is null) throw new ArgumentNullException(nameof(owner));
+        if (collect is null) throw new ArgumentNullException(nameof(collect));
+        ReclaimIdle(owner);
+        lock (_idleLock) _idlePending.Add((owner, collect));
+    }
+
+    private void AddIdleRegionsLocked(object owner, IReadOnlyCollection<IGpuBuffer> buffers)
+    {
+        foreach (var buffer in buffers)
         {
-            foreach (var buffer in buffers)
-            {
-                if (buffer is not CudaGpuBuffer cuda || cuda.IsArenaSlot || cuda.IsIdleLoan || cuda.IsReleased) continue;
-                var ptr = cuda.RawDevicePointer;
-                long bytes = cuda.SizeInBytes / IdleLoanAlignment * IdleLoanAlignment;
-                if (ptr == IntPtr.Zero || bytes <= 0) continue;
-                _idleRegions.Add(new IdleRegion(owner, cuda, ptr, bytes));
-                // Debug switch: lent memory reads as NaN, so a lender that reads a buffer it declared idle fails loudly.
-                if (PoisonUninitializedBuffers)
-                    CuBlasNative.CheckCudaResult(
-                        CudaNativeBindings.cuMemsetD8Async(ptr, 0xFF, (ulong)bytes, _stream), "cuMemsetD8Async(lent poison)");
-            }
+            if (buffer is not CudaGpuBuffer cuda || cuda.IsArenaSlot || cuda.IsIdleLoan || cuda.IsReleased) continue;
+            var ptr = cuda.RawDevicePointer;
+            long bytes = cuda.SizeInBytes / IdleLoanAlignment * IdleLoanAlignment;
+            if (ptr == IntPtr.Zero || bytes <= 0) continue;
+            _idleRegions.Add(new IdleRegion(owner, cuda, ptr, bytes));
+            // Debug switch: lent memory reads as NaN, so a lender that reads a buffer it declared idle fails loudly.
+            if (PoisonUninitializedBuffers)
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(ptr, 0xFF, (ulong)bytes, _stream), "cuMemsetD8Async(lent poison)");
         }
+    }
+
+    // Collects what the on-demand owners lend: an allocation needs memory the pool could not serve. Under _idleLock,
+    // so an owner's reclaim (the start of its next step) waits for its collection and finds it registered.
+    private void CollectPendingIdleLocked()
+    {
+        var pending = _idlePending.ToArray();
+        _idlePending.Clear();
+        foreach (var (owner, collect) in pending)
+            if (collect() is { Count: > 0 } buffers) AddIdleRegionsLocked(owner, buffers);
     }
 
     private void ReclaimIdle(object owner)
@@ -137,6 +161,8 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
         long lent = 0;
         lock (_idleLock)
         {
+            for (int i = _idlePending.Count - 1; i >= 0; i--)
+                if (ReferenceEquals(_idlePending[i].Owner, owner)) _idlePending.RemoveAt(i);
             for (int i = _idleRegions.Count - 1; i >= 0; i--)
             {
                 var region = _idleRegions[i];
@@ -199,13 +225,16 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
     /// <summary>A loan of idle step memory for <paramref name="size"/> floats, or null.</summary>
     private CudaGpuBuffer? TryRentIdleLoan(int size)
     {
-        if (_idleRegions.Count == 0 || t_noIdleLoan > 0 || IsCapturingOnThisThread || _backendStreamCaptureActive
+        if ((_idleRegions.Count == 0 && _idlePending.Count == 0) || t_noIdleLoan > 0 || IsCapturingOnThisThread
+            || _backendStreamCaptureActive
             || CaptureMemoryPool.Current is not null || AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.IsActive)
             return null;
         long need = ((long)size * sizeof(float) + IdleLoanAlignment - 1) / IdleLoanAlignment * IdleLoanAlignment;
         lock (_idleLock)
         {
-            if (_idleSuspended > 0 || _idleRegions.Count == 0) return null;
+            if (_idleSuspended > 0) return null;
+            if (_idlePending.Count > 0) CollectPendingIdleLocked();
+            if (_idleRegions.Count == 0) return null;
             IdleRegion? best = null;
             int bestRange = -1;
             long bestLength = long.MaxValue;
