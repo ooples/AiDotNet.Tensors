@@ -20,18 +20,30 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
 
     public CompiledCheckpointSegmentDeviceTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
 
+    // A lane that requires GPU tests (the POCL shard) fails when the device did not come up, instead of skipping.
+    private void RequireDevice()
+    {
+        if (_fixture.IsAvailable) return;
+        Assert.False(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1",
+            "This lane requires GPU tests, and no DirectGpu device came up: " + _fixture.InitializationException?.Message);
+        Skip.If(true, "No GPU device.");
+    }
+
     [SkippableTheory]
     [InlineData(-0.01f, false)]
     [InlineData(-0.01f, true)]
     public void CheckpointSegments_RecomputeAndTrainLikeThePlainPlan(float nudge, bool deferNudge)
     {
-        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        RequireDevice();
         var engine = _fixture.Engine!;
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
         try
         {
             const int steps = 5;
+            // A run first, discarded: a backend that tunes its kernels on first use (OpenCL) has settled them before the
+            // two runs compared below, so both run the same kernels.
+            CompiledGpuCheckpointSegmentTests.Train(engine, segmentBlocks: 2, steps: 2, nudge: nudge, deferNudge: deferNudge);
             var plain = CompiledGpuCheckpointSegmentTests.Train(engine, segmentBlocks: 0, steps, nudge: nudge, deferNudge: deferNudge);
             var checkpointed = CompiledGpuCheckpointSegmentTests.Train(engine, segmentBlocks: 2, steps, nudge: nudge, deferNudge: deferNudge);
             Assert.Equal(0, plain.Segments);
@@ -50,7 +62,7 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
     [SkippableFact]
     public void CheckpointSegment_ThatReadsItsStateAfterUpdatingIt_IsRefused()
     {
-        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        RequireDevice();
         var engine = _fixture.Engine!;
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;

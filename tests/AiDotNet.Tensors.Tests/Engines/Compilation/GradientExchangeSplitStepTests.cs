@@ -99,16 +99,20 @@ public class GradientExchangeSplitStepTests
     {
         cuda = false;
         if (where == "cpu") return new CpuEngine();
+        // A lane that requires GPU tests (the POCL shard) fails when the device did not come up, instead of skipping.
+        bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
         DirectGpuTensorEngine gpu;
         try { gpu = new DirectGpuTensorEngine(); }
         catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
         {
+            Assert.False(required, "This lane requires GPU tests, and the GPU engine failed: " + ex.Message);
             Skip.If(true, "No GPU engine: " + ex.GetType().Name);
             return null;
         }
         if (!gpu.IsGpuAvailable)
         {
             gpu.Dispose();
+            Assert.False(required, "This lane requires GPU tests, and no DirectGpu device came up.");
             Skip.If(true, "No GPU device.");
             return null;
         }

@@ -143,9 +143,10 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             {
                 Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
                 float[] mixed;
-                long declines = CudaBackend.AutocastCastDeclinesForTest;
+                var cuda = (CudaBackend)engine.GetBackend()!;
+                long declines = cuda.AutocastCastDeclinesForTest;
                 using (engine.EnterMatMulAutocast(precision)) mixed = engine.TensorMatMul(a, b).ToArray();
-                Assert.Equal(declines, CudaBackend.AutocastCastDeclinesForTest);   // cast, not the fast fallback
+                Assert.Equal(declines, cuda.AutocastCastDeclinesForTest);   // cast, not the fast fallback
                 double roundedErr = 0, exactErr = 0;
                 for (int z = 0; z < batch; z++)
                     for (int i = 0; i < m; i++)
@@ -275,6 +276,56 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
                     }
                 if (first is null) first = got;
                 else if (route == 2) Assert.Equal(first, got);   // the fixed-order reduction is bit-reproducible
+            }
+        }
+    }
+
+    // The cast-operands routes (the classic GemmEx and the fixed-order split-K on 16-bit inputs) compute
+    // D = alpha * op(rA) op(rB) + beta * D, rA and rB the operands rounded to 16 bits, for transposed operands and leading
+    // dimensions past the rows (the backward GEMMs' layouts); the split-K stays bit-reproducible.
+    [SkippableTheory]
+    [InlineData(1, 0, false, false, 0)]
+    [InlineData(1, 0, true, false, 3)]
+    [InlineData(1, 0, false, true, 5)]
+    [InlineData(2, 8, true, false, 0)]
+    [InlineData(2, 16, false, true, 2)]
+    public void CastOperandRoutes_ComputeTheRoundedProduct(int route, int splits, bool transA, bool transB, int pad)
+    {
+        Skip.If(!_fixture.IsAvailable, "No GPU device.");
+        if (_fixture.Engine!.GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
+        const int m = 64, n = 48, k = 2048;
+        const float alpha = 0.5f, beta = 2f;
+        int lda = (transA ? k : m) + pad, ldb = (transB ? n : k) + pad, ldd = m;
+        var ha = Data(lda * (transA ? m : k), 0.731, 0.2);
+        var hb = Data(ldb * (transB ? k : n), 0.293, 0.5);
+        var hd = Data(ldd * n, 0.111, 0.9);
+        using var da = backend.AllocateBuffer(ha);
+        using var db = backend.AllocateBuffer(hb);
+        foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
+        {
+            Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
+            float A(int i, int kk) => round(transA ? ha[i * lda + kk] : ha[kk * lda + i]);
+            float B(int kk, int j) => round(transB ? hb[kk * ldb + j] : hb[j * ldb + kk]);
+            float[]? first = null;
+            for (int run = 0; run < 2; run++)
+            {
+                using var dd = backend.AllocateBuffer(hd);
+                Assert.True(backend.RunAutocastGemmRouteForTest(route, splits, transA, transB, m, n, k, da, lda, db, ldb,
+                    dd, ldd, alpha, beta, precision, castOperands: true), $"cast route {route} declined");
+                var got = backend.DownloadBuffer(dd);
+                for (int j = 0; j < n; j++)
+                    for (int i = 0; i < m; i++)
+                    {
+                        double exact = 0, abs = 0;
+                        for (int kk = 0; kk < k; kk++) { double t = (double)A(i, kk) * B(kk, j); exact += t; abs += Math.Abs(t); }
+                        double want = alpha * exact + beta * hd[j * ldd + i];
+                        // FP32 accumulation of exact 16-bit products, then the alpha/beta epilogue.
+                        double bound = Math.Abs(alpha) * k * Math.Pow(2, -23) * abs + 4 * Math.Pow(2, -24) * Math.Abs(want) + 1e-7;
+                        Assert.True(Math.Abs(got[j * ldd + i] - want) <= bound,
+                            $"{precision} cast route {route}: D[{i},{j}] = {got[j * ldd + i]}, want {want} (bound {bound:E2})");
+                    }
+                if (first is null) first = got;
+                else if (route == 2) Assert.Equal(first, got);
             }
         }
     }

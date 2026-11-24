@@ -3805,21 +3805,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// on the current stream: cuBLASLt and the thread's cuBLAS handle run in that stream's order, so they can share
     /// the one workspace. Deterministic like the classic handle: one cached algorithm per problem, no atomic split-K,
     /// and strict fp32 under GpuDeterminism (the classic handle's pedantic mode). False -- nothing launched -- when
-    /// cuBLASLt or the workspace is unavailable or cuBLASLt declines the problem; the caller then runs cuBLAS.
+    /// cuBLASLt or the workspace is unavailable or cuBLASLt declines the problem; the caller then runs cuBLAS. Under a
+    /// cast-operands autocast scope a GEMM cuBLAS declines after its operands were rounded throws instead, as an FP32
+    /// GEMM on the original operands would silently drop the cast.
     /// </summary>
     private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
     {
         // Under matmul autocast the problem runs on its measured route (cuBLASLt, the classic GemmEx, or a fixed-order
         // split-K: CudaBackend.AutocastGemm).
-        if (GemmAutocastComputeType is int autocast and not 0 && UsesCublas && CurrentCublasHasWorkspace)
+        if (GemmAutocastState is int autocast and not 0 && UsesCublas && CurrentCublasHasWorkspace)
             return TryAutocastGemmColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, autocast);
         return TryLtMatmulCore(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta);
     }
 
     /// <summary>The cuBLASLt GEMM of <see cref="TryLtMatmulColumnMajor"/> itself.</summary>
     private bool TryLtMatmulCore(bool transA, bool transB, int m, int n, int k,
-        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
+        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta, int autocastCompute = -1)
     {
         // cuBLASLt is part of cuBLAS: a caller that opted out of it (TensorCodecOptions.UseCublas) gets the generated kernels.
         if (!UsesCublas || !CurrentCublasHasWorkspace) return false;
@@ -3828,7 +3830,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
         // asks for strict fp32, which is what PEDANTIC gives the classic handle.
         // Under matmul autocast the scope's compute type (CUBLAS_COMPUTE_32F_FAST_16F / _16BF).
-        var compute = GemmAutocastComputeType is int autocast and not 0 ? (CublasComputeType)autocast
+        // An autocast route passes the compute type of the state it read (autocastCompute), not a second read of it.
+        if (autocastCompute < 0) autocastCompute = GemmAutocastComputeType;
+        var compute = autocastCompute is int autocast and not 0 ? (CublasComputeType)autocast
             : !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
                 ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
         return lt.TryMatmulColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, compute,
@@ -7347,6 +7351,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CudaNativeBindings.cuLaunchKernel(kernel, gridX, 1, 1, blockX, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero),
                 "cuLaunchKernel");
             GpuLaunchProbe.OnLaunch();
+            if (s_launchCheck && !IsStreamCapturingCurrentContext())   // AIDOTNET_KERNEL_LAUNCH_CHECK, as on _stream
+                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream), "kernel launch check (side stream)");
         }
     }
 

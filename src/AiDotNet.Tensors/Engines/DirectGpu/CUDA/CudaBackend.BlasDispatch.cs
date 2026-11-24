@@ -65,15 +65,17 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     // thread's GEMMs on this backend take the open scope's type. The newest scope still open wins; scopes may close in
     // any order (two threads' scopes overlapping), and the type returns to FP32 once the last one closes. A scope that is
     // never disposed keeps its type in force, as an undisposed torch.autocast context would.
-    private int _gemmAutocastComputeType;
+    // The open scope's state in one word, read once per GEMM so a scope opening or closing on another thread is seen
+    // whole: the compute type in the low byte, and above it the 16-bit operand type the operands are cast to
+    // (CastOperands: CUDA_R_16F or CUDA_R_16BF; 0 for FastComputeType, which passes FP32 operands). 0: no scope.
+    private int _gemmAutocastState;
     private readonly List<GemmAutocastScope> _gemmAutocastScopes = new();
 
-    private int GemmAutocastComputeType => Volatile.Read(ref _gemmAutocastComputeType);
-
-    // The open scope's 16-bit operand type when it casts the operands before the GEMM (CastOperands: CUDA_R_16F or
-    // CUDA_R_16BF), 0 when it passes FP32 operands with a permissive compute type (FastComputeType) or none is open.
-    private int _gemmAutocastCastType;
-    private int GemmAutocastCastType => Volatile.Read(ref _gemmAutocastCastType);
+    private int GemmAutocastState => Volatile.Read(ref _gemmAutocastState);
+    private static int AutocastComputeOf(int state) => state & 0xFF;
+    private static int AutocastCastTypeOf(int state) => state >> 8;
+    private int GemmAutocastComputeType => AutocastComputeOf(GemmAutocastState);
+    private int GemmAutocastCastType => AutocastCastTypeOf(GemmAutocastState);
 
     /// <summary>Tests: the 16-bit operand type autocast GEMMs cast to now (0: none, or the fast compute type).</summary>
     internal int GemmAutocastCastTypeForTest => GemmAutocastCastType;
@@ -103,12 +105,11 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
         };
         int castType = compute == 0 || mode == Gpu.MatMulAutocastMode.FastComputeType ? 0
             : precision == Gpu.PrecisionMode.BFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
-        var scope = new GemmAutocastScope(this, compute, castType);
+        var scope = new GemmAutocastScope(this, compute == 0 ? 0 : compute | (castType << 8));
         lock (_gemmAutocastScopes)
         {
             _gemmAutocastScopes.Add(scope);
-            Volatile.Write(ref _gemmAutocastCastType, castType);
-            Volatile.Write(ref _gemmAutocastComputeType, compute);
+            Volatile.Write(ref _gemmAutocastState, scope.State);
         }
         return scope;
     }
@@ -116,13 +117,11 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     private sealed class GemmAutocastScope : IDisposable
     {
         private CudaBackend? _owner;
-        internal readonly int Compute;
-        internal readonly int CastType;
-        public GemmAutocastScope(CudaBackend owner, int compute, int castType)
+        internal readonly int State;
+        public GemmAutocastScope(CudaBackend owner, int state)
         {
             _owner = owner;
-            Compute = compute;
-            CastType = castType;
+            State = state;
         }
 
         public void Dispose()
@@ -132,9 +131,7 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
             lock (scopes)
             {
                 scopes.Remove(this);
-                var newest = scopes.Count == 0 ? null : scopes[scopes.Count - 1];
-                Volatile.Write(ref owner._gemmAutocastCastType, newest?.CastType ?? 0);
-                Volatile.Write(ref owner._gemmAutocastComputeType, newest?.Compute ?? 0);
+                Volatile.Write(ref owner._gemmAutocastState, scopes.Count == 0 ? 0 : scopes[scopes.Count - 1].State);
             }
         }
     }
@@ -145,11 +142,12 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     {
         if (UsesCublas)
         {
-            if (GemmAutocastComputeType is int autocast and not 0)
+            if (GemmAutocastState is int state and not 0)
             {
+                int autocast = AutocastComputeOf(state);
                 // Autocast, casting the operands (the default): A and B rounded to 16 bits, multiplied and accumulated in
                 // FP32 into the FP32 result.
-                if (GemmAutocastCastType is int castType and not 0
+                if (AutocastCastTypeOf(state) is int castType and not 0
                     && TryCastAutocastGemm(opA != CublasOperation.None, opB != CublasOperation.None, m, n, k, alpha, a,
                         lda, 0, b, ldb, 0, beta, c, ldc, 0, 1, castType, what))
                     return;
@@ -179,9 +177,10 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     {
         if (UsesCublas)
         {
-            if (GemmAutocastComputeType is int autocast and not 0)
+            if (GemmAutocastState is int state and not 0)
             {
-                if (GemmAutocastCastType is int castType and not 0
+                int autocast = AutocastComputeOf(state);
+                if (AutocastCastTypeOf(state) is int castType and not 0
                     && TryCastAutocastGemm(opA != CublasOperation.None, opB != CublasOperation.None, m, n, k, alpha, a,
                         lda, strideA, b, ldb, strideB, beta, c, ldc, strideC, batch, castType, what))
                     return;
