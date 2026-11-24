@@ -1385,7 +1385,10 @@ void main() {{
 
     public void Fill(IGpuBuffer buffer, float value, int size)
     {
-        GlslGenerateOp(VulkanGlslKernels.FillGlsl, buffer, size,
+        // The kernel strides over the buffer, so the launch stops at the device's X workgroup limit (256 per group).
+        EnsureInitialized();
+        int threads = (int)Math.Min(size, (long)_device.Limits.maxComputeWorkGroupCountX * 256);
+        GlslGenerateOp(VulkanGlslKernels.FillGlsl, buffer, threads,
             new uint[] { FloatBits(value), (uint)size }, 2 * sizeof(uint));
     }
 
