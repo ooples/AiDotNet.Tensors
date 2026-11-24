@@ -175,8 +175,12 @@ internal static class GpuPackedKernelSource
         body.Append("    for (uint l = 0u; l < ").Append(lanes).Append("u; l++) {\n");
         body.Append("        uint sh = l * ").Append(bits).Append("u;\n");
         body.Append("        if (((gid * ").Append(lanes).Append("u) + l) < pcount) {\n");
-        body.Append("            uint x = (wa >> sh) & ").Append(mask).Append(";\n");
-        if (second) body.Append("            uint y = (wb >> sh) & ").Append(mask).Append(";\n");
+        // The element is taken by two shifts, not a shift and a mask: AMD's proprietary Vulkan compiler (driver
+        // 23.19) miscompiled the masked form for the upper half of a word, so (m == 0 || m > top) on a Float16 there
+        // read true for every value and the upper element of every word came out wrong.
+        string up = "(" + (32 - bits) + "u - sh)", down = (32 - bits) + "u";
+        body.Append("            uint x = (wa << ").Append(up).Append(") >> ").Append(down).Append(";\n");
+        if (second) body.Append("            uint y = (wb << ").Append(up).Append(") >> ").Append(down).Append(";\n");
         if (scalar) body.Append("            uint y = pb & ").Append(mask).Append(";\n");
         // The operands with whatever lies above the element still in them, for the operations whose low bits depend
         // only on the operands' low bits (see the multiply in LaneValue).
