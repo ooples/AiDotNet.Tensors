@@ -45,7 +45,7 @@ public sealed class CompiledGpuCheckpointSegmentTests
         return t;
     }
 
-    private sealed class Run
+    internal sealed class Run
     {
         internal List<float> Losses = new();
         internal float[] Parameters = Array.Empty<float>();
@@ -62,7 +62,7 @@ public sealed class CompiledGpuCheckpointSegmentTests
     /// segment. Each block: h += W2 silu(W1 h) * (1 + g), g = sigmoid(h Wr) + state (state read, then nudged in place
     /// from g's column sums); the auxiliary term sum(g * g) of every block is added to the loss after the last block.
     /// </summary>
-    private static Run Train(IEngine engine, int segmentBlocks, int steps, bool stateReadAfterNudge = false, float nudge = -0.01f,
+    internal static Run Train(IEngine engine, int segmentBlocks, int steps, bool stateReadAfterNudge = false, float nudge = -0.01f,
         bool deferNudge = false)
     {
         var x = Filled(new[] { Rows, Width }, 1, 2f);
@@ -138,7 +138,7 @@ public sealed class CompiledGpuCheckpointSegmentTests
         }
     }
 
-    private static void AssertClose(IReadOnlyList<float> expected, IReadOnlyList<float> actual, double tolerance, string name)
+    internal static void AssertClose(IReadOnlyList<float> expected, IReadOnlyList<float> actual, double tolerance, string name)
     {
         Assert.Equal(expected.Count, actual.Count);
         for (int i = 0; i < expected.Count; i++)

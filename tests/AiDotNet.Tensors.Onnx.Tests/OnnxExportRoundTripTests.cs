@@ -195,6 +195,32 @@ public class OnnxExportRoundTripTests
     }
 
     [Fact]
+    public void Export_ABroadcastTile_RoundTripsAsExpand()
+    {
+        // TensorBroadcastTo's general case records a Tile that only repeats size-1 axes: exported as an Expand.
+        var (plan, input) = EnginePlans.BroadcastTile();
+        var data = RandomArray(seed: 83, n: input.Length);
+        data.AsSpan().CopyTo(input.AsWritableSpan());
+        input.MarkModified();
+        var expected = plan.Execute().ToArray();
+
+        var model = OnnxExporter.Export(plan);
+        Assert.Contains(model.Graph.Node, n => n.OpType == "Expand");
+        Assert.DoesNotContain(model.Graph.Node, n => n.OpType == "Tile");
+        var feeds = new[] { new RoundTripCases.Feed("input", input._shape, data) };
+        AssertClose(expected, RoundTrip.Run(model.ToByteArray(), feeds));
+    }
+
+    [Fact]
+    public void Export_ATileThatRepeatsALongerAxis_IsRefusedByName()
+    {
+        // The importer reads no ONNX Tile back, so a genuine tile is not exported (a model this library could not
+        // re-import), and the refusal names the op.
+        var e = Assert.Throws<NotSupportedException>(() => OnnxExporter.Export(EnginePlans.TrueTile()));
+        Assert.Contains("Tile", e.Message);
+    }
+
+    [Fact]
     public void Export_UnsupportedOperation_NamesIt()
     {
         var plan = EnginePlans.CumSum();
@@ -225,6 +251,23 @@ internal static class EnginePlans
         var plan = new CompiledModelCache<float>().GetOrCompileInference(input, () =>
             engine.ReLU(engine.TensorMatMul(input, w)).Reshape(3, 2));
         return (plan, input);
+    }
+
+    internal static (ICompiledPlan<float> Plan, Tensor<float> Input) BroadcastTile()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 1, 3 });
+        var plan = new CompiledModelCache<float>().GetOrCompileInference(input, () =>
+            engine.ReLU(engine.TensorBroadcastTo(input, new[] { 2, 4, 3 })));
+        return (plan, input);
+    }
+
+    internal static ICompiledPlan<float> TrueTile()
+    {
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 2, 3 });
+        return new CompiledModelCache<float>().GetOrCompileInference(input, () =>
+            engine.ReLU(engine.TensorTile(input, new[] { 2, 1 })));
     }
 
     internal static ICompiledPlan<float> CumSum()

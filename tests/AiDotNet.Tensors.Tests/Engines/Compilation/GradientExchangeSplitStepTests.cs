@@ -40,7 +40,7 @@ public class GradientExchangeSplitStepTests
     }
 
     // loss = (1/rows) * sum((x W - t)^2), trained with fused Adam and a global-norm clip.
-    private static Result Train(DirectGpuTensorEngine engine, float[] xs, float[] ts, int firstRow, int rows,
+    private static Result Train(IEngine engine, float[] xs, float[] ts, int firstRow, int rows,
         Func<float[], float[]>? peerGradient)
     {
         var x = Rows(xs, In, firstRow, rows);
@@ -54,7 +54,6 @@ public class GradientExchangeSplitStepTests
             plan = scope.CompileTraining(new[] { w });
         }
         var result = new Result();
-        var backend = engine.GetBackend()!;
         using (plan)
         {
             var compiled = (CompiledTrainingPlan<float>)plan;
@@ -69,10 +68,7 @@ public class GradientExchangeSplitStepTests
                     exchange.Read(local);
                     result.ExchangedLosses.Add(exchange.ReadLoss());
                     // The weights this step's backward read (the update has not run yet).
-                    var weightBuffer = w.TryGetGpuBuffer() ?? throw new InvalidOperationException("w is not on the device");
-                    var weights = new float[weightBuffer.Size];
-                    backend.DownloadBuffer(weightBuffer, weights);
-                    var peer = peerGradient(weights.Take(In * Out).ToArray());
+                    var peer = peerGradient(WeightsNow(engine, w));
                     exchange.Write(local.Zip(peer, (a, b) => (a + b) / 2f).ToArray());
                 });
             }
@@ -83,6 +79,41 @@ public class GradientExchangeSplitStepTests
             result.Split = compiled.HasSplitStepGraph;
         }
         return result;
+    }
+
+    // The weights where they are current: the device buffer on a GPU engine, the host array on the CPU.
+    private static float[] WeightsNow(IEngine engine, Tensor<float> w)
+    {
+        if (engine is DirectGpuTensorEngine gpu && w.TryGetGpuBuffer() is { } buffer)
+        {
+            var weights = new float[buffer.Size];
+            gpu.GetBackend()!.DownloadBuffer(buffer, weights);
+            return weights.Take(In * Out).ToArray();
+        }
+        return w.ToArray();
+    }
+
+    // "cpu": the host engine (the exchange reads and writes host gradients); "device": the machine's DirectGpu engine,
+    // whatever its backend (the POCL lane runs this on OpenCL). Null engine: skipped. cuda: the split-graph path exists.
+    private static IEngine? ResolveEngine(string where, out bool cuda)
+    {
+        cuda = false;
+        if (where == "cpu") return new CpuEngine();
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return null;
+        }
+        if (!gpu.IsGpuAvailable)
+        {
+            gpu.Dispose();
+            Skip.If(true, "No GPU device.");
+            return null;
+        }
+        cuda = gpu.GetBackend() is CudaBackend;
+        return gpu;
     }
 
     // d/dW (1/rows) sum((xW - t)^2) = (2/rows) x^T (xW - t), in double on the host.
@@ -100,19 +131,14 @@ public class GradientExchangeSplitStepTests
         return g.Select(v => (float)v).ToArray();
     }
 
-    [SkippableFact]
-    public void HalfBatchWithAnAveragingExchange_MatchesTheFullBatch_AndTheUpdateGraphReplaysEveryStep()
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void HalfBatchWithAnAveragingExchange_MatchesTheFullBatch_AndTheUpdateGraphReplaysEveryStep(string where)
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        var gpu = ResolveEngine(where, out bool cuda)!;
+        using (gpu as IDisposable)
         {
-            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
-            return;
-        }
-        using (gpu)
-        {
-            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
             var xs = Values(Batch * In, 1, 2f);
             var ts = Values(Batch * Out, 2, 2f);
 
@@ -127,9 +153,10 @@ public class GradientExchangeSplitStepTests
                 + $"maxDiff={full.Weights.Zip(rank0.Weights, (a, b) => Math.Abs(a - b)).Max():G4} controlDiff={aloneDiff:G4}");
             Assert.True(aloneDiff > 1e-3, $"the control matched the full batch ({aloneDiff}): the test cannot tell");
             Assert.Equal(Steps, rank0.Exchanges);   // every step, warm-up and replay alike
-            Assert.True(rank0.Split, "the step did not capture as a backward graph and an update graph");
-            // The plan runs 3 eager warm-up steps, captures on the 4th, and from then on every step launches both graphs.
-            Assert.Equal(Steps - 3, rank0.UpdateGraphLaunches);
+            // CUDA captures the step: 3 eager warm-up steps, the capture on the 4th, and from then on every step launches
+            // both graphs. Elsewhere every step runs eagerly with the exchange between the backward and the update.
+            Assert.Equal(cuda, rank0.Split);
+            Assert.Equal(cuda ? Steps - 3 : 0, rank0.UpdateGraphLaunches);
             // The loss the exchange reads (to weight and reduce it across ranks) is the loss the step returns.
             Assert.Equal(rank0.Losses, rank0.ExchangedLosses);
             double maxDiff = full.Weights.Zip(rank0.Weights, (a, b) => Math.Abs(a - b)).Max();
@@ -147,20 +174,17 @@ public class GradientExchangeSplitStepTests
     /// after each replay): the scaler then runs uncaptured after the exchange, with the same outcome.
     /// </summary>
     [SkippableTheory]
-    [InlineData(OptimizerType.SGD, true)]
-    [InlineData(OptimizerType.RMSprop, false)]
-    public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow(OptimizerType optimizer, bool capturedUpdate)
+    [InlineData(OptimizerType.SGD, true, "device")]
+    [InlineData(OptimizerType.RMSprop, false, "device")]
+    [InlineData(OptimizerType.SGD, false, "cpu")]
+    [InlineData(OptimizerType.RMSprop, false, "cpu")]
+    public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow(OptimizerType optimizer,
+        bool capturedUpdateOnCuda, string where)
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        var gpu = ResolveEngine(where, out bool cuda)!;
+        bool capturedUpdate = capturedUpdateOnCuda && cuda;
+        using (gpu as IDisposable)
         {
-            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
-            return;
-        }
-        using (gpu)
-        {
-            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
             const int overflowStep = 6, steps = 9;   // past the 3 warm-up steps and the capture: a graph replay
             var xs = Values(Batch * In, 1, 2f);
             var ts = Values(Batch * Out, 2, 2f);
@@ -174,7 +198,6 @@ public class GradientExchangeSplitStepTests
                 gpu.TensorMultiplyScalar(gpu.ReduceSum(gpu.TensorMultiply(d, d), null), 1f / Batch);
                 plan = scope.CompileTraining(new[] { w });
             }
-            var backend = gpu.GetBackend()!;
             var weightsAtExchange = new List<float[]>();
             int step = 0;
             using (plan)
@@ -185,10 +208,7 @@ public class GradientExchangeSplitStepTests
                 scaled.ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f, GrowthInterval = 1000 });
                 compiled.SetGradientExchange(exchange =>
                 {
-                    var buffer = w.TryGetGpuBuffer() ?? throw new InvalidOperationException("w is not on the device");
-                    var weights = new float[buffer.Size];
-                    backend.DownloadBuffer(buffer, weights);
-                    weightsAtExchange.Add(weights.Take(In * Out).ToArray());
+                    weightsAtExchange.Add(WeightsNow(gpu, w));
                     if (++step != overflowStep) return;
                     // The peer's half overflowed: the sum this rank receives is infinite in one element.
                     var g = new float[exchange.TotalLength];

@@ -2156,9 +2156,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // staging and 48 MiB copied from the host each step), and whose
         // two-sided device broadcast expanded both operands into full-size
         // temporaries. The tile's backward sums the copies, as the add's did.
-        // An empty target (a size-1 axis broadcast to 0) has no tile multiple, so it keeps the zero-add.
+        // A size-1 axis broadcast to 0 has no tile multiple (a tile repeats at least once), so that target keeps the
+        // zero-add; an axis already 0 tiles once like any other.
         for (int i = 0; i < targetShape.Length; i++)
-            if (targetShape[i] == 0) return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+        {
+            int inputAxis = i - rankDiff;
+            int srcDim = inputAxis < 0 ? 1 : input._shape[inputAxis];
+            if (srcDim == 1 && targetShape[i] == 0) return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+        }
         var multiples = new int[targetShape.Length];
         var padded = new int[targetShape.Length];
         for (int i = 0; i < targetShape.Length; i++)

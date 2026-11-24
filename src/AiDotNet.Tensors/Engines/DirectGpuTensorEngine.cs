@@ -29801,7 +29801,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<T>? TryBroadcastTileOnDevice<T>(Tensor<T>? tensor, int[]? multiples)
     {
         if (typeof(T) != typeof(float) || tensor is null || multiples is null || multiples.Length != tensor.Rank
-            || Compilation.GraphMode.IsActive || !TryGetBackend(out _))
+            || tensor.Length == 0 || Compilation.GraphMode.IsActive || !TryGetBackend(out _))
             return null;
         bool expands = false;
         for (int i = 0; i < multiples.Length; i++)

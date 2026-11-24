@@ -645,15 +645,21 @@ public class TorchModelOpsVulkanTests : TorchModelOpsGpuTestsBase, IClassFixture
     {
         Skip.IfNot(_vulkan.IsAvailable, "Vulkan backend not available.");
         var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+        // Without double storage the probe never runs, and there is nothing to attribute.
+        Skip.IfNot(backend.SupportsFloat64Storage, "The Vulkan device stores no doubles.");
         bool before = backend.SupportsFloat64MatrixMultiply;
         backend.ResetFloat64ProbeForTest();
         bool after;
+        long tuningReadbacks = GpuLaunchProbe.TuningReadbacks, tuningUploads = GpuLaunchProbe.TuningUploads;
         GpuResidencyScope scope;
         using (scope = GpuResidencyScope.Begin(captureOperations: true))
             after = backend.SupportsFloat64MatrixMultiply;
         Assert.Equal(before, after);
         Assert.Equal(0, scope.Downloads);
         Assert.Equal(0, scope.Uploads);
+        // The probe did run (two operands up, four results back), and its transfers count as detection evidence.
+        Assert.True(GpuLaunchProbe.TuningReadbacks - tuningReadbacks >= 4, "the probe's readbacks were not attributed to detection");
+        Assert.True(GpuLaunchProbe.TuningUploads - tuningUploads >= 2, "the probe's uploads were not attributed to detection");
     }
 }
 

@@ -33,6 +33,9 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend, INative
     /// capability 7.0+ for FP16 (BF16's own 8.0 floor is <see cref="IGpuMixedPrecisionConvBackend.SupportsBFloat16Conv"/>).
     /// Below that the "half" convolution is no faster than FP32, so autocast keeps convolutions in FP32 there.
     /// </summary>
+    /// <summary>Tests: the device's compute capability major version.</summary>
+    internal int ComputeCapabilityMajorForTest => _ccMajor;
+
     bool INativeReducedPrecisionConv.NativeReducedPrecisionMath
         => CudaDispatchPolicy.UseCudnnForConv && _ccMajor >= 7;
 

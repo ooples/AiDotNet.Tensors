@@ -39,6 +39,43 @@ public class BroadcastToCompiledInputTests
         }
     }
 
+    // Empty extents: a size-1 axis broadcast to 0 (no tile multiple exists), an axis already 0 kept, and an empty input
+    // expanded on another axis. Eager, traced and differentiated.
+    [Theory]
+    [InlineData(new[] { 1 }, new[] { 0 })]
+    [InlineData(new[] { 1, 3 }, new[] { 0, 3 })]
+    [InlineData(new[] { 0, 1 }, new[] { 0, 5 })]
+    [InlineData(new[] { 1 }, new[] { 2, 0 })]
+    public void Broadcast_with_an_empty_extent_gives_an_empty_tensor_and_a_zero_gradient(int[] from, int[] to)
+    {
+        var engine = new CpuEngine();
+        int count = 1;
+        foreach (int d in from) count *= d;
+        var data = new float[count];
+        for (int i = 0; i < count; i++) data[i] = i + 1f;
+        var x = new Tensor<float>(data, from);
+        var eager = engine.TensorBroadcastTo(x, to);
+        Assert.Equal(to, eager.Shape.ToArray());
+        Assert.Equal(0, eager.Length);
+
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { x }))
+        {
+            var expanded = engine.TensorBroadcastTo(x, to);
+            Assert.Equal(to, expanded.Shape.ToArray());
+            var loss = engine.ReduceSum(engine.TensorMultiply(expanded, expanded), null, false);
+            plan = Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(new[] { x }, loss));
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0);
+            Assert.Equal(0f, plan.Step().ToArray()[0]);
+            var grad = plan.Gradients[0];
+            Assert.Equal(from, grad.Shape.ToArray());
+            foreach (float g in grad.ToArray()) Assert.Equal(0f, g);
+        }
+    }
+
     [Fact]
     public void Broadcast_to_a_higher_rank_expands_leading_and_size_one_axes()
     {
