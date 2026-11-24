@@ -1250,6 +1250,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
     {
         if (backend is null) return null;
+        // Engines register under their unwrapped backend; a tensor's binding may name the wrapper it was placed through
+        // (a tracing or kernel-substituting DelegatingGpuBackend), which would otherwise find no owner.
+        backend = CrossBackendTensors.Unwrap(backend);
         lock (s_engineByBackendLock)
         {
             if (!s_enginesByBackend.TryGetValue(backend, out var engines)) return null;

@@ -40,6 +40,9 @@ public sealed partial class WebGpuBackend : IGpuBatchExecution
                     throw new ArgumentException($"Unsupported argument type {arg?.GetType().Name ?? "null"} for {name}.");
             }
         }
+        // The zero word a translated module reads after its own scalars (CudaDialectToWgsl.ZeroField); a hand-written
+        // module's struct ends before it.
+        fields.Add(0f);
         var pipe = await GetOrCreatePipelineAsync(BatchModuleKey + name, source, "main");
         // Uniform buffers are sized in 16-byte units.
         var uniform = new float[Math.Max(4, (fields.Count + 3) / 4 * 4)];
