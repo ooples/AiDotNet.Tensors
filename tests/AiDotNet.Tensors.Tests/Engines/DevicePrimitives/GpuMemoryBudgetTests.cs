@@ -391,14 +391,9 @@ public class GpuMemoryBudgetTests
         // The premise of this test, stated with its numbers: a failure below is then either the pool not keeping the
         // freed block (this assertion) or the admission charging a request the pool covers (the counters).
         const long requestBytes = (12L * 1024 * 1024 + 17) * sizeof(float);
-        // A driver whose pool has been trimmed earlier in this process can report less backing memory than memory in
-        // use; the pool's free blocks cannot be read then, the budget charges the whole request, and there is no
-        // reuse to observe.
-        Skip.If(poolFreed.Reserved < poolFreed.Used,
-            $"The stream-ordered pool reports less backing memory than memory in use {poolFreed}: its free blocks cannot be read.");
         Assert.True(poolFreed.Reserved - poolFreed.Used >= requestBytes,
             $"The stream-ordered pool does not hold {requestBytes} free bytes after the 96 MB buffer was returned to it: "
-            + $"reserved/used before {poolBefore}, with the buffer disposed {poolHeld}, after the return {poolFreed}.");
+            + $"backing/used before {poolBefore}, with the buffer disposed {poolHeld}, after the return {poolFreed}.");
         long reclaimsBefore = account.BudgetReclaims, refusalsBefore = account.BudgetRefusals;
         GpuMemoryBudget.SetMemoryLimit(account.ReservedBytes + 1024 * 1024, device);
         try
