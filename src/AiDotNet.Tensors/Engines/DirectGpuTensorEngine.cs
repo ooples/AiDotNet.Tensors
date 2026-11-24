@@ -9982,6 +9982,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return (T)(object)doubleSum;
         if (TrySumIntegerAny(tensor) is T integerSum)
             return integerSum;
+        if (TrySumNarrowFloat(tensor) is T narrowSum)
+            return narrowSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 

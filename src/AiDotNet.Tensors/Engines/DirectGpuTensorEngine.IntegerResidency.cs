@@ -296,6 +296,36 @@ public partial class DirectGpuTensorEngine
         return null;
     }
 
+    /// <summary>
+    /// The sum of a BFloat16 tensor whose values are on the device, accumulated there in FP32 (the device's blocked
+    /// sum, see <see cref="IGpuNarrowFloatReductions"/>) and rounded once into the type, boxed. Null when the CPU engine
+    /// takes it.
+    /// </summary>
+    private object? TrySumNarrowFloat<T>(Tensor<T> tensor)
+    {
+        if (tensor is not Tensor<NumericOperations.BFloat16> values) return null;
+        const GpuElementType Type = GpuElementType.BFloat16;
+        int length = values.Length;
+        if (length == 0 || ResidentStepActive || !IntegerDeviceRouteAllowed(typeof(NumericOperations.BFloat16))
+            || !TryGetBackend(out var backend)) return null;
+        if (backend is not IGpuNarrowFloatReductions reductions || !backend.SupportsElementType(Type) || !reductions.SupportsNarrowFloatSum(Type))
+            return null;
+        try
+        {
+            lock (_typedLock)
+            {
+                // Only a tensor already on the device is reduced there, as for the integer types.
+                if (FindResident(values) is not { } resident || !ReferenceEquals(resident.Backend, backend)) return null;
+                return NumericOperations.BFloat16.FromFloat(reductions.SumNarrowFloat(Type, resident.Buffer, length));
+            }
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorSumNarrowFloat", capabilityGap);
+            return null;
+        }
+    }
+
     private bool TrySumInteger<T>(Tensor<T> tensor, GpuElementType type, out long sum)
         where T : unmanaged
     {

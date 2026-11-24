@@ -114,6 +114,33 @@ internal static class GpuPackedCompute
         launch(GpuPackedKernelSource.Binary(operation, type), Work(type, size), (uint)size, 0u, 0u, 0u, new[] { a, b, output });
     }
 
+    /// <summary>The blocked binary32 sum of the first <paramref name="size"/> 16-bit float elements.</summary>
+    public static float Sum(IDirectGpuBackend backend, GpuPackedLaunch launch, GpuElementType type, IGpuBuffer a, int size)
+    {
+        GpuNarrowFloatLayout.Require(nameof(IGpuNarrowFloatReductions.SumNarrowFloat), type, size, (a, size));
+        if (size == 0) return 0f;
+        const int Block = GpuNarrowFloatLayout.SumBlock;
+        int partials = GpuIntegerLayout.Blocks(size, Block);
+        // Partials are binary32 bits, a word each. Two scratch buffers, alternated: a pass never reads the buffer it writes.
+        using var even = backend.AllocateBuffer(partials, GpuElementType.Int32);
+        using var odd = backend.AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, Block)), GpuElementType.Int32);
+        var kernel = GpuPackedKernelSource.FloatSum(type);
+        IGpuBuffer current = a;
+        IGpuBuffer target = even;
+        int count = size;
+        while (true)
+        {
+            int outputs = GpuIntegerLayout.Blocks(count, Block);
+            launch(kernel, outputs, (uint)count, 0u, 0u, 0u, new[] { current, target });
+            if (outputs == 1)
+                return BitConverter.ToSingle(backend.DownloadByteBuffer(target, sizeof(float)), 0);
+            current = target;
+            target = ReferenceEquals(target, even) ? odd : even;
+            count = outputs;
+            kernel = GpuPackedKernelSource.FloatSumPartials();
+        }
+    }
+
     /// <summary><c>output[i] = a[i] op scalar</c> on 16-bit floats, the scalar a binary32 value; the output may be the operand.</summary>
     public static void Scalar(GpuPackedLaunch launch, GpuNarrowFloatBinaryOperation operation, GpuElementType type,
         IGpuBuffer a, float scalar, IGpuBuffer output, int size)

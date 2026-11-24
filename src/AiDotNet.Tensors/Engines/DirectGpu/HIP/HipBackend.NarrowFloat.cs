@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 // kernels generated with the integer program (GpuNarrowFloatKernelSource), which CUDA and OpenCL also run: they compute in
 // FP32 once and round to nearest even, as the host does. The older half add and gelu kernels do not, so they are not
 // behind this interface.
-public sealed partial class HipBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply
+public sealed partial class HipBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply, IGpuNarrowFloatReductions
 {
     private bool NarrowFloatKernelsReady(GpuElementType type)
         => IsAvailable && GpuNarrowFloatLayout.IsNarrowFloat(type) && IntegerKernelsLoaded();
@@ -44,6 +44,47 @@ public sealed partial class HipBackend : IGpuNarrowFloatElementwise, IGpuNarrowF
         args[2] = &outputPtr;
         args[3] = &n;
         LaunchKernel(kernel, IntegerGrid(size), IntegerBlock, args);
+    }
+
+    /// <inheritdoc/>
+    public bool SupportsNarrowFloatSum(GpuElementType type) => NarrowFloatKernelsReady(type);
+
+    /// <inheritdoc/>
+    public unsafe float SumNarrowFloat(GpuElementType type, IGpuBuffer a, int size)
+    {
+        GpuNarrowFloatLayout.Require(nameof(SumNarrowFloat), type, size, (a, size));
+        IntPtr kernel = IntegerKernel(GpuNarrowFloatKernelSource.Sum(type));
+        if (size == 0) return 0f;
+        IntPtr later = IntegerKernel(GpuNarrowFloatKernelSource.SumPartials);
+        int block = GpuNarrowFloatLayout.SumBlock;
+        int partials = GpuIntegerLayout.Blocks(size, block);
+        // Partials are binary32 bits, a word each. Two scratch buffers, alternated: a pass never reads the buffer it writes.
+        using var even = AllocateBuffer(partials, GpuElementType.Int32);
+        using var odd = AllocateBuffer(Math.Max(1, GpuIntegerLayout.Blocks(partials, block)), GpuElementType.Int32);
+        IGpuBuffer current = a;
+        IGpuBuffer target = even;
+        int count = size;
+        void** args = stackalloc void*[4];
+        while (true)
+        {
+            int blocks = GpuIntegerLayout.Blocks(count, block);
+            // (a, o as binary32 bits, count, blocks), one thread per block.
+            IntPtr inputPtr = IntegerHandle(current);
+            IntPtr outputPtr = IntegerHandle(target);
+            int n = count;
+            int groups = blocks;
+            args[0] = &inputPtr;
+            args[1] = &outputPtr;
+            args[2] = &n;
+            args[3] = &groups;
+            LaunchKernel(kernel, IntegerGrid(blocks), IntegerBlock, args);
+            if (blocks == 1)
+                return BitConverter.ToSingle(DownloadByteBuffer(target, sizeof(float)), 0);
+            current = target;
+            target = ReferenceEquals(target, even) ? odd : even;
+            count = blocks;
+            kernel = later;
+        }
     }
 
     /// <inheritdoc/>

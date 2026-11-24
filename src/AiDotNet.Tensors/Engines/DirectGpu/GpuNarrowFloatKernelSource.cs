@@ -72,6 +72,14 @@ internal static class GpuNarrowFloatKernelSource
 
     public static string MatrixMultiply(GpuElementType type) => "nfgemm_" + Suffix(type);
 
+    /// <summary>
+    /// The first pass of a sum: arguments (a, o, count, blocks), <c>o</c> the binary32 bits of each block's sum.
+    /// </summary>
+    public static string Sum(GpuElementType type) => "nfsum_" + Suffix(type);
+
+    /// <summary>A later pass of a sum, over the partials of the pass before: arguments (a, o, count, blocks).</summary>
+    public const string SumPartials = "nfsum_w";
+
     /// <summary>The kernel of <c>o[i] = a[i] op y</c> for a 32-bit float <c>y</c>: arguments (a, o, y, size).</summary>
     public static string Scalar(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
     {
@@ -91,6 +99,8 @@ internal static class GpuNarrowFloatKernelSource
 
             foreach (var operation in UnaryOperations) names.Add(Unary(operation, type));
             names.Add(MatrixMultiply(type));
+            names.Add(Sum(type));
+            if (!names.Contains(SumPartials)) names.Add(SumPartials);
         }
     }
 
@@ -259,6 +269,19 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? NF_EXP(x) : 1.0f / (1.0f +
             }
 
             // One invocation per output element: a row of a against a column of b, accumulated in a float.
+            // A block's elements added in order into a binary32 partial, stored as its bits.
+            source.Append("IK_KERNEL ").Append(Sum(type)).Append("(IK_PTR const u16t* a, IK_PTR u32t* o, const int count, const int blocks)\n{\n"
+                + "    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * " + GpuNarrowFloatLayout.SumBlock
+                + ";\n    const int last = (count - first > " + GpuNarrowFloatLayout.SumBlock + ") ? first + " + GpuNarrowFloatLayout.SumBlock
+                + " : count;\n    float s = 0.0f;\n    for (int j = first; j < last; j++) s += " + widen + "(a[j]);\n    o[i] = NF_BITS(s);\n}\n");
+            if (type == Types[0])
+            {
+                source.Append("IK_KERNEL ").Append(SumPartials).Append("(IK_PTR const u32t* a, IK_PTR u32t* o, const int count, const int blocks)\n{\n"
+                + "    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * " + GpuNarrowFloatLayout.SumBlock
+                + ";\n    const int last = (count - first > " + GpuNarrowFloatLayout.SumBlock + ") ? first + " + GpuNarrowFloatLayout.SumBlock
+                + " : count;\n    float s = 0.0f;\n    for (int j = first; j < last; j++) s += NF_FLOAT(a[j]);\n    o[i] = NF_BITS(s);\n}\n");
+            }
+
             source.Append("IK_KERNEL ").Append(MatrixMultiply(type))
                 .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* c, const int m, const int n, const int k)\n{\n")
                 .Append("    const int i = IK_GID;\n    if (i >= m * n) return;\n    const int row = i / n;\n    const int col = i - row * n;\n")

@@ -268,6 +268,81 @@ public abstract class GpuNarrowFloatContractTests
         RequireRan(ran, Types.Length * sizes.Length, $"{operation} scalar kernel");
     }
 
+    // The device's sum, on the host: in order within blocks of 64, each partial a binary32 value, until one is left.
+    private static float BlockedSum(float[] values)
+    {
+        var current = values;
+        while (true)
+        {
+            var next = new float[(current.Length + 63) / 64];
+            for (int block = 0; block < next.Length; block++)
+            {
+                float s = 0f;
+                int last = Math.Min(current.Length, (block + 1) * 64);
+                for (int j = block * 64; j < last; j++) s = (float)(s + current[j]);
+                next[block] = s;
+            }
+
+            if (next.Length == 1) return next[0];
+            current = next;
+        }
+    }
+
+    private static uint Bits(float value) => BitConverter.ToUInt32(BitConverter.GetBytes(value), 0);
+
+    // One pass (up to 64), two (up to 4096) and three, with block edges on both sides.
+    [SkippableFact]
+    public void Sum_is_the_blocked_binary32_sum_of_the_widened_elements()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        Skip.If(backend is not IGpuNarrowFloatReductions, SkipReason);
+        var reductions = (IGpuNarrowFloatReductions)backend;
+        int[] sizes = { 1, 3, 63, 64, 65, 257, 4096, 4097, 70001 };
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !reductions.SupportsNarrowFloatSum(type)) continue;
+            using (var empty = backend.AllocateBuffer(1, type))
+                Assert.Equal(0u, Bits(reductions.SumNarrowFloat(type, empty, 0)));
+            foreach (int size in sizes)
+            {
+                var values = Patterns(type, size, 11, moderate: true);
+                using var a = Upload(backend, type, values);
+                float expected = BlockedSum(Array.ConvertAll(values, v => Widen(type, v)));
+                float actual = reductions.SumNarrowFloat(type, a, size);
+                Assert.True(Bits(expected) == Bits(actual), $"Sum<{type}> of {size}: host {expected:R}, device {actual:R}");
+                // A prefix of the buffer: the elements past it are not read.
+                if (size > 1)
+                {
+                    float prefix = BlockedSum(Array.ConvertAll(values.Take(size - 1).ToArray(), v => Widen(type, v)));
+                    Assert.True(Bits(prefix) == Bits(reductions.SumNarrowFloat(type, a, size - 1)), $"Sum<{type}> of the first {size - 1} of {size}");
+                }
+
+                ran++;
+            }
+
+            // An infinity carries, opposite infinities and a NaN give a NaN, and negative zeros sum to a positive one.
+            var cases = new (float[] Values, float Expected)[]
+            {
+                (new[] { 1f, float.PositiveInfinity, 2f }, float.PositiveInfinity),
+                (new[] { float.NegativeInfinity, 2f }, float.NegativeInfinity),
+                (new[] { float.PositiveInfinity, float.NegativeInfinity }, float.NaN),
+                (new[] { 1f, float.NaN, 2f }, float.NaN),
+                (new[] { -0f, -0f }, 0f),
+            };
+            foreach (var (inputs, expected) in cases)
+            {
+                using var a = Upload(backend, type, Array.ConvertAll(inputs, v => Narrow(type, v)));
+                float actual = reductions.SumNarrowFloat(type, a, inputs.Length);
+                if (float.IsNaN(expected)) Assert.True(float.IsNaN(actual), $"Sum<{type}> of {string.Join(", ", inputs)} gave {actual:R}");
+                else Assert.True(Bits(expected) == Bits(actual), $"Sum<{type}> of {string.Join(", ", inputs)} gave {actual:R}");
+            }
+        }
+
+        RequireRan(ran, Types.Length * sizes.Length, "sum kernel");
+    }
+
     private static float HostFunction(GpuNarrowFloatUnaryOperation operation, float x) => (float)(operation switch
     {
         GpuNarrowFloatUnaryOperation.Sqrt => Math.Sqrt(x),

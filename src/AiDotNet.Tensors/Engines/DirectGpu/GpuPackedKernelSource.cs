@@ -369,6 +369,26 @@ internal static class GpuPackedKernelSource
             () => LaneBody(type, second: true, scalar: false, FloatBinaryValue(operation, type, Widen(type) + "(y)")));
     }
 
+    /// <summary>
+    /// The first pass of a 16-bit float sum, buffers (a, o): invocation <c>i</c> adds block <c>i</c> of the
+    /// <c>pcount</c> elements in order, on the bits, and writes the partial's binary32 bits.
+    /// </summary>
+    public static GpuPackedKernel FloatSum(GpuElementType type)
+    {
+        RequireFloat(type);
+        return Kernel("pk_nfsum_" + Suffix(type), 2, FloatLibrary, () => FloatSumBody(
+            Widen(type) + "((a[j >> 1u] >> ((j & 1u) * 16u)) & 0xFFFFu)"));
+    }
+
+    /// <summary>A later pass of a 16-bit float sum, buffers (a, o): the partials of the pass before, a word each.</summary>
+    public static GpuPackedKernel FloatSumPartials()
+        => Kernel("pk_nfsum_w", 2, FloatLibrary, () => FloatSumBody("a[j]"));
+
+    private static string FloatSumBody(string element)
+        => "    uint first = gid * " + GpuNarrowFloatLayout.SumBlock + "u;\n    uint last = min(first + " + GpuNarrowFloatLayout.SumBlock
+            + "u, pcount);\n    uint s = 0u;\n    for (uint j = first; j < last; j++) {\n        s = pk_fadd(s, " + element
+            + ");\n    }\n    o[gid] = s;\n";
+
     /// <summary><c>o[i] = a[i] op scalar</c> on 16-bit floats, buffers (a, o): <c>pb</c> is the scalar's binary32 bits.</summary>
     public static GpuPackedKernel Scalar(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
     {
@@ -493,8 +513,10 @@ internal static class GpuPackedKernelSource
 
             foreach (var operation in FloatUnaryOperations) all.Add(Unary(operation, type));
             all.Add(MatrixMultiply(type));
+            all.Add(FloatSum(type));
         }
 
+        all.Add(FloatSumPartials());
         all.Add(Copy(1));
         all.Add(Copy(2));
         return all;

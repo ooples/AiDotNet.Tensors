@@ -210,6 +210,30 @@ public class GpuIntegerResidencyTests
                         $"{name} at {i} of {(float)xValues[i]:R}: expected {function((float)xValues[i]):R}, device {(float)values[i]:R}.");
             }
 
+            // Whole values sum exactly in any order, so the device's blocked sum and the host's agree to the bit.
+            var wholeValues = new BFloat16[Large];
+            float wholeTotal = 0f;
+            for (int i = 0; i < Large; i++)
+            {
+                float whole = (i * 7 % 17) - 8;
+                wholeValues[i] = BFloat16.FromFloat(whole);
+                wholeTotal += 2f * whole;
+            }
+
+            var wholeTensor = new Tensor<BFloat16>(wholeValues, new[] { Large });
+            gpu.RegisterPersistentTensor(wholeTensor, PersistentTensorRole.Weights);
+            try
+            {
+                var doubled = engine.TensorAdd(wholeTensor, wholeTensor);
+                Assert.True(gpu.IsTypedResident(doubled), "The BFloat16 sum's operand was not left on the device.");
+                Assert.True(BFloat16.FromFloat(wholeTotal).RawValue == engine.TensorSum(doubled).RawValue,
+                    $"Sum of whole values: expected {wholeTotal:R}, device {(float)engine.TensorSum(doubled):R}.");
+            }
+            finally
+            {
+                gpu.UnregisterPersistentTensor(wholeTensor);
+            }
+
             foreach (var (name, result, function, exact) in results)
             {
                 Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");

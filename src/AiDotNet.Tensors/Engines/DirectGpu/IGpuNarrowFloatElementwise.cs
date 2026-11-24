@@ -87,6 +87,22 @@ public interface IGpuNarrowFloatElementwise
     void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size);
 }
 
+/// <summary>Reductions of 16-bit float buffers, accumulated in 32-bit floats.</summary>
+/// <remarks>
+/// The sum is a defined one, the same on every device: the elements are widened and added in order within blocks of
+/// <see cref="GpuNarrowFloatLayout.SumBlock"/>, each partial a binary32 value, and the partials are summed the same way
+/// until one is left. A device that flushes binary32 subnormals may differ where a partial is below the smallest
+/// normal float.
+/// </remarks>
+public interface IGpuNarrowFloatReductions
+{
+    /// <summary>Whether this device sums <paramref name="type"/> buffers.</summary>
+    bool SupportsNarrowFloatSum(GpuElementType type);
+
+    /// <summary>The blocked binary32 sum of the first <paramref name="size"/> elements of <paramref name="a"/>; zero when empty.</summary>
+    float SumNarrowFloat(GpuElementType type, IGpuBuffer a, int size);
+}
+
 /// <summary>
 /// Matrix multiply over 16-bit float buffers: products are accumulated in 32-bit floats and the result is rounded to
 /// the storage type.
@@ -107,6 +123,9 @@ public interface IGpuNarrowFloatMatrixMultiply
 /// <summary>What the 16-bit float kernels of every backend share.</summary>
 internal static class GpuNarrowFloatLayout
 {
+    /// <summary>The elements one invocation of a sum adds: a partial per block.</summary>
+    public const int SumBlock = 64;
+
     /// <summary>Whether <paramref name="type"/> is a 16-bit float type.</summary>
     public static bool IsNarrowFloat(GpuElementType type) => type is GpuElementType.Float16 or GpuElementType.BFloat16;
 
