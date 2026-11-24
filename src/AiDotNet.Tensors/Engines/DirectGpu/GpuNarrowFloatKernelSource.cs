@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
@@ -309,15 +310,15 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
             source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Abs, type))
                 .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
                 .Append("    if (i < size) o[i] = (u16t)(a[i] & 0x7FFFu);\n}\n");
-            foreach (var operation in UnaryOperations)
+            foreach (var (operation, function) in UnaryOperations
+                .Select(operation => (Operation: operation, Function: FloatFunction(operation)))
+                .Where(kernel => kernel.Function is not null))
             {
-                if (FloatFunction(operation) is not { } function) continue;
                 source.Append("IK_KERNEL ").Append(Unary(operation, type))
                     .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
                     .Append("    if (i < size) o[i] = ").Append(narrow).Append('(').Append(function).Append('(').Append(widen).Append("(a[i])));\n}\n");
             }
 
-            // One invocation per output element: a row of a against a column of b, accumulated in a float.
             // A block's elements added in order into a binary32 partial, stored as its bits.
             source.Append("IK_KERNEL ").Append(Sum(type)).Append("(IK_PTR const u16t* a, IK_PTR u32t* o, const int count, const int blocks)\n{\n"
                 + "    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * " + GpuNarrowFloatLayout.SumBlock
@@ -331,6 +332,7 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
                 + " : count;\n    float s = 0.0f;\n    for (int j = first; j < last; j++) s += NF_FLOAT(a[j]);\n    o[i] = NF_BITS(s);\n}\n");
             }
 
+            // One invocation per output element: a row of a against a column of b, accumulated in a float.
             source.Append("IK_KERNEL ").Append(MatrixMultiply(type))
                 .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* c, const int m, const int n, const int k)\n{\n")
                 .Append("    const int i = IK_GID;\n    if (i >= m * n) return;\n    const int row = i / n;\n    const int col = i - row * n;\n")
