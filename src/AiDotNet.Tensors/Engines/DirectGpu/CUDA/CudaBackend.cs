@@ -20282,7 +20282,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 tc.SkinnyCounters = null;
             }
 
-            try { _threadCublas?.Dispose(); } catch (ObjectDisposedException) { }
+            try
+            {
+                _threadCublas?.Dispose();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                // An abandoned backend: the GC finalized the ThreadLocal first. Its handles went above, from the registry.
+                System.Diagnostics.Trace.TraceWarning($"[CUDA] The per-thread cuBLAS store was already disposed: {ex}");
+            }
             _threadCublas = null;
         }
 
