@@ -469,6 +469,7 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
         // A kernel that cannot be built or run here measures as "does not compute doubles", which is how the backend's
         // own gate reads it; anything else thrown is a defect and fails the test.
         bool measured;
+        var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin();
         try
         {
             measured = vulkan.MeasureSubnormals();
@@ -477,6 +478,15 @@ public sealed class VulkanFloat64Tests : GpuFloat64BackendContractTests
         {
             measured = false;
         }
+        finally
+        {
+            scope.Dispose();
+        }
+
+        // The measurement runs inside whichever op first asks for a precision plan; its transfers are the device's.
+        // Counted, they failed that op's stay-on-device check (TensorMatMul under HyperbolicLinear's backward).
+        Assert.Equal(0, scope.Downloads);
+        Assert.Equal(0, scope.Uploads);
 
         Assert.Equal(measured, ((IGpuFloat64Elementwise)vulkan).SupportsFloat64Elementwise);
         Assert.Equal(measured, ((IGpuFloat64Reductions)vulkan).SupportsFloat64Reductions);

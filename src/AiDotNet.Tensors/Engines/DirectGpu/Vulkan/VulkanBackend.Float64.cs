@@ -66,6 +66,9 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     // Every double kernel here is built from these operations and the same header.
     internal bool MeasureSubnormals()
     {
+        // It runs once per device, from whichever op first asks for a precision plan: its launches, uploads and
+        // readbacks are the device's, not that op's.
+        using var detection = GpuLaunchProbe.DetectionScope();
         const double smallestNormal = 2.2250738585072014E-308, smallestSubnormal = double.Epsilon;
         const double halfUlp = 1.1102230246251565E-16;   // 2^-53
         var left = new[]
