@@ -22,6 +22,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 /// <c>(float)(...)</c>), no chained assignment, no local arrays, structs or macros;</item>
 /// <item>NaN / infinity tests and constants through the bit helpers (<c>__float_as_uint</c>,
 /// <c>__uint_as_float</c>), never isnan or a constant division.</item>
+/// <item>an extracted rounding error (two-sum, Veltkamp split) rounds each step through an exactness helper
+/// (<see cref="ExactHelpers"/>): WGSL lets a compiler treat float arithmetic as real arithmetic, and Mesa's folds
+/// (a + b) - a to b. The translation makes the helper opaque: it XORs the value's bits with a uniform field every
+/// host writes as zero (<see cref="ZeroField"/>, the struct's last), which no compiler can see through.</item>
 /// </list>
 /// </summary>
 internal static class CudaDialectToWgsl
@@ -34,6 +38,12 @@ internal static class CudaDialectToWgsl
     private static readonly Regex KernelHeader = new(
         @"extern ""C"" __global__ __launch_bounds__\(256\) void (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
     private static readonly Regex ConstTable = new(@"__device__ const float (\w+)\[(\d+)\] = \{([^}]*)\};", RegexOptions.None, Timeout);
+
+    /// <summary>The dialect's exactness helpers: identity functions everywhere else, opaque in WGSL.</summary>
+    internal static readonly string[] ExactHelpers = { "tp_exact", "mo_exact" };
+
+    /// <summary>The trailing uniform field of every translated module, always written as zero by its host.</summary>
+    internal const string ZeroField = "tp_zero_";
 
     private static readonly Regex HelperHeader = new(
         @"__device__ __forceinline__ (float2|uint2|float|int|unsigned int|bool|void) (\w+)\(([^)]*)\)\s*\{", RegexOptions.None, Timeout);
@@ -82,9 +92,18 @@ internal static class CudaDialectToWgsl
             {
                 int end = MatchingBrace(source, h.Index + h.Length - 1);
                 string body = source.Substring(h.Index + h.Length, end - h.Index - h.Length);
-                helpers.Append("fn ").Append(h.Groups[2].Value).Append('(').Append(HelperParams(h.Groups[3].Value)).Append(')');
+                string helperName = h.Groups[2].Value;
+                helpers.Append("fn ").Append(helperName).Append('(').Append(HelperParams(h.Groups[3].Value)).Append(')');
                 if (h.Groups[1].Value != "void") helpers.Append(" -> ").Append(Type(h.Groups[1].Value));
-                helpers.Append(" {").Append(Statements(body, null)).Append("}\n");
+                if (System.Array.IndexOf(ExactHelpers, helperName) >= 0)
+                {
+                    var single = Regex.Match(h.Groups[3].Value.Trim(), @"^float (\w+)$", RegexOptions.None, Timeout);
+                    if (h.Groups[1].Value != "float" || !single.Success)
+                        throw new System.InvalidOperationException($"{helperName} must take and return one float.");
+                    helpers.Append(" { return bitcast<f32>(bitcast<u32>(").Append(single.Groups[1].Value).Append(") ^ p.")
+                        .Append(ZeroField).Append("); }\n");
+                }
+                else helpers.Append(" {").Append(Statements(body, null)).Append("}\n");
                 at = end + 1;
             }
             else
@@ -122,7 +141,8 @@ internal static class CudaDialectToWgsl
                 fields.Add(scalar.Groups[2].Value + ": " + Type(scalar.Groups[1].Value));
                 scalars.Add(scalar.Groups[2].Value);
             }
-            if (fields.Count == 0) fields.Add("unused_: i32");
+            // Last, after the kernel's own scalars: its host appends one zero word to the fields it packs.
+            fields.Add(ZeroField + ": u32");
             var module = new StringBuilder(bindings.ToString());
             module.Append("struct P { ").Append(string.Join(", ", fields)).Append(" };\n");
             module.Append("@group(0) @binding(").Append(binding).Append(") var<uniform> p : P;\n");

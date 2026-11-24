@@ -36,6 +36,8 @@ internal static class TorchParityF32Kernels
     private const string Helpers = @"
 __device__ __forceinline__ bool tp_isnan(float v) { return (__float_as_uint(v) & 0x7FFFFFFFu) > 0x7F800000u; }
 __device__ __forceinline__ bool tp_isinf(float v) { return (__float_as_uint(v) & 0x7FFFFFFFu) == 0x7F800000u; }
+// +0 or -0 by its bits. WGSL lets a compiler assume no NaN, so v != 0.0f can read NaN as zero (lavapipe does).
+__device__ __forceinline__ bool tp_iszero(float v) { return (__float_as_uint(v) & 0x7FFFFFFFu) == 0u; }
 __device__ __forceinline__ bool tp_signbit_f(float v) { return (__float_as_uint(v) & 0x80000000u) != 0u; }
 __device__ __forceinline__ float tp_nan() { return __uint_as_float(0x7FC00000u); }
 __device__ __forceinline__ float tp_inf() { return __uint_as_float(0x7F800000u); }
@@ -172,35 +174,42 @@ __device__ __forceinline__ float tp_log(float x)
 // True for +0 and -0 only, never a subnormal a flush-to-zero comparison would call zero.
 __device__ __forceinline__ bool tp_is_zero(float x) { return (__float_as_uint(x) & 0x7FFFFFFFu) == 0u; }
 
+// v, rounded where it stands. The double-float steps below extract a rounding error from (a + b) - a and the like,
+// which a compiler free to treat float arithmetic as real arithmetic folds to b, erasing the error term: Mesa's
+// shader compiler does for WGSL (lavapipe returned 0 for the error of 1 + 1e-8). Identity in every dialect but WGSL,
+// whose translation (CudaDialectToWgsl) makes it opaque to the compiler.
+__device__ __forceinline__ float tp_exact(float v) { return v; }
+
 // The rounding error of p = a * b, exactly (Dekker's TwoProduct over Veltkamp splits). Not fma: WGSL only requires
 // fma to round like a * b + c, and Dawn's D3D12 path returns 0 for fma(a, b, -a * b). Magnitudes past 1e30 would
 // overflow the split, and their products are past float's useful range anyway, so their error is taken as 0.
 __device__ __forceinline__ float tp_split_hi(float a)
 {
-    float c = 4097.0f * a;
-    return c - (c - a);
+    float c = tp_exact(4097.0f * a);
+    return c - tp_exact(c - a);
 }
 
 __device__ __forceinline__ float tp_two_prod_err(float a, float b, float p)
 {
     if (fabsf(a) > 1e30f || fabsf(b) > 1e30f) { return 0.0f; }
+    float pe = tp_exact(p);
     float ah = tp_split_hi(a);
     float al = a - ah;
     float bh = tp_split_hi(b);
     float bl = b - bh;
-    return ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    return ((ah * bh - pe) + ah * bl + al * bh) + al * bl;
 }
 // ---- double-float arithmetic: a value hi + lo held as float2 (x = hi, y = lo), exact sums and products via fma ----
 __device__ __forceinline__ float2 tp_df(float a) { return make_float2(a, 0.0f); }
 
 __device__ __forceinline__ float2 tp_df_add(float2 a, float2 b)
 {
-    float s = a.x + b.x;
+    float s = tp_exact(a.x + b.x);
     // Past overflow the error term is inf - inf: carry the plain float result, as the CPU's double overflows to it.
     if (tp_isinf(s) || tp_isnan(s)) { return make_float2(s, 0.0f); }
-    float bb = s - a.x;
+    float bb = tp_exact(s - a.x);
     float e = (a.x - (s - bb)) + (b.x - bb) + a.y + b.y;
-    float hi = s + e;
+    float hi = tp_exact(s + e);
     return make_float2(hi, e - (hi - s));
 }
 
@@ -208,10 +217,10 @@ __device__ __forceinline__ float2 tp_df_neg(float2 a) { return make_float2(-a.x,
 
 __device__ __forceinline__ float2 tp_df_mul(float2 a, float2 b)
 {
-    float p = a.x * b.x;
+    float p = tp_exact(a.x * b.x);
     if (tp_isinf(p) || tp_isnan(p)) { return make_float2(p, 0.0f); }
     float e = tp_two_prod_err(a.x, b.x, p) + (a.x * b.y + a.y * b.x);
-    float hi = p + e;
+    float hi = tp_exact(p + e);
     return make_float2(hi, e - (hi - p));
 }
 
@@ -221,7 +230,7 @@ __device__ __forceinline__ float2 tp_df_div(float2 a, float2 b)
     if (tp_isinf(q) || tp_isnan(q) || tp_isinf(a.x)) { return make_float2(q, 0.0f); }
     float2 r = tp_df_add(a, tp_df_neg(tp_df_mul(make_float2(q, 0.0f), b)));
     float q2 = r.x / b.x;
-    float hi = q + q2;
+    float hi = tp_exact(q + q2);
     return make_float2(hi, q2 - (hi - q));
 }";
 
@@ -712,7 +721,7 @@ __device__ __forceinline__ float tp_igamma_continued_fraction(float a, float x)
         ("tp_spherical_bessel_j0", "if (tp_isnan(v)) { y[t] = v; } else if (tp_isinf(v)) { y[t] = 0.0f; } else if (fabsf(v) < 0.5f) { float w = v * v; y[t] = 1.0f + w * (-0.16666666666666666f + w * (8.333333333333333e-3f + w * (-1.984126984126984e-4f + w * 2.7557319223985893e-6f))); } else { y[t] = sinf(v) / v; }"),
         ("tp_airy_ai", "y[t] = tp_airy_ai_f(v);"),
         ("tp_angle", "if (tp_isnan(v)) { y[t] = v; } else if (v < 0.0f) { y[t] = 3.14159265358979f; } else { y[t] = 0.0f; }"),
-        ("tp_nonzero", "y[t] = tp_pick(v != 0.0f, 1.0f, 0.0f);"),
+        ("tp_nonzero", "y[t] = tp_pick(!tp_iszero(v), 1.0f, 0.0f);"),
         // mvlgamma (p = p0 >= 1): NaN at or below (p - 1) / 2, else p (p - 1) / 4 log(pi) + sum_j lgamma(x - j / 2).
         ("tp_mvlgamma", "int q = (int)p0; if (v <= (float)(q - 1) / 2.0f) { y[t] = tp_nan(); return; } float s = (float)q * ((float)q - 1.0f) / 4.0f * 1.1447298858494002f; for (int j = 0; j < q; j++) { s = s + tp_lgamma(v - (float)j / 2.0f); } y[t] = s;"),
     };
@@ -1668,7 +1677,7 @@ extern ""C"" __global__ __launch_bounds__(256) void tp_nonzero_static_scatter(co
 {
     int i = bx_gid();
     if (i >= n) { return; }
-    if (x[i] == 0.0f) { return; }
+    if (tp_iszero(x[i])) { return; }
     int row = (int)positions[i] - 1;
     if (row >= size) { return; }
     int axes = shape[0];

@@ -49,6 +49,9 @@ internal static class TorchModelOpsKernels
     /// at run time instead of folding a second full copy of the kernels into the assembly's user-string heap (CS8103).</summary>
     public static readonly string Source = @"
 // ---- model-op helpers ----
+// v, rounded where it stands: identity here, opaque in the WGSL translation, so a compiler cannot fold the
+// rounding-error extractions below into zero (TorchParityF32Kernels.tp_exact explains).
+__device__ __forceinline__ float mo_exact(float v) { return v; }
 __device__ __forceinline__ bool mo_isnan(float u) { return (__float_as_uint(u) & 0x7FFFFFFFu) > 0x7F800000u; }
 __device__ __forceinline__ bool mo_isfinite(float u) { return (__float_as_uint(u) & 0x7FFFFFFFu) < 0x7F800000u; }
 __device__ __forceinline__ bool mo_is_neg_inf(float u) { return __float_as_uint(u) == 0xFF800000u; }
@@ -97,9 +100,10 @@ __device__ __forceinline__ float2 mo_sincos_product(float tv, float f1, float f2
     float big = th * f1;
     float small = (th * f2 + tl * f1) + (tl * f2 + tv * f3);
     float j = rintf((big + small) * 0.636619772367581343f);
-    float r = big - j * 1.5703125f;
-    r = r + small;
-    r = r - j * 4.837512969970703125e-4f;
+    // Each step rounds in this order, as the exact reduction needs: reassociated, the parts lose their precision.
+    float r = mo_exact(big - j * 1.5703125f);
+    r = mo_exact(r + small);
+    r = mo_exact(r - j * 4.837512969970703125e-4f);
     r = r - j * 7.54978995489188216e-8f;
     float z = r * r;
     float s = r + r * z * ((-1.9515295891e-4f * z + 8.3321608736e-3f) * z - 1.6666654611e-1f);
@@ -1011,12 +1015,12 @@ __device__ __forceinline__ float mo_log(float x)
 // hi + lo + y as a renormalized pair (Knuth's two-sum: exact without fma); a non-finite sum carries through.
 __device__ __forceinline__ float2 mo_pair_add(float hi, float lo, float y)
 {
-    float s = hi + y;
+    float s = mo_exact(hi + y);
     if (!mo_isfinite(s)) { return make_float2(s, 0.0f); }
-    float bb = s - hi;
+    float bb = mo_exact(s - hi);
     float e = (hi - (s - bb)) + (y - bb);
     float t = lo + e;
-    float h = s + t;
+    float h = mo_exact(s + t);
     float l = t - (h - s);
     return make_float2(h, l);
 }

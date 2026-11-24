@@ -236,6 +236,9 @@ for await (const line of rl) {
             throw new InvalidOperationException($"No WGSL port for {name}.");
         string code = WebGpuShaderPrelude.Prepare(source ?? "");
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnLaunch();   // device work, as a backend's own launch counts it
+        // The copies below move the operands to Dawn and back: they stand in for a device's own launch, so a
+        // residency check on the op does not see them as readbacks.
+        using var hosting = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.HostingScope();
         var writable = new HashSet<int>();
         foreach (Match m in Binding.Matches(code))
             if (m.Groups[2].Value == "read_write") writable.Add(int.Parse(m.Groups[1].Value));
@@ -273,7 +276,10 @@ for await (const line of rl) {
                 default: throw new ArgumentException($"Unsupported argument {arg?.GetType().Name ?? "null"} for {name}.");
             }
         }
-        while (fields.Count % 16 != 0 || fields.Count == 0) fields.Add(0);
+        // The zero word a translated module reads after its own scalars (CudaDialectToWgsl.ZeroField), as
+        // WebGpuBackend.DispatchBatchAsync appends it.
+        fields.AddRange(BitConverter.GetBytes(0u));
+        while (fields.Count % 16 != 0) fields.Add(0);
         var job = new { code, buffers = encoded, uniform = Convert.ToBase64String(fields.ToArray()), workgroups = (threads + 255) / 256 };
         RecycleServerIfDue();
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));
