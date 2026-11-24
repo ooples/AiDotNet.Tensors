@@ -156,35 +156,65 @@ public class GpuIntegerResidencyTests
 
     [SkippableFact]
     public void BFloat16_divide_and_functions_stay_on_the_device_and_equal_the_function_rounded_once()
+        // Two units in BFloat16's last place (8 significant bits).
+        => NarrowFloatFunctions(GpuElementType.BFloat16, BFloat16.FromFloat, v => (float)v, 64f);
+
+#if NET5_0_OR_GREATER
+    // Half tensors take the same routes where the FP16 activation store (which keeps its own device halves) is off.
+    [SkippableFact]
+    public void Half_divide_and_functions_stay_on_the_device_and_equal_the_function_rounded_once()
     {
-        const GpuElementType Type = GpuElementType.BFloat16;
+        var store = DirectGpuTensorEngine.Fp16FwdStoreOverride;
+        var activations = DirectGpuTensorEngine.Fp16ActOverride;
+        DirectGpuTensorEngine.Fp16FwdStoreOverride = false;
+        DirectGpuTensorEngine.Fp16ActOverride = false;
+        try
+        {
+            // Two units in Half's last place (11 significant bits).
+            NarrowFloatFunctions(GpuElementType.Float16, v => (Half)v, v => (float)v, 512f);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.Fp16FwdStoreOverride = store;
+            DirectGpuTensorEngine.Fp16ActOverride = activations;
+        }
+    }
+#endif
+
+    private static void NarrowFloatFunctions<T>(GpuElementType Type, Func<float, T> narrowTo, Func<T, float> widen, float twoUnits)
+        where T : unmanaged, IEquatable<T>
+    {
         Skip.If(AiDotNetEngine.Current is not DirectGpuTensorEngine, "No GPU engine on this host.");
         var gpu = (DirectGpuTensorEngine)AiDotNetEngine.Current;
         Skip.If(gpu.GetBackend() is not IGpuNarrowFloatElementwise narrow || gpu.GetBackend() is not { } held || !held.SupportsElementType(Type)
             || !narrow.SupportsNarrowFloatBinary(GpuNarrowFloatBinaryOperation.Divide, Type)
-            || !narrow.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Sigmoid, Type), "No device with BFloat16 kernels on this host.");
+            || !narrow.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Sigmoid, Type), $"No device with {Type} kernels on this host.");
         IEngine engine = gpu;
         using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Preserve);
 
         var random = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(37);
-        var xValues = new BFloat16[Large];
-        var yValues = new BFloat16[Large];
+        var xValues = new T[Large];
+        var yValues = new T[Large];
         for (int i = 0; i < Large; i++)
         {
-            xValues[i] = BFloat16.FromFloat((float)((random.NextDouble() - 0.5) * 8.0));
+            xValues[i] = narrowTo((float)((random.NextDouble() - 0.5) * 8.0));
             // Positive and away from zero: a divisor, and an operand of the root and the logarithm.
-            yValues[i] = BFloat16.FromFloat((float)(0.25 + random.NextDouble() * 6.0));
+            yValues[i] = narrowTo((float)(0.25 + random.NextDouble() * 6.0));
         }
 
-        var x = new Tensor<BFloat16>((BFloat16[])xValues.Clone(), new[] { Large });
-        var y = new Tensor<BFloat16>((BFloat16[])yValues.Clone(), new[] { Large });
+        var x = new Tensor<T>((T[])xValues.Clone(), new[] { Large });
+        var y = new Tensor<T>((T[])yValues.Clone(), new[] { Large });
         gpu.RegisterPersistentTensor(x, PersistentTensorRole.Weights);
         gpu.RegisterPersistentTensor(y, PersistentTensorRole.Weights);
         try
         {
-            var results = new (string Name, Tensor<BFloat16> Result, Func<double, double, double> Function, bool Exact)[]
+            var results = new (string Name, Tensor<T> Result, Func<double, double, double> Function, bool Exact)[]
             {
+                ("Add", engine.TensorAdd(x, y), (a, b) => (float)a + (float)b, true),
+                ("Subtract", engine.TensorSubtract(x, y), (a, b) => (float)a - (float)b, true),
+                ("Multiply", engine.TensorMultiply(x, y), (a, b) => (float)a * (float)b, true),
                 ("Divide", engine.TensorDivide(x, y), (a, b) => (float)a / (float)b, true),
+                ("Negate", engine.TensorNegate(x), (a, _) => -a, true),
                 ("Abs", engine.TensorAbs(x), (a, _) => Math.Abs(a), true),
                 ("Sqrt", engine.TensorSqrt(y), (_, b) => Math.Sqrt(b), false),
                 ("Exp", engine.TensorExp(x), (a, _) => Math.Exp(a), false),
@@ -192,9 +222,9 @@ public class GpuIntegerResidencyTests
                 ("Tanh", engine.TensorTanh(x), (a, _) => Math.Tanh(a), false),
                 ("Sigmoid", engine.TensorSigmoid(x), (a, _) => 1.0 / (1.0 + Math.Exp(-a)), false),
             };
-            var scalar = BFloat16.FromFloat(2.75f);
-            float s = (float)scalar;
-            var byScalar = new (string Name, Tensor<BFloat16> Result, Func<float, float> Function)[]
+            var scalar = narrowTo(2.75f);
+            float s = widen(scalar);
+            var byScalar = new (string Name, Tensor<T> Result, Func<float, float> Function)[]
             {
                 ("AddScalar", engine.TensorAddScalar(x, scalar), a => a + s),
                 ("SubtractScalar", engine.TensorSubtractScalar(x, scalar), a => a - s),
@@ -203,31 +233,34 @@ public class GpuIntegerResidencyTests
             };
             foreach (var (name, result, function) in byScalar)
             {
-                Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");
+                Assert.True(gpu.IsTypedResident(result), $"The {Type} {name} was not left on the device.");
                 var values = result.GetReadOnlyDataArray();
                 for (int i = 0; i < Large; i++)
-                    Assert.True(BFloat16.FromFloat(function((float)xValues[i])).RawValue == values[i].RawValue,
-                        $"{name} at {i} of {(float)xValues[i]:R}: expected {function((float)xValues[i]):R}, device {(float)values[i]:R}.");
+                    Assert.True(narrowTo(function(widen(xValues[i]))).Equals(values[i]),
+                        $"{Type} {name} at {i} of {widen(xValues[i]):R}: expected {function(widen(xValues[i])):R}, device {widen(values[i]):R}.");
             }
 
             // Whole values sum exactly in any order, so the device's blocked sum and the host's agree to the bit.
-            var wholeValues = new BFloat16[Large];
+            var wholeValues = new T[Large];
             float wholeTotal = 0f;
             for (int i = 0; i < Large; i++)
             {
                 float whole = (i * 7 % 17) - 8;
-                wholeValues[i] = BFloat16.FromFloat(whole);
+                wholeValues[i] = narrowTo(whole);
                 wholeTotal += 2f * whole;
             }
 
-            var wholeTensor = new Tensor<BFloat16>(wholeValues, new[] { Large });
+            var wholeTensor = new Tensor<T>(wholeValues, new[] { Large });
             gpu.RegisterPersistentTensor(wholeTensor, PersistentTensorRole.Weights);
             try
             {
                 var doubled = engine.TensorAdd(wholeTensor, wholeTensor);
-                Assert.True(gpu.IsTypedResident(doubled), "The BFloat16 sum's operand was not left on the device.");
-                Assert.True(BFloat16.FromFloat(wholeTotal).RawValue == engine.TensorSum(doubled).RawValue,
-                    $"Sum of whole values: expected {wholeTotal:R}, device {(float)engine.TensorSum(doubled):R}.");
+                Assert.True(gpu.IsTypedResident(doubled), $"The {Type} sum's operand was not left on the device.");
+                long readbacks = GpuLaunchProbe.Readbacks;
+                T total = engine.TensorSum(doubled);
+                Assert.True(narrowTo(wholeTotal).Equals(total), $"{Type} sum of whole values: expected {wholeTotal:R}, device {widen(total):R}.");
+                // One scalar came back: the sum was the device's, not a download of the tensor summed on the host.
+                Assert.Equal(readbacks + 1, GpuLaunchProbe.Readbacks);
             }
             finally
             {
@@ -236,19 +269,18 @@ public class GpuIntegerResidencyTests
 
             foreach (var (name, result, function, exact) in results)
             {
-                Assert.True(gpu.IsTypedResident(result), $"The BFloat16 {name} was not left on the device.");
+                Assert.True(gpu.IsTypedResident(result), $"The {Type} {name} was not left on the device.");
                 var values = result.GetReadOnlyDataArray();
                 for (int i = 0; i < Large; i++)
                 {
-                    float expected = (float)function((float)xValues[i], (float)yValues[i]);
-                    float got = (float)values[i];
+                    float expected = (float)function(widen(xValues[i]), widen(yValues[i]));
+                    float got = widen(values[i]);
                     if (exact)
-                        Assert.True(BFloat16.FromFloat(expected).RawValue == values[i].RawValue,
-                            $"{name} at {i} of ({(float)xValues[i]:R}, {(float)yValues[i]:R}): expected {expected:R}, device {got:R}.");
+                        Assert.True(narrowTo(expected).Equals(values[i]),
+                            $"{Type} {name} at {i} of ({widen(xValues[i]):R}, {widen(yValues[i]):R}): expected {expected:R}, device {got:R}.");
                     else
-                        // Two units in BFloat16's last place (7 significand bits).
-                        Assert.True(Math.Abs(expected - got) <= 1e-6f + Math.Abs(expected) / 64f,
-                            $"{name} at {i} of ({(float)xValues[i]:R}, {(float)yValues[i]:R}): expected {expected:R}, device {got:R}.");
+                        Assert.True(Math.Abs(expected - got) <= 1e-6f + Math.Abs(expected) / twoUnits,
+                            $"{Type} {name} at {i} of ({widen(xValues[i]):R}, {widen(yValues[i]):R}): expected {expected:R}, device {got:R}.");
                 }
             }
         }
