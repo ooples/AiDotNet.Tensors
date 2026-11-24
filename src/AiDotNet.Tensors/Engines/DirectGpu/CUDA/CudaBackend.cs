@@ -2445,7 +2445,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async(arena)");
             return slot;
         }
-        if (TryRentIdleLoan(size) is { } borrowed)
+        // A pooled buffer first: it is memory this process already holds. Idle step memory a compiled plan lent
+        // between its steps only serves what the pool cannot (an allocation that would otherwise grow the device
+        // footprint). Served first, it took every allocation between two training steps (the next batch's uploads,
+        // the loss readback), and each such loan was moved (fresh memory and a device copy) when the next step
+        // reclaimed the memory, in the gap before that step's graph launch.
+        IGpuBuffer? allocated = TryRentPooledZeroed(size);
+        if (allocated is null && TryRentIdleLoan(size) is { } borrowed)
         {
             // Idle step memory a compiled plan lent between its steps, zeroed like any fresh allocation.
             CuBlasNative.CheckCudaResult(
@@ -2453,23 +2459,38 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async(idle loan)");
             return borrowed;
         }
-        var allocated = AllocateBufferFromPool(size);
+        allocated ??= AllocateBufferFromPool(size);
         if (arena is not null && allocated is CudaGpuBuffer tracked) arena.Track(tracked);
         return allocated;
     }
 
-    private IGpuBuffer AllocateBufferFromPool(int size)
+    /// <summary>A pooled buffer of <paramref name="size"/> floats, zeroed on the compute stream, or null.</summary>
+    private IGpuBuffer? TryRentPooledZeroed(int size)
     {
         if (_asyncAlloc)
         {
-            if (TryRentAsyncBuffer(size) is { } reused)
-            {
-                // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
-                CuBlasNative.CheckCudaResult(
-                    CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
-                    "cuMemsetD8Async(reused)");
-                return reused;
-            }
+            if (TryRentAsyncBuffer(size) is not { } reused) return null;
+            // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(reused)");
+            return reused;
+        }
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD32Async");
+            return pooled;
+        }
+        return null;
+    }
+
+    private IGpuBuffer AllocateBufferFromPool(int size)
+    {
+        if (TryRentPooledZeroed(size) is { } reused) return reused;
+        if (_asyncAlloc)
+        {
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
             // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
             // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
@@ -2482,13 +2503,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
-        }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
-        {
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
-                "cuMemsetD32Async");
-            return pooled;
         }
 
         ulong byteSize = (ulong)size * sizeof(float);
@@ -2527,12 +2541,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return AllocateBuffer(size);
         using var _ = PushContext();
         var arena = StepArenaForThisAllocation();
-        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size) ?? TryRentIdleLoan(size);
+        // A pooled buffer before idle step memory, as in AllocateBuffer.
+        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size);
+        if (buffer is null && TryRentAsyncBuffer(size) is { } pooled)
+        {
+            buffer = pooled;
+            arena?.Track(buffer);
+        }
+        buffer ??= TryRentIdleLoan(size);
         if (buffer is null)
         {
-            buffer = TryRentAsyncBuffer(size)
-                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            buffer = new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
             arena?.Track(buffer);
         }
         if (PoisonUninitializedBuffers)

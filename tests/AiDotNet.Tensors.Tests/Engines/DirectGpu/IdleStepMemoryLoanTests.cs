@@ -42,6 +42,39 @@ public class IdleStepMemoryLoanTests
             backend.Add(scratch, ones, acc, N);
         });
 
+    // A pooled buffer of the requested size is memory the process already holds: it serves an allocation between
+    // steps before idle step memory does. Lent memory was served first, so every allocation between two training
+    // steps (the next batch's uploads, the loss readback) became a loan that the next step's reclaim had to move
+    // (fresh memory and a device copy) before its graph launch. A size the pool cannot serve still borrows.
+    [SkippableFact]
+    public void AllocationsBetweenSteps_TakeAPooledBufferBeforeIdleMemory_AndBorrowOnlyWhatThePoolCannotServe()
+    {
+        using var backend = OpenBackendOrSkip();
+        IIdleDeviceMemoryLender lender = backend;
+        using var scratch = backend.AllocateBuffer(N);
+        // Two buffers of N / 2 floats back in the pool.
+        var first = backend.AllocateBuffer(N / 2);
+        var second = backend.AllocateBuffer(N / 2);
+        first.Dispose();
+        second.Dispose();
+        backend.Synchronize();
+        var owner = new object();
+        lender.LendIdle(owner, new[] { scratch });
+        try
+        {
+            var loansBefore = backend.IdleLoanCounters.Loans;
+            using var pooled = backend.AllocateBuffer(N / 2);
+            using var pooledUninitialized = backend.AllocateBufferUninitialized(N / 2);
+            Assert.False(Inside(scratch, pooled), "an allocation the pool could serve borrowed the idle memory");
+            Assert.False(Inside(scratch, pooledUninitialized), "an uninitialized allocation the pool could serve borrowed the idle memory");
+            Assert.Equal(loansBefore, backend.IdleLoanCounters.Loans);
+            using var borrowed = backend.AllocateBuffer(N / 4);
+            Assert.True(Inside(scratch, borrowed), "an allocation the pool could not serve did not borrow the idle memory");
+            Assert.Equal(loansBefore + 1, backend.IdleLoanCounters.Loans);
+        }
+        finally { lender.ReclaimIdle(owner); }
+    }
+
     [SkippableFact]
     public void AllocationsBetweenSteps_BorrowTheIdleMemory_AndOneStillAliveAtReclaimIsMovedIntact()
     {
