@@ -26,7 +26,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         "TensorExp", "TensorLog", "TensorSqrt", "TensorAbs", "TensorNegate", "TensorPower", "TensorErfc",
         "TensorSign", "TensorFloor", "TensorCeiling", "TensorRound", "Floor", "Ceiling", "Round", "Sign",
         "TensorReciprocal", "Reciprocal",
-        "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims", "Expand",
+        "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims", "Expand", "Tile",
         "TensorSlice", "TensorSplit", "Concat", "Concatenate", "Gather",
         "Conv2D", "ConvTranspose2D", "MaxPool2D", "AvgPool2D", "Pad",
         "BatchNormInference", "LayerNorm", "LayerNorm[0]", "ReduceSum", "ReduceMean", "FusedLinear",
@@ -149,6 +149,24 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             case "Expand":
                 _w.AddNode("Expand", new[] { inputs[0], _w.AddInt64(outShape) }, new[] { output });
                 return;
+            case "Tile":
+            {
+                // A tile that only repeats size-1 axes (TensorBroadcastTo's general case) is an Expand; any other
+                // tile is an ONNX Tile with repeats = output extent / input extent per axis.
+                var inShape = step.Inputs[0]._shape;
+                var repeats = new long[outShape.Length];
+                bool broadcastOnly = true;
+                for (int i = 0; i < repeats.Length; i++)
+                {
+                    repeats[i] = inShape[i] == 0 ? 1 : outShape[i] / inShape[i];
+                    if (repeats[i] != 1 && inShape[i] != 1) broadcastOnly = false;
+                }
+                if (broadcastOnly)
+                    _w.AddNode("Expand", new[] { inputs[0], _w.AddInt64(outShape) }, new[] { output });
+                else
+                    _w.AddNode("Tile", new[] { inputs[0], _w.AddInt64(repeats) }, new[] { output });
+                return;
+            }
             case "TensorTranspose":
             {
                 int rank = step.Inputs[0].Rank;
