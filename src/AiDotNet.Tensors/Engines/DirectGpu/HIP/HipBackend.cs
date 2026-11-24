@@ -354,6 +354,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             DeviceName = _deviceProps.Name?.Trim() ?? "Unknown AMD GPU";
             ComputeUnits = _deviceProps.MultiProcessorCount;
             GlobalMemoryBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
+            _memoryAccount.DeviceTotalBytes = GlobalMemoryBytes;   // what a GpuMemoryBudget fraction is of
             _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             LocalMemoryBytes = (long)(ulong)_deviceProps.SharedMemPerBlock;
             // Issue #285: same approach as CUDA — total VRAM as conservative
@@ -1651,15 +1652,29 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         reclaimEpoch = -1;
         DrainCollectedBuffers();
+        // Past this process's GpuMemoryBudget, after releasing what the driver-OOM path below releases: the driver's
+        // own out-of-memory result, so every caller handles it as one.
+        if (!_memoryAccount.TryAdmit((long)(ulong)sizeBytes, () =>
+            {
+                DeviceMemoryReclaim.CollectUnreachable();
+                DrainCollectedBuffers();
+                _bufferPool.DrainAll();
+            }, out _))
+            return HipError.ErrorOutOfMemory;
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         if (result == HipError.Success) reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
-        if (result != HipError.ErrorOutOfMemory) return result;
+        if (result != HipError.ErrorOutOfMemory)
+        {
+            if (result != HipError.Success) DeviceMemoryAccount.SettleAdmission();   // admitted, not allocated
+            return result;
+        }
         DeviceMemoryReclaim.CollectUnreachable();
         DrainCollectedBuffers();
         _bufferPool.DrainAll();
         result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         // Charged like a first-try success: its dispose credits the same bytes back.
         if (result == HipError.Success) reclaimEpoch = DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
+        else DeviceMemoryAccount.SettleAdmission();   // admitted, not allocated
         return result;
     }
 
@@ -10647,6 +10662,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr srcPtr = (IntPtr)((long)source.Handle + sourceOffset * width);
         IntPtr dstPtr = (IntPtr)((long)destination.Handle + destinationOffset * width);
         var sizeBytes = (UIntPtr)((ulong)length * (ulong)width);
+        // A range copied onto itself moves nothing.
+        if (srcPtr == dstPtr) return;
+        if (GpuCopyLayout.Overlaps((long)srcPtr, (long)dstPtr, length * width))
+        {
+            GpuCopyLayout.ThroughScratch(this, source, sourceOffset, destination, destinationOffset, length);
+            return;
+        }
+
         var result = HipNativeBindings.hipMemcpy(dstPtr, srcPtr, sizeBytes, HipMemcpyKind.DeviceToDevice);
         HipNativeBindings.CheckError(result, "hipMemcpy D2D (strided)");
         GpuLaunchProbe.OnLaunch();   // a device-to-device copy is GPU work

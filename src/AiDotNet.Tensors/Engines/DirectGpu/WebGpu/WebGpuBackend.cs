@@ -228,10 +228,12 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <returns>A new zero-initialized GPU buffer.</returns>
     /// <inheritdoc/>
     // Every buffer is a 4-byte-word allocation. Doubles are held two words each, low word first: WGSL has no 64-bit
-    // float, and the double kernels compute on the words in integer arithmetic (WebGpuBackend.Float64). The narrower
-    // types have no storage here yet.
+    // float, and the double kernels compute on the words in integer arithmetic (WebGpuBackend.Float64). The 8- and
+    // 16-bit types and Int64 are held as bytes in whole words and computed by the packed kernels
+    // (GpuPackedKernelSource).
     public bool SupportsElementType(GpuElementType type)
-        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64;
+        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64
+           || GpuPackedKernelSource.Computes(type);
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);

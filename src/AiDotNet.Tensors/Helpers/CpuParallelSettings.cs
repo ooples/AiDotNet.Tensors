@@ -27,7 +27,45 @@ public static class CpuParallelSettings
     /// detected), as PyTorch and OpenMP default to; the <c>AIDOTNET_CPU_THREADS</c> environment variable overrides it.
     /// Set to 1 to disable parallelism.
     /// </remarks>
-    public static int MaxDegreeOfParallelism { get; set; } = DefaultDegreeOfParallelism();
+    public static int MaxDegreeOfParallelism
+    {
+        get
+        {
+            int degree = Volatile.Read(ref s_maxDegreeOfParallelism);
+            return degree != UndecidedDegree ? degree : DecideDegreeOfParallelism();
+        }
+        set
+        {
+            // A caller that sets the count before any CPU work still gets the process confined to its requested cores.
+            EnsureCoreConfinement();
+            // The one value that means "not decided" is stored as its neighbour: both run everything serially.
+            Volatile.Write(ref s_maxDegreeOfParallelism, value == UndecidedDegree ? UndecidedDegree + 1 : value);
+        }
+    }
+
+    private const int UndecidedDegree = int.MinValue;
+
+    // One word, read and written atomically, so the hot read takes no lock.
+    private static int s_maxDegreeOfParallelism = UndecidedDegree;
+
+    // Decided on first use rather than when the type loads: confining the process to AIDOTNET_CPU_CORES can fail, and
+    // the failure must reach the caller as itself (naming the setting), not as a type-initialization error. Every
+    // path that runs CPU work in parallel -- or decides to run it inline -- reads the count first, so the process is
+    // confined before that work runs whether or not the worker pool is ever used.
+    private static int DecideDegreeOfParallelism()
+    {
+        EnsureCoreConfinement();
+        // Kept only if no caller set a count meanwhile.
+        Interlocked.CompareExchange(ref s_maxDegreeOfParallelism, DefaultDegreeOfParallelism(), UndecidedDegree);
+        return Volatile.Read(ref s_maxDegreeOfParallelism);
+    }
+
+    private static void EnsureCoreConfinement()
+    {
+#if NET5_0_OR_GREATER
+        Engines.BlasManaged.CpuTopology.EnsureConfined();
+#endif
+    }
 
     // #653: a dispatch as wide as every logical processor cost ~90-120 us before any work on a 16-core / 32-thread 3950X:
     // the 31 workers plus the dispatching thread leave no hardware thread spare, so the pool parks them between
@@ -39,6 +77,10 @@ public static class CpuParallelSettings
     {
         if (int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_CPU_THREADS"), out int requested) && requested > 0)
             return requested;
+        // A process confined to a core set (AIDOTNET_CPU_CORES) runs one thread per core of it.
+#if NET5_0_OR_GREATER
+        if (Engines.BlasManaged.CpuTopology.RequestedCores is { Length: > 0 } cores) return cores.Length;
+#endif
         int physical = DetectPhysicalCores();
         return physical > 0 && physical <= Environment.ProcessorCount ? physical : Environment.ProcessorCount;
     }

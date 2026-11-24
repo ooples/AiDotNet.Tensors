@@ -5,18 +5,51 @@ using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-// Integer compute on Int32 buffers (this backend's buffers are 4-byte words; the narrower and wider integer types have
-// no storage here).
+// Integer compute. This backend's buffers are 4-byte words: Int32 is computed by the kernels below, and the other
+// integer types and Bool by the packed kernels (GpuPackedKernelSource), which read and write whole words.
 public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerReductions
 {
     private const string Int32LibraryName = "Int32";
     private IntPtr _int32Library;
+    private const string PackedLibraryName = "Packed";
+    private IntPtr _packedLibrary;
+    // Set when the compiler rejected the packed library: kept, so no later call compiles it again, and every
+    // capability the library backs then reports false (the engine computes those types on the CPU).
+    private Exception? _packedLibraryFailure;
+
+    private bool PackedKernelsAvailable => IsAvailable && System.Threading.Volatile.Read(ref _packedLibraryFailure) is null;
+
+    private static bool PackedInteger(GpuElementType type) => Array.IndexOf(GpuPackedKernelSource.IntegerTypes, type) >= 0;
 
     /// <inheritdoc/>
-    public bool SupportsIntegerElementwise(GpuElementType type) => type == GpuElementType.Int32 && IsAvailable;
+    public bool SupportsIntegerElementwise(GpuElementType type)
+        => type == GpuElementType.Int32 ? IsAvailable : PackedInteger(type) && PackedKernelsAvailable;
 
     /// <inheritdoc/>
-    public bool SupportsIntegerReductions(GpuElementType type) => SupportsIntegerElementwise(type);
+    public bool SupportsIntegerReductions(GpuElementType type) => type != GpuElementType.Bool && SupportsIntegerElementwise(type);
+
+    private MetalPipelineState PackedPipeline(string kernel)
+    {
+        ThrowIfDisposed();
+        // A rejected library is a capability gap (GpuCapabilityUnavailableException), recorded once.
+        IntPtr library = Float64Library(ref _packedLibrary, ref _packedLibraryFailure, PackedLibraryName,
+            () => _shaderLibrary.CompileLibrary(PackedLibraryName, GpuPackedKernelSource.MetalLibrary));
+        return GetPipeline(PackedLibraryName, library, kernel);
+    }
+
+    // Runs a packed kernel and waits for it. An output that is also an operand is separated by the launch (Metal
+    // buffer arguments cannot alias), which copies it back afterwards.
+    private void LaunchPacked(GpuPackedKernel kernel, int work, uint count, uint pa, uint pb, uint pc, IGpuBuffer[] buffers)
+    {
+        var pipeline = PackedPipeline(kernel.Name);
+        if (work <= 0) return;
+        var bound = new MetalGpuBuffer[buffers.Length];
+        for (int i = 0; i < buffers.Length; i++) bound[i] = Int32Buffer(buffers[i]);
+        LaunchFloat64(pipeline, work, bound, (uint)work, count, pa, pb, pc);
+    }
+
+    // Int32 has its own kernels; every other element type goes to the packed ones, which also refuse a non-integer.
+    private static bool IsInt32(IGpuBuffer? buffer) => buffer is not null && buffer.ElementType == GpuElementType.Int32;
 
     private MetalPipelineState Int32Pipeline(string kernel)
     {
@@ -39,6 +72,12 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     /// <inheritdoc/>
     public void BinaryInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Binary(LaunchPacked, operation, a, b, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(BinaryInteger), size, output, a, b);
         string kernel = "i32k_" + GpuInt32ShaderSource.Name(operation);
         if (size == 0) return;
@@ -48,6 +87,12 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     /// <inheritdoc/>
     public void UnaryInteger(GpuIntegerUnaryOperation operation, IGpuBuffer a, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Unary(LaunchPacked, operation, a, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(UnaryInteger), size, output, a);
         string kernel = "i32k_" + GpuInt32ShaderSource.Name(operation);
         if (size == 0) return;
@@ -57,6 +102,12 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     /// <inheritdoc/>
     public void ScalarInteger(GpuIntegerBinaryOperation operation, IGpuBuffer a, long scalar, IGpuBuffer output, int size)
     {
+        if (!IsInt32(output))
+        {
+            GpuPackedCompute.Scalar(LaunchPacked, operation, a, scalar, output, size);
+            return;
+        }
+
         GpuInt32ShaderSource.Require(nameof(ScalarInteger), size, output, a);
         string kernel = "i32k_scalar_" + GpuInt32ShaderSource.Name(operation);
         if (size == 0) return;
@@ -66,6 +117,7 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     /// <inheritdoc/>
     public long SumInteger(IGpuBuffer a, int size)
     {
+        if (!IsInt32(a)) return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
         GpuInt32ShaderSource.RequireSum(a, size);
         var pipeline = Int32Pipeline("i32k_sum");
         if (size == 0) return 0;

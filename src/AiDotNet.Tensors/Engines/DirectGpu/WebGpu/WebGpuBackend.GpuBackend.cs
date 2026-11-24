@@ -108,18 +108,45 @@ public sealed partial class WebGpuBackend
 
     // Offsets and length count elements of the buffers' type. Every element is moved as its 4-byte words, read and
     // written as integers: a float load and store need not keep a NaN's bits, and an Int32 from -1 down to -8388607
-    // is a NaN pattern. Only 4- and 8-byte elements have a copy here: a narrower element counted in words would
-    // address more bytes than the range check allowed.
+    // is a NaN pattern. A 1- or 2-byte element shares its word with its neighbours, so those ranges are moved by the
+    // packed copy kernel, which rewrites only the elements asked for.
     public void Copy(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset, int length)
     {
         EnsureInitialized();
         RequireSynchronousRoute();
         int elementBytes = GpuCopyLayout.CheckedElementBytes(source, sourceOffset, destination, destinationOffset, length, nameof(Copy));
-        if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
-            throw new NotSupportedException($"{nameof(Copy)} on WebGPU copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
         if (length == 0) return;
+        // A range copied onto itself moves nothing.
+        if (sourceOffset == destinationOffset
+            && (ReferenceEquals(source, destination) || AsWebGpu(source).BufferId == AsWebGpu(destination).BufferId))
+            return;
+        if (elementBytes == sizeof(byte) || elementBytes == sizeof(ushort))
+        {
+            CopyNarrowElements(source, sourceOffset, destination, destinationOffset, length, elementBytes);
+            return;
+        }
+
+        if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
+            throw new NotSupportedException($"{nameof(Copy)} on WebGPU copies 1-, 2-, 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
         int words = elementBytes / sizeof(float);
         CopyWordRange(source, checked(sourceOffset * words), destination, checked(destinationOffset * words), checked(length * words));
+    }
+
+    // A copy within one buffer goes through a scratch copy of the source range, so an overlapping move reads what the
+    // buffer held before it.
+    private void CopyNarrowElements(IGpuBuffer source, int sourceOffset, IGpuBuffer destination, int destinationOffset,
+        int length, int elementBytes)
+    {
+        if (ReferenceEquals(source, destination) || AsWebGpu(source).BufferId == AsWebGpu(destination).BufferId)
+        {
+            int words = (int)(((long)length * elementBytes + sizeof(uint) - 1) / sizeof(uint));
+            using var scratch = AllocateBufferCore(words, zeroInitialize: true);
+            GpuPackedCompute.Copy(LaunchPacked, source, sourceOffset, scratch, 0, length, elementBytes);
+            GpuPackedCompute.Copy(LaunchPacked, scratch, 0, destination, destinationOffset, length, elementBytes);
+            return;
+        }
+
+        GpuPackedCompute.Copy(LaunchPacked, source, sourceOffset, destination, destinationOffset, length, elementBytes);
     }
 
     // This backend serves byte buffers from its float allocations; the tag says the bytes are raw, not floats.

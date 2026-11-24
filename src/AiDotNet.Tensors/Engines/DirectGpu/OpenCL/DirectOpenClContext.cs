@@ -382,6 +382,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public ulong MaxMemAllocSize { get; private set; }
 
+        /// <summary>The device's memory account (set by the backend that owns this context): its buffers are admitted
+        /// under <see cref="AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryBudget"/> against it.</summary>
+        internal AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount? MemoryAccount { get; set; }
+
         /// <summary>
         /// Byte alignment this device requires of a sub-buffer origin (<c>CL_DEVICE_MEM_BASE_ADDR_ALIGN</c>, which the
         /// device reports in bits). An origin off this alignment fails clCreateSubBuffer with

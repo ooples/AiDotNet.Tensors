@@ -114,6 +114,7 @@ public sealed class MetalShaderCompilationTests
         yield return ("Float64Elementary", () => MetalFloat64Kernels.ElementarySource, false);
         // The Int32 kernels (MetalBackend.Integer), compiled by the two-argument overload as well.
         yield return ("Int32", () => MetalInt32Kernels.Source, false);
+        yield return ("Packed", () => GpuPackedKernelSource.MetalLibrary, false);
     }
 
     internal static string? FindCompiler()

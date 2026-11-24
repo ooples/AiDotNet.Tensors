@@ -15,17 +15,29 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// buffers: each element widened to a float, computed there and rounded back as the host conversions round, for every
 /// (operation, type) pair the backend says it has.
 /// </summary>
-[Collection("DirectGpuSerial")]
-public class GpuNarrowFloatContractTests
+public abstract class GpuNarrowFloatContractTests
 {
+    /// <summary>The backend under test, or null when its device is absent on this host.</summary>
+    protected abstract IDirectGpuBackend? Device();
+
+    /// <summary>Why <see cref="Device"/> returned null.</summary>
+    protected abstract string SkipReason { get; }
+
+    /// <summary>
+    /// True for a backend that must run every operation on both types: a kernel it lacks then fails the test instead
+    /// of skipping it.
+    /// </summary>
+    protected virtual bool RunsEveryOperation => false;
+
+    private void RequireRan(int ran, int expected, string what)
+    {
+        if (RunsEveryOperation) Assert.True(ran == expected, $"{what}: {ran} of {expected} cases ran.");
+        else Skip.If(ran == 0, $"This device has no {what} for a 16-bit float type it holds.");
+    }
+
     private static readonly GpuElementType[] Types = { GpuElementType.Float16, GpuElementType.BFloat16 };
 
-    private static readonly int[] Sizes = { 1, 255, 257, 4097 };
-
-    private static IDirectGpuBackend? Device()
-        => AiDotNetEngine.Current is DirectGpuTensorEngine gpu && gpu.GetBackend() is IGpuNarrowFloatElementwise { } backend
-            ? (IDirectGpuBackend)backend
-            : null;
+    private static readonly int[] Sizes = { 1, 2, 3, 255, 257, 4097, 70_001 };
 
     private static float Widen(GpuElementType type, ushort bits)
         => type == GpuElementType.Float16 ? (float)BitConverter.UInt16BitsToHalf(bits) : BFloat16.ToFloat(BFloat16.FromRawBits(bits));
@@ -108,7 +120,7 @@ public class GpuNarrowFloatContractTests
     public void Binary_kernels_round_as_the_host_conversion_does(GpuNarrowFloatBinaryOperation operation)
     {
         var backend = Device();
-        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.If(backend is null, SkipReason);
         var elementwise = (IGpuNarrowFloatElementwise)backend;
         int ran = 0;
         foreach (var type in Types)
@@ -145,7 +157,7 @@ public class GpuNarrowFloatContractTests
             }
         }
 
-        Skip.If(ran == 0, $"This device has no {operation} kernel for a 16-bit float type it holds.");
+        RequireRan(ran, Types.Length * Sizes.Length, $"{operation} kernel");
     }
 
     [SkippableTheory]
@@ -155,7 +167,7 @@ public class GpuNarrowFloatContractTests
     public void Unary_kernels_equal_the_host(GpuNarrowFloatUnaryOperation operation)
     {
         var backend = Device();
-        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.If(backend is null, SkipReason);
         var elementwise = (IGpuNarrowFloatElementwise)backend;
         int ran = 0;
         foreach (var type in Types)
@@ -196,14 +208,46 @@ public class GpuNarrowFloatContractTests
             }
         }
 
-        Skip.If(ran == 0, $"This device has no {operation} kernel for a 16-bit float type it holds.");
+        RequireRan(ran, Types.Length * Sizes.Length, $"{operation} kernel");
+    }
+
+    // Past the tanh clamp GELU is the input itself (or a zero): large finite inputs, whose cube overflows binary32
+    // for BFloat16, must come back as the host computes them and not as whatever an overflowed intermediate leaves.
+    [SkippableFact]
+    public void Gelu_of_a_large_finite_input_is_the_input_or_zero()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Gelu, type)) continue;
+            ushort huge = type == GpuElementType.Float16 ? (ushort)0x7BFF : (ushort)0x6780;   // 65504, and 2^80
+            var values = new[] { huge, (ushort)(huge | 0x8000), Narrow(type, 9f), Narrow(type, -9f), Narrow(type, 100f), Narrow(type, -100f) };
+            using var a = Upload(backend, type, values);
+            using var output = backend.AllocateBuffer(values.Length, type);
+            elementwise.UnaryNarrowFloat(GpuNarrowFloatUnaryOperation.Gelu, type, a, output, values.Length);
+            var actual = Download(backend, type, output, values.Length);
+            for (int i = 0; i < values.Length; i++)
+            {
+                float x = Widen(type, values[i]);
+                float got = Widen(type, actual[i]);
+                Assert.True((x > 0f ? x : 0f) == got, $"Gelu<{type}> of {x:R} (0x{values[i]:X4}) gave {got:R} (0x{actual[i]:X4})");
+            }
+
+            ran++;
+        }
+
+        RequireRan(ran, Types.Length, "Gelu kernel");
     }
 
     [SkippableFact]
     public void Matrix_multiply_accumulates_in_float_and_stores_the_type()
     {
         var backend = Device();
-        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.If(backend is null, SkipReason);
+        if (RunsEveryOperation) Assert.IsAssignableFrom<IGpuNarrowFloatMatrixMultiply>(backend);
         Skip.If(backend is not IGpuNarrowFloatMatrixMultiply, "No 16-bit float matrix multiply on this device.");
         var multiply = (IGpuNarrowFloatMatrixMultiply)backend;
         const int M = 5, K = 7, N = 3;
@@ -243,19 +287,33 @@ public class GpuNarrowFloatContractTests
             multiply.MatrixMultiplyNarrowFloat(type, rowOfOnes, columnOfOnes, dot, 1, 1, Long);
             Assert.Equal((float)Long, Widen(type, Download(backend, type, dot, 1)[0]));
 
+            // One by one, bit for bit against the host: the smallest pattern of the type (for BFloat16 a binary32
+            // subnormal, which a device may flush before a native multiply) times a large value, and an ordinary pair.
+            foreach (var (x, y) in new[] { ((ushort)0x0001, type == GpuElementType.Float16 ? (ushort)0x7800 : (ushort)0x7E80),
+                         (Narrow(type, 1.5f), Narrow(type, -2.25f)) })
+            {
+                using var one = Upload(backend, type, new[] { x });
+                using var other = Upload(backend, type, new[] { y });
+                using var product = backend.AllocateBuffer(1, type);
+                multiply.MatrixMultiplyNarrowFloat(type, one, other, product, 1, 1, 1);
+                ushort expectedBits = Narrow(type, Widen(type, x) * Widen(type, y));
+                ushort gotBits = Download(backend, type, product, 1)[0];
+                Assert.True(expectedBits == gotBits, $"{type} 0x{x:X4} times 0x{y:X4} gave 0x{gotBits:X4}, host 0x{expectedBits:X4}");
+            }
+
             Assert.Throws<ArgumentException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, a, M, N, K));
             Assert.Throws<ArgumentOutOfRangeException>(() => multiply.MatrixMultiplyNarrowFloat(type, a, b, c, 0, N, K));
             ran++;
         }
 
-        Skip.If(ran == 0, "This device multiplies no 16-bit float type it holds.");
+        RequireRan(ran, Types.Length, "matrix multiply");
     }
 
     [SkippableFact]
     public void The_capability_table_and_argument_checks_agree_with_the_interfaces()
     {
         var backend = Device();
-        Skip.If(backend is null, "No GPU backend on this host.");
+        Skip.If(backend is null, SkipReason);
         var elementwise = (IGpuNarrowFloatElementwise)backend;
         foreach (var type in Types)
         {
@@ -279,6 +337,93 @@ public class GpuNarrowFloatContractTests
         Assert.Throws<ArgumentException>(() => elementwise.BinaryNarrowFloat(Add, GpuElementType.Float32, halves, halves, halves, 16));
     }
 }
+
+/// <summary>The backend the engine picked on this host (OpenCL, CUDA or HIP where one is present).</summary>
+[Collection("DirectGpuSerial")]
+public sealed class EngineBackendNarrowFloatTests : GpuNarrowFloatContractTests
+{
+    protected override IDirectGpuBackend? Device()
+        => AiDotNetEngine.Current is DirectGpuTensorEngine gpu && gpu.GetBackend() is IGpuNarrowFloatElementwise { } backend
+            ? (IDirectGpuBackend)backend
+            : null;
+
+    protected override string SkipReason => "No GPU backend on this host.";
+}
+
+/// <summary>Vulkan: the packed GLSL kernels, both types and every operation.</summary>
+[Collection("VulkanGlobalState")]
+public sealed class VulkanNarrowFloatTests : GpuNarrowFloatContractTests
+{
+    private readonly IDirectGpuBackend? _backend;
+
+    public VulkanNarrowFloatTests()
+    {
+        try
+        {
+            var backend = AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanBackend.Instance;
+            // Gated on what the kernels need (a device and the GLSL compiler), not on the capability under test.
+            if (backend.Initialize() && backend.IsGlslCompilerAvailable) _backend = backend;
+        }
+        catch (Exception unavailable) when (unavailable is DllNotFoundException or InvalidOperationException or NotSupportedException)
+        {
+            _backend = null;
+        }
+    }
+
+    protected override IDirectGpuBackend? Device() => _backend;
+
+    protected override string SkipReason => "No Vulkan device with libshaderc.";
+
+    protected override bool RunsEveryOperation => true;
+}
+
+/// <summary>Metal: the packed kernels in Metal Shading Language, both types and every operation.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class MetalNarrowFloatTests : GpuNarrowFloatContractTests, IDisposable
+{
+    private readonly AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend? _backend;
+
+    public MetalNarrowFloatTests()
+    {
+        bool required = string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_METAL"), "1", StringComparison.Ordinal);
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+        {
+            if (required) throw new InvalidOperationException("AIDOTNET_REQUIRE_METAL=1 on a host that is not macOS.");
+            return;
+        }
+
+        var backend = new AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalBackend();
+        if (backend.IsAvailable)
+        {
+            _backend = backend;
+            return;
+        }
+
+        backend.Dispose();
+        if (required) throw new InvalidOperationException("AIDOTNET_REQUIRE_METAL=1 but the Metal backend is not available.");
+    }
+
+    protected override IDirectGpuBackend? Device() => _backend;
+
+    protected override string SkipReason => "Metal exists only on macOS with a Metal device.";
+
+    protected override bool RunsEveryOperation => true;
+
+    public void Dispose() => _backend?.Dispose();
+}
+
+#if NET7_0_OR_GREATER
+/// <summary>WebGPU on Dawn: the packed WGSL kernels, both types and every operation.</summary>
+[Collection("DirectGpuSerial")]
+public sealed class WebGpuNarrowFloatTests : GpuNarrowFloatContractTests
+{
+    protected override IDirectGpuBackend? Device() => DawnHostedWebGpu.BackendOrNull();
+
+    protected override string SkipReason => "Set AIDOTNET_WEBGPU_NODE_DIR to a directory with node_modules/webgpu (npm install webgpu).";
+
+    protected override bool RunsEveryOperation => true;
+}
+#endif
 
 /// <summary>
 /// The host GELU of the 16-bit float types is the FP32 result rounded once, which is what the device kernels store.

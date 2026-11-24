@@ -10,6 +10,14 @@ public sealed partial class CudaBackend : IDeviceMemoryPressure
 
     void IDeviceMemoryPressure.ReclaimNow() => ReclaimNow();
 
+    /// <summary>Tests: frees the host-side reuse pool's buffers into the stream-ordered pool, which keeps them
+    /// reserved (no trim), and waits for those frees.</summary>
+    internal void ReturnPooledBuffersToDriverPoolForTests()
+    {
+        _bufferPool.DrainAll();
+        SynchronizeOwnStreams("stream sync (tests)");
+    }
+
     int IDeviceMemoryPressure.ReleaseCachedBuffers()
     {
         if (!IsAvailable || IsCapturingOnThisThread) return 0;

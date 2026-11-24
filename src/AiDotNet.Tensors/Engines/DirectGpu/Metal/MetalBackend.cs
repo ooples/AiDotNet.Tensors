@@ -556,10 +556,12 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     /// <inheritdoc/>
     // Every buffer is a 4-byte-word allocation. Doubles are held two words each, low word first: MSL has no 64-bit
-    // float, and the double kernels compute on the words in integer arithmetic (MetalBackend.Float64). The narrower
-    // types have no storage here yet.
+    // float, and the double kernels compute on the words in integer arithmetic (MetalBackend.Float64). The 8- and
+    // 16-bit types and Int64 are held as bytes in whole words and computed by the packed kernels
+    // (GpuPackedKernelSource).
     public bool SupportsElementType(GpuElementType type)
-        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64;
+        => type is GpuElementType.Float32 or GpuElementType.Int32 or GpuElementType.Float64
+           || GpuPackedKernelSource.Computes(type);
 
     /// <inheritdoc/>
     public IGpuBuffer AllocateBuffer(int size, GpuElementType type) => GpuTypedAllocation.Allocate(this, size, type);
@@ -701,9 +703,30 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
         // Offsets and size count elements of the buffers' type. The float kernel below moves one 4-byte word an
         // element; a buffer of doubles (two words each) is copied by the word kernel, its range checked in doubles.
-        // Only 4- and 8-byte elements have a copy here: a narrower element counted as a double would address twice
-        // the bytes the range check allowed.
+        // A 1- or 2-byte element shares its word with its neighbours (and a blit moves multiples of four bytes), so
+        // those ranges are moved by the packed copy kernel, which rewrites only the elements asked for.
         int elementBytes = GpuCopyLayout.CheckedElementBytes(source, srcOffset, destination, destOffset, size, nameof(Copy));
+        bool sameStorage = ReferenceEquals(srcBuffer, destBuffer) || srcBuffer.Handle == destBuffer.Handle;
+        // A range copied onto itself moves nothing.
+        if (size == 0 || (sameStorage && srcBuffer.ByteOffset == destBuffer.ByteOffset && srcOffset == destOffset)) return;
+        if (elementBytes == sizeof(byte) || elementBytes == sizeof(ushort))
+        {
+            if (sameStorage)
+            {
+                // Through a scratch the size of the range, not of the buffer (the launch would otherwise separate the
+                // two arguments by copying the whole destination): the first pass reads the source before an
+                // overlapping write, the second rewrites only the requested elements.
+                int words = (int)(((long)size * elementBytes + sizeof(uint) - 1) / sizeof(uint));
+                using var scratch = AllocateIntBuffer(words);
+                GpuPackedCompute.Copy(LaunchPacked, srcBuffer, srcOffset, scratch, 0, size, elementBytes);
+                GpuPackedCompute.Copy(LaunchPacked, scratch, 0, destBuffer, destOffset, size, elementBytes);
+                return;
+            }
+
+            GpuPackedCompute.Copy(LaunchPacked, srcBuffer, srcOffset, destBuffer, destOffset, size, elementBytes);
+            return;
+        }
+
         if (elementBytes != sizeof(float) && elementBytes != sizeof(double))
             throw new NotSupportedException($"{nameof(Copy)} on Metal copies 4- or 8-byte elements, not {source.ElementType} ({elementBytes} bytes).");
         if (elementBytes == sizeof(double))

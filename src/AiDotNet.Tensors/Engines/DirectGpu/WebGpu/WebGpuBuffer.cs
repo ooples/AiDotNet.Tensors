@@ -57,7 +57,9 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
     // The count is process-wide, so it is kept by a static method rather than written from each constructor.
     private static void CountDriverAllocation() => System.Threading.Interlocked.Increment(ref s_driverAllocations);
 
-    private int _bufferId;
+    // -1 until a buffer exists: a constructor that throws first (a refused budget, a failed creation) leaves an object
+    // whose finalizer must not destroy buffer 0, a valid id another tensor may own.
+    private int _bufferId = -1;
     private readonly int _sizeBytes;
     private readonly int _elementCount;
     private readonly WebGpuBufferUsage _usage;
@@ -215,6 +217,14 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
         // Ensure buffer size is aligned to 4 bytes (required by WebGPU)
         var alignedSize = (_sizeBytes + 3) & ~3;
         if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        // Past this process's GpuMemoryBudget, after the release a refused creation runs below: out of memory. WebGPU
+        // reports no device memory size, so only a byte limit (GpuMemoryBudget.SetMemoryLimit) applies here.
+        Account.Admit(alignedSize, () =>
+            {
+                DeviceMemoryReclaim.CollectUnreachable();
+                PendingFrees.Drain();
+                Pool.DrainAll();
+            }, message => new GpuOutOfMemoryException(message, 0));
         int bufferId = WebGpuNativeBindings.CreateBuffer(alignedSize, (int)usage);
         if (bufferId < 0)
         {
@@ -229,6 +239,7 @@ public sealed class WebGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IDisposable, 
 
         if (_bufferId < 0)
         {
+            AiDotNet.Tensors.Engines.DevicePrimitives.DeviceMemoryAccount.SettleAdmission();   // admitted, not created
             throw new InvalidOperationException("Failed to create WebGPU buffer");
         }
         if (usage == DefaultStorageUsage) CountDriverAllocation();
