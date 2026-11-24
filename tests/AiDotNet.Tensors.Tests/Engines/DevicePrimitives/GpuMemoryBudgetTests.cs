@@ -383,8 +383,17 @@ public class GpuMemoryBudgetTests
         Assert.True(DeviceMemoryAccount.TryGet(device, out var account));
 
         // 96 MB freed into the stream-ordered pool, which keeps it reserved.
+        var poolBefore = cuda.StreamOrderedPoolBytesForTests();
         cuda.AllocateBuffer(24 * 1024 * 1024 + 13).Dispose();
+        var poolHeld = cuda.StreamOrderedPoolBytesForTests();
         cuda.ReturnPooledBuffersToDriverPoolForTests();
+        var poolFreed = cuda.StreamOrderedPoolBytesForTests();
+        // The premise of this test, stated with its numbers: a failure below is then either the pool not keeping the
+        // freed block (this assertion) or the admission charging a request the pool covers (the counters).
+        const long requestBytes = (12L * 1024 * 1024 + 17) * sizeof(float);
+        Assert.True(poolFreed.Reserved - poolFreed.Used >= requestBytes,
+            $"The stream-ordered pool does not hold {requestBytes} free bytes after the 96 MB buffer was returned to it: "
+            + $"reserved/used before {poolBefore}, with the buffer disposed {poolHeld}, after the return {poolFreed}.");
         long reclaimsBefore = account.BudgetReclaims, refusalsBefore = account.BudgetRefusals;
         GpuMemoryBudget.SetMemoryLimit(account.ReservedBytes + 1024 * 1024, device);
         try

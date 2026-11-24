@@ -18,6 +18,10 @@ public sealed partial class CudaBackend : IDeviceMemoryPressure
         SynchronizeOwnStreams("stream sync (tests)");
     }
 
+    /// <summary>Tests: the stream-ordered pool's (reserved, used) bytes, as the budget's growth bound reads them.</summary>
+    internal (long Reserved, long Used) StreamOrderedPoolBytesForTests()
+        => _asyncMemPool == IntPtr.Zero ? (0, 0) : (ReadMemPoolBytes(_asyncMemPool, 5), ReadMemPoolBytes(_asyncMemPool, 7));
+
     int IDeviceMemoryPressure.ReleaseCachedBuffers()
     {
         if (!IsAvailable || IsCapturingOnThisThread) return 0;
