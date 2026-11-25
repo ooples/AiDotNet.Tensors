@@ -7154,8 +7154,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     // The first cuBLAS handle loads cublas64/cublasLt64 (hundreds of MB, ~50 ms) and initializes the library; done
     // lazily, that lands inside the first training step's graph capture. The first host upload of an adopted GPU
-    // engine (weights, the first batch) starts a throwaway handle on a pool thread so the load overlaps model setup;
-    // the per-thread handle created later then only pays cublasCreate. Gated on the engine being current so a process
+    // engine (weights, the first batch) starts an extra handle on a pool thread so the load overlaps model setup;
+    // the per-thread handle created later then only pays cublasCreate. The extra handle is kept until Dispose, where
+    // it is destroyed with the per-thread ones: cublasDestroy synchronizes the whole device, and issued from the pool
+    // thread it ran beside whatever the op threads were doing (a CUDA-lane dump, 2026-11-24: access violation in
+    // cublasDestroy here while the only other GPU thread was inside cudnnFindConvolutionForwardAlgorithmEx, which no
+    // capture gate covers). Gated on the engine being current so a process
     // that auto-detected the GPU but runs on the CPU engine never maps cuBLAS. AIDOTNET_CUBLAS_PREWARM=0 disables it.
     private int _cublasWarmStarted;
     private System.Threading.Tasks.Task? _cublasWarmup;
@@ -7177,11 +7181,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 try
                 {
-                    // Creation and destruction both synchronize the device: neither may overlap a capture.
+                    // Creation synchronizes the device: it may not overlap a capture.
                     lock (CaptureGateFor(_cudaContext))
                     {
                         using var _ = PushContext();
-                        if (CuBlasNative.cublasCreate(out var h) == 0) CuBlasNative.cublasDestroy(h);
+                        if (CuBlasNative.cublasCreate(out var h) == 0 && h != IntPtr.Zero)
+                            _allThreadCublas.Enqueue(new ThreadCublas { Handle = h });
                     }
                 }
                 catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException
@@ -20366,8 +20371,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // #226: destroy EVERY per-thread cuBLAS handle created over this engine's life (not just the init
         // thread's). trackAllValues lets us enumerate handles created on any thread; reading the
-        // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread.
-        if (_threadCublas is not null)
+        // _cublasHandle property here would instead lazily create a fresh handle on the disposing thread. The registry
+        // also holds the warmup's handle (StartCublasWarmup), which exists whether or not a thread made its own.
+        if (_threadCublas is not null || !_allThreadCublas.IsEmpty)
         {
             // From the registry, not _threadCublas.Values: an abandoned backend is disposed after the GC finalized the
             // ThreadLocal (Values then throws), and its handles still have to go.
@@ -20389,7 +20395,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 DisposeSplitKBuffers(tc);
             }
 
-            try { _threadCublas.Dispose(); } catch (ObjectDisposedException) { }
+            try
+            {
+                _threadCublas?.Dispose();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                // An abandoned backend: the GC finalized the ThreadLocal first. Its handles went above, from the registry.
+                System.Diagnostics.Trace.TraceWarning($"[CUDA] The per-thread cuBLAS store was already disposed: {ex}");
+            }
             _threadCublas = null;
         }
 

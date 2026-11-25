@@ -1,0 +1,122 @@
+name: WebGPU (Dawn / lavapipe)
+
+# Why this lane exists
+# --------------------
+# The WebGPU backend's WGSL kernels and the FP32 kernels Metal and WebGPU share run nowhere else in CI: the browser has
+# no runner, and the Dawn suites skip without AIDOTNET_WEBGPU_NODE_DIR. This lane gives them a real WebGPU
+# implementation on a stock Ubuntu runner: Dawn (the npm "webgpu" package's dawn.node) over Mesa's lavapipe, a CPU
+# Vulkan driver. Most Dawn suites run their kernels through an OpenCL host engine (DawnTorchParityBackend), which POCL
+# provides on the CPU, as in gpu-parity-pocl.yml.
+#
+# Mesa's shader compiler is the one Chrome on Linux runs on Mesa GPU drivers, and it is stricter than a Windows GPU
+# driver about what WGSL leaves unspecified: it reads NaN as zero in an unordered comparison and folds the
+# rounding-error extractions of double-float arithmetic away. Both shipped broken because nothing ran them here.
+#
+#   * Node 22: dawn.node 0.6.2 crashes inside Dawn's event processing (SIGSEGV / SIGABRT a few hundred launches in)
+#     under the Node 18 Ubuntu 24.04 ships; Node 22 ran the same launch sequence clean ten times out of ten.
+#   * Two shards, each its own runner: the parity suites over the OpenCL host, and the WebGPU backend's own suites.
+
+on:
+  # Pull requests and pushes run this workflow through ci.yml, so each push is one CI run with one cancel point.
+  workflow_call:
+
+concurrency:
+  group: webgpu-dawn-${{ (github.event_name == 'pull_request' && github.ref || github.run_id) }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  MSBUILDDISABLENODEREUSE: 1
+  # The dawn.node build the suites were validated against; a new release changes the WebGPU implementation under test.
+  WEBGPU_NPM_VERSION: 0.6.2
+
+jobs:
+  webgpu-dawn:
+    # Skip on the release-please Release PR and the release merge-commit push (mirrors build.yml).
+    if: "${{ !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore(main): release')) && !startsWith(github.head_ref, 'release-please--') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The FP32 PyTorch-parity and model-op kernels as WGSL on Dawn, against the CPU.
+          - { name: parity, filter: "FullyQualifiedName~DawnDeviceTests|FullyQualifiedName~TorchModelOpsDawnTests" }
+          # The WebGPU backend's own kernels and ports on Dawn, and every WGSL source compiled at default limits.
+          - { name: backend, filter: "(FullyQualifiedName~Dawn|FullyQualifiedName~WebGpu)&FullyQualifiedName!~DawnDeviceTests&FullyQualifiedName!~TorchModelOpsDawnTests" }
+    name: webgpu-dawn (${{ matrix.name }})
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+      with:
+        dotnet-version: '10.0.x'
+        dotnet-quality: 'preview'
+
+    - name: Setup Node 22
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: '22'
+
+    - name: Install lavapipe (CPU Vulkan) and POCL (CPU OpenCL)
+      run: |
+        # Third-party apt sources fail `apt-get update` on a mirror hiccup, and none of them provide these packages
+        # (gpu-parity-pocl.yml explains).
+        sudo rm -f /etc/apt/sources.list.d/google-chrome.list /etc/apt/sources.list.d/microsoft-prod.list
+        sudo apt-get update -o Acquire::Retries=3
+        sudo apt-get install -y -o Acquire::Retries=3 mesa-vulkan-drivers libvulkan1 ocl-icd-opencl-dev pocl-opencl-icd clinfo
+        clinfo -l
+
+    - name: Install Dawn (npm webgpu)
+      run: |
+        dawn="$RUNNER_TEMP/dawn"
+        mkdir -p "$dawn"
+        cd "$dawn"
+        for attempt in 1 2 3; do
+          if npm install --no-audit --no-fund "webgpu@$WEBGPU_NPM_VERSION"; then break; fi
+          if [ "$attempt" -eq 3 ]; then echo "::error::npm install webgpu failed after three attempts."; exit 1; fi
+          sleep $((attempt * 15))
+        done
+        echo "AIDOTNET_WEBGPU_NODE_DIR=$dawn" >> "$GITHUB_ENV"
+        # Dawn must find an adapter here, or every Dawn suite would skip and the lane would pass having run nothing.
+        node --input-type=module -e "import { create, globals } from 'webgpu'; Object.assign(globalThis, globals); const a = await create([]).requestAdapter(); if (!a) { console.error('Dawn found no adapter'); process.exit(1); } console.log('Dawn adapter ready'); process.exit(0);"
+
+    - name: Restore test dependencies
+      run: |
+        for attempt in 1 2 3; do
+          if dotnet restore tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj; then
+            exit 0
+          fi
+          echo "::warning::dotnet restore failed (attempt $attempt of 3); retrying."
+          sleep $((attempt * 15))
+        done
+        echo "::error::dotnet restore failed after three attempts."
+        exit 1
+
+    - name: Build tests (net10.0)
+      run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0 --no-restore
+
+    - name: Run the Dawn suites (shard ${{ matrix.name }})
+      env:
+        AIDOTNET_OPENCL_ALLOW_CPU: '1'
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "(${{ matrix.filter }})&Category!=Benchmark&Category!=Performance" \
+          --results-directory "${{ runner.temp }}/trx" --logger "trx;LogFileName=${{ matrix.name }}.trx" \
+          --blame-hang --blame-hang-timeout 600s --blame-crash
+
+    - name: Report skipped tests
+      # A skip does not fail a build: an unexpected one means a suite did not run. The one exemption is the shipped
+      # tuning profile, asserted only on the device it was measured on.
+      if: always()
+      run: >-
+        python3 scripts/ci/summarize-test-skips.py --title "WebGPU Dawn ${{ matrix.name }}" --fail-on-skip
+        --allowed-skip '^No shipped profile is asserted for '
+        "${{ runner.temp }}/trx/*.trx"

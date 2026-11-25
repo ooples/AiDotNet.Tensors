@@ -73,6 +73,48 @@ public class GpuFloat64ReductionTests
         Assert.Equal(exact, reductions.SumFloat64(buffer, size));
     }
 
+    // The engine's backend (the tree-reducing kernels of the C-family backends among them): a comparison rounds
+    // nothing, so the extremes are the host's exactly; a prefix does not see what lies past it, and a NaN in any
+    // block is the result.
+    [SkippableFact]
+    public void MaxAndMin_AreTheHostsExactly_AtEverySize_AndPropagateANaN()
+    {
+        var device = Device();
+        Skip.If(device is null, "No device with double-precision reductions on this host.");
+        var (backend, reductions) = device.Value;
+        foreach (int size in Sizes)
+        {
+            var values = new double[size];
+            for (int i = 0; i < size; i++) values[i] = (((long)i * 7919 % 20011) - 10000) / 3.0;
+            using var buffer = backend.AllocateBuffer(size, GpuElementType.Float64);
+            backend.UploadBuffer<double>(buffer, values);
+            foreach (int count in new[] { size, Math.Max(1, size / 2), 1 })
+            {
+                double largest = values[0], smallest = values[0];
+                for (int i = 1; i < count; i++)
+                {
+                    largest = Math.Max(largest, values[i]);
+                    smallest = Math.Min(smallest, values[i]);
+                }
+
+                Assert.True(largest == reductions.MaxFloat64(buffer, count), $"Max of the first {count} of {size}: host {largest:R}, device {reductions.MaxFloat64(buffer, count):R}.");
+                Assert.True(smallest == reductions.MinFloat64(buffer, count), $"Min of the first {count} of {size}: host {smallest:R}, device {reductions.MinFloat64(buffer, count):R}.");
+            }
+
+            foreach (int at in new[] { 0, size / 2, size - 1 })
+            {
+                var withNaN = (double[])values.Clone();
+                withNaN[at] = double.NaN;
+                backend.UploadBuffer<double>(buffer, withNaN);
+                Assert.True(double.IsNaN(reductions.MaxFloat64(buffer, size)), $"Max of {size} with a NaN at {at}.");
+                Assert.True(double.IsNaN(reductions.MinFloat64(buffer, size)), $"Min of {size} with a NaN at {at}.");
+            }
+
+            Assert.Throws<ArgumentException>(() => reductions.MaxFloat64(buffer, 0));
+            Assert.Throws<ArgumentException>(() => reductions.MinFloat64(buffer, 0));
+        }
+    }
+
     [SkippableFact]
     public void Sum_OfAPrefix_IgnoresTheRestOfTheBuffer()
     {

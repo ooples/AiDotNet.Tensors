@@ -103,6 +103,16 @@ jobs:
     uses: ./.github/workflows/gpu-parity-pocl.yml
     secrets: inherit
 
+  webgpu-dawn:
+    name: WebGPU (Dawn / lavapipe)
+    uses: ./.github/workflows/webgpu-dawn.yml
+    secrets: inherit
+
+  vulkan-lavapipe:
+    name: Vulkan (lavapipe)
+    uses: ./.github/workflows/vulkan-lavapipe.yml
+    secrets: inherit
+
   metal:
     name: Metal (macOS, Apple GPU)
     uses: ./.github/workflows/metal.yml

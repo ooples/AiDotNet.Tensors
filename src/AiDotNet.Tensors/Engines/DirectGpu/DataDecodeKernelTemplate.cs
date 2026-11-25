@@ -313,8 +313,14 @@ FN uint dd_exact_to_f32(uint sHi, uint sLo, int e10, int stickyIn)
     a[0] = sLo;
     a[1] = sHi;
     b[0] = 1u;
-    for (int t = 0; t < e10; t++) dd_big_mul10(a);
-    for (int t = 0; t < -e10; t++) dd_big_mul10(b);
+    // The same trip count in every thread, the power taken under a condition: AMD's proprietary Vulkan compiler
+    // (driver 23.19) ran a loop bounded by e10 as many times as the group's largest bound in every thread, so a 1
+    // beside a 1e-19 parsed as 1e-19. The caller bounds e10 to [-55, 38].
+    for (int t = 0; t < 56; t++)
+    {
+        if (t < e10) dd_big_mul10(a);
+        if (t < -e10) dd_big_mul10(b);
+    }
     int la = dd_big_bitlen(a);
     int lb = dd_big_bitlen(b);
     int ex2 = la - lb;

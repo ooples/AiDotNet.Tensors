@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 // 16-bit float compute through the typed interfaces, for Float16 and BFloat16 alike: the packed kernels
 // (GpuPackedKernelSource), two elements to a word, their arithmetic done on the bits so every device rounds as the
 // host does.
-public sealed partial class VulkanBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply
+public sealed partial class VulkanBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply, IGpuNarrowFloatReductions
 {
     private bool HasNarrowFloatKernels(GpuElementType type) => GpuNarrowFloatLayout.IsNarrowFloat(type) && IsGlslCompilerAvailable;
 
@@ -24,6 +24,22 @@ public sealed partial class VulkanBackend : IGpuNarrowFloatElementwise, IGpuNarr
     public void BinaryNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer b,
         IGpuBuffer output, int size)
         => GpuPackedCompute.Binary(LaunchPacked, operation, type, a, b, output, size);
+
+    /// <inheritdoc/>
+    public bool SupportsNarrowFloatSum(GpuElementType type) => HasNarrowFloatKernels(type);
+
+    /// <inheritdoc/>
+    public float SumNarrowFloat(GpuElementType type, IGpuBuffer a, int size)
+    {
+        // The result is read back between passes, which resets the command buffer an open batch is recording into.
+        ThrowIfHostSpanOpInsideOpenBatch();
+        return GpuPackedCompute.Sum(this, LaunchPacked, type, a, size);
+    }
+
+    /// <inheritdoc/>
+    public void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar,
+        IGpuBuffer output, int size)
+        => GpuPackedCompute.Scalar(LaunchPacked, operation, type, a, scalar, output, size);
 
     /// <inheritdoc/>
     public void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)

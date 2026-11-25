@@ -55,6 +55,7 @@ public partial class DirectGpuTensorEngine
         nameof(TensorAdd) => GpuNarrowFloatBinaryOperation.Add,
         nameof(TensorSubtract) => GpuNarrowFloatBinaryOperation.Subtract,
         nameof(TensorMultiply) => GpuNarrowFloatBinaryOperation.Multiply,
+        nameof(TensorDivide) => GpuNarrowFloatBinaryOperation.Divide,
         _ => null,
     };
 
@@ -63,37 +64,92 @@ public partial class DirectGpuTensorEngine
         nameof(TensorNegate) => GpuNarrowFloatUnaryOperation.Negate,
         nameof(TensorReLU) => GpuNarrowFloatUnaryOperation.Relu,
         nameof(TensorGELU) => GpuNarrowFloatUnaryOperation.Gelu,
+        nameof(TensorAbs) => GpuNarrowFloatUnaryOperation.Abs,
+        nameof(TensorSqrt) => GpuNarrowFloatUnaryOperation.Sqrt,
+        nameof(TensorExp) => GpuNarrowFloatUnaryOperation.Exp,
+        nameof(TensorLog) => GpuNarrowFloatUnaryOperation.Log,
+        nameof(TensorTanh) => GpuNarrowFloatUnaryOperation.Tanh,
+        nameof(TensorSigmoid) or nameof(Sigmoid) => GpuNarrowFloatUnaryOperation.Sigmoid,
         _ => null,
     };
 
     /// <summary>
-    /// <c>left (op) right</c> for BFloat16 operands on the device, computed in FP32 and stored as BFloat16, the result
-    /// left there. Null when the CPU engine takes it. (Half tensors keep the FP16 routes they already have.)
+    /// Whether a <c>Half</c> tensor takes the typed routes below. The FP16 activation store keeps its own registry of
+    /// device halves (and its own kernels) for the tensors it holds; where it is on, they stay its.
+    /// </summary>
+    private static bool HalfTakesTypedRoute => !Fp16ActEnabled && !s_fp16FwdStore;
+
+    /// <summary>
+    /// <c>left (op) right</c> for 16-bit float operands (BFloat16, Half) on the device, computed in FP32 and stored in
+    /// the operands' type, the result left there. Null when the CPU engine takes it.
     /// </summary>
     private Tensor<T>? TryBinaryNarrowFloatAny<T>(Tensor<T> left, Tensor<T> right, string callerName)
     {
-        if (left is not Tensor<NumericOperations.BFloat16> leftValues || right is not Tensor<NumericOperations.BFloat16> rightValues) return null;
         if (NarrowFloatBinaryOperationFor(callerName) is not { } operation) return null;
-        const GpuElementType Type = GpuElementType.BFloat16;
-        return TryBinaryTyped(leftValues, rightValues, Type, callerName, backend =>
-            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(Type)
-            && elementwise.SupportsNarrowFloatBinary(operation, Type)
-                ? (a, b, output, size) => elementwise.BinaryNarrowFloat(operation, Type, a, b, output, size)
-                : null) as Tensor<T>;
+        if (left is Tensor<NumericOperations.BFloat16> leftValues && right is Tensor<NumericOperations.BFloat16> rightValues)
+            return TryBinaryNarrowFloat(leftValues, rightValues, GpuElementType.BFloat16, operation, callerName) as Tensor<T>;
+#if NET5_0_OR_GREATER
+        if (HalfTakesTypedRoute && left is Tensor<Half> leftHalves && right is Tensor<Half> rightHalves)
+            return TryBinaryNarrowFloat(leftHalves, rightHalves, GpuElementType.Float16, operation, callerName) as Tensor<T>;
+#endif
+        return null;
     }
 
-    /// <summary>Negate, ReLU or GELU of a BFloat16 tensor on the device. Null when the CPU engine takes it.</summary>
+    private Tensor<T>? TryBinaryNarrowFloat<T>(Tensor<T> left, Tensor<T> right, GpuElementType type, GpuNarrowFloatBinaryOperation operation,
+        string callerName)
+        where T : unmanaged
+        => TryBinaryTyped(left, right, type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(type)
+            && elementwise.SupportsNarrowFloatBinary(operation, type)
+                ? (a, b, output, size) => elementwise.BinaryNarrowFloat(operation, type, a, b, output, size)
+                : null);
+
+    /// <summary>
+    /// <c>input (op) scalar</c> for a 16-bit float tensor on the device, computed in FP32 and stored in its type. Null
+    /// when the CPU engine takes it, and under a graph trace or anomaly mode (which keep the CPU engine's path, as the
+    /// double route does).
+    /// </summary>
+    private Tensor<T>? TryScalarNarrowFloatAny<T>(Tensor<T> input, T scalar, GpuNarrowFloatBinaryOperation operation, string callerName)
+    {
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return null;
+        if (input is Tensor<NumericOperations.BFloat16> values && scalar is NumericOperations.BFloat16 narrowScalar)
+            return TryScalarNarrowFloat(values, GpuElementType.BFloat16, NumericOperations.BFloat16.ToFloat(narrowScalar), operation, callerName) as Tensor<T>;
+#if NET5_0_OR_GREATER
+        if (HalfTakesTypedRoute && input is Tensor<Half> halves && scalar is Half halfScalar)
+            return TryScalarNarrowFloat(halves, GpuElementType.Float16, (float)halfScalar, operation, callerName) as Tensor<T>;
+#endif
+        return null;
+    }
+
+    private Tensor<T>? TryScalarNarrowFloat<T>(Tensor<T> input, GpuElementType type, float scalar, GpuNarrowFloatBinaryOperation operation,
+        string callerName)
+        where T : unmanaged
+        => TryMapTyped(input, type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(type)
+            && elementwise.SupportsNarrowFloatBinary(operation, type)
+                ? (a, output, size) => elementwise.ScalarNarrowFloat(operation, type, a, scalar, output, size)
+                : null);
+
+    /// <summary>A unary operation of a 16-bit float tensor on the device. Null when the CPU engine takes it.</summary>
     private Tensor<T>? TryUnaryNarrowFloatAny<T>(Tensor<T> input, string callerName)
     {
-        if (input is not Tensor<NumericOperations.BFloat16> values) return null;
         if (NarrowFloatUnaryOperationFor(callerName) is not { } operation) return null;
-        const GpuElementType Type = GpuElementType.BFloat16;
-        return TryMapTyped(values, Type, callerName, backend =>
-            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(Type)
-            && elementwise.SupportsNarrowFloatUnary(operation, Type)
-                ? (a, output, size) => elementwise.UnaryNarrowFloat(operation, Type, a, output, size)
-                : null) as Tensor<T>;
+        if (input is Tensor<NumericOperations.BFloat16> values)
+            return TryUnaryNarrowFloat(values, GpuElementType.BFloat16, operation, callerName) as Tensor<T>;
+#if NET5_0_OR_GREATER
+        if (HalfTakesTypedRoute && input is Tensor<Half> halves)
+            return TryUnaryNarrowFloat(halves, GpuElementType.Float16, operation, callerName) as Tensor<T>;
+#endif
+        return null;
     }
+
+    private Tensor<T>? TryUnaryNarrowFloat<T>(Tensor<T> input, GpuElementType type, GpuNarrowFloatUnaryOperation operation, string callerName)
+        where T : unmanaged
+        => TryMapTyped(input, type, callerName, backend =>
+            backend is IGpuNarrowFloatElementwise elementwise && backend.SupportsElementType(type)
+            && elementwise.SupportsNarrowFloatUnary(operation, type)
+                ? (a, output, size) => elementwise.UnaryNarrowFloat(operation, type, a, output, size)
+                : null);
 
     /// <summary>
     /// <c>left (op) right</c> for integer operands, on the device with the result left there. Null when this op, type,
@@ -269,6 +325,47 @@ public partial class DirectGpuTensorEngine
         if (tensor is Tensor<sbyte> sbytes) return TrySumInteger(sbytes, GpuElementType.Int8, out long wide) ? unchecked((sbyte)wide) : null;
         if (tensor is Tensor<byte> bytes) return TrySumInteger(bytes, GpuElementType.UInt8, out long wide) ? unchecked((byte)wide) : null;
         return null;
+    }
+
+    /// <summary>
+    /// The sum of a 16-bit float tensor whose values are on the device, accumulated there in FP32 (the device's blocked
+    /// sum, see <see cref="IGpuNarrowFloatReductions"/>) and rounded once into the type, boxed. Null when the CPU engine
+    /// takes it.
+    /// </summary>
+    private object? TrySumNarrowFloat<T>(Tensor<T> tensor)
+    {
+        if (tensor is Tensor<NumericOperations.BFloat16> values)
+            return TrySumNarrowFloat(values, GpuElementType.BFloat16, out float sum) ? NumericOperations.BFloat16.FromFloat(sum) : null;
+#if NET5_0_OR_GREATER
+        if (HalfTakesTypedRoute && tensor is Tensor<Half> halves)
+            return TrySumNarrowFloat(halves, GpuElementType.Float16, out float sum) ? (Half)sum : null;
+#endif
+        return null;
+    }
+
+    private bool TrySumNarrowFloat<T>(Tensor<T> values, GpuElementType type, out float sum)
+        where T : unmanaged
+    {
+        sum = 0f;
+        int length = values.Length;
+        if (length == 0 || ResidentStepActive || !IntegerDeviceRouteAllowed(typeof(T)) || !TryGetBackend(out var backend)) return false;
+        if (backend is not IGpuNarrowFloatReductions reductions || !backend.SupportsElementType(type) || !reductions.SupportsNarrowFloatSum(type))
+            return false;
+        try
+        {
+            lock (_typedLock)
+            {
+                // Only a tensor already on the device is reduced there, as for the integer types.
+                if (FindResident(values) is not { } resident || !ReferenceEquals(resident.Backend, backend)) return false;
+                sum = reductions.SumNarrowFloat(type, resident.Buffer, length);
+                return true;
+            }
+        }
+        catch (NotSupportedException capabilityGap)
+        {
+            GpuLaunchProbe.OnFallback("TensorSumNarrowFloat", capabilityGap);
+            return false;
+        }
     }
 
     private bool TrySumInteger<T>(Tensor<T> tensor, GpuElementType type, out long sum)

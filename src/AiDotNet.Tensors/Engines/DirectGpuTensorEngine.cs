@@ -1298,6 +1298,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
     {
         if (backend is null) return null;
+        // Engines register under their unwrapped backend; a tensor's binding may name the wrapper it was placed through
+        // (a tracing or kernel-substituting DelegatingGpuBackend), which would otherwise find no owner.
+        backend = CrossBackendTensors.Unwrap(backend);
         lock (s_engineByBackendLock)
         {
             if (!s_enginesByBackend.TryGetValue(backend, out var engines)) return null;
@@ -10088,6 +10091,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return (T)(object)doubleSum;
         if (TrySumIntegerAny(tensor) is T integerSum)
             return integerSum;
+        if (TrySumNarrowFloat(tensor) is T narrowSum)
+            return narrowSum;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
@@ -10101,6 +10106,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleExtreme, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64Reduction.Max))
+            return (T)(object)doubleExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
@@ -10114,6 +10121,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleExtreme, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64Reduction.Min))
+            return (T)(object)doubleExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 
@@ -25595,6 +25604,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
             return integerResult;
         }
+        if (scalar is not null && TryScalarNarrowFloatAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation.Multiply, nameof(TensorMultiplyScalar)) is { } narrowResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", narrowResult, tensor,
+                Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar });
+            return narrowResult;
+        }
         if (ResidentStepActive && !AutocastUsesTypedElementwise && typeof(T) == typeof(float)
             && TryGetBackend(out var residentBackend))
         {
@@ -29297,6 +29312,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
             return integerResult;
         }
+        if (TryScalarNarrowFloatAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation.Add, nameof(TensorAddScalar)) is { } narrowResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", narrowResult, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+            return narrowResult;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -29345,6 +29365,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", integerResult, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
             return integerResult;
         }
+        if (TryScalarNarrowFloatAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation.Subtract, nameof(TensorSubtractScalar)) is { } narrowResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", narrowResult, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+            return narrowResult;
+        }
         // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
@@ -29388,6 +29413,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", onDevice, tensor,
                 Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { doubleScalar });
             return onDevice;
+        }
+        if (scalar is not null && TryScalarNarrowFloatAny(tensor, scalar, global::AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatBinaryOperation.Divide, nameof(TensorDivideScalar)) is { } narrowResult)
+        {
+            Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", narrowResult, tensor,
+                Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar });
+            return narrowResult;
         }
         // Already float-only below; under a tape it now records CpuEngine's node (saved state: the scalar).
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
@@ -32026,6 +32057,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
+        // The double sum on the device, divided once on the host.
+        if (input is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
+            return (T)(object)(doubleSum / doubles.Length);
         if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {
             try

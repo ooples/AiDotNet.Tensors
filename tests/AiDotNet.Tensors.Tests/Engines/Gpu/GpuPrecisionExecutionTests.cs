@@ -286,6 +286,11 @@ public sealed class GpuPrecisionExecutionTests
             Fp16Add(a, b, output, size);
         }
 
+        // This double stands for a device's half add, relu and gelu; the precision planner never asks it for a scalar form.
+        public void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar,
+            IGpuBuffer output, int size)
+            => throw new NotSupportedException("This test double has no scalar kernels.");
+
         public void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size)
         {
             Assert.True(SupportsNarrowFloatUnary(operation, type));

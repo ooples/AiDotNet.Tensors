@@ -6004,24 +6004,34 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
             // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
-            // acc = Max(v, acc): x86 MAXPD returns its SECOND operand when either is NaN, so a NaN
-            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
-            // `x > acc` comparison below.
+            // A NaN anywhere is the result, as it is for NumPy and PyTorch, for the .NET Framework build's
+            // SystemNumericsVectorBridge and for the device kernels. acc = Max(v, acc) alone does not give that:
+            // x86 MAXPD returns its SECOND operand when either is NaN, so a NaN element would leave the
+            // accumulator unchanged. `unordered` records it instead: a compare of two vectors is unordered in
+            // every lane where either holds a NaN.
             double result = double.NegativeInfinity;
+            bool sawNaN = false;
             int i = 0;
             if (Avx.IsSupported && data.Length >= 16)
             {
                 ref double r0 = ref MemoryMarshal.GetReference(data);
                 var acc0 = Vector256.Create(double.NegativeInfinity);
                 var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                var unordered = Vector256<double>.Zero;
                 int simdLength = data.Length & ~15;
                 for (; i < simdLength; i += 16)
                 {
-                    acc0 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
-                    acc1 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
-                    acc2 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
-                    acc3 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                    var v0 = Vector256.LoadUnsafe(ref r0, (nuint)i);
+                    var v1 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 4));
+                    var v2 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 8));
+                    var v3 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 12));
+                    unordered = Avx.Or(unordered, Avx.Or(Avx.CompareUnordered(v0, v1), Avx.CompareUnordered(v2, v3)));
+                    acc0 = Avx.Max(v0, acc0);
+                    acc1 = Avx.Max(v1, acc1);
+                    acc2 = Avx.Max(v2, acc2);
+                    acc3 = Avx.Max(v3, acc3);
                 }
+                sawNaN = Avx.MoveMask(unordered) != 0;
                 var acc = Avx.Max(Avx.Max(acc0, acc1), Avx.Max(acc2, acc3));
                 for (int l = 0; l < 4; l++)
                 {
@@ -6031,9 +6041,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
             for (; i < data.Length; i++)
             {
-                if (data[i] > result) result = data[i];
+                double x = data[i];
+                if (x > result) result = x;
+                else if (double.IsNaN(x)) sawNaN = true;
             }
-            return result;
+            return sawNaN ? double.NaN : result;
 #else
             return SystemNumericsVectorBridge.Max(data);
 #endif
@@ -6046,24 +6058,34 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
             // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
-            // acc = Min(v, acc): x86 MINPD returns its SECOND operand when either is NaN, so a NaN
-            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
-            // `x < acc` comparison below.
+            // A NaN anywhere is the result, as it is for NumPy and PyTorch, for the .NET Framework build's
+            // SystemNumericsVectorBridge and for the device kernels. acc = Min(v, acc) alone does not give that:
+            // x86 MINPD returns its SECOND operand when either is NaN, so a NaN element would leave the
+            // accumulator unchanged. `unordered` records it instead: a compare of two vectors is unordered in
+            // every lane where either holds a NaN.
             double result = double.PositiveInfinity;
+            bool sawNaN = false;
             int i = 0;
             if (Avx.IsSupported && data.Length >= 16)
             {
                 ref double r0 = ref MemoryMarshal.GetReference(data);
                 var acc0 = Vector256.Create(double.PositiveInfinity);
                 var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                var unordered = Vector256<double>.Zero;
                 int simdLength = data.Length & ~15;
                 for (; i < simdLength; i += 16)
                 {
-                    acc0 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
-                    acc1 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
-                    acc2 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
-                    acc3 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                    var v0 = Vector256.LoadUnsafe(ref r0, (nuint)i);
+                    var v1 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 4));
+                    var v2 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 8));
+                    var v3 = Vector256.LoadUnsafe(ref r0, (nuint)(i + 12));
+                    unordered = Avx.Or(unordered, Avx.Or(Avx.CompareUnordered(v0, v1), Avx.CompareUnordered(v2, v3)));
+                    acc0 = Avx.Min(v0, acc0);
+                    acc1 = Avx.Min(v1, acc1);
+                    acc2 = Avx.Min(v2, acc2);
+                    acc3 = Avx.Min(v3, acc3);
                 }
+                sawNaN = Avx.MoveMask(unordered) != 0;
                 var acc = Avx.Min(Avx.Min(acc0, acc1), Avx.Min(acc2, acc3));
                 for (int l = 0; l < 4; l++)
                 {
@@ -6073,9 +6095,11 @@ namespace AiDotNet.Tensors.Engines.Simd
             }
             for (; i < data.Length; i++)
             {
-                if (data[i] < result) result = data[i];
+                double x = data[i];
+                if (x < result) result = x;
+                else if (double.IsNaN(x)) sawNaN = true;
             }
-            return result;
+            return sawNaN ? double.NaN : result;
 #else
             return SystemNumericsVectorBridge.Min(data);
 #endif

@@ -466,6 +466,33 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_sum_f64(const double*
         output[blockIdx.x] = f64_scratch[0];
 }
 
+// The larger (OP >) or smaller (OP <) of two values, a NaN before either.
+#define F64_EXTREME(a, b, OP) (((a) != (a)) ? (a) : ((((b) != (b)) || ((b) OP (a))) ? (b) : (a)))
+#define REDUCE_EXTREME_F64(NAME, OP) \
+extern ""C"" __global__ __launch_bounds__(256) void NAME(const double* input, double* output, int size) \
+{ \
+    extern __shared__ double f64_scratch[]; \
+    unsigned int tid = threadIdx.x; \
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x; \
+    /* Past the end, the block's first element: it changes neither extreme. */ \
+    f64_scratch[tid] = input[(idx < (unsigned int)size) ? idx : blockIdx.x * blockDim.x]; \
+    __syncthreads(); \
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) \
+    { \
+        if (tid < s) \
+        { \
+            const double p = f64_scratch[tid]; \
+            const double q = f64_scratch[tid + s]; \
+            f64_scratch[tid] = F64_EXTREME(p, q, OP); \
+        } \
+        __syncthreads(); \
+    } \
+    if (tid == 0) \
+        output[blockIdx.x] = f64_scratch[0]; \
+}
+REDUCE_EXTREME_F64(reduce_max_f64, >)
+REDUCE_EXTREME_F64(reduce_min_f64, <)
+
 extern ""C"" __global__ __launch_bounds__(256) void reduce_dot_f64(const double* a, const double* b, double* output, int size)
 {
     extern __shared__ double f64_scratch[];
@@ -1464,7 +1491,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "where_backward", "norm_backward", "logsumexp_backward",
             "avg_pool1d", "max_pool1d", "bilinear_upsample2d",
             "scatter_mean", "scatter_mean_activation_deterministic", "scatter_mean_divide",
-            "reduce_sum", "reduce_sum_f64", "reduce_dot_f64", "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
+            "reduce_sum", "reduce_sum_f64", "reduce_dot_f64", "reduce_max_f64", "reduce_min_f64", "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
             "negate_f64", "abs_f64", "sqrt_f64", "exp_f64", "log_f64", "tanh_f64", "sigmoid_f64", "relu_f64", "add_scalar_f64", "subtract_scalar_f64", "multiply_scalar_f64", "divide_scalar_f64", "reduce_max", "reduce_min", "sum_axis", "sum_axis_rows", "sum_axis_rows_split", "bias_add",
             "conv2d_bias_add",
             // Vectorized (float4) unary

@@ -117,6 +117,19 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
     }
 
     /// <inheritdoc/>
+    public double MaxFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Max);
+
+    /// <inheritdoc/>
+    public double MinFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Min);
+
+    private double ExtremeFloat64(IGpuBuffer a, int size, GpuFloat64Reduction reduction)
+    {
+        var input = Float64Operand(a, size, nameof(a));
+        if (size == 0) throw new ArgumentException("An empty range has no minimum or maximum.", nameof(size));
+        return ReduceFloat64(input, null, size, reduction);
+    }
+
+    /// <inheritdoc/>
     public double DotFloat64(IGpuBuffer a, IGpuBuffer b, int size)
     {
         var left = Float64Operand(a, size, nameof(a));
@@ -126,7 +139,7 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
 
     // Each pass folds blocks of WebGpuFloat64Kernels.ReduceBlock elements into one partial each, until one value is
     // left. The first pass multiplies by `second` when it is given (the dot product); every later pass sums partials.
-    private double ReduceFloat64(WebGpuBuffer first, WebGpuBuffer? second, int size)
+    private double ReduceFloat64(WebGpuBuffer first, WebGpuBuffer? second, int size, GpuFloat64Reduction reduction = GpuFloat64Reduction.Sum)
     {
         int block = WebGpuFloat64Kernels.ReduceBlock;
         int partials = (size + block - 1) / block;
@@ -144,7 +157,9 @@ public sealed partial class WebGpuBackend : IGpuFloat64Reductions, IGpuFloat64El
                 Dispatch3BufferAsync("F64Dot", WebGpuFloat64Kernels.DotBlocks, "main", current, second, target,
                     Uniforms(outputs, count), outputs).GetAwaiter().GetResult();
             else
-                Dispatch2BufferAsync("F64Sum", WebGpuFloat64Kernels.SumBlocks, "main", current, target,
+                Dispatch2BufferAsync(reduction == GpuFloat64Reduction.Sum ? "F64Sum" : reduction == GpuFloat64Reduction.Max ? "F64Max" : "F64Min",
+                    reduction == GpuFloat64Reduction.Sum ? WebGpuFloat64Kernels.SumBlocks : WebGpuFloat64Kernels.ExtremeBlocks(reduction == GpuFloat64Reduction.Max),
+                    "main", current, target,
                     Uniforms(outputs, count), outputs).GetAwaiter().GetResult();
             firstPass = false;
             if (outputs == 1)
@@ -290,6 +305,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let last = min(first + " + ReduceBlock + @"u, params.p0);
     var y = vec2<u32>(0u, 0u);
     for (var j = first; j < last; j++) { y = f64_add(y, ld_a(j)); }" + Store);
+
+    /// <summary>
+    /// Pass of a maximum or minimum: <c>o[i]</c> is that of block <c>i</c> of the <c>p0</c> input elements, a NaN when
+    /// the block holds one. A block is never empty.
+    /// </summary>
+    public static string ExtremeBlocks(bool largest) => Sources.GetOrAdd(largest ? "max" : "min", _ => OneIn + GpuSoftFloat64.WgslArithmetic + Entry + @"
+    let first = i * " + ReduceBlock + @"u;
+    let last = min(first + " + ReduceBlock + @"u, params.p0);
+    var y = ld_a(first);
+    for (var j = first + 1u; j < last; j++) {
+        let v = ld_a(j);
+        if (!f64_is_nan(y) && (f64_is_nan(v) || " + (largest ? "f64_lt(y, v)" : "f64_lt(v, y)") + @")) { y = v; }
+    }" + Store);
 
     /// <summary>First pass of a dot product: <c>o[i]</c> is the sum of <c>a[j] * b[j]</c> over block <c>i</c>.</summary>
     public static string DotBlocks => Sources.GetOrAdd("dot", _ => TwoIn + GpuSoftFloat64.WgslArithmetic + Entry + @"

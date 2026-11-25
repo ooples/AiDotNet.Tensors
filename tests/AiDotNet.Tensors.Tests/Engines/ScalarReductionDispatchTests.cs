@@ -38,6 +38,37 @@ public class CpuDoubleReductionTests
         Assert.Equal((double)exact, cpu.TensorSum(t), 1e-6);
     }
 
+    // A NaN anywhere is the maximum and the minimum (NumPy, PyTorch): in the vector body, in the scalar tail, in any
+    // parallel chunk, and whatever follows it.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(7)]
+    [InlineData(16)]
+    [InlineData(19)]
+    [InlineData(1000)]
+    [InlineData(32 * 1024 + 1)]
+    [InlineData(100_000)]
+    public void MaxMin_PropagateANaN_WhereverItIs(int length)
+    {
+        IEngine cpu = new CpuEngine();
+        var data = Data(length, seed: length);
+        foreach (int at in new[] { 0, length / 3, length / 2, length - 1 })
+        {
+            var withNaN = (double[])data.Clone();
+            withNaN[at] = double.NaN;
+            var t = new Tensor<double>(withNaN, new[] { length });
+            Assert.True(double.IsNaN(cpu.TensorMaxValue(t)), $"Max of {length} with a NaN at {at}: {cpu.TensorMaxValue(t):R}.");
+            Assert.True(double.IsNaN(cpu.TensorMinValue(t)), $"Min of {length} with a NaN at {at}: {cpu.TensorMinValue(t):R}.");
+        }
+
+        // Infinities are ordinary extremes.
+        var infinite = (double[])data.Clone();
+        infinite[length / 2] = double.PositiveInfinity;
+        Assert.Equal(double.PositiveInfinity, cpu.TensorMaxValue(new Tensor<double>(infinite, new[] { length })));
+        infinite[length / 2] = double.NegativeInfinity;
+        Assert.Equal(double.NegativeInfinity, cpu.TensorMinValue(new Tensor<double>(infinite, new[] { length })));
+    }
+
     [Theory]
     [InlineData(100_000)]
     [InlineData(1_000_003)]

@@ -46,7 +46,7 @@ internal sealed class MockGpuBuffer : IGpuBuffer
 /// <summary>
 /// State shared between the mock backend and tests. Captures every
 /// allocation request and configures the per-allocation cap that the
-/// mock reports via <see cref="IDirectGpuBackend.MaxBufferAllocBytes"/>.
+/// mock reports via <see cref="IGpuDevice.MaxBufferAllocBytes"/>.
 /// </summary>
 internal sealed class MockBackendState
 {

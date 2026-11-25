@@ -187,6 +187,201 @@ uint pk_fmul(uint a, uint b) {
     return pk_fpack(sgn, x, s);
 }
 
+uint pk_fdiv(uint a, uint b) {
+    uint sgn = (a ^ b) & 0x80000000u;
+    uint ea = (a >> 23u) & 0xFFu;
+    uint eb = (b >> 23u) & 0xFFu;
+    uint ma = a & 0x7FFFFFu;
+    uint mb = b & 0x7FFFFFu;
+    bool za = (ea == 0u) && (ma == 0u);
+    bool zb = (eb == 0u) && (mb == 0u);
+    if (((ea == 255u) && (ma != 0u)) || ((eb == 255u) && (mb != 0u))) {
+        return 0x7FC00000u;
+    }
+    if (ea == 255u) {
+        if (eb == 255u) {
+            return 0x7FC00000u;
+        }
+        return sgn | 0x7F800000u;
+    }
+    if (eb == 255u) {
+        return sgn;
+    }
+    if (zb) {
+        if (za) {
+            return 0x7FC00000u;
+        }
+        return sgn | 0x7F800000u;
+    }
+    if (za) {
+        return sgn;
+    }
+    int xa = int(ea);
+    int xb = int(eb);
+    if (ea == 0u) {
+        xa = 1;
+        for (uint j = 0u; j < 23u; j++) {
+            if ((ma & 0x800000u) == 0u) {
+                ma = ma << 1u;
+                xa = xa - 1;
+            }
+        }
+    } else {
+        ma = ma | 0x800000u;
+    }
+    if (eb == 0u) {
+        xb = 1;
+        for (uint j = 0u; j < 23u; j++) {
+            if ((mb & 0x800000u) == 0u) {
+                mb = mb << 1u;
+                xb = xb - 1;
+            }
+        }
+    } else {
+        mb = mb | 0x800000u;
+    }
+    int x = (xa - xb) + 127;
+    if (ma < mb) {
+        ma = ma << 1u;
+        x = x - 1;
+    }
+    // Long division of two 24-bit significands, the quotient in [1, 2): 27 bits (24 and three to round on), and
+    // whatever remains is sticky.
+    uint q = 0u;
+    uint r = ma;
+    for (uint j = 0u; j < 27u; j++) {
+        q = q << 1u;
+        if (r >= mb) {
+            r = r - mb;
+            q = q | 1u;
+        }
+        r = r << 1u;
+    }
+    if (r != 0u) {
+        q = q | 1u;
+    }
+    return pk_fpack(sgn, x, q);
+}
+
+// The functions below take and return binary32 bits. A device need not keep a NaN, an infinity or a subnormal through
+// a float function, so those are decided here on the bits and only an ordinary operand reaches the device's function.
+uint pk_usqrt(uint w) {
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 255u) {
+        if ((m != 0u) || ((w & 0x80000000u) != 0u)) {
+            return 0x7FC00000u;
+        }
+        return w;
+    }
+    if ((e == 0u) && (m == 0u)) {
+        return w;
+    }
+    if ((w & 0x80000000u) != 0u) {
+        return 0x7FC00000u;
+    }
+    if (e == 0u) {
+        // A subnormal is m 2^-149: its root is sqrt(2 m) 2^-75, and 2 m is exact in a float.
+        return FBITS(sqrt(float(m << 1u)) * 2.6469779601696886e-23f);
+    }
+    return FBITS(sqrt(UFLOAT(w)));
+}
+
+uint pk_uexp(uint w) {
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 255u) {
+        if (m != 0u) {
+            return 0x7FC00000u;
+        }
+        if ((w & 0x80000000u) != 0u) {
+            return 0u;
+        }
+        return w;
+    }
+    if (e < 97u) {
+        // Below 2^-30 in magnitude (zeros and subnormals included) the result is 1 in binary32.
+        return 0x3F800000u;
+    }
+    float v = UFLOAT(w);
+    // ln of the largest float is 88.7228: no 16-bit float lies between this bound and it.
+    if (v > 88.72f) {
+        return 0x7F800000u;
+    }
+    if (v < -104.0f) {
+        return 0u;
+    }
+    if (v < -87.0f) {
+        // The result is a binary32 subnormal, which a device may flush to zero: e^(v + 64 ln 2) is an ordinary
+        // float, and its product with 2^-64 is taken on the bits.
+        return pk_fmul(FBITS(exp(v + 44.3614195558365f)), 0x1F800000u);
+    }
+    return FBITS(exp(v));
+}
+
+uint pk_ulog(uint w) {
+    uint e = (w >> 23u) & 0xFFu;
+    uint m = w & 0x7FFFFFu;
+    if (e == 255u) {
+        if ((m != 0u) || ((w & 0x80000000u) != 0u)) {
+            return 0x7FC00000u;
+        }
+        return w;
+    }
+    if ((e == 0u) && (m == 0u)) {
+        return 0xFF800000u;
+    }
+    if ((w & 0x80000000u) != 0u) {
+        return 0x7FC00000u;
+    }
+    if (e == 0u) {
+        // A subnormal is m 2^-149: ln m - 149 ln 2.
+        return FBITS(log(float(m)) - 103.27892990343185f);
+    }
+    return FBITS(log(UFLOAT(w)));
+}
+
+uint pk_utanh(uint w) {
+    uint e = (w >> 23u) & 0xFFu;
+    if ((e == 255u) && ((w & 0x7FFFFFu) != 0u)) {
+        return 0x7FC00000u;
+    }
+    if (e >= 131u) {
+        // 16 and beyond, the infinities included: 1 in binary32, with the operand's sign.
+        return (w & 0x80000000u) | 0x3F800000u;
+    }
+    if (e < 114u) {
+        // Below 2^-13 the result is the operand to far more than 16-bit precision; zeros and subnormals come back whole.
+        return w;
+    }
+    return FBITS(tanh(UFLOAT(w)));
+}
+
+uint pk_usigmoid(uint w) {
+    uint e = (w >> 23u) & 0xFFu;
+    if (e == 255u) {
+        if ((w & 0x7FFFFFu) != 0u) {
+            return 0x7FC00000u;
+        }
+        if ((w & 0x80000000u) != 0u) {
+            return 0u;
+        }
+        return 0x3F800000u;
+    }
+    float v = UFLOAT(w);
+    if (v >= 17.0f) {
+        return 0x3F800000u;
+    }
+    if (v <= -104.0f) {
+        return 0u;
+    }
+    if (v < -80.0f) {
+        // e^-v would overflow on its way to the quotient; here the result is e^v to binary32 precision.
+        return pk_uexp(w);
+    }
+    return FBITS(1.0f / (1.0f + exp(-v)));
+}
+
 uint pk_w_f16(uint h) {
     uint sgn = (h & 0x8000u) << 16u;
     uint e = (h >> 10u) & 0x1Fu;
