@@ -236,9 +236,12 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             if (_paging) RestoreOutputForReplay(_order[i]);
             RunForward(_order[i], eng);
             if (_paging)
-                foreach (var t in _pageOutAt![i]) PageOut(t);
-            else if (_freeEng is not null)
-                foreach (var t in _freeAfterFwd![i]) _freeEng.FreeFloatActivation(t); // dead after forward
+            {
+                if (_pageOutAt is { } pageOutAt)
+                    foreach (var t in pageOutAt[i]) PageOut(t);
+            }
+            else if (_freeEng is not null && _freeAfterFwd is { } freeAfterForward)
+                foreach (var t in freeAfterForward[i]) _freeEng.FreeFloatActivation(t); // dead after forward
         }
         return _output;
     }

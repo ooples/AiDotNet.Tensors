@@ -82,13 +82,26 @@ internal static class NvmlNative
     private static bool IsLoadFailure(Exception ex) =>
         ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException;
 
+    private static int s_loadFailureLogged;
+
+    // NVML is optional (a machine without the NVIDIA driver has none), and telemetry polls: logged once.
+    private static void LogLoadFailure(Exception ex, string call)
+    {
+        if (System.Threading.Interlocked.Exchange(ref s_loadFailureLogged, 1) == 0)
+            System.Diagnostics.Trace.TraceInformation($"NVML is unavailable ({call}: {ex.GetType().Name}); device telemetry falls back to the CUDA driver.");
+    }
+
     /// <summary>The NVML handle of the device with this UUID ("GPU-xxxxxxxx-..."), or false when NVML is unavailable.</summary>
     internal static bool TryGetDevice(string uuid, out IntPtr device)
     {
         device = IntPtr.Zero;
         if (!EnsureInitialized()) return false;
         try { return (s_windows ? Windows.HandleByUuid(uuid, out device) : Linux.HandleByUuid(uuid, out device)) == 0; }
-        catch (Exception ex) when (IsLoadFailure(ex)) { return false; }
+        catch (Exception ex) when (IsLoadFailure(ex))
+        {
+            LogLoadFailure(ex, "query");
+            return false;
+        }
     }
 
     /// <summary>The device's kernel and memory utilization over NVML's last sample period, in percent.</summary>
@@ -104,7 +117,11 @@ internal static class NvmlNative
             memoryPercent = (int)rates.Memory;
             return true;
         }
-        catch (Exception ex) when (IsLoadFailure(ex)) { return false; }
+        catch (Exception ex) when (IsLoadFailure(ex))
+        {
+            LogLoadFailure(ex, "query");
+            return false;
+        }
     }
 
     /// <summary>
@@ -120,7 +137,12 @@ internal static class NvmlNative
             var v2 = new NvmlMemoryV2 { Version = s_memoryV2Version };
             int status;
             try { status = s_windows ? Windows.MemoryInfoV2(device, ref v2) : Linux.MemoryInfoV2(device, ref v2); }
-            catch (EntryPointNotFoundException) { status = -1; }
+            catch (EntryPointNotFoundException ex)
+            {
+                // An NVML without the version 2 query: the version 1 figure below.
+                LogLoadFailure(ex, "nvmlDeviceGetMemoryInfo_v2");
+                status = -1;
+            }
             if (status == 0)
             {
                 usedBytes = (long)v2.Used;
@@ -133,7 +155,11 @@ internal static class NvmlNative
             totalBytes = (long)v1.Total;
             return true;
         }
-        catch (Exception ex) when (IsLoadFailure(ex)) { return false; }
+        catch (Exception ex) when (IsLoadFailure(ex))
+        {
+            LogLoadFailure(ex, "query");
+            return false;
+        }
     }
 
     private static bool EnsureInitialized()
@@ -143,7 +169,11 @@ internal static class NvmlNative
         {
             if (s_state != 0) return s_state > 0;
             try { s_state = (s_windows ? Windows.Init() : Linux.Init()) == 0 ? 1 : -1; }
-            catch (Exception ex) when (IsLoadFailure(ex)) { s_state = -1; }
+            catch (Exception ex) when (IsLoadFailure(ex))
+            {
+                LogLoadFailure(ex, "nvmlInit_v2");
+                s_state = -1;
+            }
             return s_state > 0;
         }
     }

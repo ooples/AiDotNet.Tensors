@@ -306,6 +306,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
         {
             if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: {ex.GetType().Name}: {ex.Message}");
+            System.Diagnostics.Trace.TraceWarning(
+                $"Compiled plan {_planId} could not lend its idle step memory ({ex.GetType().Name}); the allocation is served without it.");
             return null;
         }
         finally

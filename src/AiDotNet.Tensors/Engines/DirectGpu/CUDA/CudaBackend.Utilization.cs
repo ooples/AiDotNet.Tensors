@@ -48,6 +48,11 @@ public sealed partial class CudaBackend : IDeviceUtilization
             uuid = "GPU-" + hex;
             return true;
         }
-        catch (EntryPointNotFoundException) { return false; }
+        catch (EntryPointNotFoundException ex)
+        {
+            // A driver older than cuDeviceGetUuid_v2: no NVML telemetry for this device.
+            System.Diagnostics.Trace.TraceInformation($"The CUDA driver cannot report a device UUID ({ex.GetType().Name}); NVML telemetry is off.");
+            return false;
+        }
     }
 }

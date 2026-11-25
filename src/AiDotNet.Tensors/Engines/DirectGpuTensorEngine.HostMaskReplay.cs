@@ -39,7 +39,8 @@ public partial class DirectGpuTensorEngine
         HostMaskDeviceCopy copy;
         lock (_hostMaskLock)
         {
-            if (!_hostMaskCopies.TryGetValue(mask, out copy!))
+            if (_hostMaskCopies.TryGetValue(mask, out var known) && known is not null) copy = known;
+            else
             {
                 // A copy first made inside a capture would be an upload in the captured stream. Refuse, so the capture
                 // fails and the step runs uncaptured; the eager steps before a capture make the copies it reads.
@@ -52,7 +53,7 @@ public partial class DirectGpuTensorEngine
         }
         RefreshHostMaskDeviceCopy(backend, copy, mask);
         RecordHostMaskBinding(copy, mask);
-        return copy.Buffer!;
+        return copy.Buffer ?? throw new InvalidOperationException("A host mask's device copy was not allocated.");
     }
 
     private static void RefreshHostMaskDeviceCopy(IDirectGpuBackend backend, HostMaskDeviceCopy copy, Tensor<bool> mask)
@@ -91,7 +92,8 @@ public partial class DirectGpuTensorEngine
         if (bindings is null || !ReferenceEquals(bindings.Engine, this)) return;
         foreach (var binding in bindings.Masks)
             if (ReferenceEquals(binding.Copy, copy)) return;
-        bindings.Masks.Add((copy, mask, copy.Buffer!.Handle));
+        if (copy.Buffer is not { } buffer) throw new InvalidOperationException("A host mask's device copy was not allocated.");
+        bindings.Masks.Add((copy, mask, buffer.Handle));
     }
 
     // Before a replay (outside the capture): a mask the caller rewrote since the capture is uploaded into the buffer the

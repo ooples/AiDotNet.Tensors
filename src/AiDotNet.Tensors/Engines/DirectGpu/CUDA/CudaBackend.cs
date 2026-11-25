@@ -15640,6 +15640,25 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// plan's gradient buffers are stable from step to step, so the tables are built and uploaded once and reused;
     /// rebuilding them per call would cost seven allocations and uploads, more than the kernels themselves.
     /// </summary>
+    /// <summary>
+    /// The first <paramref name="count"/> frames of <paramref name="trace"/> as Type.Method, outside the types whose
+    /// full name holds one of <paramref name="skipTypes"/> (the allocator's own frames). Diagnostics only.
+    /// </summary>
+    internal static List<string> CallerFrames(System.Diagnostics.StackTrace trace, int count, params string[] skipTypes)
+    {
+        var names = new List<string>(count);
+        foreach (var frame in trace.GetFrames() ?? Array.Empty<System.Diagnostics.StackFrame>())
+        {
+            if (names.Count == count) break;
+            if (frame?.GetMethod() is not { DeclaringType: { } type } method) continue;
+            string typeName = type.FullName ?? type.Name;
+            bool skip = false;
+            foreach (var skipped in skipTypes) skip |= typeName.Contains(skipped);
+            if (!skip) names.Add(type.Name + "." + method.Name);
+        }
+        return names;
+    }
+
     private sealed class MultiTensorTable : IDisposable
     {
         public IntPtr[] Handles = Array.Empty<IntPtr>();
@@ -21865,10 +21884,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 _capturePool = capture;
                 if (s_captureAllocStacks)
                 {
-                    var frames = new System.Diagnostics.StackTrace(1, false).GetFrames()
-                        .Select(f => f.GetMethod()).Where(m => m is not null && m.DeclaringType is { } t
-                            && !t.FullName!.Contains("CudaBackend") && !t.FullName.Contains("CaptureMemory"))
-                        .Take(6).Select(m => m!.DeclaringType!.Name + "." + m.Name);
+                    var frames = CallerFrames(new System.Diagnostics.StackTrace(1, false), 6, "CudaBackend", "CaptureMemory");
                     AiDotNet.Tensors.Engines.AiDotNetEngine.LogDiagnostic(
                         $"[CAPTURE-ALLOC] bytes={(long)size * sizeof(float)} at {string.Join(" < ", frames)}");
                 }

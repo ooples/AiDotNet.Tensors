@@ -172,12 +172,15 @@ public sealed partial class CudaBackend
             if (parked is null) return;
             foreach (var release in parked)
             {
-                try { release(); } catch { /* one buffer's free must not strand the rest */ }
+                // One buffer's free must not strand the rest.
+                try { release(); }
+                catch (Exception ex) { System.Diagnostics.Trace.TraceWarning($"A capture's parked buffer could not be freed: {ex.GetType().Name}."); }
             }
             // Memory released within the capture and never handed out again goes with the graph.
             foreach (var lease in free)
             {
-                try { lease.Release(); } catch { /* as above */ }
+                try { lease.Release(); }
+                catch (Exception ex) { System.Diagnostics.Trace.TraceWarning($"A capture's released memory could not be freed: {ex.GetType().Name}."); }
             }
         }
     }

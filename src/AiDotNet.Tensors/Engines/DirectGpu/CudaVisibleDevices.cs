@@ -82,6 +82,9 @@ internal static class CudaVisibleDevices
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)
         {
+            // No CUDA driver to ask: the caller reads full GPU- UUIDs from the variable itself.
+            System.Diagnostics.Trace.TraceInformation(
+                $"CUDA_VISIBLE_DEVICES could not be resolved through the CUDA driver ({ex.GetType().Name}); only GPU- UUIDs in it are applied to Vulkan.");
             return null;
         }
     }

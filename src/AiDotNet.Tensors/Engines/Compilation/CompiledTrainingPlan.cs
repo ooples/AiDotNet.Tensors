@@ -5622,7 +5622,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var pool = _scratchPool!;
         var steps = _forwardSteps;
-        if (trackOutput && steps is not null && action < _spanStepOfAction!.Length && _spanStepOfAction[action] is int s and >= 0
+        if (trackOutput && steps is not null && _spanStepOfAction is { } spanSteps && action < spanSteps.Length && spanSteps[action] is int s and >= 0
             && steps[s].OutputBuffer is Tensor<float> output && output.TryGetGpuBuffer() is { } buffer)
         {
             int release = _spanReleaseAfter![s];

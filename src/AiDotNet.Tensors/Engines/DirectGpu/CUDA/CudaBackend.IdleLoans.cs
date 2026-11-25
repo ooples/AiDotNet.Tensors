@@ -276,9 +276,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
             var borrower = CudaGpuBuffer.ForIdleLoan(_cudaContext, best.Base + (nint)offset, size);
             var loan = new IdleLoan(this, best, offset, need, borrower);
             if (s_idleLoanDiag)
-                loan.Origin = string.Join(" < ", new System.Diagnostics.StackTrace(2, false).GetFrames()
-                    .Select(f => f.GetMethod()).Where(m => m?.DeclaringType is { } t && !t.FullName!.Contains("CudaBackend"))
-                    .Take(5).Select(m => m!.DeclaringType!.Name + "." + m.Name));
+                loan.Origin = string.Join(" < ", CallerFrames(new System.Diagnostics.StackTrace(2, false), 5, "CudaBackend"));
             borrower.AttachIdleLoan(loan);
             _idleLoans.Add(loan);
             _idleLoanCount++;

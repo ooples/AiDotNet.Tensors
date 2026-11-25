@@ -17,6 +17,10 @@ internal sealed class GradientExchange<T>
     private readonly Engines.DirectGpu.IGpuBuffer?[] _deviceGradients;
     private readonly Engines.DirectGpu.IDirectGpuBackend? _backend;
 
+    // A device gradient or loss is only ever recorded with the backend that holds it.
+    private Engines.DirectGpu.IDirectGpuBackend Backend
+        => _backend ?? throw new InvalidOperationException("A gradient on the device was exchanged without its backend.");
+
     private readonly Tensor<T> _loss;
     private readonly Engines.DirectGpu.IGpuBuffer? _deviceLoss;
 
@@ -53,7 +57,7 @@ internal sealed class GradientExchange<T>
         if (_deviceLoss is { } buffer)
         {
             var host = new float[buffer.Size];
-            _backend!.DownloadBuffer(buffer, host);
+            Backend.DownloadBuffer(buffer, host);
             return (T)(object)host[0];
         }
         using var lease = _loss.LeaseArray();
@@ -73,7 +77,7 @@ internal sealed class GradientExchange<T>
             {
                 // Synchronizes the compute stream first, so the backward that wrote the buffer has finished.
                 var host = new float[buffer.Size];
-                _backend!.DownloadBuffer(buffer, host);
+                Backend.DownloadBuffer(buffer, host);
                 Array.Copy(host, 0, (float[])(object)destination, offset, length);   // device gradients are float
             }
             else
@@ -98,7 +102,7 @@ internal sealed class GradientExchange<T>
             {
                 var host = new float[length];
                 Array.Copy((float[])(object)source, offset, host, 0, length);
-                _backend!.UploadBufferInPlace(host, buffer);   // synchronous: done before the update launches
+                Backend.UploadBufferInPlace(host, buffer);   // synchronous: done before the update launches
             }
             else
             {

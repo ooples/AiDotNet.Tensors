@@ -202,19 +202,20 @@ public sealed partial class CudaBackend
         long outputs = (long)p.M * p.N;
         float alphaValue = alpha, zero = 0f, one = 1f, betaValue = beta;
         IntPtr handle = _cublasHandle;
-        var tc = _threadCublas!.Value!;
+        // EnsureSplitKBuffers gave this thread both buffers before any split-K route is run.
+        if (_threadCublas?.Value is not { SplitKPartials: { } partials, SplitKOnes: { } ones }) return false;
         if (CuBlasNative.cublasGemmStridedBatchedEx(handle,
                 p.TransA ? CublasOperation.Transpose : CublasOperation.None,
                 p.TransB ? CublasOperation.Transpose : CublasOperation.None,
                 p.M, p.N, kc, (IntPtr)(&alphaValue), a, p.InputType, p.Lda, strideA,
                 b, p.InputType, p.Ldb, strideB, (IntPtr)(&zero),
-                tc.SplitKPartials!.Handle, CuBlasNative.CUDA_R_32F, p.M, outputs, splits, p.Compute,
+                partials.Handle, CuBlasNative.CUDA_R_32F, p.M, outputs, splits, p.Compute,
                 CuBlasNative.CUBLAS_GEMM_DEFAULT) != Engines.CublasStatus.Success)
             return false;
         // D = partials[outputs x splits] * ones[splits] + beta * D, in strict FP32 and a fixed order.
         return CuBlasNative.cublasGemmEx(handle, CublasOperation.None, CublasOperation.None,
-            checked((int)outputs), 1, splits, (IntPtr)(&one), tc.SplitKPartials.Handle, CuBlasNative.CUDA_R_32F,
-            checked((int)outputs), tc.SplitKOnes!.Handle, CuBlasNative.CUDA_R_32F, splits, (IntPtr)(&betaValue),
+            checked((int)outputs), 1, splits, (IntPtr)(&one), partials.Handle, CuBlasNative.CUDA_R_32F,
+            checked((int)outputs), ones.Handle, CuBlasNative.CUDA_R_32F, splits, (IntPtr)(&betaValue),
             d, CuBlasNative.CUDA_R_32F, checked((int)outputs), CuBlasNative.CUBLAS_COMPUTE_32F_PEDANTIC,
             CuBlasNative.CUBLAS_GEMM_DEFAULT) == Engines.CublasStatus.Success;
     }

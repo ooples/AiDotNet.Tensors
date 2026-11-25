@@ -113,6 +113,10 @@ internal sealed partial class CompiledTrainingPlan<T>
                 "Activation checkpointing inside a compiled training plan needs every backward action to report the forward "
                 + "steps it covers (a fused or analytic backward does not), to know where each segment's backward starts.");
 
+        // Every backward action's covered steps (none is missing: refused above).
+        var coverage = new int[actionCoverage.Count][];
+        for (int a = 0; a < coverage.Length; a++) coverage[a] = actionCoverage[a] ?? Array.Empty<int>();
+
         var cmp = Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance;
         var seg = new int[n];
         for (int i = 0; i < n; i++) seg[i] = forwardSteps[i].CheckpointSegment;
@@ -181,8 +185,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         var firstBackward = Enumerable.Repeat(int.MaxValue, segments).ToArray();
         var lastBackward = Enumerable.Repeat(-1, segments).ToArray();
         var backwardRuns = new bool[n];
-        for (int a = 0; a < actionCoverage.Count; a++)
-            foreach (int s in actionCoverage[a]!)
+        for (int a = 0; a < coverage.Length; a++)
+            foreach (int s in coverage[a])
             {
                 backwardRuns[s] = true;
                 if (seg[s] < 0) continue;
@@ -268,8 +272,8 @@ internal sealed partial class CompiledTrainingPlan<T>
                 if (item is null) return;
                 lastRead[item] = lastRead.TryGetValue(item, out int prior) ? Math.Max(prior, a) : a;
             }
-            for (int a = 0; a < actionCoverage.Count; a++)
-                foreach (int st in actionCoverage[a]!)
+            for (int a = 0; a < coverage.Length; a++)
+                foreach (int st in coverage[a])
                 {
                     if (seg[st] != k) continue;
                     var step = forwardSteps[st];
@@ -284,8 +288,8 @@ internal sealed partial class CompiledTrainingPlan<T>
             // has its backward at the very end of the step and reads nothing the recompute wrote).
             var recomputedOutputs = new HashSet<Tensor<T>>(steps.Select(st => forwardSteps[st].OutputBuffer), cmp);
             int useEnd = -1;
-            for (int a = 0; a < actionCoverage.Count; a++)
-                foreach (int st in actionCoverage[a]!)
+            for (int a = 0; a < coverage.Length; a++)
+                foreach (int st in coverage[a])
                     if (seg[st] == k && (recompute[k].Contains(st) || forwardSteps[st].Inputs.Any(i => i is not null && recomputedOutputs.Contains(i))))
                         useEnd = Math.Max(useEnd, a);
             schedule.LastBackward[k] = useEnd;
@@ -422,8 +426,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// </summary>
     private void ApplyCheckpointLifetimes()
     {
-        var schedule = _checkpoint!;
-        var forwardSteps = _forwardSteps!;
+        if (_checkpoint is not { } schedule || _forwardSteps is not { } forwardSteps) return;
         var firstBackwardOfSegment = schedule.FirstBackward;
         if (_lastBackwardReads is not { } lastReads) return;
         for (int k = 0; k < schedule.SegmentCount; k++)
@@ -478,9 +481,10 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// <summary>Starts holding the leases of forward action <paramref name="action"/> when its segment releases them.</summary>
     private bool CheckpointHoldsForwardAction(int action, StepScratchPool pool)
     {
-        int k = _checkpoint!.SegmentOfForwardAction[action];
+        if (_checkpoint is not { } schedule) return false;
+        int k = schedule.SegmentOfForwardAction[action];
         if (k < 0) return false;
-        pool.HoldLeasesIn = _checkpoint.HeldForward[k];
+        pool.HoldLeasesIn = schedule.HeldForward[k];
         return true;
     }
 
@@ -491,7 +495,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void CheckpointAfterForwardAction(int action, StepScratchPool pool)
     {
         pool.HoldLeasesIn = null;
-        if (_checkpoint!.ReleaseAfterForwardAction[action] is not { } segments) return;
+        if (_checkpoint is null || _checkpoint.ReleaseAfterForwardAction[action] is not { } segments) return;
         foreach (int k in segments)
         {
             var held = _checkpoint.HeldForward[k];
@@ -521,7 +525,7 @@ internal sealed partial class CompiledTrainingPlan<T>
                 var buffer = held[j];
                 var root = GpuBufferViewRoot.Of(buffer);
                 if (keep.Contains(root)) pool.PinSpanLease(buffer);
-                else if (segmentEnds || (releaseAt!.TryGetValue(root, out int after) && after <= action))
+                else if (segmentEnds || (releaseAt is not null && releaseAt.TryGetValue(root, out int after) && after <= action))
                 {
                     pool.EndSpanLease(buffer);
                     released.Add(root);
@@ -541,7 +545,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void CheckpointBeforeBackwardAction(int action, IEngine engine, DirectGpuTensorEngine? de, StepScratchPool? pool,
         IDirectGpuBackend backend, bool capturing, Action<IEngine>[] forward, int recomputeKeyBase)
     {
-        if (_checkpoint!.RecomputeBeforeBackward[action] is not { } segments) return;
+        if (_checkpoint is null || _checkpoint.RecomputeBeforeBackward[action] is not { } segments) return;
         foreach (int k in segments)
         {
             var state = _checkpoint.State[k];
@@ -576,7 +580,9 @@ internal sealed partial class CompiledTrainingPlan<T>
                 if (de is not null) de.StochasticSeedPosition = seedPosition;
             }
             for (int j = 0; j < state.Length; j++)
-                CopyDevice(backend, _checkpoint.Current[k][j]!, StateBuffer(state[j], k), state[j].Length);
+                CopyDevice(backend,
+                    _checkpoint.Current[k][j] ?? throw new InvalidOperationException($"Checkpoint segment {k}: its current state was not saved before the recompute."),
+                    StateBuffer(state[j], k), state[j].Length);
             if (!capturing) _checkpoint.RecomputeRuns++;
             ScheduleRecomputeReleases(k, action, pool);
         }
@@ -591,7 +597,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// </summary>
     private void ScheduleRecomputeReleases(int k, int action, StepScratchPool? pool)
     {
-        var cp = _checkpoint!;
+        if (_checkpoint is not { } cp) return;
         var releaseAt = new Dictionary<IGpuBuffer, int>(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
         foreach (var (item, at) in cp.BackwardReads[k])
         {
@@ -622,7 +628,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// <summary>After backward action <paramref name="action"/>: releases the recomputed buffers whose last reader ran.</summary>
     private void CheckpointAfterBackwardAction(int action, StepScratchPool? pool)
     {
-        var cp = _checkpoint!;
+        if (_checkpoint is not { } cp) return;
         for (int k = 0; k < cp.SegmentCount; k++)
         {
             var pending = cp.Pending[k];

@@ -88,8 +88,10 @@ public sealed partial class CudaBackend : IDeviceGradScalerFactory
                 || !_backend._kernelCache.TryGetValue("gs_update", out var update))
                 throw new GpuCapabilityUnavailableException("CUDA kernels not found: gs_unscale / gs_update");
             using var _ = _backend.PushContext();
-            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle,
-                csH = table.ChunkStart!.Handle, stH = State.Handle, seedH = seed.Handle;
+            if (table is not { Pointers: { } pointers, SizesBuffer: { } sizes, ChunkTensor: { } chunkTensor, ChunkStart: { } chunkStart })
+                throw new ObjectDisposedException(nameof(CudaDeviceGradScaler));
+            IntPtr pH = pointers.Handle, sH = sizes.Handle, ctH = chunkTensor.Handle,
+                csH = chunkStart.Handle, stH = State.Handle, seedH = seed.Handle;
             int total = table.TotalChunks, chunk = GradientTableChunk;
             void** a = stackalloc void*[7];
             a[0] = &pH; a[1] = &sH; a[2] = &ctH; a[3] = &csH; a[4] = &total; a[5] = &chunk; a[6] = &stH;

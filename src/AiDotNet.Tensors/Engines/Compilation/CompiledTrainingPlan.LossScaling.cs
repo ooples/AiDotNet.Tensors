@@ -78,7 +78,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             if (_lossScaleOnDevice)
             {
                 try { _lossScaleHost = device.Read(); }
-                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+                {
+                    // The device is gone (the backend was disposed first): the host copy keeps the last state read.
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"The device loss scale could not be read back before its scaler was released ({ex.GetType().Name}); "
+                        + $"the plan keeps scale {_lossScaleHost.Scale} from its last read.");
+                }
             }
             device.Dispose();
         }
@@ -142,7 +148,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     // The device scaler over the current gradient buffers, holding the current state; null when there is none.
     private Engines.DirectGpu.IDeviceGradScaler? EnsureLossScaleDevice(Engines.DirectGpu.IDeviceGradScalerFactory factory)
     {
-        var options = _lossScaling!;
+        var options = _lossScaling ?? throw new InvalidOperationException("Loss scaling is off.");
         if (_lossScaleDevice is { } existing && existing.Covers(_lossScaleBuffers, _lossScaleSizes))
         {
             if (!_lossScaleOnDevice)
@@ -246,7 +252,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
 
     private void AdvanceHostLossScale(bool nonFinite)
     {
-        var options = _lossScaling!;
+        var options = _lossScaling ?? throw new InvalidOperationException("Loss scaling is off.");
         var state = _lossScaleHost;
         float scale = state.Scale;
         int tracker = state.GrowthTracker;
