@@ -243,6 +243,8 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
         if (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
+        // .NET Framework has no resolver for cuBLASLt, and a CUDA install may lack it: that route is then not offered.
+        Skip.If(route == 0 && !CuBlasLtMatmul.IsAvailable, "cuBLASLt is not loadable here.");
         const int m = 96, n = 80, k = 4096;
         const float alpha = 0.5f, beta = 2f;
         int lda = transA ? k : m, ldb = transB ? n : k, ldd = m;

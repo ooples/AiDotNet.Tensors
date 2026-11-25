@@ -79,7 +79,9 @@ public sealed partial class CudaBackend
 
     private (Helpers.Autotune.KernelId Id, Helpers.Autotune.ShapeProfile Shape) AutocastGemmKey(in AutocastGemmProblem p)
     {
-        ulong version = CuBlasLtNative.cublasLtGetVersion().ToUInt64();
+        // No cuBLASLt (not installed, or .NET Framework, which has no resolver for it) keys as "lt0": its candidate set
+        // has no cuBLASLt route, so its recorded winner must not be confused with a build that has one.
+        ulong version = TryGetCuBlasLt() is null ? 0 : CuBlasLtNative.cublasLtGetVersion().ToUInt64();
         string input = p.InputType == CuBlasNative.CUDA_R_32F ? string.Empty : "-i" + p.InputType;
         var id = new Helpers.Autotune.KernelId("cublas-autocast-gemm", $"{DeviceName}-sm{_ccMajor}{_ccMinor}-lt{version}-c{p.Compute}{input}");
         return (id, new Helpers.Autotune.ShapeProfile(p.TransA ? 1 : 0, p.TransB ? 1 : 0, p.M, p.N, p.K, p.Lda, p.Ldb, p.Ldd));
@@ -112,14 +114,16 @@ public sealed partial class CudaBackend
     {
         // cuBLASLt here takes FP32 operands only, so 16-bit operands choose between the classic GemmEx and split-K.
         bool castOperands = p.InputType != CuBlasNative.CUDA_R_32F;
-        var lt = castOperands ? (AutocastGemmRoute.Classic, 0) : (AutocastGemmRoute.Lt, 0);
+        // Without cuBLASLt the FP32-operand problem chooses between the same routes as a 16-bit one.
+        bool noLtRoute = castOperands || TryGetCuBlasLt() is null;
+        var lt = noLtRoute ? (AutocastGemmRoute.Classic, 0) : (AutocastGemmRoute.Lt, 0);
         var (id, shape) = AutocastGemmKey(p);
         if (Helpers.Autotune.AutotuneCache.Lookup(id, shape) is { } recorded && ParseRoute(recorded.Variant) is { } parsed)
             return parsed;
         // A capture cannot time (or allocate): cuBLASLt runs and nothing is recorded, so a later uncaptured call measures.
         if (IsStreamCapturing()) return lt;
 
-        var candidates = castOperands
+        var candidates = noLtRoute
             ? new List<(AutocastGemmRoute, int)> { lt }
             : new List<(AutocastGemmRoute, int)> { lt, (AutocastGemmRoute.Classic, 0) };
         foreach (int s in SplitKCandidates(p)) candidates.Add((AutocastGemmRoute.SplitK, s));
