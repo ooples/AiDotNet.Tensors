@@ -7,7 +7,9 @@ namespace AiDotNet.Tensors.LinearAlgebra.Decompositions;
 /// Eigenvalues come out as (real, imag) pairs along a trailing size-2 axis; right eigenvectors do
 /// the same, one per column.
 ///
-/// <para>float and double inputs run in double precision: diagonal balancing (EISPACK
+/// <para>float, double, Half and BFloat16 inputs run in double precision (narrow types are rounded on output);
+/// decimal runs the same algorithm in decimal (<see cref="GenericLinalg{T}.EigWorkspace"/>) without
+/// balancing. The double kernel performs diagonal balancing (EISPACK
 /// <c>balanc</c>, scaling only), Householder reduction to upper-Hessenberg form (<c>orthes</c>/<c>ortran</c>),
 /// then the Francis double-shift QR algorithm with deflation and exceptional shifts, followed by
 /// back-substitution on the real Schur form for the eigenvectors (<c>hqr2</c>). Everything works in
@@ -65,14 +67,19 @@ internal static class EigDecomposition
         int vecStride = n * n * 2;
 
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            GenericLinalg<T>.EnsureSupported("Eig");
+        if (n == 0 || batch == 0) return (eigvals, eigvecs);
+
+        if (typeof(T) == typeof(decimal))
         {
-            // decimal / Half / BFloat16: Hessenberg + Francis double-shift QR carried out in T.
+            // decimal carries 28 digits, more than double: the same algorithm runs in T.
+            var genericWork = new GenericLinalg<T>.EigWorkspace(n);
             for (int b = 0; b < batch; b++)
-                GenericLinalg<T>.Eig(inData, b * matStride, valData, b * valStride, vecData, b * vecStride, n);
+                genericWork.Solve(inData, b * matStride, valData, b * valStride, vecData, b * vecStride);
             return (eigvals, eigvecs);
         }
 
-        if (n == 0 || batch == 0) return (eigvals, eigvecs);
+        // float, double, and the narrow Half / BFloat16 (accumulated in double, rounded on output).
         var work = new Workspace(n);
         for (int b = 0; b < batch; b++)
         {
@@ -710,13 +717,13 @@ internal static class EigDecomposition
     {
         if (typeof(T) == typeof(float)) return (float)(object)v!;
         if (typeof(T) == typeof(double)) return (double)(object)v!;
-        throw new NotSupportedException($"Eig requires float or double, got {typeof(T).Name}.");
+        return Real<T>.Ops.ToDouble(v);
     }
 
     private static T FromDouble<T>(double v)
     {
         if (typeof(T) == typeof(float)) return (T)(object)(float)v;
         if (typeof(T) == typeof(double)) return (T)(object)v;
-        throw new NotSupportedException($"Eig requires float or double, got {typeof(T).Name}.");
+        return Real<T>.Ops.FromDouble(v);
     }
 }

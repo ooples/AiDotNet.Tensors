@@ -58,10 +58,19 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// print(ev(reservoir(37, .3, 4)))
 /// for size, dens, seed in [(100, .1, 1), (37, .3, 4), (100, 1.0, 3), (200, .05, 5)]:
 ///     print(np.abs(np.linalg.eigvals(reservoir(size, dens, seed))).max())
+/// # Half inputs: the same matrices rounded to float16 first
+/// print(ev(A.astype(np.float16).astype(np.float64)))
+/// print(np.abs(np.linalg.eigvals(reservoir(37, .3, 4).astype(np.float16).astype(np.float64))).max())
 /// </code>
 /// </summary>
 public class LinalgEigReferenceTests
 {
+    private static readonly double[] RandomSixExpected =
+    {
+        -2.167014102762344, 0.0, -0.8887516682348182, -0.34126802245752774, -0.8887516682348182, 0.34126802245752774,
+        0.8493781868627006, -0.9279408968174128, 0.8493781868627006, 0.9279408968174128, 2.02856106550658, 0.0,
+    };
+
     [Fact]
     public void RandomNonsymmetric_WithComplexPairs_MatchesNumpy()
     {
@@ -245,6 +254,154 @@ public class LinalgEigReferenceTests
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
 
         Assert.True(allocated < 1_000_000, $"Eig of a 100x100 matrix allocated {allocated:N0} bytes");
+    }
+#endif
+
+    // ── decimal: Hessenberg + Francis QR + Schur back-substitution carried out in decimal ──
+
+    [Fact]
+    public void Decimal_RandomNonsymmetric_MatchesNumpy()
+    {
+        var a = new[]
+        {
+            -0.7931m, 0.2406m, -1.8963m, 1.3958m, 0.6383m, -0.292m,
+            -0.3119m, 0.3038m, -0.2677m, -0.2259m, 0.7201m, 0.5147m,
+            -0.0641m, -0.0855m, 0.1609m, -0.614m, -0.4038m, 0.5483m,
+            -0.1305m, -1.3744m, -0.4773m, 0.6566m, -0.2323m, -0.1487m,
+            0.6418m, 1.8246m, -0.7132m, 1.3482m, -1.23m, 0.175m,
+            -1.1695m, 1.3515m, 0.8339m, 1.1377m, -0.8855m, 0.6846m,
+        };
+        var (wt, vt) = Linalg.Eig(new Tensor<decimal>(a, new[] { 6, 6 }));
+        var w = wt.GetDataArray();
+        var v = vt.GetDataArray();
+        var actual = new double[12];
+        for (int i = 0; i < 12; i++) actual[i] = (double)w[i];
+        AssertSpectraMatch(RandomSixExpected, actual, 1e-12);
+
+        // Decimal eigenpairs are far tighter than the double oracle: A·v = λ·v to 1e-20 with unit norm.
+        for (int k = 0; k < 6; k++)
+        {
+            decimal lr = w[k * 2], li = w[k * 2 + 1], norm2 = 0m;
+            for (int r = 0; r < 6; r++)
+            {
+                decimal avr = 0m, avi = 0m;
+                for (int c = 0; c < 6; c++)
+                {
+                    avr += a[r * 6 + c] * v[(c * 6 + k) * 2];
+                    avi += a[r * 6 + c] * v[(c * 6 + k) * 2 + 1];
+                }
+                decimal xr = v[(r * 6 + k) * 2], xi = v[(r * 6 + k) * 2 + 1];
+                Assert.True(Math.Abs(avr - (lr * xr - li * xi)) < 1e-20m, $"eigenpair {k} row {r} (re)");
+                Assert.True(Math.Abs(avi - (lr * xi + li * xr)) < 1e-20m, $"eigenpair {k} row {r} (im)");
+                norm2 += xr * xr + xi * xi;
+            }
+            Assert.True(Math.Abs(norm2 - 1m) < 1e-24m, $"eigenvector {k} squared norm {norm2}");
+        }
+    }
+
+    [Fact]
+    public void Decimal_AiDotNetReservoir37_SpectralRadiusMatchesNumpy()
+    {
+        // (decimal)double keeps 15 significant digits: a ~1e-16 relative perturbation of the numpy matrix.
+        var src = RandomReservoir(37, 0.3, 4);
+        var a = new decimal[src.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = (decimal)src[i];
+        var w = Linalg.Eigvals(new Tensor<decimal>(a, new[] { 37, 37 })).GetDataArray();
+        double radius = 0;
+        for (int k = 0; k < 37; k++) radius = Math.Max(radius, Math.Sqrt((double)(w[k * 2] * w[k * 2] + w[k * 2 + 1] * w[k * 2 + 1])));
+        Assert.Equal(0.9486365196746817, radius, 10);
+    }
+
+    // ── Half: accumulated in double, rounded to Half on output ──
+
+    [Fact]
+    public void Half_RandomNonsymmetric_MatchesNumpyOnTheRoundedMatrix()
+    {
+        var src = new[]
+        {
+            -0.7931, 0.2406, -1.8963, 1.3958, 0.6383, -0.292,
+            -0.3119, 0.3038, -0.2677, -0.2259, 0.7201, 0.5147,
+            -0.0641, -0.0855, 0.1609, -0.614, -0.4038, 0.5483,
+            -0.1305, -1.3744, -0.4773, 0.6566, -0.2323, -0.1487,
+            0.6418, 1.8246, -0.7132, 1.3482, -1.23, 0.175,
+            -1.1695, 1.3515, 0.8339, 1.1377, -0.8855, 0.6846,
+        };
+        var a = new Half[src.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = (Half)src[i];
+        var expected = new[]
+        {
+            -2.167222942525127, 0.0, -0.8886911191462048, -0.34152753624919174, -0.8886911191462048, 0.34152753624919174,
+            0.8491950924991476, -0.927896888689763, 0.8491950924991476, 0.927896888689763, 2.028685698944235, 0.0,
+        };
+        var (wt, vt) = Linalg.Eig(new Tensor<Half>(a, new[] { 6, 6 }));
+        var w = wt.GetDataArray();
+        var v = vt.GetDataArray();
+        var actual = new double[12];
+        for (int i = 0; i < 12; i++) actual[i] = (double)w[i];
+        // Only the output rounding remains: half an ulp of Half at |λ| ≈ 2 is 9.8e-4.
+        AssertSpectraMatch(expected, actual, 1e-3);
+        for (int k = 0; k < 6; k++)
+        {
+            double norm2 = 0;
+            for (int r = 0; r < 6; r++)
+            {
+                double xr = (double)v[(r * 6 + k) * 2], xi = (double)v[(r * 6 + k) * 2 + 1];
+                norm2 += xr * xr + xi * xi;
+            }
+            Assert.True(Math.Abs(norm2 - 1) < 4e-3, $"Half eigenvector {k} squared norm {norm2}");
+        }
+    }
+
+    [Fact]
+    public void Half_AiDotNetReservoir37_SpectralRadiusMatchesNumpyOnTheRoundedMatrix()
+    {
+        var src = RandomReservoir(37, 0.3, 4);
+        var a = new Half[src.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = (Half)src[i];
+        var w = Linalg.Eigvals(new Tensor<Half>(a, new[] { 37, 37 })).GetDataArray();
+        double radius = 0;
+        for (int k = 0; k < 37; k++)
+        {
+            double re = (double)w[k * 2], im = (double)w[k * 2 + 1];
+            radius = Math.Max(radius, Math.Sqrt(re * re + im * im));
+        }
+        Assert.True(Math.Abs(radius - 0.9486886876240023) < 1e-3, $"Half spectral radius {radius}");
+    }
+
+#if NET5_0_OR_GREATER
+    [Fact]
+    public void Decimal40x40_AllocatesOnlyOutputsAndOneWorkspace()
+    {
+        // Outputs 40x40x2 + 40x2 decimals (~52 KB) and two 40x40 workspaces (~51 KB); the old dense 80x80
+        // inverse iteration per eigenvalue allocated O(n³).
+        var src = RandomReservoir(40, 0.3, 9);
+        var a = new decimal[src.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = (decimal)src[i];
+        var input = new Tensor<decimal>(a, new[] { 40, 40 });
+        Linalg.Eig(input);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Linalg.Eig(input);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 300_000, $"decimal Eig of a 40x40 matrix allocated {allocated:N0} bytes");
+    }
+
+    [Fact]
+    public void Half100x100_AllocatesOnlyOutputsAndOneWorkspace()
+    {
+        // Outputs 100x100x2 + 100x2 Halfs (~40 KB) and the double workspace (~160 KB).
+        var src = RandomReservoir(100, 0.1, 7);
+        var a = new Half[src.Length];
+        for (int i = 0; i < a.Length; i++) a[i] = (Half)src[i];
+        var input = new Tensor<Half>(a, new[] { 100, 100 });
+        Linalg.Eig(input);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Linalg.Eig(input);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 600_000, $"Half Eig of a 100x100 matrix allocated {allocated:N0} bytes");
     }
 #endif
 
