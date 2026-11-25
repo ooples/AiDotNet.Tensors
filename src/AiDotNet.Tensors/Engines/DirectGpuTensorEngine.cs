@@ -6584,9 +6584,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // resident/cached fast path. A contiguous view with a storage offset,
         // or a view into a larger backing allocation, is not a canonical base
         // pointer and cannot be passed to a stride-free device kernel.
+        // Such a view (a parameter of a trained model is a view into one flat ParameterBuffer storage: offset != 0,
+        // or a prefix at offset 0) is NOT an error: it is materialized as a buffer holding exactly its Length
+        // elements from its element 0 -- GetOrAllocateBuffer's view path (device-authoritative parameter view,
+        // device slice / strided gather, or a dense host copy with its own cache key), the same resolution
+        // GetResidentOrPersistentInputBuffer gives a partial view. None of the fast paths below (which key off the
+        // shared backing array and would hand back the WHOLE storage's buffer) is reached for it.
         if (!IsCanonicalDenseAllocation(tensor))
-            throw new InvalidOperationException(
-                "GPU destination-aware tensor ops require a contiguous, dense, zero-offset canonical allocation.");
+        {
+            if (tensor.IsSparse)
+                throw new InvalidOperationException(
+                    "GPU destination-aware tensor ops require a dense input; a sparse tensor has no dense device layout.");
+            return GetOrAllocateBuffer(backend, tensor);
+        }
         if (TryBf16StreamingWeight(backend, tensor, out var bf16Weight)) return bf16Weight;
 
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32 (see GetResidentOrPersistentInputBuffer).
