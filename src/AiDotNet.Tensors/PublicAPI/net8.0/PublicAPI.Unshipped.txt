@@ -187,3 +187,14 @@ AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.SupportsNarrowFloatSum(A
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.SumNarrowFloat(AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, int size) -> float
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.SupportsNarrowFloatUnary(AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type) -> bool
 AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuBackend.UnaryNarrowFloat(AiDotNet.Tensors.Engines.DirectGpu.GpuNarrowFloatUnaryOperation operation, AiDotNet.Tensors.Engines.DirectGpu.GpuElementType type, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! a, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, int size) -> void
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.Entropy.get -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.ExitProbabilities.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.ExpectedLoops.get -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.ExpectedLoss(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! perIterationTokenLoss) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.LoopsRun.get -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.Output.get -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>.States.get -> System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>!
+AiDotNet.Tensors.Engines.Compilation.WeightTiedLoop
+static AiDotNet.Tensors.Engines.Compilation.WeightTiedLoop.Run<T>(AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! state, int iterations, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, int, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! body, bool checkpointEachIteration = false) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
+static AiDotNet.Tensors.Engines.Compilation.WeightTiedLoop.RunAdaptive<T>(AiDotNet.Tensors.Engines.IEngine! engine, AiDotNet.Tensors.LinearAlgebra.Tensor<T>! state, int maxIterations, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, int, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! body, System.Func<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!, AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! haltLogit, double exitThreshold = 1, bool checkpointEachIteration = false) -> AiDotNet.Tensors.Engines.Compilation.AdaptiveLoopResult<T>!
