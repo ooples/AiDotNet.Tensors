@@ -24,12 +24,18 @@ internal sealed class GradientExchange<T>
     private readonly Tensor<T> _loss;
     private readonly Engines.DirectGpu.IGpuBuffer? _deviceLoss;
 
+    // Host staging for the device gradients, owned by the plan and kept across its steps: [0] what a download fills
+    // (the whole device buffer), [1] what an upload sends (exactly the gradient), each indexed like the gradients.
+    // A step allocated both for every gradient before, twice the model's gradients in garbage per step.
+    private readonly float[]?[][] _staging;
+
     internal GradientExchange(Tensor<T>[] parameters, Tensor<T>[] gradients,
         Engines.DirectGpu.IGpuBuffer?[] deviceGradients, Engines.DirectGpu.IDirectGpuBackend? backend,
-        Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss)
+        Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss, float[]?[][] staging)
     {
         _loss = loss;
         _deviceLoss = deviceLoss;
+        _staging = staging;
         _parameters = parameters;
         _gradients = gradients;
         _deviceGradients = deviceGradients;
@@ -49,6 +55,13 @@ internal sealed class GradientExchange<T>
     public int DeviceGradientCount
     {
         get { int n = 0; foreach (var b in _deviceGradients) if (b is not null) n++; return n; }
+    }
+
+    private float[] Staging(int kind, int index, int size)
+    {
+        var held = _staging[kind];
+        if (held[index] is { } array && array.Length == size) return array;
+        return held[index] = new float[size];
     }
 
     /// <summary>This rank's loss for the step (the plan's loss output, read where the step left it).</summary>
@@ -76,7 +89,7 @@ internal sealed class GradientExchange<T>
             if (_deviceGradients[i] is { } buffer)
             {
                 // Synchronizes the compute stream first, so the backward that wrote the buffer has finished.
-                var host = new float[buffer.Size];
+                var host = Staging(0, i, buffer.Size);
                 Backend.DownloadBuffer(buffer, host);
                 Array.Copy(host, 0, (float[])(object)destination, offset, length);   // device gradients are float
             }
@@ -100,7 +113,8 @@ internal sealed class GradientExchange<T>
             int length = _gradients[i].Length;
             if (_deviceGradients[i] is { } buffer)
             {
-                var host = new float[length];
+                // The upload sends the whole array, so it is exactly the gradient (a pooled device buffer can be larger).
+                var host = buffer.Size == length ? Staging(0, i, length) : Staging(1, i, length);
                 Array.Copy((float[])(object)source, offset, host, 0, length);
                 Backend.UploadBufferInPlace(host, buffer);   // synchronous: done before the update launches
             }
@@ -117,6 +131,9 @@ internal sealed class GradientExchange<T>
 internal sealed partial class CompiledTrainingPlan<T>
 {
     private Action<GradientExchange<T>>? _gradientExchange;
+
+    // The exchange's host staging (see GradientExchange): one slot per exchanged gradient, kept across steps.
+    private readonly float[]?[][] _exchangeStaging = { Array.Empty<float[]?>(), Array.Empty<float[]?>() };
 
     // With an exchange the captured step is two graphs: the backward (this plan's _stepGraphExec) and the update (clip
     // and the captured fused optimizer), with the exchange between their launches.
@@ -173,7 +190,10 @@ internal sealed partial class CompiledTrainingPlan<T>
         var loss = _lossOutput;
         var deviceLoss = typeof(T) == typeof(float) && backend is not null && loss.TryGetGpuBuffer() is { } lossBuffer
             && (deviceAuthoritative || loss._gpuBufferVersion == loss.GpuCacheVersion) ? lossBuffer : null;
-        exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), device.ToArray(), backend, loss, deviceLoss));
+        for (int kind = 0; kind < _exchangeStaging.Length; kind++)
+            if (_exchangeStaging[kind].Length != gradients.Count) _exchangeStaging[kind] = new float[]?[gradients.Count];
+        exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), device.ToArray(), backend, loss, deviceLoss,
+            _exchangeStaging));
         GradientExchangeCount++;
     }
 
