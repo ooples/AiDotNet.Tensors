@@ -1353,6 +1353,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
 
+    /// <summary>A contiguous view at storage offset 0 covering only a prefix of its storage (a narrow keeping the leading elements).</summary>
+    internal bool IsPrefixView => IsContiguous && _storageOffset == 0 && _data is not null && Length < _data.Length;
+
     // Planner identity probes must not use DataVector: its getter realizes lazy nodes. An output can be rebound
     // only before residency is established and while the tensor and the known trace lease are its sole owners.
     internal object GraphVectorIdentity => _data;

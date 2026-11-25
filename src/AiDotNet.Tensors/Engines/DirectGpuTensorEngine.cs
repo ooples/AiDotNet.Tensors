@@ -2111,7 +2111,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             result = gathered;
             return true;
         }
-        if (view._storageOffset == 0) return false;
+        if (view._storageOffset == 0 && !view.IsPrefixView) return false;   // the whole storage: not a slice
         if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
         var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
@@ -2227,7 +2227,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
-        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0;
+        // A contiguous view at storage offset 0 that covers only a PREFIX of its storage (a narrow keeping the leading
+        // elements) shares the source's backing array and data vector, the keys of every cache below: treated as the
+        // whole tensor, its upload cached a buffer of the view's length under the source's key, and the source's next
+        // device read got that short buffer (a GEMM's "Buffer A is too small"). It is a view like any offset one.
+        bool prefixView = tensor.IsPrefixView;
+        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0 || prefixView;
         int tCountG = 0;
         var tHalfG = isView ? null : TryFp16ResidentInput(tensor, out tCountG);
         if (tHalfG is not null)
@@ -2268,6 +2273,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
+        else if (prefixView)
+            tensor = new Tensor<T>(tensor._shape.ToArray(), new Vector<T>(tensor.AsSpan().ToArray()));   // own storage, own cache key
 
         int hostVersion = tensor.GpuCacheVersion;
 
@@ -2734,7 +2741,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // gave a wrong result (an innermost-axis IEngine.ReduceSum of a permuted resident tensor was off by
         // 3.7, #1090). GetOrAllocateBuffer resolves views: it permutes or slices on the device, else
         // materializes the view's logical layout.
-        if (!tensor.IsContiguous || tensor._storageOffset != 0)
+        if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.IsPrefixView)
             return GetOrAllocateBuffer(backend, tensor);
         // As GetOrAllocateBuffer: a released intermediate fails loudly instead of handing out a buffer the pool may have
         // re-rented, and a device read of a quarantined one is reported to the probe. The resident and activation-cache
@@ -2845,6 +2852,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // correctly keyed.
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
+        else if (tensor.IsPrefixView)   // offset 0 but only a prefix of the storage: Contiguous() returns the view itself
+            tensor = new Tensor<T>(tensor._shape.ToArray(), new Vector<T>(tensor.AsSpan().ToArray()));
 
         var owned = UploadTensor(backend, tensor);
         if (owned.OwnsBuffer)
