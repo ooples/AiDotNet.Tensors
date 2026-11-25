@@ -4687,6 +4687,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             RunGpuStepBodyForCapture(cb);   // the pre-pass runs, as it does before a real failure
                             throw new InvalidOperationException("capture failure forced for testing");
                         }
+                        // No buffer this capture reads may be a loan of idle step memory when the step I/O's tables
+                        // read device addresses below: the capture would move it only after they were written.
+                        if (gte.GetBackend() is Engines.DirectGpu.IIdleDeviceMemoryLender lender) lender.MoveLiveLoans();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
                         // The pre-pass executes the step; the graph launch below executes it again. Recomputed outputs
@@ -7323,9 +7326,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Engines.DirectGpu.IDirectGpuBackend backend, int length)
     {
         if (length == 0) return backend.AllocateBuffer(Array.Empty<float>());
-        var buffer = backend is Engines.DirectGpu.IUninitializedGpuAllocation uninitialized
-            ? uninitialized.AllocateBufferUninitialized(length)
-            : backend.AllocateBuffer(length);
+        // Optimizer state lives as long as the plan: never a loan of another plan's idle step memory, which that plan
+        // takes back (moving the state) at its next step, and which the state would otherwise hold for good.
+        Engines.DirectGpu.IGpuBuffer buffer;
+        using (Engines.DirectGpu.CUDA.CudaBackend.NoIdleLoans())
+            buffer = backend is Engines.DirectGpu.IUninitializedGpuAllocation uninitialized
+                ? uninitialized.AllocateBufferUninitialized(length)
+                : backend.AllocateBuffer(length);
         try
         {
             backend.Fill(buffer, 0f, length);

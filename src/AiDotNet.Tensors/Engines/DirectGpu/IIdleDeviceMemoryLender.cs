@@ -36,4 +36,10 @@ internal interface IIdleDeviceMemoryLender
 
     /// <summary>Takes back everything <paramref name="owner"/> lent, moving any allocation still using it.</summary>
     void ReclaimIdle(object owner);
+
+    /// <summary>
+    /// Moves every allocation still using lent memory to memory of its own, whoever lent it. A capture's preparation
+    /// calls this before it reads device addresses into tables its graph keeps.
+    /// </summary>
+    void MoveLiveLoans();
 }

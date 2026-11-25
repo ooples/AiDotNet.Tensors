@@ -20,6 +20,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
 {
     void IIdleDeviceMemoryLender.LendIdle(object owner, IReadOnlyCollection<IGpuBuffer> buffers) => LendIdle(owner, buffers);
     void IIdleDeviceMemoryLender.ReclaimIdle(object owner) => ReclaimIdle(owner);
+    void IIdleDeviceMemoryLender.MoveLiveLoans() => MoveLiveIdleLoans();
     void IIdleDeviceMemoryLender.LendIdleOnDemand(object owner, Func<IReadOnlyCollection<IGpuBuffer>?> collect)
         => LendIdleOnDemand(owner, collect);
 
@@ -210,25 +211,46 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender
     /// </summary>
     private void SuspendIdleLoans()
     {
-        List<IdleLoan>? live = null;
-        lock (_idleLock)
-        {
-            _idleSuspended++;
-            for (int i = _idleLoans.Count - 1; i >= 0; i--)
-            {
-                var loan = _idleLoans[i];
-                if (loan.IsLent) (live ??= new()).Add(loan);
-            }
-        }
+        lock (_idleLock) _idleSuspended++;
         try
         {
-            if (live is not null) foreach (var loan in live) MoveIdleLoan(loan);
+            MoveLiveIdleLoans();
         }
         catch
         {
             ResumeIdleLoans();   // the capture never opens
             throw;
         }
+    }
+
+    /// <summary>
+    /// Moves every live loan to memory of its own, so that no address read from here on is a lent one. A capture's
+    /// preparation calls this before it reads device addresses into tables a graph keeps (the step I/O's
+    /// multi-tensor tables): a loan moved later, when the capture itself begins, would leave those tables naming
+    /// memory its lender overwrites and lends again.
+    /// </summary>
+    internal void MoveLiveIdleLoans()
+    {
+        List<IdleLoan>? live = null;
+        lock (_idleLock)
+        {
+            for (int i = _idleLoans.Count - 1; i >= 0; i--)
+            {
+                var loan = _idleLoans[i];
+                if (loan.IsLent) (live ??= new()).Add(loan);
+            }
+        }
+        if (live is null) return;
+        // Every live loan is moved even when one cannot be, as a reclaim does.
+        List<Exception>? failures = null;
+        foreach (var loan in live)
+        {
+            try { MoveIdleLoan(loan); }
+            catch (Exception ex) { (failures ??= new()).Add(ex); }
+        }
+        if (failures is not null)
+            throw failures.Count == 1 ? failures[0] : new AggregateException(
+                "Some buffers borrowed from a compiled plan's idle step memory could not be moved.", failures);
     }
 
     private void ResumeIdleLoans()

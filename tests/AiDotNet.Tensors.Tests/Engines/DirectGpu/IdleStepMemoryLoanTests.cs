@@ -343,6 +343,88 @@ public class IdleStepMemoryLoanTests
         }
     }
 
+    // An Adam-trained MLP (moments live on the device) on a captured plan, validated between steps from step 3 on.
+    // The plan is returned undisposed when keep is set: it stays between steps, lending its idle memory.
+    private static (float[] Losses, ICompiledTrainingPlan<float>? Kept) TrainAdam(
+        DirectGpuTensorEngine engine, int steps, bool validate, bool keep)
+    {
+        var x = Filled(new[] { 256, 256 }, 1, 1f);
+        var held = Filled(new[] { 256, 256 }, 2, 1f);
+        var w1 = Filled(new[] { 256, 512 }, 3, 0.05f);
+        var w2 = Filled(new[] { 512, 256 }, 4, 0.05f);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var h = engine.ReLU(engine.TensorMatMul(x, w1));
+            var y = engine.TensorMatMul(h, w2);
+            engine.ReduceSum(engine.TensorMultiply(y, y), null);
+            plan = scope.CompileTraining(new[] { w1, w2 });
+        }
+        var losses = new float[steps];
+        try
+        {
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-3f);
+            for (int s = 0; s < steps; s++)
+            {
+                losses[s] = plan.Step().ToArray()[0];
+                if (!validate || s < 3) continue;
+                var vh = engine.ReLU(engine.TensorMatMul(held, w1));
+                var vy = engine.TensorMatMul(vh, w2);
+                float metric = engine.ReduceSum(engine.TensorMultiply(vy, vy), null).ToArray()[0];
+                Assert.False(float.IsNaN(metric) || float.IsInfinity(metric), $"validation at step {s} gave {metric}");
+            }
+        }
+        catch
+        {
+            plan.Dispose();
+            throw;
+        }
+        if (keep) return (losses, plan);
+        plan.Dispose();
+        return (losses, null);
+    }
+
+    // A plan set up while an earlier plan is between steps allocates its device state (Adam's moments, the step I/O,
+    // the clip scratch) from that plan's idle memory. Its capture moves those loans to memory of its own, but only once
+    // the capture begins: the step I/O's multi-tensor tables were already written with the lent addresses, so the
+    // captured update read and wrote memory the earlier plan lends again. Its losses drifted from the second step after
+    // the capture, and validation between its steps (borrowing that memory) made them diverge (6.79 -> 61926).
+    [SkippableFact]
+    public void A_plan_set_up_while_another_lends_trains_as_it_does_alone()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
+            bool previousSharing = SharedStepScratch.Enabled;
+            ICompiledTrainingPlan<float>? earlier = null;
+            try
+            {
+                // Without co-owned step scratch, which is never lent: the earlier plan lends all of its scratch.
+                SharedStepScratch.Enabled = false;
+                const int steps = 12;
+                var alone = TrainAdam(gpu, steps, validate: true, keep: false).Losses;
+                var (_, kept) = TrainAdam(gpu, steps, validate: false, keep: true);
+                earlier = kept;
+                var afterAnother = TrainAdam(gpu, steps, validate: true, keep: false).Losses;
+                for (int s = 0; s < steps; s++)
+                    Assert.True(alone[s] == afterAnother[s],
+                        $"step {s}: {afterAnother[s]:G9} set up while another plan lends, {alone[s]:G9} alone");
+            }
+            finally
+            {
+                earlier?.Dispose();
+                SharedStepScratch.Enabled = previousSharing;
+            }
+        }
+    }
+
     // Scratch another plan co-owns is never lent: that plan's step writes it while a borrower would still be using it.
     // Two plans on one engine step in turn and co-own scratch; validation between the first plan's steps borrows only
     // what that plan holds alone, and computes what it computes without lending.

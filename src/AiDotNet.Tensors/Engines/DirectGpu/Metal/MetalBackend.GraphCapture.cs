@@ -56,4 +56,9 @@ public sealed partial class MetalBackend : IIdleDeviceMemoryLender
     {
         if (owner is null) throw new System.ArgumentNullException(nameof(owner));
     }
+
+    // Nothing is lent here, so nothing is ever moved.
+    void IIdleDeviceMemoryLender.MoveLiveLoans()
+    {
+    }
 }

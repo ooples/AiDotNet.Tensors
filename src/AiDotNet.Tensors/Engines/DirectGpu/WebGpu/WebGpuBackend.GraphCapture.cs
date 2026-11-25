@@ -56,6 +56,11 @@ public sealed partial class WebGpuBackend : IIdleDeviceMemoryLender
     {
         if (owner is null) throw new System.ArgumentNullException(nameof(owner));
     }
+
+    // Nothing is lent here, so nothing is ever moved.
+    void IIdleDeviceMemoryLender.MoveLiveLoans()
+    {
+    }
 }
 
 #endif
