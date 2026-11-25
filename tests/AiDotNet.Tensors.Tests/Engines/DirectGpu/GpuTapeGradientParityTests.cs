@@ -1047,7 +1047,7 @@ public class GpuTapeGradientParityTests : IDisposable
     public void FusedLinearCrossEntropy_index_chunked_backward_under_determinism_keeps_no_sort_scratch()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
-        using (gpu!)
+        using (TestRequire.NotNull(gpu, "gpu"))
         {
             var cuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
             Skip.If(cuda is null, "CUDA backend only.");
@@ -1066,7 +1066,7 @@ public class GpuTapeGradientParityTests : IDisposable
                 for (int i = 0; i < cpuGrad.Length; i++)
                     Assert.True(Math.Abs(first[i] - cpuGrad[i]) <= 1e-6, $"gradient[{i}] {first[i]} vs CPU {cpuGrad[i]}");
                 long chunkCells = 672L * ChunkVocab;
-                Assert.True(cuda!.SortedScatterScratchBytes < chunkCells,
+                Assert.True(TestRequire.NotNull(cuda, "cuda").SortedScatterScratchBytes < chunkCells,
                     $"sort scratch {cuda.SortedScatterScratchBytes} bytes, a start slot per logit of a chunk is {chunkCells * 4}.");
             }
             finally { AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(wasDeterministic); }
@@ -1102,7 +1102,7 @@ public class GpuTapeGradientParityTests : IDisposable
     public void FusedLinearCrossEntropy_index_chunked_scratch_is_one_block_per_direction()
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
-        using (gpu!)
+        using (TestRequire.NotNull(gpu, "gpu"))
         {
             var backend = gpu.GetBackend();
             Skip.If(backend is null, "No device backend.");
@@ -1113,12 +1113,12 @@ public class GpuTapeGradientParityTests : IDisposable
             // Warm: kernels, pools and the inputs' uploads.
             _ = GradientOf(gpu, ChunkHidden, Op);
             Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined, "The chunked forward declined on this device.");
-            long before = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(backend!).AllocatedBytes;
-            AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.ResetPeakStats(backend!);
+            long before = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(TestRequire.NotNull(backend, "backend")).AllocatedBytes;
+            AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.ResetPeakStats(TestRequire.NotNull(backend, "backend"));
             DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
             DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
             _ = GradientOf(gpu, ChunkHidden, Op);
-            long peak = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(backend!).PeakAllocatedBytes;
+            long peak = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(TestRequire.NotNull(backend, "backend")).PeakAllocatedBytes;
             Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);    // 672 rows a chunk
             Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
             // What the forward and backward hold at once beyond what was live before them: one block, plus the inputs
@@ -1140,19 +1140,19 @@ public class GpuTapeGradientParityTests : IDisposable
     public void FusedLinearCrossEntropy_index_chunked_in_place_row_transforms_match(int rows)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
-        using (gpu!)
+        using (TestRequire.NotNull(gpu, "gpu"))
         {
             var backend = gpu.GetBackend();
             Skip.If(backend is null, "No device backend.");
             Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend does not declare in-place row transforms.");
-            var inPlaceBackend = (IInPlaceRowTransformsBackend)backend!;
+            var inPlaceBackend = (IInPlaceRowTransformsBackend)TestRequire.NotNull(backend, "backend");
             int v = ChunkVocab, cells = rows * v;
-            var rng = new Random(rows);
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(rows);
             var x = new float[cells];
             for (int i = 0; i < cells; i++) x[i] = (float)(rng.NextDouble() * 8 - 4);
             var bias = new float[v];
             for (int i = 0; i < v; i++) bias[i] = (float)(rng.NextDouble() - 0.5);
-            using var biasB = backend!.AllocateBuffer(bias);
+            using var biasB = TestRequire.NotNull(backend, "backend").AllocateBuffer(bias);
             using var scaleB = backend.AllocateBuffer(new[] { 0.37f });
 
             // The in-place entry point the fused cross-entropy calls against the same kernel run out of place. (The
@@ -1175,9 +1175,9 @@ public class GpuTapeGradientParityTests : IDisposable
 
             var cuda = backend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
             Skip.If(cuda is null, "The reference-kernel hooks are CUDA's.");
-            Check("BiasAdd", (a, c) => cuda!.BiasAddReferenceForTest(a, biasB, c, rows, v), d => inPlaceBackend.BiasAddInPlace(d, biasB, rows, v));
+            Check("BiasAdd", (a, c) => TestRequire.NotNull(cuda, "cuda").BiasAddReferenceForTest(a, biasB, c, rows, v), d => inPlaceBackend.BiasAddInPlace(d, biasB, rows, v));
             Check("Exp", (a, c) => backend.Exp(a, c, cells), d => inPlaceBackend.ExpInPlace(d, cells));
-            Check("Softmax", (a, c) => cuda!.SoftmaxReferenceForTest(a, c, rows, v), d => inPlaceBackend.SoftmaxInPlace(d, rows, v));
+            Check("Softmax", (a, c) => TestRequire.NotNull(cuda, "cuda").SoftmaxReferenceForTest(a, c, rows, v), d => inPlaceBackend.SoftmaxInPlace(d, rows, v));
             Check("BroadcastMultiplyLastAxis", (a, c) => backend.BroadcastMultiplyLastAxis(a, scaleB, c, cells, 1),
                 d => inPlaceBackend.BroadcastMultiplyLastAxisInPlace(d, scaleB, cells, 1));
         }

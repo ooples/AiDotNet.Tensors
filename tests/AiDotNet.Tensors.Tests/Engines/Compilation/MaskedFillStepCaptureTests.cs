@@ -34,7 +34,7 @@ public class MaskedFillStepCaptureTests
         using (gpu)
         {
             Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
-            var rng = new Random(3);
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(3);
             var xs = Enumerable.Range(0, Rows * Cols).Select(_ => (float)(rng.NextDouble() - 0.5)).ToArray();
             var w0 = Enumerable.Range(0, Cols * Cols).Select(_ => (float)(rng.NextDouble() - 0.5) * 0.5f).ToArray();
             // Upper triangle (j > i) masked, as a causal attention mask.
@@ -62,7 +62,7 @@ public class MaskedFillStepCaptureTests
                 for (int s = 0; s < Steps; s++) losses[s] = plan.Step().ToArray()[0];
                 mask[Rows - 1, 0] = true;   // the caller rewrites the mask; the next replays must see it
                 for (int s = Steps; s < total; s++) losses[s] = plan.Step().ToArray()[0];
-                replays = (long)replaysProperty.GetValue(plan)!;
+                replays = (long)TestRequire.NotNull(replaysProperty.GetValue(plan), "the replay count");
             }
 
             // Reference: the same SGD steps on the host, in double.

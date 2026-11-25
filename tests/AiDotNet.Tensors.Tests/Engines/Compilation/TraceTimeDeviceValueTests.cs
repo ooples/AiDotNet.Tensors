@@ -18,7 +18,7 @@ public class TraceTimeDeviceValueTests
 {
     private static Tensor<float> Random(int[] shape, int seed)
     {
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var t = new Tensor<float>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() * 2 - 1);
         return t;
@@ -54,7 +54,7 @@ public class TraceTimeDeviceValueTests
                     plan = scope.CompileTraining(new[] { x, y, gamma }, gpu.ReduceSum(gpu.TensorMultiply(n, n), null, false));
                 }
                 Skip.If(traced is null || tracedOwned, "The trace did not leave an unowned device value.");
-                Assert.True(traced!.IsReleased || traced.RawDevicePointer == IntPtr.Zero,
+                Assert.True(TestRequire.NotNull(traced, "traced").IsReleased || traced.RawDevicePointer == IntPtr.Zero,
                     "after the compile the trace-time Swish value is still allocated; only its finalizer would free it");
                 using (plan as IDisposable)
                 {
@@ -64,7 +64,7 @@ public class TraceTimeDeviceValueTests
                         Assert.Equal(first, plan.Step().ToArray()[0]);
                     Assert.True(!float.IsNaN(first) && !float.IsInfinity(first) && first > 0);
                     Assert.False(ReferenceEquals(swish._gpuBuffer, traced));
-                    Assert.True(traced!.IsReleased || traced.RawDevicePointer == IntPtr.Zero,
+                    Assert.True(TestRequire.NotNull(traced, "traced").IsReleased || traced.RawDevicePointer == IntPtr.Zero,
                         "the trace-time Swish value is still allocated; only its finalizer would free it");
                 }
             }

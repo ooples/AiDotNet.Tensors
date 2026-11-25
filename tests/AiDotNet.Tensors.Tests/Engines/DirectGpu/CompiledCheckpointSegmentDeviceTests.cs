@@ -35,7 +35,7 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
     public void CheckpointSegments_RecomputeAndTrainLikeThePlainPlan(float nudge, bool deferNudge)
     {
         RequireDevice();
-        var engine = _fixture.Engine!;
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
         try
@@ -129,7 +129,7 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
     public void CheckpointSegment_ThatReadsItsStateAfterUpdatingIt_IsRefused()
     {
         RequireDevice();
-        var engine = _fixture.Engine!;
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
         try

@@ -156,7 +156,7 @@ public class IdleStepMemoryLoanTests
             });
             Assert.NotEqual(IntPtr.Zero, other);
             Assert.False(Inside(scratch, borrowed), "a capture read a buffer that still borrowed lent memory");
-            Assert.False(Inside(scratch, inside!), "a capture allocated lent memory");
+            Assert.False(Inside(scratch, TestRequire.NotNull(inside, "inside")), "a capture allocated lent memory");
 
             // The lender's step overwrites its memory; the other graph still reads 2 + 1.
             lender.ReclaimIdle(owner);
@@ -176,7 +176,7 @@ public class IdleStepMemoryLoanTests
 
     private static Tensor<float> Filled(int[] shape, int seed, float scale)
     {
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var t = new Tensor<float>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5) * scale;
         return t;
@@ -210,7 +210,7 @@ public class IdleStepMemoryLoanTests
             plan = scope.CompileTraining(parameters);
         }
         var run = new Run();
-        var backend = (CudaBackend)engine.GetBackend()!;
+        var backend = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
         long replaysBefore = CompiledTrainingPlan<float>.GraphReplayCount;
         long loansBefore = backend.IdleLoanCounters.Loans;
         Tensor<float>? kept = null;
@@ -224,7 +224,7 @@ public class IdleStepMemoryLoanTests
                 if (kept is not null)
                 {
                     // Kept across a step: its memory was moved before the replay overwrote what it borrowed.
-                    Assert.Equal(keptValues!, kept.ToArray());
+                    Assert.Equal(TestRequire.NotNull(keptValues, "keptValues"), kept.ToArray());
                     kept = null;
                 }
                 run.LentBytes = Math.Max(run.LentBytes, ((CompiledTrainingPlan<float>)plan).IdleLentBytesLastStep);
@@ -260,7 +260,7 @@ public class IdleStepMemoryLoanTests
         using (gpu)
         {
             Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
-            var backend = (CudaBackend)gpu.GetBackend()!;
+            var backend = (CudaBackend)TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
             var x = Filled(new[] { 256, 256 }, 1, 1f);
             var w1 = Filled(new[] { 256, 512 }, 3, 0.05f);
             var w2 = Filled(new[] { 512, 256 }, 4, 0.05f);
@@ -388,7 +388,7 @@ public class IdleStepMemoryLoanTests
                     var v = gpu.ReLU(gpu.TensorMatMul(held, held));
                     var lent = ((CompiledTrainingPlan<float>)a).IdleLentBuffersForTest;
                     Assert.All(lent, buffer => Assert.False(
-                        gpu.SharedStepScratch.HasOtherOwner(buffer, ((CompiledTrainingPlan<float>)a).ScratchPoolForTest!),
+                        gpu.SharedStepScratch.HasOtherOwner(buffer, TestRequire.NotNull(((CompiledTrainingPlan<float>)a).ScratchPoolForTest, "the plan's scratch pool")),
                         "a lent scratch another plan co-owns"));
                     GC.KeepAlive(v);
                 }

@@ -39,7 +39,7 @@ public sealed class CompiledGpuCheckpointSegmentTests
 
     private static Tensor<float> Filled(int[] shape, int seed, float scale)
     {
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         var t = new Tensor<float>(shape);
         for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5) * scale;
         return t;

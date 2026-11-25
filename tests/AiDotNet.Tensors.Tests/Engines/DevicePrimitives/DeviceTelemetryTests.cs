@@ -38,7 +38,7 @@ public class DeviceTelemetryTests
         Skip.IfNot(TryCuda(out var gpu) && gpu is not null, "CUDA backend did not resolve.");
         using (gpu)
         {
-            var backend = gpu.GetBackend()!;
+            var backend = TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
             Assert.True(GpuMemoryStats.TryGetDeviceMemory(backend, out long free, out long total));
             Assert.True(total > 0 && free > 0 && free <= total, $"free {free} total {total}");
             Assert.Equal(backend.GlobalMemoryBytes, total);
@@ -63,7 +63,7 @@ public class DeviceTelemetryTests
         Skip.IfNot(TryCuda(out var gpu) && gpu is not null, "CUDA backend did not resolve.");
         using (gpu)
         {
-            var backend = gpu.GetBackend()!;
+            var backend = TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
             bool read = GpuUtilization.TryRead(backend, out int gpuPercent, out int memoryPercent);
             Skip.IfNot(read, "NVML is not installed with this driver.");
             Assert.InRange(gpuPercent, 0, 100);
@@ -80,7 +80,7 @@ public class DeviceTelemetryTests
         Skip.IfNot(TryCuda(out var gpu) && gpu is not null, "CUDA backend did not resolve.");
         using (gpu)
         {
-            var backend = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
+            var backend = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
             using var held = backend.AllocateBuffer(64 << 20);   // 256 MiB, so this process is on the device
             backend.Synchronize();
             Skip.IfNot(TryNvidiaSmi(backend, out double smiBeforeMb, out double smiTotalMb), "nvidia-smi is not on PATH or did not answer.");
@@ -108,7 +108,7 @@ public class DeviceTelemetryTests
             var info = new System.Diagnostics.ProcessStartInfo("nvidia-smi",
                 $"-i {uuid} --query-gpu=memory.used,memory.total --format=csv,noheader,nounits")
             { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
-            using var smi = System.Diagnostics.Process.Start(info)!;
+            using var smi = TestRequire.NotNull(System.Diagnostics.Process.Start(info), "the nvidia-smi process");
             var output = smi.StandardOutput.ReadToEndAsync();
             // A stalled nvidia-smi skips the test instead of hanging the run.
             if (!smi.WaitForExit(15000) || !output.Wait(5000))
@@ -134,7 +134,7 @@ public class DeviceTelemetryTests
         AiDotNetEngine.Current = engine;
         try
         {
-            var rng = new Random(11);
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(11);
             var p = new Tensor<float>(new[] { 48, 32 });
             double sq = 0;
             for (int i = 0; i < p.Length; i++)

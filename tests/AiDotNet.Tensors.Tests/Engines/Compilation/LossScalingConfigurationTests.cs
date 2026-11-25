@@ -17,9 +17,16 @@ public class LossScalingConfigurationTests
 {
     private sealed class PlanHandle : IDisposable
     {
-        public ICompiledTrainingPlanLossScaling Scaling = null!;
-        public INonFiniteGradientPolicyTarget Policy = null!;
-        public IDisposable Owner = null!;
+        public PlanHandle(ICompiledTrainingPlanLossScaling scaling, INonFiniteGradientPolicyTarget policy, IDisposable owner)
+        {
+            Scaling = scaling;
+            Policy = policy;
+            Owner = owner;
+        }
+
+        public ICompiledTrainingPlanLossScaling Scaling { get; }
+        public INonFiniteGradientPolicyTarget Policy { get; }
+        public IDisposable Owner { get; }
         public void Dispose() => Owner.Dispose();
     }
 
@@ -38,12 +45,7 @@ public class LossScalingConfigurationTests
                 engine.ReduceSum(engine.TensorMatMul(x, w), null);
                 plan = scope.CompileTraining(new[] { w });
             }
-            return new PlanHandle
-            {
-                Scaling = (ICompiledTrainingPlanLossScaling)plan,
-                Policy = (INonFiniteGradientPolicyTarget)plan,
-                Owner = plan,
-            };
+            return new PlanHandle((ICompiledTrainingPlanLossScaling)plan, (INonFiniteGradientPolicyTarget)plan, plan);
         }
         finally
         {
@@ -94,7 +96,7 @@ public class LossScalingConfigurationTests
         {
             plan.Scaling.ConfigureLossScaling(new LossScalingOptions { InitialScale = 8f });
             Assert.Throws<InvalidOperationException>(() => plan.Policy.SetNonFiniteGradientPolicy(NonFiniteGradientPolicy.Error));
-            Assert.Equal(8f, plan.Scaling.ReadLossScaleState()!.Value.Scale);
+            Assert.Equal((float?)8f, plan.Scaling.ReadLossScaleState()?.Scale);
             plan.Scaling.ConfigureLossScaling(null);
             Assert.Null(plan.Scaling.ReadLossScaleState());
         }

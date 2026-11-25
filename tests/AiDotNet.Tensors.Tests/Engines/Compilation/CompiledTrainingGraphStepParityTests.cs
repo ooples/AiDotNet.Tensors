@@ -991,8 +991,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 {
                     AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
                     // The update runs inside the graph, so the bad label must be stopped by the captured update's gate.
-                    Assert.NotNull(typeof(CompiledTrainingPlan<float>)
-                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan));
+                    Assert.NotNull(TestRequire.NotNull(typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance), "the _capturedOptimizer field").GetValue(plan));
                 }
                 var beforeBad = parameters.Select(p => p.ToArray()).ToArray();
                 int acceptedBefore = ((CompiledTrainingPlan<float>)plan).OptimizerStep;
@@ -1045,7 +1045,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 foreach (var t in parameters) t.Gpu();
                 void Feed(int step)
                 {
-                    var rng = new Random(900 + step);
+                    var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(900 + step);
                     for (int i = 0; i < Batch; i++) labels.SetFlat(i, rng.Next(vocab));
                     labels.MarkModified();
                 }
@@ -1071,8 +1071,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         losses[s] = plan.Step().ToArray()[0];
                     }
                     if (capture) AssertGraphCaptured(concrete);
-                    bool updateCaptured = typeof(CompiledTrainingPlan<float>)
-                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete) is not null;
+                    bool updateCaptured = TestRequire.NotNull(typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance), "the _capturedOptimizer field").GetValue(concrete) is not null;
                     return (losses, parameters.Select(p => p.ToArray()).ToArray(), updateCaptured, concrete.OptimizerStep);
                 }
             }

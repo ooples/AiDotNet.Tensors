@@ -153,7 +153,7 @@ public class SharedStepScratchTrainingTests : IDisposable
             // again: skipped on those facts alone. Where they hold, the route must resolve (a broken resolution fails).
             if (autocast is { } precision)
             {
-                var cuda = (CudaBackend)gpu.GetBackend()!;
+                var cuda = (CudaBackend)TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
                 int floor = precision == PrecisionMode.BFloat16 ? 8 : 7;
                 Skip.IfNot(AiDotNet.Tensors.Engines.CuDnnContext.IsAvailable,
                     $"cuDNN is not loadable here: {precision} convolutions run in FP32 by design.");

@@ -111,7 +111,7 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
     public void MatMulAutocast_RoundsTheProduct_AccumulatesInFp32(PrecisionMode precision)
     {
         SkipUnlessAvailable(true);
-        var engine = _fixture.Engine!;
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         const int m = 512, k = 1024, n = 512;   // large enough that cuBLAS takes tensor cores (FAST_* permits, not requires)
         var a = new Tensor<float>(new[] { m, k }, new Vector<float>(Data(m * k, 0.731, 0.2))).Gpu();
         var b = new Tensor<float>(new[] { k, n }, new Vector<float>(Data(k * n, 0.293, 0.5))).Gpu();

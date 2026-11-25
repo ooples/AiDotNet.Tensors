@@ -31,21 +31,21 @@ public class CudaVisibleDevicesTests
     public void Without_the_cuda_driver_full_uuids_are_read_from_the_value()
     {
         var visible = CudaVisibleDevices.Resolve(" " + Uuid + " ,", () => null);
-        Assert.Equal(new[] { "3cc6845a128eb8623de97b3ea1e8495d" }, visible!.ToArray());
+        Assert.Equal(new[] { "3cc6845a128eb8623de97b3ea1e8495d" }, TestRequire.NotNull(visible, "visible").ToArray());
         // Indices (or UUID prefixes) need the driver's ordering: unmapped, nothing is filtered.
         Assert.Null(CudaVisibleDevices.Resolve("0,1", () => null));
         // MIG instance UUIDs never match a whole-GPU Vulkan UUID: not filtered.
         Assert.Null(CudaVisibleDevices.Resolve("MIG-1b2c3d4e-0000-1111-2222-333344445555", () => new List<string>()));
         Assert.Null(CudaVisibleDevices.Resolve("GPU-3cc6845a", () => null));
         // An empty value hides every device, as it does for CUDA.
-        Assert.Empty(CudaVisibleDevices.Resolve("", () => null)!);
+        Assert.Empty(TestRequire.NotNull(CudaVisibleDevices.Resolve("", () => null), "the resolved set"));
     }
 
     [Fact]
     public void The_cuda_drivers_view_wins_when_present()
     {
         var visible = CudaVisibleDevices.Resolve("1", () => new List<string> { "00112233445566778899aabbccddeeff" });
-        Assert.Equal(new[] { "00112233445566778899aabbccddeeff" }, visible!.ToArray());
+        Assert.Equal(new[] { "00112233445566778899aabbccddeeff" }, TestRequire.NotNull(visible, "visible").ToArray());
         Assert.True(CudaVisibleDevices.Hex(new byte[] { 0x0a, 0xf0 }) == "0af0");
     }
 
@@ -61,8 +61,8 @@ public class CudaVisibleDevicesTests
         var all = NvidiaSmi("--query-gpu=uuid --format=csv,noheader");
         Skip.If(all is null || all.Length < 2, "Needs nvidia-smi and two or more NVIDIA GPUs.");
         var visible = CudaVisibleDevices.VisibleNvidiaUuids;
-        Skip.If(visible is null || visible.Count >= all!.Length, "CUDA_VISIBLE_DEVICES does not hide a GPU here.");
-        var hidden = all!.Select(u => u.Trim()).Where(u => !visible!.Contains(u.Substring(4).Replace("-", "").ToLowerInvariant())).ToArray();
+        Skip.If(visible is null || visible.Count >= TestRequire.NotNull(all, "all").Length, "CUDA_VISIBLE_DEVICES does not hide a GPU here.");
+        var hidden = TestRequire.NotNull(all, "all").Select(u => u.Trim()).Where(u => !TestRequire.NotNull(visible, "visible").Contains(u.Substring(4).Replace("-", "").ToLowerInvariant())).ToArray();
         Assert.NotEmpty(hidden);
 
         var backend = VulkanBackend.Instance;

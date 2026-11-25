@@ -57,7 +57,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     private void Bf16RoundsCoarserThanFp16(int m, int k, int n, MatMulAutocastMode mode)
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        var engine = _fixture.Engine!;
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         Skip.If(engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend,
             "The backend has no matmul autocast.");
         var previous = AiDotNetEngine.Current;
@@ -127,7 +127,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     public void CastOperands_RoundsTheOperandsTo16Bits_AtEveryShape(int m, int k, int n, int batch)
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        var engine = _fixture.Engine!;
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         Skip.If(engine.GetBackend() is not CudaBackend, "Matmul autocast is CUDA's.");
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
@@ -143,7 +143,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             {
                 Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
                 float[] mixed;
-                var cuda = (CudaBackend)engine.GetBackend()!;
+                var cuda = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
                 long declines = cuda.AutocastCastDeclinesForTest;
                 using (engine.EnterMatMulAutocast(precision)) mixed = engine.TensorMatMul(a, b).ToArray();
                 Assert.Equal(declines, cuda.AutocastCastDeclinesForTest);   // cast, not the fast fallback
@@ -186,14 +186,14 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     public void FastComputeType_keeps_FP32_operands_and_the_permissive_compute_type()
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        Skip.IfNot(_fixture.Engine!.GetBackend() is CudaBackend, "CUDA only.");
-        var cuda = (CudaBackend)_fixture.Engine!.GetBackend()!;
-        using (_fixture.Engine!.EnterMatMulAutocast(PrecisionMode.Float16, MatMulAutocastMode.FastComputeType))
+        Skip.IfNot(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is CudaBackend, "CUDA only.");
+        var cuda = (CudaBackend)TestRequire.NotNull(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend(), "the engine's backend");
+        using (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").EnterMatMulAutocast(PrecisionMode.Float16, MatMulAutocastMode.FastComputeType))
         {
             Assert.Equal((int)CublasComputeType.Float32Fast16F, cuda.GemmAutocastComputeTypeForTest);
             Assert.Equal(0, cuda.GemmAutocastCastTypeForTest);
         }
-        using (_fixture.Engine!.EnterMatMulAutocast(PrecisionMode.BFloat16))
+        using (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").EnterMatMulAutocast(PrecisionMode.BFloat16))
         {
             Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
             Assert.Equal(CuBlasNative.CUDA_R_16BF, cuda.GemmAutocastCastTypeForTest);
@@ -207,8 +207,8 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     public void Autocast_scopes_closing_out_of_order_return_to_fp32()
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        Skip.IfNot(_fixture.Engine!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "CUDA only.");
-        var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)_fixture.Engine!.GetBackend()!;
+        Skip.IfNot(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "CUDA only.");
+        var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)TestRequire.NotNull(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend(), "the engine's backend");
         var autocast = (AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend)cuda;
         Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
         var a = autocast.EnterGemmAutocast(PrecisionMode.Float16);
@@ -242,7 +242,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     public void AutocastRoutes_ComputeTheGemm(int route, int splits, bool transA, bool transB)
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        if (_fixture.Engine!.GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
+        if (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
         const int m = 96, n = 80, k = 4096;
         const float alpha = 0.5f, beta = 2f;
         int lda = transA ? k : m, ldb = transB ? n : k, ldd = m;
@@ -292,7 +292,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
     public void CastOperandRoutes_ComputeTheRoundedProduct(int route, int splits, bool transA, bool transB, int pad)
     {
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
-        if (_fixture.Engine!.GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
+        if (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is not CudaBackend backend) { Skip.If(true, "Not the CUDA backend."); return; }
         const int m = 64, n = 48, k = 2048;
         const float alpha = 0.5f, beta = 2f;
         int lda = (transA ? k : m) + pad, ldb = (transB ? n : k) + pad, ldd = m;

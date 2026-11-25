@@ -23,7 +23,7 @@ public class GradientExchangeSplitStepTests
 
     private static float[] Values(int count, int seed, float scale)
     {
-        var rng = new Random(seed);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(seed);
         return Enumerable.Range(0, count).Select(_ => (float)(rng.NextDouble() - 0.5) * scale).ToArray();
     }
 
@@ -87,7 +87,7 @@ public class GradientExchangeSplitStepTests
         if (engine is DirectGpuTensorEngine gpu && w.TryGetGpuBuffer() is { } buffer)
         {
             var weights = new float[buffer.Size];
-            gpu.GetBackend()!.DownloadBuffer(buffer, weights);
+            TestRequire.NotNull(gpu.GetBackend(), "the engine's backend").DownloadBuffer(buffer, weights);
             return weights.Take(In * Out).ToArray();
         }
         return w.ToArray();
@@ -140,7 +140,7 @@ public class GradientExchangeSplitStepTests
     [InlineData("device")]
     public void HalfBatchWithAnAveragingExchange_MatchesTheFullBatch_AndTheUpdateGraphReplaysEveryStep(string where)
     {
-        var gpu = ResolveEngine(where, out bool cuda)!;
+        var gpu = TestRequire.NotNull(ResolveEngine(where, out bool cuda), "the engine");
         using (gpu as IDisposable)
         {
             var xs = Values(Batch * In, 1, 2f);
@@ -185,7 +185,7 @@ public class GradientExchangeSplitStepTests
     public void APeersOverflowAtTheExchange_SkipsTheStepAndBacksOffTheScale_LikeALocalOverflow(OptimizerType optimizer,
         bool capturedUpdateOnCuda, string where)
     {
-        var gpu = ResolveEngine(where, out bool cuda)!;
+        var gpu = TestRequire.NotNull(ResolveEngine(where, out bool cuda), "the engine");
         bool capturedUpdate = capturedUpdateOnCuda && cuda;
         using (gpu as IDisposable)
         {
