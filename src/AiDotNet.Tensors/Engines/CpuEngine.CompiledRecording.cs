@@ -334,14 +334,15 @@ public partial class CpuEngine
     {
         const System.Reflection.BindingFlags fields =
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
-        foreach (var field in closure.GetType().GetFields(fields))
+        foreach (var field in closure.GetType().GetFields(fields).Where(candidate => !candidate.FieldType.IsValueType))
         {
-            if (field.FieldType.IsValueType || field.GetValue(closure) is not { } value) continue;
+            var value = field.GetValue(closure);
             if (value is Tensor<int> indices)
             {
                 if (CaptureIndexProducers(indices, opName) is { } one) refresh += one;
             }
-            else if (depth < 4 && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+            else if (value is not null && depth < 4
+                && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
             {
                 CollectClosureIndexProducers(value, opName, depth + 1, ref refresh);
             }
