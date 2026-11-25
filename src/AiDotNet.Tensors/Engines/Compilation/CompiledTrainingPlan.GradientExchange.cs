@@ -29,10 +29,17 @@ internal sealed class GradientExchange<T>
     // A step allocated both for every gradient before, twice the model's gradients in garbage per step.
     private readonly float[]?[][] _staging;
 
+    // Page-locked staging for the whole step (every gradient in order, then the loss), owned by the plan and kept
+    // across its steps; null where the backend has none. See TryReadStaged.
+    private readonly Engines.DirectGpu.IGradientHostStaging? _pinned;
+    private bool _readStaged;
+
     internal GradientExchange(Tensor<T>[] parameters, Tensor<T>[] gradients,
         Engines.DirectGpu.IGpuBuffer?[] deviceGradients, Engines.DirectGpu.IDirectGpuBackend? backend,
-        Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss, float[]?[][] staging)
+        Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss, float[]?[][] staging,
+        Engines.DirectGpu.IGradientHostStaging? pinned = null)
     {
+        _pinned = pinned;
         _loss = loss;
         _deviceLoss = deviceLoss;
         _staging = staging;
@@ -100,6 +107,88 @@ internal sealed class GradientExchange<T>
             }
             offset += length;
         }
+    }
+
+    /// <summary>
+    /// Reads every gradient, in plan order, and the loss into the plan's page-locked staging: one copy per device
+    /// gradient queued on the compute stream after the backward, then a single host wait. Returns false where there
+    /// is no page-locked staging (a backend without it, or a non-float plan); <see cref="Read"/> and
+    /// <see cref="Write"/> are the path then.
+    /// </summary>
+    /// <param name="gradients">The staged gradients (length <see cref="TotalLength"/>), valid until
+    /// <see cref="WriteStaged"/>; the caller may overwrite them in place with the reduced gradients.</param>
+    /// <param name="loss">This rank's loss for the step.</param>
+    public bool TryReadStaged(out Span<float> gradients, out float loss)
+    {
+        gradients = default;
+        loss = 0f;
+        if (_pinned is null || typeof(T) != typeof(float)) return false;
+        var host = _pinned.Host;
+        if (host.Length < TotalLength + 1)
+            throw new InvalidOperationException("The page-locked gradient staging is smaller than the step's gradients.");
+        int offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is { } buffer) _pinned.EnqueueDownload(buffer, offset, length);
+            offset += length;
+        }
+        if (_deviceLoss is { } lossBuffer) _pinned.EnqueueDownload(lossBuffer, TotalLength, 1);
+        _pinned.WaitForTransfers();
+        offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is null)
+            {
+                using var lease = _gradients[i].LeaseArray();
+                ((float[])(object)lease.Array).AsSpan(0, length).CopyTo(host.Slice(offset, length));
+            }
+            offset += length;
+        }
+        if (_deviceLoss is null)
+        {
+            using var lease = _loss.LeaseArray();
+            loss = ((float[])(object)lease.Array)[0];
+        }
+        else
+        {
+            loss = host[TotalLength];
+        }
+        gradients = host.Slice(0, TotalLength);
+        _readStaged = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Writes the staged gradients (as the caller left them after <see cref="TryReadStaged"/>) back where they were
+    /// found. Device gradients are copied on the compute stream, ordered before the update that reads them, without
+    /// a host wait.
+    /// </summary>
+    public void WriteStaged()
+    {
+        if (!_readStaged || _pinned is null)
+            throw new InvalidOperationException("WriteStaged needs a TryReadStaged of the same step first.");
+        var host = _pinned.Host;
+        int offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is { } buffer)
+            {
+                _pinned.EnqueueUpload(buffer, offset, length);
+            }
+            else
+            {
+                using var lease = _gradients[i].LeaseWritable();
+                var destination = lease.Span;
+                var source = host.Slice(offset, length);
+                for (int k = 0; k < length; k++)
+                    destination[k] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref source[k]);
+            }
+            offset += length;
+        }
+        _readStaged = false;
     }
 
     /// <summary>Writes the reduced gradients back where <see cref="Read"/> found them.</summary>
@@ -193,8 +282,33 @@ internal sealed partial class CompiledTrainingPlan<T>
         for (int kind = 0; kind < _exchangeStaging.Length; kind++)
             if (_exchangeStaging[kind].Length != gradients.Count) _exchangeStaging[kind] = new float[]?[gradients.Count];
         exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), device.ToArray(), backend, loss, deviceLoss,
-            _exchangeStaging));
+            _exchangeStaging, PinnedExchangeStaging(backend, gradients)));
         GradientExchangeCount++;
+    }
+
+    // The exchange's page-locked staging (every gradient, then the loss), sized to the step and kept across steps.
+    private Engines.DirectGpu.IGradientHostStaging? _exchangePinned;
+    private int _exchangePinnedFloats;
+
+    private Engines.DirectGpu.IGradientHostStaging? PinnedExchangeStaging(
+        Engines.DirectGpu.IDirectGpuBackend? backend, List<Tensor<T>> gradients)
+    {
+        if (typeof(T) != typeof(float) || backend is not Engines.DirectGpu.IGradientHostStagingSource source) return null;
+        long total = 1;
+        foreach (var g in gradients) total += g.Length;
+        if (total > int.MaxValue / sizeof(float)) return null;
+        if (_exchangePinned is not null && _exchangePinnedFloats == total) return _exchangePinned;
+        ReleasePinnedExchangeStaging();
+        _exchangePinned = source.TryCreateGradientHostStaging((int)total);
+        _exchangePinnedFloats = _exchangePinned is null ? 0 : (int)total;
+        return _exchangePinned;
+    }
+
+    private void ReleasePinnedExchangeStaging()
+    {
+        _exchangePinned?.Dispose();
+        _exchangePinned = null;
+        _exchangePinnedFloats = 0;
     }
 
     private void DestroyUpdateGraph(Engines.DirectGpuTensorEngine? gte)

@@ -584,6 +584,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // Land captured counters/parameter ages while the old moment storage is still owned.
         ReclaimIdleStepMemory();
         InvalidateCapturedStepGraph();
+        ReleasePinnedExchangeStaging();
         LeaveSharedMoments();
         DisposeGpuOptimizerBuffers();
         ReturnPooledMoments(_optimizerRuntimeState);

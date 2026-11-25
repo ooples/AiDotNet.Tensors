@@ -241,6 +241,82 @@ public class GradientExchangeSplitStepTests
         }
     }
 
+    /// <summary>
+    /// The page-locked exchange path (every gradient and the loss downloaded in one batch, written back stream-ordered
+    /// before the update) trains bitwise like the per-buffer Read/Write path, on a two-parameter plan (so the
+    /// gradients' offsets in the staging matter) and through the captured update graph. The exchange rewrites the
+    /// gradient (halves it and adds a fixed pattern), so a write that did not reach the update would show.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void ThePageLockedExchange_TrainsBitwiseLikeThePerBufferExchange(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out bool cuda), "the engine");
+        using (engine as IDisposable)
+        {
+            const int hidden = 8;
+            var xs = Values(Batch * In, 1, 2f);
+            var ts = Values(Batch * Out, 2, 2f);
+            (List<float> Losses, List<float> ExchangedLosses, float[] Weights, int Staged) Run(bool staged)
+            {
+                var x = Rows(xs, In, 0, Batch);
+                var t = Rows(ts, Out, 0, Batch);
+                var w1 = new Tensor<float>(new[] { In, hidden }, new Vector<float>(Values(In * hidden, 5, 0.4f)));
+                var w2 = new Tensor<float>(new[] { hidden, Out }, new Vector<float>(Values(hidden * Out, 6, 0.4f)));
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    var d = engine.TensorSubtract(engine.TensorMatMul(engine.TensorMatMul(x, w1), w2), t);
+                    engine.TensorMultiplyScalar(engine.ReduceSum(engine.TensorMultiply(d, d), null), 1f / Batch);
+                    plan = scope.CompileTraining(new[] { w1, w2 });
+                }
+                var losses = new List<float>();
+                var exchanged = new List<float>();
+                int stagedSteps = 0;
+                using (plan)
+                {
+                    var compiled = (CompiledTrainingPlan<float>)plan;
+                    plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
+                    plan.SetMaxGradNorm(1.0);
+                    compiled.SetGradientExchange(exchange =>
+                    {
+                        Assert.Equal(In * hidden + hidden * Out, exchange.TotalLength);
+                        if (staged && exchange.TryReadStaged(out Span<float> g, out float loss))
+                        {
+                            stagedSteps++;
+                            exchanged.Add(loss);
+                            for (int i = 0; i < g.Length; i++) g[i] = g[i] * 0.5f + (i % 7) * 1e-3f;
+                            exchange.WriteStaged();
+                            return;
+                        }
+                        var local = new float[exchange.TotalLength];
+                        exchange.Read(local);
+                        exchanged.Add(exchange.ReadLoss());
+                        for (int i = 0; i < local.Length; i++) local[i] = local[i] * 0.5f + (i % 7) * 1e-3f;
+                        exchange.Write(local);
+                    });
+                    for (int s = 0; s < Steps; s++) losses.Add(plan.Step().ToArray()[0]);
+                    Assert.Equal(cuda, compiled.HasSplitStepGraph);
+                }
+                return (losses, exchanged, w1.ToArray().Concat(w2.ToArray()).ToArray(), stagedSteps);
+            }
+
+            var perBuffer = Run(staged: false);
+            var pageLocked = Run(staged: true);
+            Console.WriteLine($"cuda={cuda} stagedSteps={pageLocked.Staged} "
+                + $"maxDiff={perBuffer.Weights.Zip(pageLocked.Weights, (a, b) => Math.Abs(a - b)).Max():G4}");
+            // CUDA has the page-locked staging (every step, warm-up and replay); other backends and the host fall back.
+            Assert.Equal(cuda ? Steps : 0, pageLocked.Staged);
+            Assert.Equal(perBuffer.Losses, pageLocked.Losses);
+            Assert.Equal(perBuffer.ExchangedLosses, pageLocked.ExchangedLosses);
+            Assert.Equal(pageLocked.Losses, pageLocked.ExchangedLosses);
+            Assert.Equal(perBuffer.Weights, pageLocked.Weights);
+            Assert.True(perBuffer.Weights.Zip(Values(In * 8, 5, 0.4f), (a, b) => Math.Abs(a - b)).Max() > 1e-2,
+                "training must move the weights");
+        }
+    }
+
     // A loss scale state to resume from with no usable scale is refused, not silently replaced by the default.
     [Theory]
     [InlineData(0f)]
