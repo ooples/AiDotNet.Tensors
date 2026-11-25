@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return ExactFloatKernels.OpenCl + @"
+            return ExactFloatKernels.OpenCl + PackedFloatLibrary.OpenCl + @"
 // ===========================================================================
 // ATOMIC OPERATIONS FOR OPENCL 1.x COMPATIBILITY
 // ===========================================================================
@@ -136,7 +136,8 @@ __kernel void leaky_relu_forward(
     if (idx >= size) return;
 
     float x = input[idx];
-    output[idx] = x > 0.0f ? x : alpha * x;
+    // Keeps subnormals (PackedFloatLibrary.OpenCl) on a device that flushes them, as the CPU does.
+    output[idx] = pk_positive(x) ? x : pk_mul_keep(alpha, x);
 }
 
 

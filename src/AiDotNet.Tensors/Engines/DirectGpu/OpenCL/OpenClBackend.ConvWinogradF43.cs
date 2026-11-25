@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint arg = 2;
             output.SetArg(arg++, n); output.SetArg(arg++, k); output.SetArg(arg++, outH); output.SetArg(arg++, outW);
             output.SetArg(arg++, tilesH); output.SetArg(arg++, tilesW);
-            output.SetArg(arg++, BufferHandle(bias ?? y)); output.SetArg(arg++, epilogue);
+            output.SetArg(arg++, BufferHandle(bias ?? m)); output.SetArg(arg++, epilogue);
             RunWinograd(output, (long)k * n * tilesH * tilesW);
         }
     }
