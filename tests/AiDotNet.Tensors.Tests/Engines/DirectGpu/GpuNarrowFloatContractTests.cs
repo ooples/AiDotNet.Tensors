@@ -3,6 +3,7 @@
 #if NET6_0_OR_GREATER
 
 using System;
+using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.NumericOperations;
@@ -117,6 +118,7 @@ public abstract class GpuNarrowFloatContractTests
     [InlineData(GpuNarrowFloatBinaryOperation.Add)]
     [InlineData(GpuNarrowFloatBinaryOperation.Subtract)]
     [InlineData(GpuNarrowFloatBinaryOperation.Multiply)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Divide)]
     public void Binary_kernels_round_as_the_host_conversion_does(GpuNarrowFloatBinaryOperation operation)
     {
         var backend = Device();
@@ -143,6 +145,7 @@ public abstract class GpuNarrowFloatContractTests
                     {
                         GpuNarrowFloatBinaryOperation.Add => x + y,
                         GpuNarrowFloatBinaryOperation.Subtract => x - y,
+                        GpuNarrowFloatBinaryOperation.Divide => x / y,
                         _ => x * y,
                     };
                     AssertSame(type, expected, actual[i], $"{operation}<{type}> at {i} of {size} (0x{left[i]:X4}, 0x{right[i]:X4})");
@@ -209,6 +212,278 @@ public abstract class GpuNarrowFloatContractTests
         }
 
         RequireRan(ran, Types.Length * Sizes.Length, $"{operation} kernel");
+    }
+
+    // The function itself, evaluated in double: a binary32 evaluation of 1 / (1 + e^-x) overflows to a zero below
+    // -88.7, where the logistic function is still 8e-40 (a value BFloat16 holds).
+    // The scalar is a binary32 value, not one of the type's: a value the type holds, one it does not (0.1), zeros of
+    // both signs, a binary32 subnormal, an infinity and the largest float.
+    [SkippableTheory]
+    [InlineData(GpuNarrowFloatBinaryOperation.Add)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Subtract)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Multiply)]
+    [InlineData(GpuNarrowFloatBinaryOperation.Divide)]
+    public void Scalar_kernels_round_as_the_host_conversion_does(GpuNarrowFloatBinaryOperation operation)
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        float[] scalars = { 1.5f, -3f, 0.1f, 0f, -0f, 1e-40f, float.PositiveInfinity, float.MaxValue, 1024f };
+        int[] sizes = { 1, 3, 257, 4097 };
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatBinary(operation, type)) continue;
+            foreach (int size in sizes)
+            {
+                var left = Patterns(type, size, 9);
+                foreach (float y in scalars)
+                {
+                    using var a = Upload(backend, type, left);
+                    using var output = backend.AllocateBuffer(size, type);
+                    elementwise.ScalarNarrowFloat(operation, type, a, y, output, size);
+                    var actual = Download(backend, type, output, size);
+                    for (int i = 0; i < size; i++)
+                    {
+                        float x = Widen(type, left[i]);
+                        float expected = operation switch
+                        {
+                            GpuNarrowFloatBinaryOperation.Add => x + y,
+                            GpuNarrowFloatBinaryOperation.Subtract => x - y,
+                            GpuNarrowFloatBinaryOperation.Divide => x / y,
+                            _ => x * y,
+                        };
+                        AssertSame(type, expected, actual[i], $"{operation}<{type}> by {y:R} at {i} of {size} (0x{left[i]:X4})");
+                    }
+
+                    // The output may be the operand.
+                    elementwise.ScalarNarrowFloat(operation, type, a, y, a, size);
+                    Assert.Equal(actual, Download(backend, type, a, size));
+                }
+
+                ran++;
+            }
+        }
+
+        RequireRan(ran, Types.Length * sizes.Length, $"{operation} scalar kernel");
+    }
+
+    // The device's sum, on the host: in order within blocks of 64, each partial a binary32 value, until one is left.
+    private static float BlockedSum(float[] values)
+    {
+        var current = values;
+        while (true)
+        {
+            var next = new float[(current.Length + 63) / 64];
+            for (int block = 0; block < next.Length; block++)
+            {
+                float s = 0f;
+                int last = Math.Min(current.Length, (block + 1) * 64);
+                for (int j = block * 64; j < last; j++) s = (float)(s + current[j]);
+                next[block] = s;
+            }
+
+            if (next.Length == 1) return next[0];
+            current = next;
+        }
+    }
+
+    private static uint Bits(float value) => BitConverter.ToUInt32(BitConverter.GetBytes(value), 0);
+
+    // One pass (up to 64), two (up to 4096) and three, with block edges on both sides.
+    [SkippableFact]
+    public void Sum_is_the_blocked_binary32_sum_of_the_widened_elements()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        if (RunsEveryOperation) Assert.IsAssignableFrom<IGpuNarrowFloatReductions>(backend);
+        Skip.If(backend is not IGpuNarrowFloatReductions, "No 16-bit float reductions on this device.");
+        var reductions = (IGpuNarrowFloatReductions)backend;
+        int[] sizes = { 1, 3, 63, 64, 65, 257, 4096, 4097, 70001 };
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !reductions.SupportsNarrowFloatSum(type)) continue;
+            using (var empty = backend.AllocateBuffer(1, type))
+                Assert.Equal(0u, Bits(reductions.SumNarrowFloat(type, empty, 0)));
+            foreach (int size in sizes)
+            {
+                var values = Patterns(type, size, 11, moderate: true);
+                using var a = Upload(backend, type, values);
+                float expected = BlockedSum(Array.ConvertAll(values, v => Widen(type, v)));
+                float actual = reductions.SumNarrowFloat(type, a, size);
+                Assert.True(Bits(expected) == Bits(actual), $"Sum<{type}> of {size}: host {expected:R}, device {actual:R}");
+                // A prefix of the buffer: the elements past it are not read.
+                if (size > 1)
+                {
+                    float prefix = BlockedSum(Array.ConvertAll(values.Take(size - 1).ToArray(), v => Widen(type, v)));
+                    Assert.True(Bits(prefix) == Bits(reductions.SumNarrowFloat(type, a, size - 1)), $"Sum<{type}> of the first {size - 1} of {size}");
+                }
+
+                ran++;
+            }
+
+            // An infinity carries, opposite infinities and a NaN give a NaN, and negative zeros sum to a positive one.
+            var cases = new (float[] Values, float Expected)[]
+            {
+                (new[] { 1f, float.PositiveInfinity, 2f }, float.PositiveInfinity),
+                (new[] { float.NegativeInfinity, 2f }, float.NegativeInfinity),
+                (new[] { float.PositiveInfinity, float.NegativeInfinity }, float.NaN),
+                (new[] { 1f, float.NaN, 2f }, float.NaN),
+                (new[] { -0f, -0f }, 0f),
+            };
+            foreach (var (inputs, expected) in cases)
+            {
+                using var a = Upload(backend, type, Array.ConvertAll(inputs, v => Narrow(type, v)));
+                float actual = reductions.SumNarrowFloat(type, a, inputs.Length);
+                if (float.IsNaN(expected)) Assert.True(float.IsNaN(actual), $"Sum<{type}> of {string.Join(", ", inputs)} gave {actual:R}");
+                else Assert.True(Bits(expected) == Bits(actual), $"Sum<{type}> of {string.Join(", ", inputs)} gave {actual:R}");
+            }
+        }
+
+        RequireRan(ran, Types.Length * sizes.Length, "sum kernel");
+    }
+
+    // A value's place among the type's values: the zeros share 0, and negative values count down from it.
+    private static int Ordered(ushort bits) => (bits & 0x8000) != 0 ? -(bits & 0x7FFF) : bits & 0x7FFF;
+
+    private static float HostFunction(GpuNarrowFloatUnaryOperation operation, float x) => (float)(operation switch
+    {
+        GpuNarrowFloatUnaryOperation.Sqrt => Math.Sqrt(x),
+        GpuNarrowFloatUnaryOperation.Exp => Math.Exp(x),
+        GpuNarrowFloatUnaryOperation.Log => Math.Log(x),
+        GpuNarrowFloatUnaryOperation.Tanh => Math.Tanh(x),
+        GpuNarrowFloatUnaryOperation.Sigmoid => 1.0 / (1.0 + Math.Exp(-(double)x)),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation)),
+    });
+
+    [SkippableFact]
+    public void Abs_clears_the_sign_bit_and_nothing_else()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatUnary(GpuNarrowFloatUnaryOperation.Abs, type)) continue;
+            foreach (int size in Sizes)
+            {
+                var values = Patterns(type, size, 5);
+                using var a = Upload(backend, type, values);
+                using var output = backend.AllocateBuffer(size, type);
+                elementwise.UnaryNarrowFloat(GpuNarrowFloatUnaryOperation.Abs, type, a, output, size);
+                var actual = Download(backend, type, output, size);
+                for (int i = 0; i < size; i++)
+                    Assert.True((ushort)(values[i] & 0x7FFF) == actual[i], $"Abs<{type}> at {i} of {size}: 0x{values[i]:X4} gave 0x{actual[i]:X4}");
+                ran++;
+            }
+        }
+
+        RequireRan(ran, Types.Length * Sizes.Length, "Abs kernel");
+    }
+
+    // Over every bit pattern of the type (the patterns hold zeros of both signs, subnormals, both infinities and the
+    // largest finite values): a result is the host's to within two units in the last place of the type, and where the
+    // host's is a NaN, an infinity or a zero the device's is too.
+    [SkippableTheory]
+    [InlineData(GpuNarrowFloatUnaryOperation.Sqrt)]
+    [InlineData(GpuNarrowFloatUnaryOperation.Exp)]
+    [InlineData(GpuNarrowFloatUnaryOperation.Log)]
+    [InlineData(GpuNarrowFloatUnaryOperation.Tanh)]
+    [InlineData(GpuNarrowFloatUnaryOperation.Sigmoid)]
+    public void Function_kernels_equal_the_host_function_rounded_into_the_type(GpuNarrowFloatUnaryOperation operation)
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type) || !elementwise.SupportsNarrowFloatUnary(operation, type)) continue;
+            foreach (int size in Sizes)
+            {
+                // Both ranges: every bit pattern, and operands of moderate size where the functions vary fastest.
+                foreach (bool moderate in new[] { false, true })
+                {
+                    var values = Patterns(type, size, moderate ? 7 : 6, moderate);
+                    using var a = Upload(backend, type, values);
+                    using var output = backend.AllocateBuffer(size, type);
+                    elementwise.UnaryNarrowFloat(operation, type, a, output, size);
+                    var actual = Download(backend, type, output, size);
+                    for (int i = 0; i < size; i++)
+                    {
+                        float x = Widen(type, values[i]);
+                        float got = Widen(type, actual[i]);
+                        ushort expectedBits = Narrow(type, HostFunction(operation, x));
+                        float expected = Widen(type, expectedBits);
+                        string what = $"{operation}<{type}> at {i} of {size} (0x{values[i]:X4} = {x:R}) gave 0x{actual[i]:X4} = {got:R}, host {expected:R}";
+                        if (float.IsNaN(expected))
+                        {
+                            Assert.True(float.IsNaN(got), what);
+                            continue;
+                        }
+
+                        // Two units in the last place, counted on the storage bits: adjacent values of the type are
+                        // adjacent patterns, the infinity next to the largest finite value included.
+                        Assert.False(float.IsNaN(got), what);
+                        Assert.True(Math.Abs(Ordered(expectedBits) - Ordered(actual[i])) <= 2, what);
+                    }
+                }
+
+                ran++;
+            }
+        }
+
+        RequireRan(ran, Types.Length * Sizes.Length, $"{operation} kernel");
+    }
+
+    // The values a device's float function need not keep: decided on the bits, so every device returns these exactly.
+    [SkippableFact]
+    public void Function_kernels_return_the_special_values_exactly()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var elementwise = (IGpuNarrowFloatElementwise)backend;
+        const float NaN = float.NaN, Inf = float.PositiveInfinity;
+        var cases = new (GpuNarrowFloatUnaryOperation Operation, float Input, float Expected)[]
+        {
+            (GpuNarrowFloatUnaryOperation.Sqrt, 0f, 0f), (GpuNarrowFloatUnaryOperation.Sqrt, Inf, Inf),
+            (GpuNarrowFloatUnaryOperation.Sqrt, -1f, NaN), (GpuNarrowFloatUnaryOperation.Sqrt, -Inf, NaN),
+            (GpuNarrowFloatUnaryOperation.Sqrt, NaN, NaN), (GpuNarrowFloatUnaryOperation.Sqrt, 4f, 2f),
+            (GpuNarrowFloatUnaryOperation.Exp, 0f, 1f), (GpuNarrowFloatUnaryOperation.Exp, Inf, Inf),
+            (GpuNarrowFloatUnaryOperation.Exp, -Inf, 0f), (GpuNarrowFloatUnaryOperation.Exp, NaN, NaN),
+            (GpuNarrowFloatUnaryOperation.Exp, 1000f, Inf), (GpuNarrowFloatUnaryOperation.Exp, -1000f, 0f),
+            (GpuNarrowFloatUnaryOperation.Log, 1f, 0f), (GpuNarrowFloatUnaryOperation.Log, 0f, -Inf),
+            (GpuNarrowFloatUnaryOperation.Log, Inf, Inf), (GpuNarrowFloatUnaryOperation.Log, -1f, NaN),
+            (GpuNarrowFloatUnaryOperation.Log, -Inf, NaN), (GpuNarrowFloatUnaryOperation.Log, NaN, NaN),
+            (GpuNarrowFloatUnaryOperation.Tanh, 0f, 0f), (GpuNarrowFloatUnaryOperation.Tanh, Inf, 1f),
+            (GpuNarrowFloatUnaryOperation.Tanh, -Inf, -1f), (GpuNarrowFloatUnaryOperation.Tanh, NaN, NaN),
+            (GpuNarrowFloatUnaryOperation.Tanh, 1000f, 1f), (GpuNarrowFloatUnaryOperation.Tanh, -1000f, -1f),
+            (GpuNarrowFloatUnaryOperation.Sigmoid, 0f, 0.5f), (GpuNarrowFloatUnaryOperation.Sigmoid, Inf, 1f),
+            (GpuNarrowFloatUnaryOperation.Sigmoid, -Inf, 0f), (GpuNarrowFloatUnaryOperation.Sigmoid, NaN, NaN),
+            (GpuNarrowFloatUnaryOperation.Sigmoid, 1000f, 1f), (GpuNarrowFloatUnaryOperation.Sigmoid, -1000f, 0f),
+        };
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!backend.SupportsElementType(type)) continue;
+            foreach (var operation in cases.Select(c => c.Operation).Distinct())
+            {
+                if (!elementwise.SupportsNarrowFloatUnary(operation, type)) continue;
+                var mine = cases.Where(c => c.Operation == operation).ToArray();
+                var values = Array.ConvertAll(mine, c => Narrow(type, c.Input));
+                using var a = Upload(backend, type, values);
+                using var output = backend.AllocateBuffer(values.Length, type);
+                elementwise.UnaryNarrowFloat(operation, type, a, output, values.Length);
+                var actual = Download(backend, type, output, values.Length);
+                for (int i = 0; i < mine.Length; i++)
+                    AssertSame(type, mine[i].Expected, actual[i], $"{operation}<{type}> of {mine[i].Input:R}");
+                ran++;
+            }
+        }
+
+        RequireRan(ran, Types.Length * 5, "function kernels");
     }
 
     // Past the tanh clamp GELU is the input itself (or a zero): large finite inputs, whose cube overflows binary32

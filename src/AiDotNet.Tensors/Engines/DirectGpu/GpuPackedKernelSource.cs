@@ -366,17 +366,71 @@ internal static class GpuPackedKernelSource
             GpuNarrowFloatBinaryOperation.Add => "nfadd",
             GpuNarrowFloatBinaryOperation.Subtract => "nfsub",
             GpuNarrowFloatBinaryOperation.Multiply => "nfmul",
+            GpuNarrowFloatBinaryOperation.Divide => "nfdiv",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
         };
-        string w = Widen(type), n = Narrow(type);
-        string value = operation switch
-        {
-            GpuNarrowFloatBinaryOperation.Add => n + "(pk_fadd(" + w + "(x), " + w + "(y)))",
-            GpuNarrowFloatBinaryOperation.Subtract => n + "(pk_fadd(" + w + "(x), " + w + "(y) ^ 0x80000000u))",
-            _ => n + "(pk_fmul(" + w + "(x), " + w + "(y)))",
-        };
-        return Kernel("pk_" + stem + "_" + Suffix(type), 3, FloatLibrary, () => LaneBody(type, second: true, scalar: false, value));
+        return Kernel("pk_" + stem + "_" + Suffix(type), 3, FloatLibrary,
+            () => LaneBody(type, second: true, scalar: false, FloatBinaryValue(operation, type, Widen(type) + "(y)")));
     }
+
+    /// <summary>
+    /// The first pass of a 16-bit float sum, buffers (a, o): invocation <c>i</c> adds block <c>i</c> of the
+    /// <c>pcount</c> elements in order, on the bits, and writes the partial's binary32 bits.
+    /// </summary>
+    public static GpuPackedKernel FloatSum(GpuElementType type)
+    {
+        RequireFloat(type);
+        return Kernel("pk_nfsum_" + Suffix(type), 2, FloatLibrary, () => FloatSumBody(
+            Widen(type) + "((a[j >> 1u] >> ((j & 1u) * 16u)) & 0xFFFFu)"));
+    }
+
+    /// <summary>A later pass of a 16-bit float sum, buffers (a, o): the partials of the pass before, a word each.</summary>
+    public static GpuPackedKernel FloatSumPartials()
+        => Kernel("pk_nfsum_w", 2, FloatLibrary, () => FloatSumBody("a[j]"));
+
+    private static string FloatSumBody(string element)
+        => "    uint first = gid * " + GpuNarrowFloatLayout.SumBlock + "u;\n    uint last = min(first + " + GpuNarrowFloatLayout.SumBlock
+            + "u, pcount);\n    uint s = 0u;\n    for (uint j = first; j < last; j++) {\n        s = pk_fadd(s, " + element
+            + ");\n    }\n    o[gid] = s;\n";
+
+    /// <summary><c>o[i] = a[i] op scalar</c> on 16-bit floats, buffers (a, o): <c>pb</c> is the scalar's binary32 bits.</summary>
+    public static GpuPackedKernel Scalar(GpuNarrowFloatBinaryOperation operation, GpuElementType type)
+    {
+        RequireFloat(type);
+        // LaneBody's `yw` is the whole parameter word: the scalar as it was passed, already binary32.
+        return Kernel(Binary(operation, type).Name + "_s", 2, FloatLibrary,
+            () => LaneBody(type, second: false, scalar: true, FloatBinaryValue(operation, type, "yw")));
+    }
+
+    // `x` widened, combined on the bits with `right` (binary32 bits) and rounded once into the type.
+    private static string FloatBinaryValue(GpuNarrowFloatBinaryOperation operation, GpuElementType type, string right)
+    {
+        string w = Widen(type), n = Narrow(type);
+        return operation switch
+        {
+            GpuNarrowFloatBinaryOperation.Add => n + "(pk_fadd(" + w + "(x), " + right + "))",
+            GpuNarrowFloatBinaryOperation.Subtract => n + "(pk_fadd(" + w + "(x), " + right + " ^ 0x80000000u))",
+            GpuNarrowFloatBinaryOperation.Divide => n + "(pk_fdiv(" + w + "(x), " + right + "))",
+            _ => n + "(pk_fmul(" + w + "(x), " + right + "))",
+        };
+    }
+
+    // A function of the widened operand's binary32 bits, its result narrowed into the type.
+    private static string OnBits(string function, GpuElementType type) => Narrow(type) + "(" + function + "(" + Widen(type) + "(x)))";
+
+    /// <summary>The 16-bit float operations, in the order their kernels are listed.</summary>
+    internal static readonly GpuNarrowFloatBinaryOperation[] FloatBinaryOperations =
+    {
+        GpuNarrowFloatBinaryOperation.Add, GpuNarrowFloatBinaryOperation.Subtract, GpuNarrowFloatBinaryOperation.Multiply,
+        GpuNarrowFloatBinaryOperation.Divide,
+    };
+
+    internal static readonly GpuNarrowFloatUnaryOperation[] FloatUnaryOperations =
+    {
+        GpuNarrowFloatUnaryOperation.Negate, GpuNarrowFloatUnaryOperation.Relu, GpuNarrowFloatUnaryOperation.Gelu,
+        GpuNarrowFloatUnaryOperation.Abs, GpuNarrowFloatUnaryOperation.Sqrt, GpuNarrowFloatUnaryOperation.Exp,
+        GpuNarrowFloatUnaryOperation.Log, GpuNarrowFloatUnaryOperation.Tanh, GpuNarrowFloatUnaryOperation.Sigmoid,
+    };
 
     /// <summary><c>o[i] = op a[i]</c> on 16-bit floats: buffers (a, o).</summary>
     public static GpuPackedKernel Unary(GpuNarrowFloatUnaryOperation operation, GpuElementType type)
@@ -387,6 +441,12 @@ internal static class GpuPackedKernelSource
             GpuNarrowFloatUnaryOperation.Negate => "nfneg",
             GpuNarrowFloatUnaryOperation.Relu => "nfrelu",
             GpuNarrowFloatUnaryOperation.Gelu => "nfgelu",
+            GpuNarrowFloatUnaryOperation.Abs => "nfabs",
+            GpuNarrowFloatUnaryOperation.Sqrt => "nfsqrt",
+            GpuNarrowFloatUnaryOperation.Exp => "nfexp",
+            GpuNarrowFloatUnaryOperation.Log => "nflog",
+            GpuNarrowFloatUnaryOperation.Tanh => "nftanh",
+            GpuNarrowFloatUnaryOperation.Sigmoid => "nfsig",
             _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown 16-bit float operation."),
         };
         // The largest pattern below the sign bit that is not a NaN: infinity.
@@ -395,6 +455,12 @@ internal static class GpuPackedKernelSource
         {
             GpuNarrowFloatUnaryOperation.Negate => "x ^ 0x8000u",
             GpuNarrowFloatUnaryOperation.Relu => "pk_relu(x, " + top + ")",
+            GpuNarrowFloatUnaryOperation.Abs => "x & 0x7FFFu",
+            GpuNarrowFloatUnaryOperation.Sqrt => OnBits("pk_usqrt", type),
+            GpuNarrowFloatUnaryOperation.Exp => OnBits("pk_uexp", type),
+            GpuNarrowFloatUnaryOperation.Log => OnBits("pk_ulog", type),
+            GpuNarrowFloatUnaryOperation.Tanh => OnBits("pk_utanh", type),
+            GpuNarrowFloatUnaryOperation.Sigmoid => OnBits("pk_usigmoid", type),
             _ => Narrow(type) + "(FBITS(pk_gelu(UFLOAT(" + Widen(type) + "(x)))))",
         };
         return Kernel("pk_" + stem + "_" + Suffix(type), 2, FloatLibrary, () => LaneBody(type, second: false, scalar: false, value));
@@ -443,15 +509,18 @@ internal static class GpuPackedKernelSource
 
         foreach (var type in FloatTypes)
         {
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Add, type));
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Subtract, type));
-            all.Add(Binary(GpuNarrowFloatBinaryOperation.Multiply, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Negate, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Relu, type));
-            all.Add(Unary(GpuNarrowFloatUnaryOperation.Gelu, type));
+            foreach (var operation in FloatBinaryOperations)
+            {
+                all.Add(Binary(operation, type));
+                all.Add(Scalar(operation, type));
+            }
+
+            foreach (var operation in FloatUnaryOperations) all.Add(Unary(operation, type));
             all.Add(MatrixMultiply(type));
+            all.Add(FloatSum(type));
         }
 
+        all.Add(FloatSumPartials());
         all.Add(Copy(1));
         all.Add(Copy(2));
         return all;
