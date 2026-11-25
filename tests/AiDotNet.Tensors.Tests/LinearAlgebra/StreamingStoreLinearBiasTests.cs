@@ -74,15 +74,22 @@ public class StreamingStoreLinearBiasTests
             engine.FusedLinearInto(into, x, w, bias, FusedActivationType.ReLU);
             Assert.NotNull(w.StreamingInt4);
 
+            // The int4 kernel's result differs from the decoded-weight reference by the CPU's kernel choice (1.1e-3 on an
+            // output of 0.44 on the CI runner): a relative bound, as the int8 routing test uses. A lost bias (up to 0.3
+            // on outputs of about 0.5) is far outside it.
             var e = expected.AsSpan(); var a = viaFused.AsSpan(); var b = into.AsSpan();
+            double ref2 = 0, errA = 0, errB = 0;
             bool biasShows = false;
             for (int i = 0; i < e.Length; i++)
             {
-                Assert.True(Math.Abs(e[i] - a[i]) < 1e-4f, $"FusedLinear [{i}]: {a[i]} vs {e[i]}");
-                Assert.True(Math.Abs(e[i] - b[i]) < 1e-4f, $"FusedLinearInto [{i}]: {b[i]} vs {e[i]}");
+                ref2 += (double)e[i] * e[i];
+                errA += (double)(a[i] - e[i]) * (a[i] - e[i]);
+                errB += (double)(b[i] - e[i]) * (b[i] - e[i]);
                 biasShows |= e[i] > 0.25f;
             }
             Assert.True(biasShows, "the bias must move the output");
+            Assert.True(Math.Sqrt(errA / ref2) < 0.01, $"FusedLinear: relative error {Math.Sqrt(errA / ref2):E3}");
+            Assert.True(Math.Sqrt(errB / ref2) < 0.01, $"FusedLinearInto: relative error {Math.Sqrt(errB / ref2):E3}");
         }
         finally { Cleanup(dir); }
     }

@@ -144,6 +144,56 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
         }
     }
 
+    /// <summary>
+    /// A segmented plan reports what its schedule releases and recomputes, and refuses the frozen-weight forward
+    /// rebuild: the schedule names forward actions by index, and specialized actions would write elsewhere.
+    /// </summary>
+    [SkippableFact]
+    public void CheckpointedPlan_ReportsItsSchedule_AndRefusesTheFrozenWeightRebuild()
+    {
+        RequireDevice();
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            const int n = 256;
+            var weights = new Tensor<float>(new[] { 1, n });
+            var ones = new Tensor<float>(new[] { 1, n });
+            var column = new Tensor<float>(new[] { 1, n });
+            for (int i = 0; i < n; i++) { weights[i] = 0.5f + i / (float)n; ones[i] = 1f; column[i] = 1f + (i % 7) / 7f; }
+
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { weights }))
+            {
+                var segment = GraphMode.BeginCheckpointSegment();
+                var scaled = engine.TensorMultiply(weights, ones);
+                var hidden = engine.TensorMultiply(engine.Tanh(scaled), column);
+                segment.Dispose();
+                var loss = engine.ReduceSum(hidden, null);
+                plan = (CompiledTrainingPlan<float>)scope.CompileTraining(new[] { weights }, loss);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-3f);
+                Assert.Equal(1, plan.CheckpointSegmentCount);
+                Assert.True(plan.CheckpointReleasedActionCount > 0, "the segment released no forward action");
+                Assert.True(plan.CheckpointRecomputedActionCount > 0, "the segment recomputes no action");
+                Assert.Single(plan.CheckpointRecomputeSteps);
+                Assert.NotEmpty(plan.CheckpointRecomputeSteps[0]);
+
+                var ex = Assert.Throws<NotSupportedException>(() => plan.EnableFrozenWeightOptimizations());
+                Assert.Contains("does not compose with activation checkpoint segments", ex.Message);
+                plan.Step();   // the refused rebuild left the plan usable
+                Assert.True(plan.CheckpointRecomputeRuns > 0, "the segment was never recomputed");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
     [Fact]
     public void CheckpointSegments_OnAHostPlan_AreRefused()
     {

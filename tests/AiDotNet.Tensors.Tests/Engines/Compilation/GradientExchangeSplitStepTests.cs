@@ -64,6 +64,10 @@ public class GradientExchangeSplitStepTests
                 compiled.SetGradientExchange(exchange =>
                 {
                     Assert.Equal(In * Out, exchange.TotalLength);
+                    Assert.Same(w, Assert.Single(exchange.Parameters));
+                    // A host plan's gradients are host arrays; a device plan keeps its gradient on the device.
+                    if (engine is DirectGpuTensorEngine) Assert.Equal(1, exchange.DeviceGradientCount);
+                    else Assert.Equal(0, exchange.DeviceGradientCount);
                     var local = new float[exchange.TotalLength];
                     exchange.Read(local);
                     result.ExchangedLosses.Add(exchange.ReadLoss());

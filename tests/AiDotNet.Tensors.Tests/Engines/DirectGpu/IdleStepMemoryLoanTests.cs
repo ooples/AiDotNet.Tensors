@@ -461,20 +461,34 @@ public class IdleStepMemoryLoanTests
                 using var a = Compile(10);
                 using var b = Compile(20);
                 var held = Filled(new[] { 256, 256 }, 30, 1f);
+                var backend = (CudaBackend)TestRequire.NotNull(gpu.GetBackend(), "the engine's backend");
+                var planA = (CompiledTrainingPlan<float>)a;
+                int coOwnedIdle = 0;
                 for (int s = 0; s < 8; s++)
                 {
                     a.Step();
                     b.Step();
                     a.Step();
-                    // An allocation between a's steps: whatever a lends must not be scratch b co-owns.
+                    var pool = TestRequire.NotNull(planA.ScratchPoolForTest, "the plan's scratch pool");
+                    // a's step buffers that are idle until its next replay, among them scratch b co-owns.
+                    var idle = new HashSet<IGpuBuffer>();
+                    pool.CollectIdleBetweenRuns(int.MaxValue, _ => true, idle);
+                    var coOwned = idle.Where(buffer => gpu.SharedStepScratch.HasOtherOwner(buffer, pool)).ToList();
+                    coOwnedIdle += coOwned.Count;
+                    // Allocations between a's steps; the odd size is one nothing pooled serves, so it asks a for its idle
+                    // memory. Whatever a lends must not be scratch b co-owns.
                     var v = gpu.ReLU(gpu.TensorMatMul(held, held));
-                    var lent = ((CompiledTrainingPlan<float>)a).IdleLentBuffersForTest;
-                    Assert.All(lent, buffer => Assert.False(
-                        gpu.SharedStepScratch.HasOtherOwner(buffer, TestRequire.NotNull(((CompiledTrainingPlan<float>)a).ScratchPoolForTest, "the plan's scratch pool")),
-                        "a lent scratch another plan co-owns"));
+                    using (var odd = backend.AllocateBuffer(12_345 + s))
+                    {
+                        var lent = planA.IdleLentBuffersForTest;
+                        Assert.All(lent, buffer => Assert.False(gpu.SharedStepScratch.HasOtherOwner(buffer, pool),
+                            "a lent scratch another plan co-owns"));
+                        Assert.All(coOwned, buffer => Assert.DoesNotContain(buffer, lent));
+                    }
                     GC.KeepAlive(v);
                 }
                 Assert.True(gpu.SharedStepScratch.Takes > 0, "the two plans did not co-own any scratch: the test cannot tell");
+                Assert.True(coOwnedIdle > 0, "no idle buffer of a was co-owned by b: the test cannot tell");
             }
             finally
             {
