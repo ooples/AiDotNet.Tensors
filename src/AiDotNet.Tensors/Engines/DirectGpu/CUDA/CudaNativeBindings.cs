@@ -283,24 +283,28 @@ internal static class CudaNativeBindings
     /// finished / not ready, or an event the current context cannot make, falls back to cuStreamSynchronize, so errors
     /// and capture checks surface exactly as before.
     /// </summary>
+    /// <remarks>
+    /// Every path ends in a native cuStreamSynchronize, which returns at once on a stream already finished: a query or
+    /// an event wait reports completion, but only a stream synchronization makes the stream's completed cuMemFreeAsync
+    /// frees releasable, so without it a cuMemPoolTrimTo after the wait (empty_cache, an engine reset) freed nothing.
+    /// </remarks>
     private static CudaResult PollThenBlockStreamSynchronize(IntPtr stream)
     {
         var result = cuStreamQuery(stream);
-        if (result != CudaResult.NotReady) return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+        if (result != CudaResult.NotReady) return cuStreamSynchronizeNative(stream);
         long window = (long)(GpuHostWaitOptions.PollWindow.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
         long start = System.Diagnostics.Stopwatch.GetTimestamp();
         while (System.Diagnostics.Stopwatch.GetTimestamp() - start < window)
         {
             result = cuStreamQuery(stream);
-            if (result != CudaResult.NotReady) return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+            if (result != CudaResult.NotReady) return cuStreamSynchronizeNative(stream);
         }
         if (cuEventCreate(out IntPtr done, BlockingWaitEventFlags) != CudaResult.Success) return cuStreamSynchronizeNative(stream);
         try
         {
-            if (cuEventRecord(done, stream) != CudaResult.Success) return cuStreamSynchronizeNative(stream);
-            result = cuEventSynchronizeNative(done);
-            // An error the event reports is the stream's: report it the way cuStreamSynchronize does.
-            return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+            if (cuEventRecord(done, stream) == CudaResult.Success) cuEventSynchronizeNative(done);
+            // Finished (or failed) by now: the native wait returns at once and reports an error as it always did.
+            return cuStreamSynchronizeNative(stream);
         }
         finally
         {
