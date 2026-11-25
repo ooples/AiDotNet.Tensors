@@ -46,6 +46,18 @@ public sealed class CudaWddmPoolPressureTests
         Assert.Equal(256 * MiB, threshold);
     }
 
+    [Fact]
+    public void ZeroFreeReading_IsZeroHeadroom_NotAnEmptyDevice()
+    {
+        // cuMemGetInfo succeeded and reported no headroom: the floors apply, not the whole-device estimate.
+        Assert.Equal(256 * MiB, CudaBackend.ComputeDefaultMemPoolReleaseThreshold(12 * GiB, 0UL, isWddm: true, envOverrideMb: null));
+        Assert.Equal((long)(64 * MiB) / sizeof(float),
+            CudaBackend.ComputeDefaultWddmHostPoolMaxElements((long)(2 * GiB) / sizeof(float), freeBytes: 0UL));
+        // An unavailable reading falls back to the whole device / the existing cap.
+        Assert.Equal(6 * GiB, CudaBackend.ComputeDefaultMemPoolReleaseThreshold(12 * GiB, null, isWddm: true, envOverrideMb: null));
+        Assert.Equal(123L, CudaBackend.ComputeDefaultWddmHostPoolMaxElements(123L, freeBytes: null));
+    }
+
     [Theory]
     [InlineData("0", 0UL)]
     [InlineData("2048", 2048UL * MiB)]

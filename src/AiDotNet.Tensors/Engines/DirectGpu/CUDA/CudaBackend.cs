@@ -947,8 +947,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                     bool isWddm = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                         && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
                             || tccMode == 0);
-                    ulong initFreeBytes = totalMem;
-                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success && queriedFree > 0) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
+                    // Null when the reading is unavailable; a successful reading of zero headroom is kept as zero.
+                    ulong? initFreeBytes = null;
+                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
                         initFreeBytes = queriedFree;
                     if (isWddm)
                     {
@@ -2319,7 +2320,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private const long MinWddmHostPoolMaxBytes = 64L << 20;
 
     internal static ulong ComputeDefaultMemPoolReleaseThreshold(
-        ulong totalBytes, ulong freeBytes, bool isWddm, string? envOverrideMb)
+        ulong totalBytes, ulong? freeBytes, bool isWddm, string? envOverrideMb)
     {
         if (envOverrideMb is not null
             && !string.IsNullOrWhiteSpace(envOverrideMb)
@@ -2331,16 +2332,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         if (!isWddm || totalBytes == 0)
             return ulong.MaxValue;
-        ulong effectiveFree = freeBytes > 0 && freeBytes <= totalBytes ? freeBytes : totalBytes;
+        // An unavailable reading falls back to the whole device; zero headroom stays zero (the floor below applies).
+        ulong effectiveFree = freeBytes is { } f && f <= totalBytes ? f : totalBytes;
         ulong bounded = Math.Min(totalBytes / 2, effectiveFree / 2);
         return Math.Max(MinWddmMemPoolReleaseThresholdBytes, Math.Min(bounded, totalBytes));
     }
 
-    internal static long ComputeDefaultWddmHostPoolMaxElements(long currentMaxElements, ulong freeBytes)
+    internal static long ComputeDefaultWddmHostPoolMaxElements(long currentMaxElements, ulong? freeBytes)
     {
-        if (currentMaxElements <= 0 || freeBytes == 0)
+        // An unavailable reading leaves the cap as it is; zero headroom caps the pool at its floor.
+        if (currentMaxElements <= 0 || freeBytes is not { } free)
             return currentMaxElements;
-        long wddmCapBytes = Math.Max(MinWddmHostPoolMaxBytes, (long)Math.Min(freeBytes / 4, (ulong)long.MaxValue));
+        long wddmCapBytes = Math.Max(MinWddmHostPoolMaxBytes, (long)Math.Min(free / 4, (ulong)long.MaxValue));
         long wddmCapElements = wddmCapBytes / sizeof(float);
         return Math.Min(currentMaxElements, wddmCapElements);
     }

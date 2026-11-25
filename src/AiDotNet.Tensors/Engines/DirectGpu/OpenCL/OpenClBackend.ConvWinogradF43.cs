@@ -19,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var input = WinogradKernel(Kernels.WinogradF43Kernels.Input, x, v);
             uint arg = 2;
             input.SetArg(arg++, n); input.SetArg(arg++, c); input.SetArg(arg++, h); input.SetArg(arg++, w);
-            input.SetArg(arg++, pad); input.SetArg(arg++, tilesH); input.SetArg(arg++, tilesW);
+            input.SetArg(arg++, pad); input.SetArg(arg++, tilesH); input.SetArg(arg, tilesW);
             RunWinograd(input, (long)c * n * tilesH * tilesW);
         }
 
@@ -30,7 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint arg = 2;
             output.SetArg(arg++, n); output.SetArg(arg++, k); output.SetArg(arg++, outH); output.SetArg(arg++, outW);
             output.SetArg(arg++, tilesH); output.SetArg(arg++, tilesW);
-            output.SetArg(arg++, BufferHandle(bias ?? m)); output.SetArg(arg++, epilogue);
+            output.SetArg(arg++, BufferHandle(bias ?? m)); output.SetArg(arg, epilogue);
             RunWinograd(output, (long)k * n * tilesH * tilesW);
         }
     }

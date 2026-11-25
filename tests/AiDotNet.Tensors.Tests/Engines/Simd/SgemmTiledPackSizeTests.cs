@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines.Simd;
 using Xunit;
 
+#if NET5_0_OR_GREATER   // SgemmTiled, and its packing, is compiled only on .NET 5+
 namespace AiDotNet.Tensors.Tests.Engines.Simd;
 
 /// <summary>
@@ -58,3 +59,4 @@ public sealed class SgemmTiledPackSizeTests
         }
     }
 }
+#endif
