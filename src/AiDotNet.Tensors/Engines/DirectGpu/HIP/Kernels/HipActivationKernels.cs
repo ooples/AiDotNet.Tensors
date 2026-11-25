@@ -538,7 +538,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* inpu
     // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
     // merge below), and the compare no longer flushes a subnormal under fast math. Ties keep the left operand.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0xFF800000u;
-    if (xf_isnan(val)) val = 0x7FC00000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
     xf_scratch[tid] = val;
     __syncthreads();
 
@@ -564,7 +564,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* inpu
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // Exact as reduce_max: a NaN anywhere is the result, +inf identity.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0x7F800000u;
-    if (xf_isnan(val)) val = 0x7FC00000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
     xf_scratch[tid] = val;
     __syncthreads();
 

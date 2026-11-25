@@ -14933,8 +14933,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (outerSize <= 0) return;
-        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
-            return;
+        // The opt-in direct-PTX row maximum is not taken here: its fold is max.f32, which drops a NaN operand, and a
+        // row that holds a NaN must reduce to NaN. Its modules are precompiled (the embedded SM86 cubins are keyed by
+        // the PTX text), so the fold can only change together with regenerated cubins. The kernels below run on the
+        // device as well.
         // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
         bool rows = reduceSize >= 256 && _kernelCache.ContainsKey("max_axis_rows");
         if (!_kernelCache.TryGetValue(rows ? "max_axis_rows" : "max_axis", out var kernel))

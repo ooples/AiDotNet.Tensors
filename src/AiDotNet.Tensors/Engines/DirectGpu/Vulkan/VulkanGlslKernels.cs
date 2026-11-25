@@ -1468,7 +1468,7 @@ void main() {
             uint v = floatBitsToUint(a[i]);
             if (xf_isnan(v)) sawNaN = true; else if (xf_gt(v, value)) value = v;
         }
-        b[0] = uintBitsToFloat(sawNaN ? 0x7FC00000u : value);
+        b[0] = uintBitsToFloat(sawNaN ? 0xFFC00000u : value);
     } else if (op == 2u) {
         uint value = 0x7F800000u;
         bool sawNaN = false;
@@ -1476,7 +1476,7 @@ void main() {
             uint v = floatBitsToUint(a[i]);
             if (xf_isnan(v)) sawNaN = true; else if (xf_lt(v, value)) value = v;
         }
-        b[0] = uintBitsToFloat(sawNaN ? 0x7FC00000u : value);
+        b[0] = uintBitsToFloat(sawNaN ? 0xFFC00000u : value);
     } else if (op == 3u) {
         float mean = 0.0;
         for (uint i = 0u; i < size; ++i) mean += a[i];
@@ -1531,7 +1531,7 @@ void main() {
     uint offset = outer * reduceSize;
     for (uint j = 0u; j < reduceSize; ++j) {
         uint v = floatBitsToUint(a[offset + j]);
-        if (xf_isnan(v)) { value = 0x7FC00000u; break; }
+        if (xf_isnan(v)) { value = v; break; }
         if (xf_gt(v, value)) value = v;
     }
     b[outer] = uintBitsToFloat(value);

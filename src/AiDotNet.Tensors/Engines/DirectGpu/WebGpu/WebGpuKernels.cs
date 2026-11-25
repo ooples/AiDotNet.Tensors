@@ -689,7 +689,7 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
         // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
         // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, 0x7FC00000u, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0xFFC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -719,7 +719,7 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
         // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
         // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, 0x7FC00000u, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0xFFC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -3551,7 +3551,7 @@ fn max_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
             let v = bitcast<u32>(input[idx * params.reduce_size + j]);
             if (xf_isnan(v)) {
-                max_bits = 0x7FC00000u;
+                max_bits = v;
                 break;
             }
             if (xf_gt(v, max_bits)) {

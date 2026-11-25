@@ -1082,7 +1082,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
     // merge below), and fmaxf no longer flushes a subnormal under fast math.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0xFF800000u;
-    if (xf_isnan(val)) val = 0x7FC00000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
@@ -1124,7 +1124,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     // Exact as reduce_max: a NaN anywhere is the result, +inf identity.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0x7F800000u;
-    if (xf_isnan(val)) val = 0x7FC00000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;

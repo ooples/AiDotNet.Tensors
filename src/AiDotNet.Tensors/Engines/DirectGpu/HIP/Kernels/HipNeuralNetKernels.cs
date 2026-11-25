@@ -740,7 +740,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
     unsigned int best = 0xFF800000u;
     for (int i = 0; i < axisSize; i++) {
-        if (xf_isnan(row[i])) { best = 0x7FC00000u; break; }
+        if (xf_isnan(row[i])) { best = row[i]; break; }
         if (xf_gt(row[i], best)) best = row[i];
     }
     output[outer] = __uint_as_float(best);

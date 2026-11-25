@@ -70,7 +70,7 @@ __kernel void reduce_max(
 
     // Load into local memory
     const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0xFF800000u;
-    scratch[localIdx] = xf_isnan(loaded) ? 0x7FC00000u : loaded;
+    scratch[localIdx] = xf_isnan(loaded) ? 0xFFC00000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -105,7 +105,7 @@ __kernel void reduce_min(
 
     // Load into local memory
     const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0x7F800000u;
-    scratch[localIdx] = xf_isnan(loaded) ? 0x7FC00000u : loaded;
+    scratch[localIdx] = xf_isnan(loaded) ? 0xFFC00000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -240,7 +240,7 @@ __kernel void max_axis(
     __global const uint* row = (__global const uint*)input + (size_t)outerIdx * reduceSize;
     uint best = 0xFF800000u;
     for (int i = 0; i < reduceSize; i++) {
-        if (xf_isnan(row[i])) { best = 0x7FC00000u; break; }
+        if (xf_isnan(row[i])) { best = row[i]; break; }
         if (xf_gt(row[i], best)) best = row[i];
     }
     output[outerIdx] = as_float(best);

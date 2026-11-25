@@ -1797,7 +1797,7 @@ kernel void max_reduce(
     uint max_val = 0xFF800000u;
     for (uint i = gid; i < size; i += group_size * 256) {
         uint v = as_type<uint>(input[i]);
-        if (xf_isnan(v)) max_val = 0x7FC00000u; else if (xf_gt(v, max_val)) max_val = v;
+        if (xf_isnan(v)) max_val = 0xFFC00000u; else if (xf_gt(v, max_val)) max_val = v;
     }
     shared[lid] = as_type<float>(max_val);
 
@@ -1831,7 +1831,7 @@ kernel void min_reduce(
     uint min_val = 0x7F800000u;
     for (uint i = gid; i < size; i += group_size * 256) {
         uint v = as_type<uint>(input[i]);
-        if (xf_isnan(v)) min_val = 0x7FC00000u; else if (xf_lt(v, min_val)) min_val = v;
+        if (xf_isnan(v)) min_val = 0xFFC00000u; else if (xf_lt(v, min_val)) min_val = v;
     }
     shared[lid] = as_type<float>(min_val);
 
@@ -1984,7 +1984,7 @@ kernel void max_axis(
         uint offset = gid * reduce_size;
         for (uint i = 0; i < reduce_size; i++) {
             uint v = as_type<uint>(input[offset + i]);
-            if (xf_isnan(v)) { max_val = 0x7FC00000u; break; }
+            if (xf_isnan(v)) { max_val = v; break; }
             if (xf_gt(v, max_val)) max_val = v;
         }
         output[gid] = as_type<float>(max_val);
