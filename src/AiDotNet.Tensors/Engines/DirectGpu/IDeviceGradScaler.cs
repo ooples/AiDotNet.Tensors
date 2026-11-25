@@ -42,12 +42,14 @@ internal interface IDeviceGradScalerFactory
         DeviceGradScalerSettings settings, Compilation.LossScaleState initial);
 }
 
-/// <summary>A backend whose FP32 GEMMs can multiply in FP16 or BF16 (matmul autocast).</summary>
-[BackendSpecificRoute("CUDA cuBLAS FP16/BF16 tensor-core compute for FP32 GEMMs (operands down-converted inside the kernel); "
-    + "every backend runs the GEMM natively in FP32",
-    nameof(IDirectGpuBackend.Gemm), nameof(IDirectGpuBackend.BatchedGemm))]
+/// <summary>
+/// A backend whose FP32 GEMMs run under matmul autocast: every backend. CUDA multiplies on cuBLAS's 16-bit tensor-core
+/// kernels; the others round the operands on the device (<see cref="GemmOperandAutocast"/>) and run their FP32 GEMM.
+/// </summary>
 internal interface IGemmAutocastBackend
 {
-    /// <summary>Until the scope is disposed, FP32 GEMMs multiply in <paramref name="precision"/> and accumulate FP32.</summary>
+    /// <summary>
+    /// Until the scope is disposed, FP32 GEMMs take operands rounded to <paramref name="precision"/> and accumulate FP32.
+    /// </summary>
     IDisposable EnterGemmAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode = Gpu.MatMulAutocastMode.CastOperands);
 }

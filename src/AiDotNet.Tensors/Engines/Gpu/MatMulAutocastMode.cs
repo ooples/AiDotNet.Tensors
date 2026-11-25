@@ -17,7 +17,8 @@ public enum MatMulAutocastMode
     /// The FP32 operands go to cuBLAS with a compute type that permits FP16/BF16 tensor-core math
     /// (<c>CUBLAS_COMPUTE_32F_FAST_16F</c> / <c>_FAST_16BF</c>). No cast kernels or 16-bit copies, but the rounding is
     /// cuBLAS's choice per shape: it keeps FP32 kernels where it prefers them (typically small GEMMs), so a model's
-    /// results can depend on its batch size and the device.
+    /// results can depend on its batch size and the device. A backend without cuBLAS has no such compute type and
+    /// rounds the operands, as under <see cref="CastOperands"/>.
     /// </summary>
     FastComputeType = 1,
 }

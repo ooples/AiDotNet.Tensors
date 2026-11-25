@@ -1834,6 +1834,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         if (TryExecuteHipBlasGemm(A, B, C, M, N, K, alpha, beta))
         {
             return;
@@ -1922,6 +1924,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public unsafe void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         if (!HipBlasReady)
         {
             // No vendor BLAS: route through Gemm with a materialized
@@ -2071,6 +2075,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)batchCount * M * K, ref B, (long)batchCount * K * N);
         if (batchCount <= 0)
             throw new ArgumentException("Batch count must be positive", nameof(batchCount));
 
@@ -2222,6 +2228,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer GemmBiasLeakyRelu(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, float alpha = 0.01f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         var output = AllocateBuffer(M * N);
 
         if (!_kernelCache.TryGetValue("gemm_bias_leaky_relu", out var krnl))

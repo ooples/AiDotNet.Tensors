@@ -488,6 +488,17 @@ internal static class GpuPackedKernelSource
             + "            r = (r & (~(0xFFFFu << sh))) | (v << sh);\n        }\n    }\n    o[gid] = r;\n");
     }
 
+    /// <summary>
+    /// Rounds 32-bit floats to the type and back, buffers (a, o), a word each: <c>o[i] = (float)(type)a[i]</c> on the
+    /// bits, one invocation per element. What matmul autocast casts a GEMM's operands with.
+    /// </summary>
+    public static GpuPackedKernel Round(GpuElementType type)
+    {
+        RequireFloat(type);
+        return Kernel("pk_nfround_" + Suffix(type), 2, FloatLibrary, () =>
+            "    o[gid] = " + Widen(type) + "(" + Narrow(type) + "(a[gid]));\n");
+    }
+
     /// <summary>Every kernel, in a stable order: what a Metal library holds, and what the compilation tests compile.</summary>
     public static IReadOnlyList<GpuPackedKernel> All => AllKernels.Value;
 
@@ -517,6 +528,7 @@ internal static class GpuPackedKernelSource
 
             foreach (var operation in FloatUnaryOperations) all.Add(Unary(operation, type));
             all.Add(MatrixMultiply(type));
+            all.Add(Round(type));
             all.Add(FloatSum(type));
         }
 

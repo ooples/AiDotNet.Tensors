@@ -518,12 +518,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Opens a matmul autocast scope, PyTorch's <c>torch.autocast(dtype=float16|bfloat16)</c> for matrix products: until
-    /// the returned scope is disposed, every FP32 GEMM this engine's CUDA backend runs through cuBLAS rounds its operands
-    /// to FP16 or BF16 (round to nearest even), multiplies them on tensor cores and accumulates and returns FP32, whatever
-    /// the shape (<see cref="Gpu.MatMulAutocastMode.CastOperands"/>). Tensors, master weights and every non-matmul op stay
-    /// FP32, and a compiled training plan traced or captured inside the scope records the reduced-precision GEMMs.
-    /// <see cref="Gpu.PrecisionMode.Float32"/> opens a scope that turns autocast off. A backend without cuBLAS (or a
-    /// non-CUDA backend) runs its FP32 GEMMs unchanged.
+    /// the returned scope is disposed, every FP32 GEMM of this engine's backend rounds its operands to FP16 or BF16
+    /// (round to nearest even) on the device and accumulates and returns FP32, whatever the shape
+    /// (<see cref="Gpu.MatMulAutocastMode.CastOperands"/>). CUDA multiplies them on cuBLAS's tensor-core kernels; OpenCL,
+    /// Vulkan, Metal, WebGPU and HIP round them with a kernel and run their own FP32 GEMM, so the products are the same
+    /// up to the order of the FP32 accumulation and there is no speed to gain. Tensors, master weights and every
+    /// non-matmul op stay FP32, and a compiled training plan traced or captured inside the scope records the
+    /// reduced-precision GEMMs. <see cref="Gpu.PrecisionMode.Float32"/> opens a scope that turns autocast off.
     /// </summary>
     /// <param name="precision">FP16, BF16 or FP32.</param>
     public IDisposable EnterMatMulAutocast(Gpu.PrecisionMode precision)
@@ -534,6 +535,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="Gpu.MatMulAutocastMode.CastOperands"/> (the default, PyTorch's semantics) rounds the operands to 16 bits
     /// before every GEMM; <see cref="Gpu.MatMulAutocastMode.FastComputeType"/> passes the FP32 operands to cuBLAS with a
     /// compute type that permits 16-bit tensor-core math, which cuBLAS may decline for a shape it serves faster in FP32.
+    /// Only cuBLAS has such a compute type: every other backend rounds the operands under either mode.
     /// </summary>
     /// <param name="precision">FP16, BF16 or FP32.</param>
     /// <param name="mode">How the operands reach 16 bits.</param>

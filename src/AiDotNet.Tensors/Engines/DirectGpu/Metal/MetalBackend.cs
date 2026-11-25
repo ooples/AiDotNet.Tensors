@@ -889,6 +889,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <inheritdoc/>
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         ThrowIfDisposed();
         // The matmul_tiled_transposed kernel writes C unconditionally
         // (no β·C blend). Fail fast on β != 0 rather than silently
@@ -915,6 +917,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         ThrowIfDisposed();
 
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer || C is not MetalGpuBuffer cBuffer)
@@ -980,6 +984,8 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)batchCount * M * K, ref B, (long)batchCount * K * N);
         ThrowIfDisposed();
 
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer || C is not MetalGpuBuffer cBuffer)
