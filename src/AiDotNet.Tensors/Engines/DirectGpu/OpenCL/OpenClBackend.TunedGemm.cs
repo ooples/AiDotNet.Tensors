@@ -125,7 +125,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
             reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
             reduce.SetArg(2, m * n); reduce.SetArg(3, planes);
-            reduce.SetArg(4, BufferHandle(c)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
+            reduce.SetArg(4, BufferHandle(partial)); reduce.SetArg(5, 0); reduce.SetArg(6, n);
             reduce.Execute1D(RoundUpToMultiple(m * n, ReduceGroupSize), ReduceGroupSize);
         }
 

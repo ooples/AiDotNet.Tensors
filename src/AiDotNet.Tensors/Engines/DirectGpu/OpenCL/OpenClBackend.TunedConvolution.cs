@@ -51,8 +51,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                             // Fused F(2x2, 3x3): transforms, per-point products and output transform in one launch, so
                             // the 16-plane V and M never reach global memory.
                             new DelegateTunedKernelCandidate<TunedConv2DArgs>("opencl.conv2d.winograd_fused", TunedKernelOrigin.Builtin, true,
-                                shape => WinogradF23Pipeline.AdmitsShape(shape)
-                                    && HasTunedKernel(Kernels.WinogradFusedKernels.Forward, WinogradFusedGroupSize),
+                                shape => WinogradF23Pipeline.AdmitsShape(shape) && WinogradFusedRunsHere,
                                 (in TunedConv2DArgs a) => Conv2DWinogradFused(a)),
                             // im2col (none for a 1x1 stride-1 unpadded batch-1 conv) + the register-blocked split-K GEMM,
                             // which keeps every CU busy on the small late-layer products CLBlast leaves underfilled.
@@ -143,8 +142,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // ConvEpiloguePasses after the convolution.
         private static int ConvEpilogueFlags(in TunedConv2DArgs a) => ConvEpilogue.Flags(a);
 
-        // A bias buffer for the epilogue argument; the output stands in when there is none (the kernel never reads it).
-        private static IntPtr ConvEpilogueBias(in TunedConv2DArgs a) => BufferHandle(a.Bias ?? a.Output);
+        // A bias buffer for the epilogue argument; the filter stands in when there is none (the kernel never reads it).
+        // Not the output: bound a second time as a const argument, AMD's driver (Windows, 23.19) stopped ordering the
+        // next kernel after the output's write (see RbSplitKGemm).
+        private static IntPtr ConvEpilogueBias(in TunedConv2DArgs a) => BufferHandle(a.Bias ?? a.Kernel);
 
         private void ConvEpiloguePasses(in TunedConv2DArgs a)
         {
@@ -230,6 +231,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private const int WinogradFusedChunkAlign = 8;
         private const int WinogradFusedMinSlice = 32;
         private const int WinogradFusedGroupsPerComputeUnit = 2;
+
+        // Whether the fused Winograd forward can launch here: its 34 KB of local memory exceeds a 32 KB device (gfx90c).
+        internal bool WinogradFusedRunsHere => HasTunedKernel(Kernels.WinogradFusedKernels.Forward, WinogradFusedGroupSize);
 
         // (batch, C, H, W, O, kH, kW, sH, sW, pH, pW, dH, dW, OH, OW): 1 x 1 in and out, odd undilated filter, half padding.
         private static bool AdmitsCenterTap(TunedShape shape)
@@ -459,14 +463,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             gemm.SetArg(0, BufferHandle(a)); gemm.SetArg(1, BufferHandle(b)); gemm.SetArg(2, BufferHandle(partial ?? c));
             gemm.SetArg(3, m); gemm.SetArg(4, n); gemm.SetArg(5, k); gemm.SetArg(6, k); gemm.SetArg(7, n);
             gemm.SetArg(8, kChunk);
-            gemm.SetArg(9, BufferHandle(bias ?? c)); gemm.SetArg(10, partial is null ? epilogue : 0);
+            // The unused bias slot takes an input, never the output: AMD's driver (Windows, 23.19) did not order the next
+            // kernel after this one's write when the output was bound a second time as a const argument, so a transpose
+            // queued after the GEMM read its operand before the GEMM wrote it.
+            gemm.SetArg(9, BufferHandle(bias ?? a)); gemm.SetArg(10, partial is null ? epilogue : 0);
             gemm.Execute3D(RoundUpToMultiple(n, Rb64Tile) / Rb64OutputsPerItem, RoundUpToMultiple(m, Rb64Tile) / Rb64OutputsPerItem,
                 splits, Rb64GroupSide, Rb64GroupSide, 1);
             if (partial is null) return;
             var reduce = _kernelCache[Kernels.BatchedGemmKernels.SplitKReduce];
             reduce.SetArg(0, BufferHandle(partial)); reduce.SetArg(1, BufferHandle(c));
             reduce.SetArg(2, m * n); reduce.SetArg(3, splits);
-            reduce.SetArg(4, BufferHandle(bias ?? c)); reduce.SetArg(5, epilogue); reduce.SetArg(6, n);
+            reduce.SetArg(4, BufferHandle(bias ?? partial)); reduce.SetArg(5, epilogue); reduce.SetArg(6, n);
             reduce.Execute1D(RoundUpToMultiple(m * n, ReduceGroupSize), ReduceGroupSize);
         }
 
