@@ -944,7 +944,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             zero = 0;
                             CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
                         });
-                    bool isWddm = OperatingSystem.IsWindows()
+                    bool isWddm = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
                         && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success
                             || tccMode == 0);
                     ulong initFreeBytes = totalMem;
@@ -2318,7 +2318,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     internal static ulong ComputeDefaultMemPoolReleaseThreshold(
         ulong totalBytes, ulong freeBytes, bool isWddm, string? envOverrideMb)
     {
-        if (!string.IsNullOrWhiteSpace(envOverrideMb)
+        if (envOverrideMb is not null
+            && !string.IsNullOrWhiteSpace(envOverrideMb)
             && long.TryParse(envOverrideMb.Trim(), System.Globalization.NumberStyles.Integer,
                 System.Globalization.CultureInfo.InvariantCulture, out long overrideMb))
         {
