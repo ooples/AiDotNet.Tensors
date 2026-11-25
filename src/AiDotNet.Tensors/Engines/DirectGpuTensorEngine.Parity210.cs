@@ -625,6 +625,14 @@ public partial class DirectGpuTensorEngine
 
     public override Tensor<T> TensorRemainder<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (!Compilation.GraphMode.IsActive && ShapesMatch(a.Shape._dims, b.Shape._dims)
+            && TryBinaryIntegerAny(a, b, nameof(TensorRemainder)) is { } integerResult)
+        {
+            Autodiff.DifferentiableOps.RecordBinary("TensorRemainder", integerResult, a, b,
+                Autodiff.BackwardFunctions<T>.RemainderBackward);
+            return integerResult;
+        }
+
         try
         {
             var r = TryRunParity210Binary(a, b, (int[])a._shape.Clone(),

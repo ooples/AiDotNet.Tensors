@@ -113,6 +113,14 @@ public abstract class GpuIntegerBackendContractTests
             GpuIntegerBinaryOperation.Max => Math.Max(x, y),
             GpuIntegerBinaryOperation.And => x & y,
             GpuIntegerBinaryOperation.Or => x | y,
+            // Defined everywhere: a zero divisor gives 0, and over -1 the quotient is the wrapping negation (the host
+            // operators raise for both in 64 bits).
+            GpuIntegerBinaryOperation.Divide => y == 0 ? 0 : y == -1 ? unchecked(-x) : x / y,
+            GpuIntegerBinaryOperation.Remainder => y == 0 || y == -1 ? 0 : x % y,
+            GpuIntegerBinaryOperation.Equal => x == y ? 1 : 0,
+            GpuIntegerBinaryOperation.NotEqual => x != y ? 1 : 0,
+            GpuIntegerBinaryOperation.Greater => x > y ? 1 : 0,
+            GpuIntegerBinaryOperation.Less => x < y ? 1 : 0,
             _ => x ^ y,
         };
         return GpuIntegerLayout.Wrap(wide, type);
@@ -120,7 +128,14 @@ public abstract class GpuIntegerBackendContractTests
 
     private static long Host(GpuIntegerUnaryOperation operation, GpuElementType type, long x)
         => type == GpuElementType.Bool ? (x == 0 ? 1 : 0)
-            : GpuIntegerLayout.Wrap(operation == GpuIntegerUnaryOperation.Negate ? unchecked(-x) : ~x, type);
+            : GpuIntegerLayout.Wrap(operation switch
+            {
+                GpuIntegerUnaryOperation.Negate => unchecked(-x),
+                // The most negative value is its own absolute value, as it is its own negation.
+                GpuIntegerUnaryOperation.Abs => x < 0 ? unchecked(-x) : x,
+                GpuIntegerUnaryOperation.Sign => Math.Sign(x),
+                _ => ~x,
+            }, type);
 
     private static readonly GpuElementType[] Types =
     {
@@ -158,6 +173,12 @@ public abstract class GpuIntegerBackendContractTests
     [InlineData(GpuIntegerBinaryOperation.And)]
     [InlineData(GpuIntegerBinaryOperation.Or)]
     [InlineData(GpuIntegerBinaryOperation.Xor)]
+    [InlineData(GpuIntegerBinaryOperation.Divide)]
+    [InlineData(GpuIntegerBinaryOperation.Remainder)]
+    [InlineData(GpuIntegerBinaryOperation.Equal)]
+    [InlineData(GpuIntegerBinaryOperation.NotEqual)]
+    [InlineData(GpuIntegerBinaryOperation.Greater)]
+    [InlineData(GpuIntegerBinaryOperation.Less)]
     public void Binary_and_scalar_kernels_equal_the_host(GpuIntegerBinaryOperation operation)
     {
         var backend = Device();
@@ -201,6 +222,8 @@ public abstract class GpuIntegerBackendContractTests
     [SkippableTheory]
     [InlineData(GpuIntegerUnaryOperation.Negate)]
     [InlineData(GpuIntegerUnaryOperation.Not)]
+    [InlineData(GpuIntegerUnaryOperation.Abs)]
+    [InlineData(GpuIntegerUnaryOperation.Sign)]
     public void Unary_kernels_equal_the_host(GpuIntegerUnaryOperation operation)
     {
         var backend = Device();
@@ -249,6 +272,44 @@ public abstract class GpuIntegerBackendContractTests
                 long prefixExpected = 0;
                 for (int i = 0; i < prefix; i++) prefixExpected = unchecked(prefixExpected + values[i]);
                 Assert.Equal(GpuIntegerLayout.Wrap(prefixExpected, type), reductions.SumInteger(a, prefix));
+                ran++;
+            }
+        }
+
+        Assert.True(ran > 0, "No element type ran.");
+    }
+
+    // By the element type's own order: the values hold both extremes of every type, and a prefix must not read past
+    // itself (the extreme of the whole buffer usually lies outside a short prefix).
+    [SkippableFact]
+    public void Min_and_max_are_the_extremes_in_the_element_types_order()
+    {
+        var backend = Device();
+        Skip.If(backend is null, SkipReason);
+        var reductions = Reductions(backend);
+        int ran = 0;
+        foreach (var type in Types)
+        {
+            if (!reductions.SupportsIntegerReductions(type)) continue;
+            foreach (int size in Sizes)
+            {
+                var values = Values(type, size, 6);
+                using var a = Upload(backend, type, values);
+                foreach (int count in new[] { size, Math.Max(1, size / 2), 1 })
+                {
+                    long smallest = values[0], largest = values[0];
+                    for (int i = 1; i < count; i++)
+                    {
+                        smallest = Math.Min(smallest, values[i]);
+                        largest = Math.Max(largest, values[i]);
+                    }
+
+                    Assert.True(smallest == reductions.MinInteger(a, count), $"Min<{type}> of the first {count} of {size}: host {smallest}, device {reductions.MinInteger(a, count)}.");
+                    Assert.True(largest == reductions.MaxInteger(a, count), $"Max<{type}> of the first {count} of {size}: host {largest}, device {reductions.MaxInteger(a, count)}.");
+                }
+
+                Assert.Throws<ArgumentException>(() => reductions.MinInteger(a, 0));
+                Assert.Throws<ArgumentException>(() => reductions.MaxInteger(a, 0));
                 ran++;
             }
         }
