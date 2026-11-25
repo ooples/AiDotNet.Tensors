@@ -789,7 +789,14 @@ float spiral_angle(int center, int reference, int vertex) {
     float ax = vertices[vertex * 3] - cx;
     float ay = vertices[vertex * 3 + 1] - cy;
     float az = vertices[vertex * 3 + 2] - cz;
-    return atan(ax * ry - ay * rx, ax * rx + ay * ry + az * rz);
+    // The CPU's atan2 (IEEE): a neighbour opposite the reference has a zero cross product, and its sign decides
+    // between -pi and +pi, so between first and last in the ring. GLSL's atan leaves that sign undefined (an AMD
+    // driver returns +pi for atan(-0, -1)) and an unqualified expression may lose the -0, so both are pinned here.
+    precise float cross = ax * ry - ay * rx;
+    precise float along = ax * rx + ay * ry + az * rz;
+    if (cross == 0.0 && along < 0.0)
+        return (floatBitsToUint(cross) >> 31) != 0u ? -3.14159274 : 3.14159274;
+    return atan(cross, along);
 }
 void main() {
     if (gl_GlobalInvocationID.x != 0) return;
