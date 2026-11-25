@@ -5904,6 +5904,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private float SumGpuReduction(IGpuBuffer A, int size)
         => ReduceGpuScalar("reduce_sum", A, size, 0.0f);
 
+    // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU, also for a single element, which a
+    // reduction with nothing to merge can hand back as it is, payload included.
+    private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
+
     private float ReduceGpuScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
     {
         if (!IsAvailable)
@@ -5946,12 +5950,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public float Max(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_max", A, size, float.MinValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_max", A, size, float.MinValue));
     }
 
     public float Min(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_min", A, size, float.MaxValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_min", A, size, float.MaxValue));
     }
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)

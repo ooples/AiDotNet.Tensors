@@ -4562,13 +4562,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float Max(IGpuBuffer A, int size)
         {
-            return ReduceScalar("reduce_max", A, size, float.MinValue);
+            return CanonicalNaN(ReduceScalar("reduce_max", A, size, float.MinValue));
         }
 
         public float Min(IGpuBuffer A, int size)
         {
-            return ReduceScalar("reduce_min", A, size, float.MaxValue);
+            return CanonicalNaN(ReduceScalar("reduce_min", A, size, float.MaxValue));
         }
+
+        // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU. The kernel writes it for every range it
+        // reduces, but a single element needs no pass and came back as the element itself, payload included.
+        private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
 
         private float ReduceScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
         {
