@@ -2,7 +2,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
-namespace AiDotNet.Tensors.Tests.Engines;
+namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// A narrow that keeps the LEADING elements of its source (start 0) is a contiguous view at storage offset 0 that
