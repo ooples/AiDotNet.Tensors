@@ -40848,7 +40848,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!indices.IsContiguous) indices = indices.Contiguous();
 
         int normalizedAxis = axis < 0 ? source._shape.Length + axis : axis;
         if (normalizedAxis < 0 || normalizedAxis >= source._shape.Length)
@@ -40859,16 +40858,21 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
+                // Before anything reads the indices: a contiguous copy taken here would hold the zeros of indices
+                // the trace has not computed yet, and would not be the tensor their producers write.
+                var refreshIndices = CaptureIndexProducers(indices, "TensorGather");
                 var captured = source;
-                var capIndices = indices;
+                var capIndices = refreshIndices is null && !indices.IsContiguous ? indices.Contiguous() : indices;
                 var capAxis = normalizedAxis;
                 // Compute output shape: replace source._shape[axis] with indices shape
                 var outShape = ComputeGatherOutputShape(source._shape, indices._shape, capAxis);
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorGather", source, outShape,
-                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorGather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
             }
         }
+
+        if (!indices.IsContiguous) indices = indices.Contiguous();
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -43641,9 +43645,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// A captured indexed op reads its indices when the plan runs, but the plan schedules only its float operands:
-    /// indices still to be produced by another captured op would be read before they are computed. Such a capture
-    /// cannot replay, so it is rejected rather than run on uninitialized indices.
+    /// A captured scatter or index-select reads its indices when the plan runs, but the plan schedules only its float
+    /// operands: indices still to be produced by another captured op would be read before they are computed. Such a
+    /// capture is rejected rather than run on uninitialized indices (a saved plan stores the indices by value).
     /// </summary>
     private static void RequireConcreteIndices(Tensor<int> indices, string opName)
     {
@@ -43651,6 +43655,47 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new NotSupportedException(
                 $"{opName} cannot be captured with indices produced inside the same graph; compute the indices "
                 + "before entering graph mode.");
+    }
+
+    /// <summary>
+    /// A captured gather or index-copy reads its indices when the plan runs, but the plan schedules only its float
+    /// operands: indices that integer ops of the same trace still have to produce (an arange plus an offset, a broadcast sum of
+    /// row and column offsets) would be read before they are computed, and the first step would index with zeros.
+    /// Returns what recomputes those indices, for the op's replay to run before it reads them, or null when the
+    /// indices are concrete already. Each replay recomputes them, as each eager call would, so an integer tensor the
+    /// caller edits between steps is followed too.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The indices come from an in-place integer write, or from an op of
+    /// another element type recorded in the same trace: neither can be recomputed in isolation.</exception>
+    private static Action<IEngine>? CaptureIndexProducers(Tensor<int> indices, string opName)
+    {
+        if (indices.LazySource is not ILazyNode root || root.IsRealized) return null;
+
+        var producers = new List<ILazyNode>();
+        var pending = new Stack<ILazyNode>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            var node = pending.Pop();
+            if (producers.Contains(node)) continue;
+            if (node is not LazyNode<int> || node.WritesInPlace)
+                throw new NotSupportedException(
+                    $"{opName} cannot be captured with indices produced inside the same graph by '{node.OpName}'; "
+                    + "compute the indices before entering graph mode.");
+            producers.Add(node);
+            foreach (var input in node.GetInputNodes()) pending.Push(input);
+        }
+
+        var nodes = producers.ToArray();
+        return engine =>
+        {
+            // Not a host read by the objective: the op that owns these indices is running.
+            using (GraphMode.SuspendRecording())
+            {
+                foreach (var node in nodes) node.IsRealized = false;
+                root.Realize(engine);
+            }
+        };
     }
 
     /// <inheritdoc/>

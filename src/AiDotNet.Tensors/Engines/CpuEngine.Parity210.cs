@@ -2588,9 +2588,10 @@ public partial class CpuEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
+                var refreshIndices = CaptureIndexProducers(indices, "TensorIndexCopy");
                 var ct = tensor; var ca = axis; var ci = indices; var cs = source;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorIndexCopy", tensor, source, (int[])tensor._shape.Clone(),
-                    (eng, output) => { var r = eng.TensorIndexCopy(ct, ca, ci, cs); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorIndexCopy(ct, ca, ci, cs); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.IndexCopyBackward, new object[] { ca, ci });
             }
         }
