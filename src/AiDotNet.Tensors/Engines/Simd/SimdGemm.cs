@@ -4785,6 +4785,20 @@ internal static partial class SimdGemm
         }
     }
 
+    /// <summary>
+    /// Packed-panel sizes for one <see cref="SgemmTiled"/> call: a panel is at most Mc x Kc of A and Kc x Nc of B, and
+    /// never more than the problem itself (rounded up to the micro-tile). Sizing by the Mc/Kc/Nc ceilings alone rented
+    /// 8 MB for B on every thread, whatever the shape: a compiled training step's [64 x 32] weight-gradient GEMM paid
+    /// that once per worker thread.
+    /// </summary>
+    internal static (int PackedA, int PackedB) TiledPackSizes(int mc, int m, int k, int n)
+    {
+        int panelM = Math.Min(mc, m), panelK = Math.Min(Kc, k), panelN = Math.Min(Nc, n);
+        int mcRounded = ((panelM + Mr - 1) / Mr) * Mr;   // PackA/PackB pad to whole micro-tiles
+        int ncRounded = ((panelN + Nr - 1) / Nr) * Nr;
+        return (mcRounded * panelK, panelK * ncRounded);
+    }
+
     [MethodImpl(Hot)]
     private static void SgemmTiled(
         ReadOnlySpan<float> a, int lda, bool transA,
@@ -4821,11 +4835,7 @@ internal static partial class SimdGemm
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
             && (long)m * k * n >= ParallelWorkThreshold;
 
-        // Round up to micro-tile dimensions to avoid buffer overruns in PackA/PackB padding
-        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
-        int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
-        int packedASize = mcRounded * Kc;
-        int packedBSize = Kc * ncRounded;
+        var (packedASize, packedBSize) = TiledPackSizes(Mc, m, k, n);
         float[] packedABuf = ArrayPool<float>.Shared.Rent(packedASize);
         float[] packedBBuf = ArrayPool<float>.Shared.Rent(packedBSize);
 
