@@ -31998,6 +31998,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _persistentBufferCache.Clear();
         _tensorVersions.Clear();
         _persistentWeightHostVersion.Clear();
+        ReleaseBf16DeviceWeights();
         // Reclaim buffers awaiting deferred disposal (engine teardown — no reader to race).
         foreach (var retired in _retiredWeightBuffers) retired.Dispose();
         _retiredWeightBuffers.Clear();
