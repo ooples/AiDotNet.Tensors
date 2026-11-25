@@ -71,7 +71,8 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     private int _gemmAutocastState;
     private readonly List<GemmAutocastScope> _gemmAutocastScopes = new();
 
-    private int GemmAutocastState => Volatile.Read(ref _gemmAutocastState);
+    // A GEMM a non-matmul operation issues (GemmAutocastExemption: a ones-vector sum or broadcast) runs in FP32.
+    private int GemmAutocastState => GemmAutocastExemption.Active ? 0 : Volatile.Read(ref _gemmAutocastState);
     private static int AutocastComputeOf(int state) => state & 0xFF;
     private static int AutocastCastTypeOf(int state) => state >> 8;
     private int GemmAutocastComputeType => AutocastComputeOf(GemmAutocastState);

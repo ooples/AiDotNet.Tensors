@@ -306,6 +306,7 @@ public sealed partial class CudaBackend
                     + "fast compute type instead, which cuBLAS may serve in FP32 for some shapes.");
             return false;
         }
+        CastGemmObserver?.Invoke(new CastGemmRecord(castType, transA, transB, m, n, k, batch));
         long aCount = OperandSpan(transA ? k : m, transA ? m : k, lda, strideA, batch);
         long bCount = OperandSpan(transB ? n : k, transB ? k : n, ldb, strideB, batch);
         int aWords = HalfWords(aCount, what), bWords = HalfWords(bCount, what);

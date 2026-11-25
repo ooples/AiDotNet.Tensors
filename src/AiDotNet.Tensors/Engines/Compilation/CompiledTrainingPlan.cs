@@ -3228,7 +3228,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     throw new InvalidOperationException("A parameter's accepted-update age is inconsistent with the optimizer's global step.");
             int previousStep = _optimizerStep;
             ThrowOnInvalidCurrentFusedCeLabels();
-            _optimizerUpdate?.Invoke();
+            // The optimizer is not part of the autocast region: its GEMMs run in FP32 like every other update op.
+            using (Engines.DirectGpu.GemmAutocastExemption.Enter())
+                _optimizerUpdate?.Invoke();
             if (_optimizerStep > previousStep)
             {
                 if (_finitenessDeferred) _pendingParameterAgeMembership = (bool[])_optimizerGradientMembership.Clone();
@@ -5298,6 +5300,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_capturedOptimizer is { } optimizer && _stepIo is { } io)
         {
+            // Captured optimizer work stays outside the autocast region, as in InvokeOptimizerUpdate.
+            using var _fp32 = Engines.DirectGpu.GemmAutocastExemption.Enter();
             if (parity == 0) optimizer.Capture(io);
             else optimizer.CaptureOdd!(io);
         }

@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
         int n,
         DirectPtxLinearActivation activation)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!IsDirectPtxFusedLinearEnabled ||
             !DirectPtxFeatureGate.FusedLinearExperimentOverride)
             return false;
@@ -155,6 +157,8 @@ public sealed partial class CudaBackend
         DirectPtxLinearActivation activation,
         bool derivativeFromOutput)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         bool requiresOutput = activation == DirectPtxLinearActivation.Sigmoid ||
             activation == DirectPtxLinearActivation.Tanh;
         if (derivativeFromOutput != requiresOutput)

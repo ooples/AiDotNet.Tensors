@@ -46,7 +46,8 @@ internal sealed class GemmOperandAutocast
 
     /// <summary>The type GEMM operands are rounded to now, or null.</summary>
     internal GpuElementType? CastType
-        => Volatile.Read(ref _state) is int state and not 0 ? (GpuElementType)(state - 1) : null;
+        => !GemmAutocastExemption.Active && Volatile.Read(ref _state) is int state and not 0
+            ? (GpuElementType)(state - 1) : null;
 
     internal IDisposable Enter(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode)
     {

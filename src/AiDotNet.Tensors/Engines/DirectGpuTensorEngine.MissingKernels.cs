@@ -6875,21 +6875,26 @@ public partial class DirectGpuTensorEngine
             if (inPlace is not null) inPlace.BiasAddInPlace(logits, b, c, vocab);   // logits = h_c·W + b
             else backend.BiasAdd(work, b, logits, c, vocab);
             backend.MaxAxis(logits, rowStat, c, vocab);                    // m_r
-            backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
             backend.Gather(logits, chunkPositions, picked, c, 1);          // shifted target logit
             if (inPlace is not null) inPlace.ExpInPlace(logits, cv);
             else backend.Exp(logits, work, cv);
             backend.SumAxis(work, rowStat, c, vocab);
             backend.Log(rowStat, rowStat, c);                              // shifted lse_r
-            backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
-            backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
             if (chunkFlags is not null)
             {
                 backend.Copy(positions.Buffer, n + r0, chunkFlags, 0, c);
-                backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
                 // Finite 0/1 flags, so the count holds even where a backend assumes no NaN. Sticky until read.
                 backend.Copy(positions.Buffer, 2 * n + r0, chunkFlags, 0, c);
-                backend.Gemm(ones, chunkFlags, labelError!, 1, 1, c, 1f, 1f);
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, chunkFlags, labelError!, 1, 1, c, 1f, 1f);
             }
         }
         backend.Scale(meanLoss, meanLoss, 1f / n, 1);
@@ -6997,7 +7002,8 @@ public partial class DirectGpuTensorEngine
             if (needWeight)
                 transposedA!.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
             if (needBias)
-                backend.Gemm(ones!, work, dBias.Buffer, 1, vocab, c, 1f, beta);   // dB += 1ᵀ·dL_c
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones!, work, dBias.Buffer, 1, vocab, c, 1f, beta);   // dB += 1ᵀ·dL_c
         }
         RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
         if (needHidden)

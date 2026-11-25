@@ -545,7 +545,51 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(precision), precision, "Matmul autocast supports FP16, BF16 and FP32.");
         if (mode is not (Gpu.MatMulAutocastMode.CastOperands or Gpu.MatMulAutocastMode.FastComputeType))
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown matmul autocast mode.");
-        return GetBackend() is DirectGpu.IGemmAutocastBackend autocast ? autocast.EnterGemmAutocast(precision, mode) : NoOpScope.Instance;
+        if (GetBackend() is not DirectGpu.IGemmAutocastBackend autocast) return NoOpScope.Instance;
+        var scope = new MatMulAutocastScope(this, precision, autocast.EnterGemmAutocast(precision, mode));
+        lock (_matMulAutocastScopes) _matMulAutocastScopes.Add(scope);
+        return scope;
+    }
+
+    // The matmul autocast scopes open on this engine, newest last (EnterMatMulAutocast). As on the backend, the newest
+    // still open decides, and a Float32 scope turns autocast off.
+    private readonly System.Collections.Generic.List<MatMulAutocastScope> _matMulAutocastScopes = new();
+
+    /// <summary>
+    /// Whether this engine's GEMMs autocast now: a FP16 or BF16 matmul autocast scope is the newest open one, and this
+    /// thread is not issuing a non-matmul GEMM (<see cref="GemmAutocastExemption"/>). Fused ops whose
+    /// kernels multiply in FP32 decline while it holds, so their products reach the GEMMs that cast their operands.
+    /// </summary>
+    internal bool MatMulAutocastActive
+    {
+        get
+        {
+            if (GemmAutocastExemption.Active) return false;
+            lock (_matMulAutocastScopes)
+                return _matMulAutocastScopes.Count > 0
+                    && _matMulAutocastScopes[_matMulAutocastScopes.Count - 1].Precision != Gpu.PrecisionMode.Float32;
+        }
+    }
+
+    private sealed class MatMulAutocastScope : IDisposable
+    {
+        private DirectGpuTensorEngine? _engine;
+        private readonly IDisposable _backendScope;
+        internal readonly Gpu.PrecisionMode Precision;
+
+        public MatMulAutocastScope(DirectGpuTensorEngine engine, Gpu.PrecisionMode precision, IDisposable backendScope)
+        {
+            _engine = engine;
+            Precision = precision;
+            _backendScope = backendScope;
+        }
+
+        public void Dispose()
+        {
+            if (System.Threading.Interlocked.Exchange(ref _engine, null) is not { } engine) return;
+            lock (engine._matMulAutocastScopes) engine._matMulAutocastScopes.Remove(this);
+            _backendScope.Dispose();
+        }
     }
 
     private sealed class NoOpScope : IDisposable
@@ -7434,9 +7478,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var ones = GetCachedOnesBuffer(backend, onesOnRight ? cols : rows);
             if (ones is null) { AliasDiag($"OuterBroadcast NULL ones (capturing, not pre-warmed) rows={rows} cols={cols}"); return null; }
             if (onesOnRight)
-                backend.Gemm(sR, ones, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(sR, ones, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
             else
-                backend.Gemm(ones, sR, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, sR, outBuf, rows, cols, 1, alpha, 0f);   // [rows,1]·[1,cols]
             ResidentSyncCheck("OuterBroadcast");
             BindResidentBuffer(output, outBuf, backend);
             return output;
@@ -21564,7 +21610,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 afterTrailing = rowSums.Buffer;
             }
             if (ones is not null)
-                backend.Gemm(ones, afterTrailing, output.Buffer, 1, kept, leading);
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, afterTrailing, output.Buffer, 1, kept, leading);
             else
                 backend.Copy(afterTrailing, output.Buffer, kept);
             if (op == ReduceOperation.Mean)
@@ -21649,7 +21696,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         else
         {
             if (!TryColumnSumsOnDevice(backend, inBuf, outBuf, leading, kept, add: false) && ones is not null)
-                backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, inBuf, outBuf, 1, kept, leading);   // [1, leading] · [leading, kept]
             if (op == ReduceOperation.Mean)
                 backend.Scale(outBuf, outBuf, 1f / leading, kept);
         }
@@ -21706,7 +21754,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // outer batches of [1, reduced] x [reduced, inner] -> [1, inner]; the ones buffer holds outer * reduced ones,
             // i.e. outer concatenated [1, reduced] rows.
-            backend.BatchedGemm(ones, inputBuffer.Buffer, output.Buffer, 1, inner, reduced, outer);
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.BatchedGemm(ones, inputBuffer.Buffer, output.Buffer, 1, inner, reduced, outer);
             if (op == ReduceOperation.Mean)
                 backend.Scale(output.Buffer, output.Buffer, 1f / reduced, outputLength);
             var result = DeferTensorResult<T>(backend, output.Buffer, outputLength, outputShape);
@@ -21807,7 +21856,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 && broadcast.TryBroadcastMiddle(gradient.Buffer, output, outer, reduced, inner, scale, add: false))
                 return;
             // outer batches of [reduced, 1] x [1, inner] -> [reduced, inner].
-            backend.BatchedGemm(ones, gradient.Buffer, output, reduced, inner, 1, outer);
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.BatchedGemm(ones, gradient.Buffer, output, reduced, inner, 1, outer);
             if (scale != 1f)
                 backend.Scale(output, output, scale, inputSize);
         }, fullyWritten: true);
@@ -24432,7 +24482,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             if (!TryColumnSumsOnDevice(backend, inBuf, target, rows, cols, add))
-                backend.Gemm(ones, inBuf, target, 1, cols, rows, 1f, add ? 1f : 0f);   // [1, rows] · [rows, cols]
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, inBuf, target, 1, cols, rows, 1f, add ? 1f : 0f);   // [1, rows] · [rows, cols]
         }
         catch (NotSupportedException ex)
         {

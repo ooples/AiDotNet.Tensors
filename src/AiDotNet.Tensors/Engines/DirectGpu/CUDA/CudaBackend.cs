@@ -3880,6 +3880,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IGpuBuffer? TryGemmBiasFusedEpilogue(
         IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, CublasLtEpilogue epilogue)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return null;
         if (!CuBlasLtFusedEnabled) return null;
         var lt = TryGetCuBlasLt();
         if (lt is null) return null;
@@ -6468,6 +6470,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
+        if (TryAutocastGemmOnStream(A, B, C, M, N, K, alpha, beta, stream))
+            return;
+
         if (stream.Handle == _stream && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
@@ -6527,6 +6532,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
             return;
         }
+
+        if (TryAutocastGemmBiasActivationOnStream(A, B, bias, output, M, N, K, activation, stream))
+            return;
 
         DirectPtxLinearActivation directActivation = activation switch
         {
@@ -12551,6 +12559,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.ReLU))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearReluCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -12573,6 +12583,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Sigmoid))
+            return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearSigmoidCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid");
@@ -12597,6 +12609,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Tanh))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearTanhCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -12619,6 +12633,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Gelu))
+            return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearGeluCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu");
@@ -12671,6 +12687,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Swish))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearSwishCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
@@ -12693,6 +12711,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.ReLU))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearReluCode))
             return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
@@ -12740,6 +12761,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Sigmoid))
             return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearSigmoidCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
@@ -12782,6 +12806,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Tanh))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearTanhCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
@@ -12826,6 +12853,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Gelu))
             return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearGeluCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
@@ -12868,6 +12898,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Swish))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearSwishCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
@@ -19739,6 +19772,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        // Under matmul autocast the logits product reads its operands cast to 16 bits, as the unfused GEMM would; the
+        // accumulation, the softmax and the loss stay FP32.
+        using var roundedHidden = RoundAutocastOperand(hidden, checked(n * d), kernelName);
+        using var roundedWeight = RoundAutocastOperand(weight, checked(d * vocab), kernelName);
+        if (roundedHidden is not null) hidden = roundedHidden;
+        if (roundedWeight is not null) weight = roundedWeight;
         DirectPtxCrossEntropyTarget directTarget = kernelName == "fused_linear_ce_index"
             ? DirectPtxCrossEntropyTarget.Index
             : DirectPtxCrossEntropyTarget.Dense;
