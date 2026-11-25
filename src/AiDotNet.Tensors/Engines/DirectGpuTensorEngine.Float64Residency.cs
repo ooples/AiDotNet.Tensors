@@ -393,7 +393,7 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>The sum of a double tensor computed on the device, when that is the cheaper route.</summary>
-    private bool TrySumFloat64Tensor(Tensor<double> tensor, out double sum)
+    private bool TrySumFloat64Tensor(Tensor<double> tensor, out double sum, GpuFloat64Reduction reduction = GpuFloat64Reduction.Sum)
     {
         sum = 0.0;
         int length = tensor.Length;
@@ -410,7 +410,12 @@ public partial class DirectGpuTensorEngine
                 CountResidentTransfers(tensor, out int uploads, out _);
                 if (length < (uploads == 0 ? Float64ElementwiseMinLength : Float64ReductionMinLength)) return false;
                 using var operand = ResolveResidentOperand(backend, tensor, GpuElementType.Float64);
-                sum = reductions.SumFloat64(operand.Buffer, length);
+                sum = reduction switch
+                {
+                    GpuFloat64Reduction.Max => reductions.MaxFloat64(operand.Buffer, length),
+                    GpuFloat64Reduction.Min => reductions.MinFloat64(operand.Buffer, length),
+                    _ => reductions.SumFloat64(operand.Buffer, length),
+                };
                 return true;
             }
         }

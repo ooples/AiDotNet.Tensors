@@ -240,6 +240,19 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
     }
 
     /// <inheritdoc/>
+    public double MaxFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Max);
+
+    /// <inheritdoc/>
+    public double MinFloat64(IGpuBuffer a, int size) => ExtremeFloat64(a, size, GpuFloat64Reduction.Min);
+
+    private double ExtremeFloat64(IGpuBuffer a, int size, GpuFloat64Reduction reduction)
+    {
+        var input = Float64Operand(a, size, nameof(a));
+        if (size == 0) throw new ArgumentException("An empty range has no minimum or maximum.", nameof(size));
+        return ReduceFloat64(input, null, size, reduction);
+    }
+
+    /// <inheritdoc/>
     public double DotFloat64(IGpuBuffer a, IGpuBuffer b, int size)
     {
         var left = Float64Operand(a, size, nameof(a));
@@ -249,7 +262,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
 
     // Each pass folds blocks of MetalFloat64Kernels.ReduceBlock elements into one partial each, until one value is left.
     // The first pass multiplies by `second` when it is given (the dot product); every later pass sums partials.
-    private double ReduceFloat64(MetalGpuBuffer first, MetalGpuBuffer? second, int size)
+    private double ReduceFloat64(MetalGpuBuffer first, MetalGpuBuffer? second, int size, GpuFloat64Reduction reduction = GpuFloat64Reduction.Sum)
     {
         int block = MetalFloat64Kernels.ReduceBlock;
         int partials = (size + block - 1) / block;
@@ -267,7 +280,7 @@ public sealed partial class MetalBackend : IGpuFloat64Reductions, IGpuFloat64Ele
             if (firstPass && second is not null)
                 LaunchFloat64(Float64Pipeline("f64k_dot"), outputs, new[] { current, second, target }, (uint)outputs, (uint)count);
             else
-                LaunchFloat64(Float64Pipeline("f64k_sum"), outputs, new[] { current, target }, (uint)outputs, (uint)count);
+                LaunchFloat64(Float64Pipeline(reduction == GpuFloat64Reduction.Sum ? "f64k_sum" : reduction == GpuFloat64Reduction.Max ? "f64k_max" : "f64k_min"), outputs, new[] { current, target }, (uint)outputs, (uint)count);
             firstPass = false;
             if (outputs == 1)
                 return BitConverter.ToDouble(DownloadByteBuffer(target, sizeof(double)), 0);
@@ -456,6 +469,46 @@ kernel void f64k_sum(
     uint last = min(first + " + ReduceBlock + @"u, count);
     uint2 y = uint2(0u, 0u);
     for (uint j = first; j < last; j++) { y = f64_add(y, f64k_load(a, j)); }
+    f64k_store(o, gid, y);
+}
+
+// Pass of a maximum: o[gid] is that of block gid of the `count` input elements, a NaN when the block holds one.
+kernel void f64k_max(
+    device const uint* a [[buffer(0)]],
+    device uint* o [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) { return; }
+    uint first = gid * " + ReduceBlock + @"u;
+    uint last = min(first + " + ReduceBlock + @"u, count);
+    uint2 y = f64k_load(a, first);
+    for (uint j = first + 1u; j < last; j++)
+    {
+        uint2 v = f64k_load(a, j);
+        if (!f64_is_nan(y) && (f64_is_nan(v) || f64_lt(y, v))) { y = v; }
+    }
+    f64k_store(o, gid, y);
+}
+
+// Pass of a minimum: o[gid] is that of block gid of the `count` input elements, a NaN when the block holds one.
+kernel void f64k_min(
+    device const uint* a [[buffer(0)]],
+    device uint* o [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) { return; }
+    uint first = gid * " + ReduceBlock + @"u;
+    uint last = min(first + " + ReduceBlock + @"u, count);
+    uint2 y = f64k_load(a, first);
+    for (uint j = first + 1u; j < last; j++)
+    {
+        uint2 v = f64k_load(a, j);
+        if (!f64_is_nan(y) && (f64_is_nan(v) || f64_lt(v, y))) { y = v; }
+    }
     f64k_store(o, gid, y);
 }
 

@@ -9998,6 +9998,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleExtreme, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64Reduction.Max))
+            return (T)(object)doubleExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
@@ -10011,6 +10013,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(tensor);
         using var __gpuOp = EnterGpuOp();
+        if (tensor is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleExtreme, global::AiDotNet.Tensors.Engines.DirectGpu.GpuFloat64Reduction.Min))
+            return (T)(object)doubleExtreme;
         if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 
@@ -31889,6 +31893,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         BeginHostScalarRead(input);
         using var __gpuOp = EnterGpuOp();
+        // The double sum on the device, divided once on the host.
+        if (input is Tensor<double> doubles && TrySumFloat64Tensor(doubles, out double doubleSum))
+            return (T)(object)(doubleSum / doubles.Length);
         if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {
             try
