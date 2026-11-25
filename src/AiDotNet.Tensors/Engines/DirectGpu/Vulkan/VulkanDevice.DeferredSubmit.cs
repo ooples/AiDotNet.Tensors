@@ -76,7 +76,23 @@ public sealed unsafe partial class VulkanDevice
     private readonly object _pendingLock = new();
     private readonly Queue<PendingSubmission> _pending = new();
     private readonly Stack<DeferredCommandSlot> _freeSlots = new();
-    private readonly List<(long Serial, Action Release)> _deferredReleases = new();
+    private readonly List<(long Serial, Action Release, long Bytes)> _deferredReleases = new();
+    private long _deferredReleaseBytes;
+
+    /// <summary>
+    /// Device memory that released buffers may hold while they wait for a queued submission, before the next
+    /// dispatch waits for the oldest submissions. <see cref="MaxPendingSubmissions"/> bounds only how many
+    /// submissions are queued: a forward that releases each intermediate as it goes kept every one of them
+    /// allocated until a host read, up to 64 submissions of 16 dispatches each (a 16-layer dense block peaked at
+    /// 159 MB of device memory for 4 MB of live results; AiDotNet#2383).
+    /// </summary>
+    internal const long DefaultDeferredReleaseByteBudget = 16L * 1024 * 1024;
+
+    /// <summary>The budget in force: <see cref="DefaultDeferredReleaseByteBudget"/> unless a test changes it.</summary>
+    internal long DeferredReleaseByteBudget { get; set; } = DefaultDeferredReleaseByteBudget;
+
+    /// <summary>Bytes of released buffers still waiting for the submission that last used them.</summary>
+    internal long DeferredReleaseBytes => Interlocked.Read(ref _deferredReleaseBytes);
     private IntPtr _deferredCommandPool;
     private long _submittedSerial;
     private long _completedSerial;
@@ -141,6 +157,38 @@ public sealed unsafe partial class VulkanDevice
         lock (_pendingLock)
             foreach (var buffer in boundBuffers) buffer.MarkUsedBySubmission(_openSerial);
         if (_openSets.Count >= Math.Max(1, CoalescedDispatchLimit)) SubmitOpenCommands();
+        EnforceDeferredReleaseBudget();
+    }
+
+    // Between two dispatches, with DispatchLock held: when released buffers hold more than the budget, completes
+    // the submissions they wait on, oldest first, until they do not. What has already finished is taken first and
+    // costs no wait; the open command buffer is submitted only if the queue alone does not free enough.
+    private void EnforceDeferredReleaseBudget()
+    {
+        long budget = DeferredReleaseByteBudget;
+        if (Interlocked.Read(ref _deferredReleaseBytes) <= budget) return;
+        List<Action>? releases = null;
+        try
+        {
+            lock (_pendingLock)
+            {
+                ReapCompletedLocked(waitForAll: false, ref releases);
+                while (_deferredReleaseBytes > budget && _pending.Count > 0)
+                    CompleteOldestLocked(ref releases);
+            }
+            if (Interlocked.Read(ref _deferredReleaseBytes) <= budget) return;
+            // What is left waits on dispatches still in the open command buffer.
+            SubmitOpenCommands();
+            lock (_pendingLock)
+            {
+                while (_deferredReleaseBytes > budget && _pending.Count > 0)
+                    CompleteOldestLocked(ref releases);
+            }
+        }
+        finally
+        {
+            RunReleases(releases);
+        }
     }
 
     /// <summary>Ends the open command buffer and submits it without waiting. Does nothing when none is open.</summary>
@@ -412,14 +460,17 @@ public sealed unsafe partial class VulkanDevice
     /// already has, otherwise when it is observed complete. A buffer a pending dispatch still reads or writes must
     /// not be destroyed, or handed to another owner, before then.
     /// </summary>
-    internal void ReleaseAfterSubmission(long serial, Action release)
+    /// <param name="bytes">Device memory the release frees, counted against <see cref="DeferredReleaseByteBudget"/>
+    /// while it waits; 0 for a release that frees none of its own (a view).</param>
+    internal void ReleaseAfterSubmission(long serial, Action release, long bytes = 0)
     {
         if (release is null) throw new ArgumentNullException(nameof(release));
         lock (_pendingLock)
         {
             if (serial > _completedSerial)
             {
-                _deferredReleases.Add((serial, release));
+                _deferredReleases.Add((serial, release, Math.Max(0, bytes)));
+                _deferredReleaseBytes += Math.Max(0, bytes);
                 return;
             }
         }
@@ -470,6 +521,7 @@ public sealed unsafe partial class VulkanDevice
         {
             if (_deferredReleases[i].Serial > completed) continue;
             (releases ??= new List<Action>()).Add(_deferredReleases[i].Release);
+            _deferredReleaseBytes -= _deferredReleases[i].Bytes;
             _deferredReleases.RemoveAt(i);
         }
     }
@@ -514,6 +566,7 @@ public sealed unsafe partial class VulkanDevice
             _openSets.Clear();
             _deferredCommandPool = IntPtr.Zero;
             _deferredReleases.Clear();
+            _deferredReleaseBytes = 0;
         }
     }
 }

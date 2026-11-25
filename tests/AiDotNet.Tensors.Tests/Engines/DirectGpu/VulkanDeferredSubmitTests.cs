@@ -143,6 +143,57 @@ void main() {
         Assert.Equal(scratchHandle, reused.Handle);
     }
 
+    /// <summary>
+    /// A chain that releases each intermediate as it goes, with no host read: the released buffers wait for the
+    /// submission that last used them, and what they hold stays within the budget instead of growing with the chain.
+    /// </summary>
+    [SkippableFact]
+    public void ReleasedBuffers_WaitingOnQueuedSubmissions_StayWithinTheByteBudget()
+    {
+        var backend = BackendOrSkip();
+        const int size = 256 * 1024, steps = 200;            // 1 MiB per buffer
+        const long bufferBytes = (long)size * sizeof(float);
+        long budgetBefore = Device.DeferredReleaseByteBudget;
+        try
+        {
+            long Chain(long budget)
+            {
+                Device.DeferredReleaseByteBudget = budget;
+                backend.Synchronize();
+                Assert.Equal(0, Device.DeferredReleaseBytes);
+                long peak = 0;
+                var current = backend.AllocateBuffer(Enumerable.Range(0, size).Select(i => (float)(i % 7)).ToArray());
+                for (int step = 0; step < steps; step++)
+                {
+                    var next = backend.AllocateBuffer(size);
+                    RunAddOne(backend, current, next, size);
+                    current.Dispose();
+                    current = next;
+                    peak = Math.Max(peak, Device.DeferredReleaseBytes);
+                }
+                float[] values = backend.DownloadBuffer(current);
+                current.Dispose();
+                backend.Synchronize();
+                Assert.Equal(0, Device.DeferredReleaseBytes);
+                for (int i = 0; i < size; i += 4099) Assert.Equal((i % 7) + (float)steps, values[i]);
+                return peak;
+            }
+
+            // Without a budget the chain parks far more than the bounded run may: the test can tell the two apart.
+            long unbounded = Chain(long.MaxValue);
+            Assert.True(unbounded > 32 * bufferBytes, $"only {unbounded} bytes were parked without a budget");
+
+            const long budget = 8 * bufferBytes;
+            long bounded = Chain(budget);
+            // One release past the budget can be waiting when the dispatch that enforces it has not been recorded yet.
+            Assert.True(bounded <= budget + bufferBytes, $"{bounded} bytes parked with a budget of {budget}");
+        }
+        finally
+        {
+            Device.DeferredReleaseByteBudget = budgetBefore;
+        }
+    }
+
     [SkippableFact]
     public void WithSubmitAndWaitForced_NothingIsLeftPending()
     {
