@@ -296,6 +296,89 @@ public class IdleStepMemoryLoanTests
         }
     }
 
+    // A second plan's loss-scaled step trained while a first plan is between steps: its warmup steps allocate their
+    // gradients from the first plan's idle memory, and the capture moves those loans to memory of their own. The
+    // second plan prepares its step I/O, optimizer and loss-scaler tables before the capture opens, so those tables
+    // must be built over the moved addresses. Before they were, the scaler covered the lent addresses, its capture
+    // threw, and the scaled plan never replayed.
+    [SkippableFact]
+    public void APlanTrainedWhileAnotherIsIdle_CapturesOverItsOwnMemory_AndReplays()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException or DllNotFoundException)
+        {
+            Skip.If(true, "No GPU engine: " + ex.GetType().Name);
+            return;
+        }
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "No CUDA device.");
+            var backend = (CudaBackend)gpu.GetBackend()!;
+            var previous = AiDotNetEngine.Current;
+            AiDotNetEngine.Current = gpu;
+            try
+            {
+                var x = Filled(new[] { 256, 256 }, 1, 1f);
+                var w1 = Filled(new[] { 256, 512 }, 3, 0.05f);
+                var w2 = Filled(new[] { 512, 256 }, 4, 0.05f);
+                ICompiledTrainingPlan<float> idle;
+                float[] scaled;
+                using (var scope = GraphMode.Enable())
+                {
+                    var h = gpu.ReLU(gpu.TensorMatMul(x, w1));
+                    gpu.ReduceSum(gpu.TensorMultiply(gpu.TensorMatMul(h, w2), gpu.TensorMatMul(h, w2)), null);
+                    idle = scope.CompileTraining(new[] { w1, w2 });
+                }
+                using (idle)
+                {
+                    idle.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-4f);
+                    for (int s = 0; s < 6; s++) idle.Step();
+                    // Nothing pooled, so the scaled plan's allocations can only come from fresh memory or the idle plan's
+                    // step memory. Whether any is lent depends on the allocator's order (on an RTX 3090 this branch lent
+                    // none), so this holds the capture-preparation guard by replay and parity, not by an observed loan.
+                    gpu.ReleaseUnusedDeviceMemory();
+                    scaled = TrainScaled(gpu, out long replays);
+                    Assert.True(replays > 0, "a plan trained while another was idle never replayed");
+                }
+
+                var reference = TrainScaled(gpu, out long referenceReplays);
+                Assert.True(referenceReplays > 0, "the scaled plan alone never replayed");
+                Assert.Equal(reference, scaled);
+            }
+            finally
+            {
+                AiDotNetEngine.Current = previous;
+            }
+        }
+    }
+
+    // Odd sizes the pool holds nothing for, so its allocations between the other plan's steps borrow.
+    private static float[] TrainScaled(DirectGpuTensorEngine gpu, out long replays)
+    {
+        const int rows = 13, inputs = 19, outputs = 37;
+        var x = Filled(new[] { rows, inputs }, 5, 1f);
+        var c = Filled(new[] { rows, outputs }, 6, 1f);
+        var w = Filled(new[] { inputs, outputs }, 7, 0.2f);
+        var b = Filled(new[] { outputs }, 8, 0.2f);
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var z = gpu.Tanh(gpu.FusedLinear(x, w, b, FusedActivationType.None));
+            gpu.ReduceSum(gpu.TensorMultiply(z, c), null);
+            plan = scope.CompileTraining(new[] { w, b });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
+            ((ICompiledTrainingPlanLossScaling)plan).ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f });
+            long before = CompiledTrainingPlan<float>.GraphReplayCount;
+            for (int s = 0; s < 10; s++) plan.Step();
+            replays = CompiledTrainingPlan<float>.GraphReplayCount - before;
+            return w.ToArray().Concat(b.ToArray()).ToArray();
+        }
+    }
+
     [SkippableFact]
     public void TrainValidateTrain_MatchesTrainingWithoutValidation_AndKeepsReplaying()
     {

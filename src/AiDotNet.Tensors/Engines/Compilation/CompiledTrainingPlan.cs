@@ -4683,6 +4683,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived). Instance-scoped
                         // (not thread-local): op execution fans out to the BLAS pool threads.
                         using var _cap = gte.EnterCompiledCapturePath();
+                        // Every address recorded from here to the end of the capture must stay the step's: the pre-pass
+                        // binds the step's buffers, and the step I/O, the optimizer and the loss scaler build pointer
+                        // tables over them before the graph is recorded. A buffer borrowed from idle memory would be
+                        // moved when the capture opens, leaving those tables on the lent address (a scaled step then
+                        // never captured: its scaler covered other gradient buffers).
+                        using var _loans = (cb as Engines.DirectGpu.IIdleLoanCaptureGuard)?.SuspendLoansForCapture();
                         if (FailNextCaptureForTesting)
                         {
                             FailNextCaptureForTesting = false;

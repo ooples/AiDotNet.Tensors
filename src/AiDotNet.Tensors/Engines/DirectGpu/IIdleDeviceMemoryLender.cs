@@ -43,3 +43,17 @@ internal interface IIdleDeviceMemoryLender
     /// </summary>
     void MoveLiveLoans();
 }
+
+/// <summary>
+/// A lender whose captures must not bake in a lent address. A plan opens <see cref="SuspendLoansForCapture"/> before it
+/// prepares a capture, not only around the capture itself, because the preparation records device addresses too: the
+/// pre-pass that binds the step's buffers, the step I/O, the optimizer's and the loss scaler's pointer tables.
+/// </summary>
+internal interface IIdleLoanCaptureGuard
+{
+    /// <summary>
+    /// Moves every live loan to memory of its own and serves no new loan until the result is disposed (nests with the
+    /// capture's own suspension).
+    /// </summary>
+    System.IDisposable SuspendLoansForCapture();
+}

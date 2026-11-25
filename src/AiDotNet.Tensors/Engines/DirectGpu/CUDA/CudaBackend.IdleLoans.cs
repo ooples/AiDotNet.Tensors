@@ -16,8 +16,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 /// loan before it begins and takes none while it is open, so no graph ever bakes in a lent address; an export to
 /// another library (DLPack) moves its loan first for the same reason.
 /// </remarks>
-public sealed partial class CudaBackend : IIdleDeviceMemoryLender
+public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCaptureGuard
 {
+    IDisposable IIdleLoanCaptureGuard.SuspendLoansForCapture()
+    {
+        SuspendIdleLoans();
+        return new LoanSuspension(this);
+    }
+
+    private sealed class LoanSuspension : IDisposable
+    {
+        private CudaBackend? _backend;
+        public LoanSuspension(CudaBackend backend) => _backend = backend;
+        public void Dispose() => System.Threading.Interlocked.Exchange(ref _backend, null)?.ResumeIdleLoans();
+    }
+
     void IIdleDeviceMemoryLender.LendIdle(object owner, IReadOnlyCollection<IGpuBuffer> buffers) => LendIdle(owner, buffers);
     void IIdleDeviceMemoryLender.ReclaimIdle(object owner) => ReclaimIdle(owner);
     void IIdleDeviceMemoryLender.MoveLiveLoans() => MoveLiveIdleLoans();

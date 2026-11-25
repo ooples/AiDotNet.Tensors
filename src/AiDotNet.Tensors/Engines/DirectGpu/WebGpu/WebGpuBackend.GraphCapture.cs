@@ -37,8 +37,17 @@ public sealed partial class WebGpuBackend : IGpuGraphCapture
 }
 // No device graphs on this backend, so no plan holds step memory across its steps: nothing idle is lent, and an owner's
 // reclaim has nothing to take back. Allocations between steps come from the backend's own allocator.
-public sealed partial class WebGpuBackend : IIdleDeviceMemoryLender
+public sealed partial class WebGpuBackend : IIdleDeviceMemoryLender, IIdleLoanCaptureGuard
 {
+    // This backend lends nothing (LendIdle is a no-op), so there is no loan to move before a capture.
+    System.IDisposable IIdleLoanCaptureGuard.SuspendLoansForCapture() => NoLoans.Instance;
+
+    private sealed class NoLoans : System.IDisposable
+    {
+        public static readonly NoLoans Instance = new();
+        public void Dispose() { }
+    }
+
     void IIdleDeviceMemoryLender.LendIdle(object owner, System.Collections.Generic.IReadOnlyCollection<IGpuBuffer> buffers)
     {
         if (owner is null) throw new System.ArgumentNullException(nameof(owner));
