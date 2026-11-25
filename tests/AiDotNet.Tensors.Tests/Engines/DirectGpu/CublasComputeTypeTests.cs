@@ -70,22 +70,41 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             var b = new Tensor<float>(new[] { k, n }, new Vector<float>(hostB)).Gpu();
             // The reference is the host product in double: a device FP32 GEMM may itself run TF32 on Ampere.
             var exact = new double[m * n];
+            var magnitude = new double[m * n];
             for (int i = 0; i < m; i++)
                 for (int j = 0; j < n; j++)
                 {
-                    double acc = 0;
-                    for (int t = 0; t < k; t++) acc += (double)hostA[i * k + t] * hostB[t * n + j];
+                    double acc = 0, abs = 0;
+                    for (int t = 0; t < k; t++)
+                    {
+                        double term = (double)hostA[i * k + t] * hostB[t * n + j];
+                        acc += term;
+                        abs += Math.Abs(term);
+                    }
                     exact[i * n + j] = acc;
+                    magnitude[i * n + j] = abs;
                 }
             double Error(PrecisionMode precision)
             {
                 float[] mixed;
                 using (engine.EnterMatMulAutocast(precision, mode)) mixed = engine.TensorMatMul(a, b).ToArray();
                 double sum = 0;
-                for (int i = 0; i < exact.Length; i++) sum += Math.Abs(exact[i] - mixed[i]);
+                // Whatever kernel cuBLAS picks, the product is within the BF16 rounding bound (the coarser of the two).
+                double u = Math.Pow(2, -8), factor = 2 * u + u * u + 2.0 * k * Math.Pow(2, -24);
+                for (int i = 0; i < exact.Length; i++)
+                {
+                    double error = Math.Abs(exact[i] - mixed[i]);
+                    Assert.True(error <= factor * magnitude[i] + 1e-30,
+                        $"{mode} {precision}: [{i}] {mixed[i]} vs {exact[i]}, error {error:E2} > {factor * magnitude[i]:E2}");
+                    sum += error;
+                }
                 return sum / exact.Length;
             }
             double fp16 = Error(PrecisionMode.Float16), bf16 = Error(PrecisionMode.BFloat16);
+            // The fast compute types PERMIT reduced precision; cuBLAS may keep a TF32 or FP32 kernel for either (an
+            // RTX 1000 Ada ran both shapes with identical FP16 and BF16 errors). Only the cast-operands mode guarantees
+            // the operands are rounded, so only it is held to the BF16-coarser-than-FP16 ordering.
+            if (mode != MatMulAutocastMode.CastOperands) return;
             Assert.True(fp16 > 0, $"{mode}: FP16 autocast was bit-identical to FP32");
             // Unit roundoff 2^-8 against 2^-11: the mean error ratio is ~8; require at least 3.
             Assert.True(bf16 > 3 * fp16, $"{mode}: BF16 mean error {bf16:E2} is not coarser than FP16's {fp16:E2}");
