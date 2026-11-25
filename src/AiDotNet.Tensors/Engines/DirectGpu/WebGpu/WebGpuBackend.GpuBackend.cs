@@ -51,6 +51,18 @@ public sealed partial class WebGpuBackend
         return result;
     }
 
+    // The read the synchronous DownloadBuffer waits on, for callers that must not block.
+    internal async Task<float[]> DownloadBufferAsync(IGpuBuffer buffer)
+    {
+        EnsureInitialized();
+        // As DownloadBuffer: a buffer of another element layout would come back as reinterpreted bytes. Thrown inside
+        // the async method, so the caller receives it through the task.
+        GpuFloatLayout.Require(buffer, nameof(DownloadBufferAsync));
+        var result = await AsWebGpu(buffer).DownloadAsync().ConfigureAwait(false);
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
+        return result;
+    }
+
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
         EnsureInitialized();

@@ -1576,8 +1576,10 @@ void main() {
 layout(set = 0, binding = 0) buffer O { float o[]; };
 layout(push_constant) uniform Params { float value; uint size; };
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx < size) o[idx] = value;
+    // Grid-stride: a device at the spec minimum of 65535 X workgroups runs at most 65535 * 256 threads, fewer than a
+    // buffer may hold, so each thread fills every stride-th element from its own.
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint idx = gl_GlobalInvocationID.x; idx < size; idx += stride) o[idx] = value;
 }";
 
     public static string PixelShuffleGlsl => Header + TwoBufferLayout + @"

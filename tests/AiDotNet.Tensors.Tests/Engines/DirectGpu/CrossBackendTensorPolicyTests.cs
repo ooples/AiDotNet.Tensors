@@ -675,6 +675,44 @@ public sealed class CrossBackendTensorPolicyTests
             DirectGpuTensorEngine.EngineOwning(CrossBackendTensors.Unwrap(engines.Consumer.QueryBackend!)));
     }
 
+    // A tensor's binding can name the wrapper it was placed through (a tracing or kernel-substituting
+    // DelegatingGpuBackend), while engines register under the backend inside it.
+    [SkippableFact]
+    public void An_engine_is_found_through_a_wrapper_of_its_backend()
+    {
+        using var engines = CreateEngines();
+        var inner = CrossBackendTensors.Unwrap(engines.Placer.QueryBackend!);
+        Assert.Same(engines.Placer, DirectGpuTensorEngine.EngineOwning(new AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend(inner)));
+    }
+
+    // Measured on the Dawn parity harness: a tape over data from an engine on a wrapped backend found no owner for the
+    // wrapper, ran its backward on AiDotNetEngine.Current (another GPU backend), and migrated every saved tensor there.
+    [SkippableFact]
+    public void A_tape_over_a_wrapped_backends_data_runs_its_backward_on_that_engine()
+    {
+        using var engines = CreateEngines();
+        var wrapper = new AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend(CrossBackendTensors.Unwrap(engines.Placer.QueryBackend!));
+        using var device = new DirectGpuEngine(wrapper, borrowsBackend: true);
+        using var wrapped = new DirectGpuTensorEngine(device);
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engines.Consumer;
+        try
+        {
+            var x = wrapped.TensorMultiplyScalar(Seeded(3, 4, 7), 1f);
+            long before = CrossBackendTensors.MigrationCount;
+            float[] dx;
+            using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+            {
+                var loss = wrapped.ReduceSum(wrapped.TensorMultiply(x, x), null);
+                dx = tape.ComputeGradients(loss, new[] { x })[x].ToArray();
+            }
+            Assert.Equal(0, CrossBackendTensors.MigrationCount - before);
+            var expected = x.ToArray().Select(v => 2 * v).ToArray();
+            for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], dx[i], 5);
+        }
+        finally { AiDotNetEngine.Current = previous; }
+    }
+
     // An input its owner updates on the device (a running statistic) is asked for as host-authoritative by a plan that
     // merely reads it: the device value must still come home.
     [SkippableFact]

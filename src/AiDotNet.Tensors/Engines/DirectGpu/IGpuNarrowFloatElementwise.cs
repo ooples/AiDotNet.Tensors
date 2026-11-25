@@ -13,6 +13,9 @@ public enum GpuNarrowFloatBinaryOperation
 
     /// <summary><c>a * b</c>.</summary>
     Multiply,
+
+    /// <summary><c>a / b</c>, rounded once into the storage type as the three above are.</summary>
+    Divide,
 }
 
 /// <summary>Element-wise operations on one 16-bit float buffer.</summary>
@@ -26,6 +29,24 @@ public enum GpuNarrowFloatUnaryOperation
 
     /// <summary>GELU in its tanh form, <c>0.5 a (1 + tanh(sqrt(2/pi) (a + 0.044715 a^3)))</c>.</summary>
     Gelu,
+
+    /// <summary><c>|a|</c>: the sign bit cleared.</summary>
+    Abs,
+
+    /// <summary><c>sqrt(a)</c>; a NaN for a negative operand, and the zero itself for a zero of either sign.</summary>
+    Sqrt,
+
+    /// <summary><c>e^a</c>.</summary>
+    Exp,
+
+    /// <summary>The natural logarithm; negative infinity at zero and a NaN for a negative operand.</summary>
+    Log,
+
+    /// <summary><c>tanh(a)</c>.</summary>
+    Tanh,
+
+    /// <summary>The logistic function <c>1 / (1 + e^-a)</c>.</summary>
+    Sigmoid,
 }
 
 /// <summary>
@@ -33,6 +54,12 @@ public enum GpuNarrowFloatUnaryOperation
 /// <see cref="GpuElementType.BFloat16"/>). Each element is widened to a 32-bit float, the operation is done there, and
 /// the result is rounded to the storage type to nearest, ties to even.
 /// </summary>
+/// <remarks>
+/// Add, subtract, multiply, divide, negate, abs and relu return the host's bits. Square root and the transcendental
+/// operations (exp, log, tanh, sigmoid, gelu) use the device's 32-bit functions, so they agree with the host to within
+/// two units in the last place of the storage type; their special values (NaN, the infinities, the zeros, an operand
+/// outside the domain) are decided on the bits and are the same on every device.
+/// </remarks>
 /// <remarks>
 /// The buffers hold <paramref name="type"/> elements; the output may be one of the operands. Which (operation, type)
 /// pairs a device has is asked per pair: a backend whose buffers are 4-byte words has the half kernels it always had
@@ -49,8 +76,31 @@ public interface IGpuNarrowFloatElementwise
     /// <summary><c>output[i] = a[i] (operation) b[i]</c> for the first <paramref name="size"/> elements.</summary>
     void BinaryNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size);
 
+    /// <summary>
+    /// <c>output[i] = a[i] (operation) scalar</c> for the first <paramref name="size"/> elements, wherever
+    /// <see cref="SupportsNarrowFloatBinary"/> has the operation. The scalar is a 32-bit float (a 16-bit scalar
+    /// widened): the element is widened, the operation done once in 32 bits and the result rounded into the type.
+    /// </summary>
+    void ScalarNarrowFloat(GpuNarrowFloatBinaryOperation operation, GpuElementType type, IGpuBuffer a, float scalar, IGpuBuffer output, int size);
+
     /// <summary><c>output[i] = (operation) a[i]</c> for the first <paramref name="size"/> elements.</summary>
     void UnaryNarrowFloat(GpuNarrowFloatUnaryOperation operation, GpuElementType type, IGpuBuffer a, IGpuBuffer output, int size);
+}
+
+/// <summary>Reductions of 16-bit float buffers, accumulated in 32-bit floats.</summary>
+/// <remarks>
+/// The sum is a defined one, the same on every device: the elements are widened and added in order within blocks of
+/// <see cref="GpuNarrowFloatLayout.SumBlock"/>, each partial a binary32 value, and the partials are summed the same way
+/// until one is left. A device that flushes binary32 subnormals may differ where a partial is below the smallest
+/// normal float.
+/// </remarks>
+public interface IGpuNarrowFloatReductions
+{
+    /// <summary>Whether this device sums <paramref name="type"/> buffers.</summary>
+    bool SupportsNarrowFloatSum(GpuElementType type);
+
+    /// <summary>The blocked binary32 sum of the first <paramref name="size"/> elements of <paramref name="a"/>; zero when empty.</summary>
+    float SumNarrowFloat(GpuElementType type, IGpuBuffer a, int size);
 }
 
 /// <summary>
@@ -73,6 +123,9 @@ public interface IGpuNarrowFloatMatrixMultiply
 /// <summary>What the 16-bit float kernels of every backend share.</summary>
 internal static class GpuNarrowFloatLayout
 {
+    /// <summary>The elements one invocation of a sum adds: a partial per block.</summary>
+    public const int SumBlock = 64;
+
     /// <summary>Whether <paramref name="type"/> is a 16-bit float type.</summary>
     public static bool IsNarrowFloat(GpuElementType type) => type is GpuElementType.Float16 or GpuElementType.BFloat16;
 
@@ -104,6 +157,9 @@ internal static class GpuNarrowFloatLayout
                 throw new System.ArgumentOutOfRangeException(nameof(count), $"{operation}: {elements} elements are outside a buffer of {buffer.Size}.");
         }
     }
+
+    /// <summary>The binary32 bits of <paramref name="value"/> (BitConverter.SingleToUInt32Bits is not on every target).</summary>
+    public static unsafe uint Bits(float value) => *(uint*)&value;
 
     /// <summary>Whether <paramref name="backend"/> multiplies <see cref="GpuElementType.Float16"/> matrices.</summary>
     public static bool HasHalfMatrixMultiply(object? backend)

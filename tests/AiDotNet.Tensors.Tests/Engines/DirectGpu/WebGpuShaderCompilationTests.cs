@@ -49,10 +49,14 @@ Object.assign(globalThis, globals);
 const dir = process.argv[2];
 // Keep the GPU object referenced: dawn.node tears the instance down once it is collected.
 const gpu = create([]);
-const adapter = await gpu.requestAdapter();
+let adapter = await gpu.requestAdapter();
 if (!adapter) { console.log('NOADAPTER'); process.exit(0); }
-const device = await adapter.requestDevice();
+let device = await adapter.requestDevice();
+// One device that has built every pipeline crashes dawn.node natively (0xC0000005, at a different file each run, after
+// ~1,350 of ~1,700): its pipelines are never released. A fresh device every 200 files keeps it within what it holds.
+let built = 0;
 for (const f of fs.readdirSync(dir).filter(f => f.endsWith('.wgsl')).sort()) {
+  if (++built % 200 === 0) { device.destroy(); adapter = await gpu.requestAdapter(); device = await adapter.requestDevice(); }
   const code = fs.readFileSync(path.join(dir, f), 'utf8');
   device.pushErrorScope('validation');
   const m = device.createShaderModule({ code });

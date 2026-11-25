@@ -276,7 +276,10 @@ for await (const line of rl) {
                 default: throw new ArgumentException($"Unsupported argument {arg?.GetType().Name ?? "null"} for {name}.");
             }
         }
-        while (fields.Count % 16 != 0 || fields.Count == 0) fields.Add(0);
+        // The zero word a translated module reads after its own scalars (CudaDialectToWgsl.ZeroField), as
+        // WebGpuBackend.DispatchBatchAsync appends it.
+        fields.AddRange(BitConverter.GetBytes(0u));
+        while (fields.Count % 16 != 0) fields.Add(0);
         var job = new { code, buffers = encoded, uniform = Convert.ToBase64String(fields.ToArray()), workgroups = (threads + 255) / 256 };
         RecycleServerIfDue();
         _node.StandardInput.WriteLine(JsonSerializer.Serialize(job));

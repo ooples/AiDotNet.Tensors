@@ -254,7 +254,7 @@ internal interface IElementTypedByteBuffer
     void DeclareElements(GpuElementType type, int count);
 }
 
-/// <summary>The one implementation of <see cref="IDirectGpuBackend.AllocateBuffer(int, GpuElementType)"/>.</summary>
+/// <summary>The one implementation of <see cref="IGpuDevice.AllocateBuffer(int, GpuElementType)"/>.</summary>
 internal static class GpuTypedAllocation
 {
     public static IGpuBuffer Allocate(IDirectGpuBackend backend, int size, GpuElementType type)

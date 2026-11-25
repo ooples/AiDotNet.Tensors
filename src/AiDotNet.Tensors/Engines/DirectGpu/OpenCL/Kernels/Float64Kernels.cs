@@ -10,7 +10,7 @@ internal static class Float64Kernels
 {
     public static string[] GetKernelNames() => new[]
     {
-        "reduce_sum_f64", "reduce_dot_f64", "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
+        "reduce_sum_f64", "reduce_dot_f64", "reduce_max_f64", "reduce_min_f64", "add_f64", "subtract_f64", "multiply_f64", "divide_f64",
         "negate_f64", "abs_f64", "sqrt_f64", "exp_f64", "log_f64", "tanh_f64",
         "sigmoid_f64", "relu_f64", "add_scalar_f64", "subtract_scalar_f64", "multiply_scalar_f64", "divide_scalar_f64",
     };
@@ -48,6 +48,36 @@ __kernel void reduce_sum_f64(
     TREE_REDUCE_F64(scratch, localIdx, localSize)
     if (localIdx == 0) output[get_group_id(0)] = scratch[0];
 }
+
+// The larger (OP >) or smaller (OP <) of two values, a NaN before either.
+#define F64_EXTREME(a, b, OP) (((a) != (a)) ? (a) : ((((b) != (b)) || ((b) OP (a))) ? (b) : (a)))
+// One partial maximum or minimum per work-group. Past the end a slot holds the group's first element, which changes
+// neither extreme.
+#define REDUCE_EXTREME_F64(NAME, OP) \
+__kernel void NAME( \
+    __global const double* input, \
+    __global double* output, \
+    __local double* scratch, \
+    const int size) \
+{ \
+    const int globalIdx = get_global_id(0); \
+    const int localIdx = get_local_id(0); \
+    const int localSize = get_local_size(0); \
+    scratch[localIdx] = input[(globalIdx < size) ? globalIdx : globalIdx - localIdx]; \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    for (int active = localSize, stride = (localSize + 1) / 2; stride > 0; \
+         active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) { \
+        if (localIdx < stride && localIdx + stride < active) { \
+            const double p = scratch[localIdx]; \
+            const double q = scratch[localIdx + stride]; \
+            scratch[localIdx] = F64_EXTREME(p, q, OP); \
+        } \
+        barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    if (localIdx == 0) output[get_group_id(0)] = scratch[0]; \
+}
+REDUCE_EXTREME_F64(reduce_max_f64, >)
+REDUCE_EXTREME_F64(reduce_min_f64, <)
 
 // One partial dot product per work-group.
 __kernel void reduce_dot_f64(
