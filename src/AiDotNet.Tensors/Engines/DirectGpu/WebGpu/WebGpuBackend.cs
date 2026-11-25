@@ -678,45 +678,53 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         var pipelineId = await GetOrCreatePipelineAsync("Reduction", WebGpuKernels.ReductionSource, kernelName);
 
-        // First pass reduction
-        using var partialResults = new WebGpuBuffer(numWorkgroups);
-
         var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), 0, 0, 0 };
         using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
 
-        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, partialResults);
-
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
-        await WebGpuNativeBindings.SubmitAndWaitAsync();
-
-        // Continue reducing until we have a single value
-        while (numWorkgroups > 1)
+        // Each pass reduces the previous pass's partials, one per workgroup, until one value is left. The later
+        // passes read `current`: they once all read the FIRST pass's partials, so a reduction needing three passes
+        // (more than 65,536 elements) reduced only that buffer's first few entries and returned a wrong sum, maximum
+        // or minimum.
+        WebGpuBuffer? current = null;
+        try
         {
-            int prevSize = numWorkgroups;
-            numWorkgroups = (numWorkgroups + workgroupSize - 1) / workgroupSize;
-
-            using var newPartialResults = new WebGpuBuffer(numWorkgroups);
-
-            paramsData[0] = BitConverter.Int32BitsToSingle(prevSize);
-            uniformBuffer.CopyFrom(paramsData);
-
-            using var bindGroup2 = new WebGpuBindGroup(pipelineId, partialResults, newPartialResults);
-
-            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup2.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
-            await WebGpuNativeBindings.SubmitAndWaitAsync();
-
-            if (numWorkgroups == 1)
+            WebGpuBuffer source = aBuffer;
+            int remaining = size;
+            do
             {
-                // A host read like DownloadBuffer: counted, so the readback probe sees reductions too.
-                GpuLaunchProbe.OnReadback((long)newPartialResults.Size * sizeof(float), GpuBackendType.WebGpu);
-                var result = await newPartialResults.DownloadAsync();
-                return result[0];
-            }
-        }
+                var partials = new WebGpuBuffer(numWorkgroups);
+                bool reduced = false;
+                try
+                {
+                    paramsData[0] = BitConverter.Int32BitsToSingle(remaining);
+                    uniformBuffer.CopyFrom(paramsData);
+                    using var bindGroup = new WebGpuBindGroup(pipelineId, source, partials);
+                    await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
+                    await WebGpuNativeBindings.SubmitAndWaitAsync();
+                    reduced = true;
+                }
+                finally
+                {
+                    if (!reduced) partials.Dispose();
+                }
 
-        GpuLaunchProbe.OnReadback((long)partialResults.Size * sizeof(float), GpuBackendType.WebGpu);
-        var finalResult = await partialResults.DownloadAsync();
-        return finalResult[0];
+                current?.Dispose();
+                current = partials;
+                source = partials;
+                remaining = numWorkgroups;
+                numWorkgroups = (remaining + workgroupSize - 1) / workgroupSize;
+            }
+            while (remaining > 1);
+
+            // A host read like DownloadBuffer: counted, so the readback probe sees reductions too.
+            GpuLaunchProbe.OnReadback((long)current.Size * sizeof(float), GpuBackendType.WebGpu);
+            var finalResult = await current.DownloadAsync();
+            return finalResult[0];
+        }
+        finally
+        {
+            current?.Dispose();
+        }
     }
 
     #endregion

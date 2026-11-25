@@ -1079,10 +1079,10 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the -inf identity (the CPU scan never
-    // takes one, so an all-NaN input gives -inf), and fmaxf no longer flushes a subnormal under fast math.
+    // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+    // merge below), and fmaxf no longer flushes a subnormal under fast math.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0xFF800000u;
-    if (xf_isnan(val)) val = 0xFF800000u;
+    if (xf_isnan(val)) val = 0x7FC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
@@ -1090,7 +1090,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     for (int offset = 16; offset > 0; offset >>= 1)
     {
         unsigned int other = __shfl_down_sync(mask, val, offset);
-        val = xf_max(other, val);
+        val = (xf_isnan(other) || xf_gt(other, val)) ? other : val;
     }
 
     // Write warp results to shared memory
@@ -1109,7 +1109,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
         for (int offset = 16; offset > 0; offset >>= 1)
         {
             unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = xf_max(other, val);
+            val = (xf_isnan(other) || xf_gt(other, val)) ? other : val;
         }
 
         if (tid == 0)
@@ -1122,9 +1122,9 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact as reduce_max: NaN skipped, +inf identity.
+    // Exact as reduce_max: a NaN anywhere is the result, +inf identity.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0x7F800000u;
-    if (xf_isnan(val)) val = 0x7F800000u;
+    if (xf_isnan(val)) val = 0x7FC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
@@ -1132,7 +1132,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
     for (int offset = 16; offset > 0; offset >>= 1)
     {
         unsigned int other = __shfl_down_sync(mask, val, offset);
-        val = xf_min(other, val);
+        val = (xf_isnan(other) || xf_lt(other, val)) ? other : val;
     }
 
     // Write warp results to shared memory
@@ -1151,7 +1151,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
         for (int offset = 16; offset > 0; offset >>= 1)
         {
             unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = xf_min(other, val);
+            val = (xf_isnan(other) || xf_lt(other, val)) ? other : val;
         }
 
         if (tid == 0)

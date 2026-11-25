@@ -683,13 +683,13 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
     let idx = gid.x;
     let local_idx = lid.x;
-    let IDENTITY_BITS = 0xFF800000u;   // -inf: what a NaN or an absent element contributes
+    let IDENTITY_BITS = 0xFF800000u;   // -inf: what an absent element contributes
 
     if (idx < params.size) {
-        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
-        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+        // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0x7FC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -697,7 +697,7 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_gt(shared_bits[local_idx + stride], shared_bits[local_idx]));
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_isnan(shared_bits[local_idx + stride]) || xf_gt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }
@@ -716,10 +716,10 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
     let IDENTITY_BITS = 0x7F800000u;   // +inf
 
     if (idx < params.size) {
-        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
-        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+        // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0x7FC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -727,7 +727,7 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_lt(shared_bits[local_idx + stride], shared_bits[local_idx]));
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_isnan(shared_bits[local_idx + stride]) || xf_lt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }

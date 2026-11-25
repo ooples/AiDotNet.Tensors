@@ -55,8 +55,8 @@ __kernel void reduce_sum(
     }
 }
 
-// Parallel max reduction, exact on the bit patterns (ExactFloatKernels): a NaN is skipped (the CPU scan never takes one)
-// and loads as the -inf identity, so an all-NaN input reduces to -inf as on the CPU; ties keep the left operand.
+// Parallel max reduction, exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels.
+// A NaN wins every merge, so it survives the tree and the later passes over the partials; ties keep the left operand.
 __kernel void reduce_max(
     __global const float* input,
     __global float* output,
@@ -70,7 +70,7 @@ __kernel void reduce_max(
 
     // Load into local memory
     const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0xFF800000u;
-    scratch[localIdx] = xf_isnan(loaded) ? 0xFF800000u : loaded;
+    scratch[localIdx] = xf_isnan(loaded) ? 0x7FC00000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -80,7 +80,7 @@ __kernel void reduce_max(
         for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (localIdx < stride && localIdx + stride < stride_active) {
             const uint right = scratch[localIdx + stride];
-            if (xf_gt(right, scratch[localIdx])) scratch[localIdx] = right;
+            if (xf_isnan(right) || xf_gt(right, scratch[localIdx])) scratch[localIdx] = right;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
@@ -91,7 +91,7 @@ __kernel void reduce_max(
     }
 }
 
-// Parallel min reduction, exact as reduce_max (NaN skipped, +inf identity).
+// Parallel min reduction, exact as reduce_max (a NaN anywhere is the result, +inf identity).
 __kernel void reduce_min(
     __global const float* input,
     __global float* output,
@@ -105,7 +105,7 @@ __kernel void reduce_min(
 
     // Load into local memory
     const uint loaded = (globalIdx < size) ? as_uint(input[globalIdx]) : 0x7F800000u;
-    scratch[localIdx] = xf_isnan(loaded) ? 0x7F800000u : loaded;
+    scratch[localIdx] = xf_isnan(loaded) ? 0x7FC00000u : loaded;
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Tree reduction in local memory
@@ -115,7 +115,7 @@ __kernel void reduce_min(
         for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (localIdx < stride && localIdx + stride < stride_active) {
             const uint right = scratch[localIdx + stride];
-            if (xf_lt(right, scratch[localIdx])) scratch[localIdx] = right;
+            if (xf_isnan(right) || xf_lt(right, scratch[localIdx])) scratch[localIdx] = right;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
