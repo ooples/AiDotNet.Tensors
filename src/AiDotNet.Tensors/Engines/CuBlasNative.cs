@@ -1093,7 +1093,7 @@ public sealed class CudaBlasContext : IDisposable
     public CudaBlasContext(int deviceId = 0)
     {
         _deviceId = deviceId;
-        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
+        uint contextScheduling = CudaContextScheduling.ResolveContextFlags();
 
         // Initialize CUDA
         CuBlasNative.CheckCudaResult(CuBlasNative.cuInit(0), "cuInit");

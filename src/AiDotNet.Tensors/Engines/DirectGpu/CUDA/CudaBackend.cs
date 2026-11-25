@@ -820,7 +820,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Resolve explicit configuration before native probing or the availability fallback. A
         // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
         // be hidden by converting the backend into an unavailable instance.
-        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
+        uint contextScheduling = CudaContextScheduling.ResolveContextFlags();
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {

@@ -39,13 +39,15 @@ public enum GpuHostWaitPolicy
 /// </summary>
 /// <remarks>
 /// The scheduling flag is applied when a CUDA context is created, so set <see cref="Policy"/> before the first GPU
-/// engine is constructed; a context that is already active keeps its flag. <see cref="GpuHostWaitPolicy.PollThenBlock"/> stream waits
-/// read the settings on every wait. The <c>AIDOTNET_CUDA_CONTEXT_SCHEDULING</c> environment variable, when set,
-/// overrides <see cref="Policy"/>.
+/// engine is constructed; a context that is already active keeps its flag. <see cref="GpuHostWaitPolicy.PollThenBlock"/>
+/// stream waits read the settings on every wait. The older <c>AIDOTNET_CUDA_CONTEXT_SCHEDULING</c> environment variable
+/// is deprecated: it is read only while <see cref="Policy"/> has never been set, with a warning, and a set
+/// <see cref="Policy"/> always wins over it.
 /// </remarks>
 public static class GpuHostWaitOptions
 {
     private static int _policy = (int)GpuHostWaitPolicy.PollThenBlock;
+    private static int _policySet;
     private static long _pollWindowTicks = TimeSpan.FromMilliseconds(2).Ticks;
 
     /// <summary>The host-wait policy. Default: <see cref="GpuHostWaitPolicy.PollThenBlock"/>.</summary>
@@ -57,7 +59,18 @@ public static class GpuHostWaitOptions
             if (value < GpuHostWaitPolicy.PollThenBlock || value > GpuHostWaitPolicy.Auto)
                 throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown host-wait policy.");
             System.Threading.Volatile.Write(ref _policy, (int)value);
+            System.Threading.Volatile.Write(ref _policySet, 1);
         }
+    }
+
+    /// <summary>Whether <see cref="Policy"/> has been set (then it wins over the deprecated environment variable).</summary>
+    internal static bool IsPolicySet => System.Threading.Volatile.Read(ref _policySet) != 0;
+
+    /// <summary>Tests: puts the policy and whether it was set back as they were.</summary>
+    internal static void RestoreForTests(GpuHostWaitPolicy policy, bool set)
+    {
+        System.Threading.Volatile.Write(ref _policy, (int)policy);
+        System.Threading.Volatile.Write(ref _policySet, set ? 1 : 0);
     }
 
     /// <summary>

@@ -87,11 +87,9 @@ LOOP:
     public void ShortStreamWait_UnderPollThenBlock_IsAsFastAsSpin()
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
-        Skip.If(CudaContextScheduling.EffectivePolicy != GpuHostWaitOptions.Policy,
-            $"{CudaContextScheduling.EnvironmentVariable} overrides the typed policy in this process.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend is unavailable.");
-        var prior = GpuHostWaitOptions.Policy;
+        var prior = GpuHostWaitOptions.Policy; bool priorSet = GpuHostWaitOptions.IsPolicySet;
         IntPtr module = IntPtr.Zero;
         try
         {
@@ -122,7 +120,7 @@ LOOP:
         }
         finally
         {
-            GpuHostWaitOptions.Policy = prior;
+            GpuHostWaitOptions.RestoreForTests(prior, priorSet);
             if (module != IntPtr.Zero)
             {
                 CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(backend.CudaContextHandle), "cuCtxPushCurrent");
@@ -167,6 +165,59 @@ LOOP:
         return Stopwatch.GetTimestamp() - start;
     }
 
+    /// <summary>
+    /// The typed option is what takes effect: once <see cref="GpuHostWaitOptions.Policy"/> is set it decides both the
+    /// stream waits and a new context's scheduling flag, whatever the deprecated environment variable says. The
+    /// variable is read, with a deprecation warning, only while the typed policy has never been set.
+    /// </summary>
+    [Fact]
+    public void TheTypedPolicyWinsOverTheDeprecatedEnvironmentVariable()
+    {
+        var prior = GpuHostWaitOptions.Policy; bool priorSet = GpuHostWaitOptions.IsPolicySet;
+        string? priorEnvironment = Environment.GetEnvironmentVariable(CudaContextScheduling.EnvironmentVariable);
+        var warnings = new WarningListener();
+        System.Diagnostics.Trace.Listeners.Add(warnings);
+        try
+        {
+            Environment.SetEnvironmentVariable(CudaContextScheduling.EnvironmentVariable, "blocking");
+            CudaContextScheduling.ResetEnvironmentCacheForTests();
+
+            // Never set: the deprecated variable still decides, and says it is deprecated.
+            GpuHostWaitOptions.RestoreForTests(GpuHostWaitPolicy.PollThenBlock, set: false);
+            Assert.Equal(GpuHostWaitPolicy.BlockingSync, CudaContextScheduling.EffectivePolicy);
+            Assert.Equal(CudaContextScheduling.Blocking, CudaContextScheduling.ResolveContextFlags());
+            Assert.Contains(warnings.Messages, m => m.Contains("deprecated") && m.Contains(nameof(GpuHostWaitOptions)));
+
+            // Set: the typed policy wins over the variable, for the waits and for a new context's flag.
+            GpuHostWaitOptions.Policy = GpuHostWaitPolicy.Spin;
+            Assert.Equal(GpuHostWaitPolicy.Spin, CudaContextScheduling.EffectivePolicy);
+            Assert.Equal(CudaContextScheduling.Spin, CudaContextScheduling.ResolveContextFlags());
+            GpuHostWaitOptions.Policy = GpuHostWaitPolicy.PollThenBlock;
+            Assert.Equal(GpuHostWaitPolicy.PollThenBlock, CudaContextScheduling.EffectivePolicy);
+
+            // A misspelled variable is ignored once the typed policy is set, and an error while it decides.
+            Environment.SetEnvironmentVariable(CudaContextScheduling.EnvironmentVariable, "park-sometimes");
+            CudaContextScheduling.ResetEnvironmentCacheForTests();
+            Assert.Equal(CudaContextScheduling.Spin, CudaContextScheduling.ResolveContextFlags());
+            GpuHostWaitOptions.RestoreForTests(GpuHostWaitPolicy.PollThenBlock, set: false);
+            Assert.Throws<InvalidOperationException>(() => CudaContextScheduling.ResolveContextFlags());
+        }
+        finally
+        {
+            System.Diagnostics.Trace.Listeners.Remove(warnings);
+            Environment.SetEnvironmentVariable(CudaContextScheduling.EnvironmentVariable, priorEnvironment);
+            CudaContextScheduling.ResetEnvironmentCacheForTests();
+            GpuHostWaitOptions.RestoreForTests(prior, priorSet);
+        }
+    }
+
+    private sealed class WarningListener : System.Diagnostics.TraceListener
+    {
+        internal readonly List<string> Messages = new();
+        public override void Write(string? message) { lock (Messages) Messages.Add(message ?? ""); }
+        public override void WriteLine(string? message) => Write(message);
+    }
+
     [Fact]
     public void Options_RejectAnUnknownPolicyAndANegativeWindow()
     {
@@ -182,11 +233,9 @@ LOOP:
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         Skip.If(!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && !RuntimeInformation.IsOSPlatform(OSPlatform.Linux),
             "Thread CPU time is read on Windows and Linux.");
-        Skip.If(CudaContextScheduling.EffectivePolicy != GpuHostWaitOptions.Policy,
-            $"{CudaContextScheduling.EnvironmentVariable} overrides the typed policy in this process.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend is unavailable.");
-        var prior = GpuHostWaitOptions.Policy;
+        var prior = GpuHostWaitOptions.Policy; bool priorSet = GpuHostWaitOptions.IsPolicySet;
         IntPtr host = IntPtr.Zero, module = IntPtr.Zero;
         Thread? releaser = null;
         try
@@ -228,7 +277,7 @@ LOOP:
             if (host != IntPtr.Zero) *(int*)host = 1;   // never leave the kernel spinning
             releaser?.Join();
             backend.Synchronize();
-            GpuHostWaitOptions.Policy = prior;
+            GpuHostWaitOptions.RestoreForTests(prior, priorSet);
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(backend.CudaContextHandle), "cuCtxPushCurrent");
             if (module != IntPtr.Zero) CudaNativeBindings.cuModuleUnload(module);
             if (host != IntPtr.Zero) CudaNativeBindings.cuMemFreeHost(host);
