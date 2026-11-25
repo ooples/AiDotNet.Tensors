@@ -571,6 +571,16 @@ public static partial class WeightRegistry
     private static bool? _streamingTrainingMode;
 
     /// <summary>
+    /// The hint last set by <see cref="SetStreamingExecutionTraining"/>: <c>true</c> training, <c>false</c> inference,
+    /// <c>null</c> unknown (also after <see cref="Reset"/>). A caller that changes the hint for a scoped operation (a
+    /// model load that may fail partway) reads it first so it can put it back.
+    /// </summary>
+    public static bool? StreamingExecutionTraining
+    {
+        get { lock (_lock) return _streamingTrainingMode; }
+    }
+
+    /// <summary>
     /// Hints whether streaming weights are currently used in TRAINING (<c>true</c>)
     /// or INFERENCE (<c>false</c>) so <see cref="StreamingStoreDtype.Auto"/> picks
     /// bf16 only where it's safe. <c>null</c> = unknown (treated as training → full

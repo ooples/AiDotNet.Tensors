@@ -1217,3 +1217,4 @@ static AiDotNet.Tensors.Engines.Compilation.LossScaleState.operator ==(AiDotNet.
 ~override AiDotNet.Tensors.Engines.Compilation.LossScaleState.Equals(object obj) -> bool
 ~override AiDotNet.Tensors.Engines.Compilation.LossScaleState.ToString() -> string
 static AiDotNet.Tensors.Engines.AiDotNetEngine.UseInCurrentContext(AiDotNet.Tensors.Engines.IEngine! engine) -> System.IDisposable!
+static AiDotNet.Tensors.LinearAlgebra.WeightRegistry.StreamingExecutionTraining.get -> bool?
