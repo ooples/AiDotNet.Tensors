@@ -264,9 +264,48 @@ internal static class CudaNativeBindings
     // them all here, after the driver reports success, instead of only the ones a Synchronize() wrapper makes.
     public static CudaResult cuStreamSynchronize(IntPtr stream)
     {
-        var result = cuStreamSynchronizeNative(stream);
+        var result = CudaContextScheduling.EffectivePolicy == GpuHostWaitPolicy.PollThenBlock
+            ? PollThenBlockStreamSynchronize(stream)
+            : cuStreamSynchronizeNative(stream);
         if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
         return result;
+    }
+
+    // CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING: cuEventSynchronize on it blocks the thread whatever the
+    // context's scheduling flag.
+    private const uint BlockingWaitEventFlags = 0x1 | 0x2;
+
+    /// <summary>
+    /// <see cref="GpuHostWaitPolicy.PollThenBlock"/>: polls the stream for the poll window (a short wait ends as a spin
+    /// wait does), then waits on a blocking-sync event recorded behind everything queued so far. Under the context's
+    /// spin flag, cuStreamSynchronize itself spins a core for as long as the device takes: a device starved of memory
+    /// by other processes left a process spinning for hours with nothing of its own running. Any result other than
+    /// finished / not ready, or an event the current context cannot make, falls back to cuStreamSynchronize, so errors
+    /// and capture checks surface exactly as before.
+    /// </summary>
+    private static CudaResult PollThenBlockStreamSynchronize(IntPtr stream)
+    {
+        var result = cuStreamQuery(stream);
+        if (result != CudaResult.NotReady) return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+        long window = (long)(GpuHostWaitOptions.PollWindow.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        while (System.Diagnostics.Stopwatch.GetTimestamp() - start < window)
+        {
+            result = cuStreamQuery(stream);
+            if (result != CudaResult.NotReady) return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+        }
+        if (cuEventCreate(out IntPtr done, BlockingWaitEventFlags) != CudaResult.Success) return cuStreamSynchronizeNative(stream);
+        try
+        {
+            if (cuEventRecord(done, stream) != CudaResult.Success) return cuStreamSynchronizeNative(stream);
+            result = cuEventSynchronizeNative(done);
+            // An error the event reports is the stream's: report it the way cuStreamSynchronize does.
+            return result == CudaResult.Success ? result : cuStreamSynchronizeNative(stream);
+        }
+        finally
+        {
+            cuEventDestroy(done);
+        }
     }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]

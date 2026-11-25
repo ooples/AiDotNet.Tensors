@@ -1222,3 +1222,14 @@ AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBudgetBytes.get -
 AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBudgetBytes.set -> void
 AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBytes.get -> long
 AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightEvictions.get -> long
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy.Auto = 4 -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy.BlockingSync = 3 -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy.PollThenBlock = 0 -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy.Spin = 1 -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy.Yield = 2 -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions
+static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.PollWindow.get -> System.TimeSpan
+static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.PollWindow.set -> void
+static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.Policy.get -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
+static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.Policy.set -> void
