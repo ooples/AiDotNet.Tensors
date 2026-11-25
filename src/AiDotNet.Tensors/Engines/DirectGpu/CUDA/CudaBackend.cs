@@ -945,10 +945,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
                         });
                     bool isWddm = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                        && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success
+                        && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
                             || tccMode == 0);
                     ulong initFreeBytes = totalMem;
-                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success && queriedFree > 0)
+                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success && queriedFree > 0) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
                         initFreeBytes = queriedFree;
                     if (isWddm)
                     {
@@ -2284,27 +2284,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         }
 
-        // Pressured: collect unreachable managed wrappers AND drain the finalizer queue (which raw
-        // GC.Collect alone leaves queued in _pendingFinalizerFrees), then release idle buffers cached
-        // in _bufferPool and _asyncMemPool back to the driver so cuMemGetInfo sees the reclaimed bytes
-        // and Windows WDDM does not spill over physical VRAM into shared PCIe system memory.
+        // Pressured: collect unreachable managed wrappers AND drain the finalizer queue first, measuring
+        // actual unreachable-tensor / deferred-free reclamation BEFORE releasing reusable scratch pools.
+        // That way reusable pool eviction relieves physical VRAM pressure without resetting the GC backoff
+        // on steady-state workloads that legitimately recycle scratch memory each step.
+        long allocatedBeforeGc = _memoryAccount.AllocatedBytes;
         ReclaimUnreachableForRetry();
         DrainDeferredFrees(blockOldest: false);
-        if (!IsCapturingOnThisThread && !_backendStreamCaptureActive)
+        long allocatedAfterGc = _memoryAccount.AllocatedBytes;
+        long garbageReclaimed = Math.Max(0L, allocatedBeforeGc - allocatedAfterGc);
+
+        ulong freeAfterGc = free;
+        using (PushContext())
+        {
+            if (CudaNativeBindings.cuMemGetInfo(out var f2, out _) == CudaResult.Success) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
+                freeAfterGc = f2;
+        }
+        bool effective = ((ulong)garbageReclaimed >= total / 100)
+            || (freeAfterGc > free && (freeAfterGc - free) >= total / 100);
+
+        if ((double)freeAfterGc / total <= freeFractionThreshold
+            && !IsCapturingOnThisThread && !_backendStreamCaptureActive)
         {
             ((IDeviceMemoryPressure)this).ReleaseCachedBuffers();
         }
-
-        // Effectiveness check: a workload legitimately resident below the threshold reclaims ~nothing;
-        // back off exponentially so the per-step GC tax amortizes away. A sweep that frees >=1% of the
-        // device means transient garbage IS accumulating — keep full cadence.
-        ulong freeAfter = free;
-        using (PushContext())
-        {
-            if (CudaNativeBindings.cuMemGetInfo(out var f2, out _) == CudaResult.Success)
-                freeAfter = f2;
-        }
-        bool effective = freeAfter > free && (freeAfter - free) >= total / 100;
         _reclaimBackoffSteps = effective ? 1 : Math.Min(_reclaimBackoffSteps * 2, 256);
         _reclaimCooldownRemaining = effective ? 0 : _reclaimBackoffSteps;
     }
