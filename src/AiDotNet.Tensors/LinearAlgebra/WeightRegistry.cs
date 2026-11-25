@@ -1960,6 +1960,23 @@ public static partial class WeightRegistry
     }
 
     /// <summary>
+    /// The bf16 bytes (2 per element, little-endian, logical layout) of a weight whose streaming store is bf16, read from
+    /// the pool without materializing its fp32 view; null for any other weight. A device that keeps the weight in bf16
+    /// uploads these once.
+    /// </summary>
+    internal static byte[]? TryReadBf16Store<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0
+            || weight.StreamingStoreEncoding != StreamingEncoding.Bf16) return null;
+        StreamingTensorPool? pool;
+        lock (_lock) { pool = _streamingPool; }
+        if (pool is null) return null;
+        var bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
+        return bytes.Length == 2L * weight.Length ? bytes : null;
+    }
+
+    /// <summary>
     /// Issues a background read of <paramref name="weight"/>'s bytes from
     /// the streaming pool's backing store into the resident set. Returns
     /// immediately; the next <see cref="Materialize{T}"/> call should hit

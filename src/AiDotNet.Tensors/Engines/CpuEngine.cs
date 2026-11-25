@@ -25052,8 +25052,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outWidth = (inWidth - 1) * strideW - 2 * padW + kW + outPadW;
 
         var outputData = new T[batch * outChannels * outDepth * outHeight * outWidth];
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         // PARTITIONED BY OUTPUT, NOT BY INPUT. The previous form parallelised over (b, ic), gave
         // every task a full-size accumulator, and merged those accumulators under a lock -- so the
         // order the partial sums were added in was whatever order the tasks happened to finish in.
@@ -45442,7 +45442,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
-                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                         CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
                     }
                     return int4Result;
@@ -45532,7 +45532,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (bias != null || activation != FusedActivationType.None)
                 {
-                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    var bArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 
@@ -45555,7 +45555,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 using var outArrLease = matMulResult.LeaseArray();
                 var outArr = (float[])(object)outArrLease.Array;
-                var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                var bArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                 // matMulResult shape: [..batchDims.., M_rows, N]
                 // Collapse batch dims to treat as a single [M_total, N] for the epilogue.
                 int N = matMulResult._shape[matMulResult._shape.Length - 1];
@@ -45669,7 +45669,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
-                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                         CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
                     }
                     return;
@@ -45736,7 +45736,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (bias != null || activation != FusedActivationType.None)
                 {
-                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    var bArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 

@@ -2219,6 +2219,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ThrowIfReleased(tensor);
         ThrowIfNarrowingDouble<T>();
         CrossBackendTensors.ResolveIfForeign(tensor, backend);
+        if (TryBf16StreamingWeight(backend, tensor, out var bf16Weight)) return bf16Weight;
         // A device read of an intermediate a probe run quarantined: retain its producer (AutoRetainProbe).
         if (Autodiff.AutoRetainProbe.Active) Autodiff.AutoRetainProbe.NoteAccess(tensor.DataVector);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
@@ -3674,6 +3675,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Against the backend that dispatches the kernel, as GetOrAllocateBuffer does for activations.
         CrossBackendTensors.ResolveIfForeign(weights, backend);
+        if (TryBf16StreamingWeight(backend, weights, out var bf16Weight)) return bf16Weight;
         var resident = weights.TryGetGpuBuffer();
         if (resident != null)
         {
@@ -3727,6 +3729,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // re-upload is correct. This is the read/write split GetDataArray's own remarks call
         // "Stage 2"; weights are an input operand the GPU only reads.
     {
+        if (TryBf16StreamingWeight(backend, weights, out var bf16Weight)) return bf16Weight;
         // Look up by the backing array WITHOUT materializing it first. GetReadOnlyDataArray fires a pending
         // device-to-host download, so a weight whose current value lives on the device (a parameter the optimizer
         // updated in place, or a GPU-computed table such as RoPE's cos/sin) was downloaded on EVERY forward only to
@@ -6573,6 +6576,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!IsCanonicalDenseAllocation(tensor))
             throw new InvalidOperationException(
                 "GPU destination-aware tensor ops require a contiguous, dense, zero-offset canonical allocation.");
+        if (TryBf16StreamingWeight(backend, tensor, out var bf16Weight)) return bf16Weight;
 
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32 (see GetResidentOrPersistentInputBuffer).
         var tHalfC = TryFp16ResidentInput(tensor, out var tCountC);
@@ -7900,6 +7904,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // whole graph). Falls back to the transient path if it has no backing array.
     private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
     {
+        if (TryBf16StreamingWeight(backend, t, out var bf16Weight)) return bf16Weight;
         // A view onto part of another tensor's storage shares that storage's backing array, and every lookup below
         // (the _gpuBuffer field, the resident registry, the caches keyed on that array) returns the WHOLE storage's
         // buffer from element 0. The stacked-gradient slices of a backward pass are such views: a negate backward on

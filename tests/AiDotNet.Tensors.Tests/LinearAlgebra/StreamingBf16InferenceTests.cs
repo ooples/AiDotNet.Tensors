@@ -1,0 +1,100 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
+
+using System;
+using System.IO;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.LinearAlgebra;
+
+/// <summary>
+/// Inference over weights held in the streaming pool's bf16 store (read-only by design). The CPU engine read a bf16
+/// weight's bias through the write-intent accessor, so a linear layer over bf16 weights threw "Cannot mutate a
+/// streaming tensor"; the GPU engine uploaded such a weight at fp32 size. The values here are exact in bf16, so every
+/// path must reproduce the plain fp32 reference.
+/// </summary>
+[Collection("WeightRegistry")]
+public class StreamingBf16InferenceTests
+{
+    private const int M = 3, K = 8, N = 5;
+
+    private static float Value(int i, int salt) => ((i * 7 + salt) % 17 - 8) / 64f;   // exact in bf16
+
+    private static Tensor<T> Filled<T>(int[] shape, int salt, Func<float, T> cast)
+    {
+        var t = new Tensor<T>(shape);
+        for (int i = 0; i < t.Length; i++) t.SetFlat(i, cast(Value(i, salt)));
+        return t;
+    }
+
+    private static string Configure()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-bf16-inf-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Bf16,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        return dir;
+    }
+
+    private static void Cleanup(string dir)
+    {
+        WeightRegistry.SetStreamingExecutionTraining(null);
+        WeightRegistry.Reset();
+        if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+    }
+
+    private static Tensor<T> Stream<T>(Tensor<T> t)
+    {
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        Assert.Equal((byte)1, t.StreamingStoreEncoding);   // bf16
+        return t;
+    }
+
+    private static void Linear<T>(IEngine engine, Func<float, T> cast, Func<T, double> back)
+    {
+        var x = Filled(new[] { M, K }, 1, cast);
+        // Reference: the same values in ordinary (non-streamed) tensors.
+        var expected = new CpuEngine().FusedLinear(x, Filled(new[] { K, N }, 2, cast), Filled(new[] { N }, 3, cast), FusedActivationType.None);
+        var dir = Configure();
+        try
+        {
+            var w = Stream(Filled(new[] { K, N }, 2, cast));
+            var b = Stream(Filled(new[] { N }, 3, cast));
+            var y = engine.FusedLinear(x, w, b, FusedActivationType.None);
+            for (int i = 0; i < M * N; i++)
+                Assert.True(Math.Abs(back(y.GetFlat(i)) - back(expected.GetFlat(i))) <= 1e-5,
+                    $"[{i}] {back(y.GetFlat(i))} vs {back(expected.GetFlat(i))}");
+        }
+        finally { Cleanup(dir); }
+    }
+
+    [Fact]
+    public void Cpu_linear_layer_reads_bf16_streamed_weights_and_bias_float() => Linear(new CpuEngine(), v => v, v => v);
+
+    [Fact]
+    public void Cpu_linear_layer_reads_bf16_streamed_weights_and_bias_double() => Linear(new CpuEngine(), v => (double)v, v => v);
+
+    [SkippableFact]
+    public void Gpu_keeps_bf16_streamed_weights_bf16_on_the_device_and_matches_the_reference()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        try
+        {
+            long before = gpu.Bf16WeightBytesUploaded;
+            Linear<float>(gpu, v => v, v => v);
+            // The weight went up as bf16 (2 bytes per element), not through the fp32 host view.
+            Assert.True(gpu.Bf16WeightBytesUploaded - before >= 2L * K * N,
+                $"bf16 weight bytes uploaded {gpu.Bf16WeightBytesUploaded - before}, expected at least {2L * K * N}");
+        }
+        finally { gpu.Dispose(); }
+    }
+}
