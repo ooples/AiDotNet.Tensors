@@ -191,7 +191,7 @@ public abstract partial class GpuNarrowFloatContractTests
         var backend = Device();
         Skip.If(backend is null, SkipReason);
         Skip.If(backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
-            "CUDA multiplies on cuBLAS's 16-bit kernels, covered by its own autocast tests.");
+            "Not applicable: CUDA multiplies on cuBLAS's 16-bit kernels (CublasComputeTypeTests cover its autocast).");
         var type = precision == PrecisionMode.Float16 ? GpuElementType.Float16 : GpuElementType.BFloat16;
         var autocast = (IGemmAutocastBackend)backend;
         Skip.If(!((IGpuNarrowFloatRounding)backend).SupportsRoundToNarrowFloat(type), $"This device has no rounding kernel for {type}.");
@@ -238,7 +238,7 @@ public abstract partial class GpuNarrowFloatContractTests
     {
         var backend = Device();
         Skip.If(backend is null, SkipReason);
-        Skip.If(backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Covered by CUDA's own autocast tests.");
+        Skip.If(backend is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Not applicable: CUDA multiplies on cuBLAS's 16-bit kernels (CublasComputeTypeTests cover its autocast).");
         var rounding = (IGpuNarrowFloatRounding)backend;
         Skip.If(!rounding.SupportsRoundToNarrowFloat(GpuElementType.Float16) || !rounding.SupportsRoundToNarrowFloat(GpuElementType.BFloat16),
             "Needs both rounding kernels.");
