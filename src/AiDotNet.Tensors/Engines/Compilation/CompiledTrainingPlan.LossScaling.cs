@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
@@ -145,6 +146,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         return backend is not null;
     }
 
+    private string DescribeUncollectableGradient()
+    {
+        var grads = ActiveOptimizerGradients();
+        for (int i = 0; i < grads.Length; i++)
+        {
+            var grad = grads[i];
+            if (grad is null || grad.Length == 0) continue;
+            if (grad.TryGetGpuBuffer() is null) return $"gradient {i} [{string.Join(",", grad._shape)}] has no device buffer";
+            if (grad._gpuBackend is not Engines.DirectGpu.IDirectGpuBackend) return $"gradient {i} is not on a direct GPU backend";
+            if (!grad.IsContiguous) return $"gradient {i} is not contiguous";
+        }
+        return "the gradients are on more than one backend";
+    }
+
     // The device scaler over the current gradient buffers, holding the current state; null when there is none.
     private Engines.DirectGpu.IDeviceGradScaler? EnsureLossScaleDevice(Engines.DirectGpu.IDeviceGradScalerFactory factory)
     {
@@ -184,16 +199,43 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
                 "Loss scaling needs every trained gradient and the loss-gradient seed on one CUDA device to run inside the "
                 + "step graph.");
         device.WriteSeed(seed, _lossGradSeed.Length);
+        _lossScalePreparedHandles = DescribeGradientBuffers();
+    }
+
+    // The gradient buffers the scaler was prepared over, for the capture's mismatch message.
+    private string[]? _lossScalePreparedHandles;
+
+    private string[] DescribeGradientBuffers()
+        => ActiveOptimizerGradients().Select(g => g is null || g.Length == 0 ? "-"
+            : $"[{string.Join(",", g._shape)}]@{g.TryGetGpuBuffer()?.Handle.ToInt64():x}").ToArray();
+
+    private string DescribeMovedGradientBuffers()
+    {
+        var now = DescribeGradientBuffers();
+        var prepared = _lossScalePreparedHandles ?? Array.Empty<string>();
+        var moved = new List<string>();
+        for (int i = 0; i < now.Length; i++)
+            if (i >= prepared.Length || prepared[i] != now[i])
+                moved.Add($"gradient {i} {(i < prepared.Length ? prepared[i] : "?")} -> {now[i]}");
+        return moved.Count == 0 ? "the same buffers, other sizes" : string.Join("; ", moved);
     }
 
     /// <summary>Records the unscale and the scale update into the step graph being captured, after its backward.</summary>
     private void CaptureLossScaling()
     {
         if (_lossScaling is null) return;
-        if (_lossScaleDevice is not { } device || !_lossScaleOnDevice
-            || !TryCollectLossScaleBuffers(capturing: true, out _) || !device.Covers(_lossScaleBuffers, _lossScaleSizes)
-            || _lossGradSeed.TryGetGpuBuffer() is not { } seed)
-            throw new InvalidOperationException("The loss scaler was not prepared for the gradients this graph captures.");
+        string? unprepared =
+            _lossScaleDevice is null ? "there is no device scaler"
+            : !_lossScaleOnDevice ? "the device scaler does not hold the current scale"
+            : !TryCollectLossScaleBuffers(capturing: true, out _) ? DescribeUncollectableGradient()
+            : !_lossScaleDevice.Covers(_lossScaleBuffers, _lossScaleSizes) ? "the device scaler covers other gradient buffers ("
+                + DescribeMovedGradientBuffers() + ")"
+            : _lossGradSeed.TryGetGpuBuffer() is null ? "the loss-gradient seed is not on the device"
+            : null;
+        if (unprepared is not null)
+            throw new InvalidOperationException($"The loss scaler was not prepared for the gradients this graph captures: {unprepared}.");
+        var device = _lossScaleDevice!;
+        var seed = _lossGradSeed.TryGetGpuBuffer()!;
         device.UnscaleAndUpdate(seed, _lossGradSeed.Length);
     }
 

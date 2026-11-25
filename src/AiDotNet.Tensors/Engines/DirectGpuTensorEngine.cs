@@ -8918,8 +8918,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
     {
         using var __gpuOp = EnterGpuOp();
-        if (AutocastUsesTypedElementwise || typeof(T) != typeof(float))
-        { AliasDiag($"{opName}-resident SKIP gate1 residentStep={ResidentStepActive} autocast={Gpu.AutocastScope.IsEnabled} T={typeof(T).Name}"); return false; }
+        // Autocast does not apply: an elementwise activation runs in its input's precision (PyTorch's autocast lists no
+        // unary activation), and these float tensors stay float. Refusing here under autocast sent a compiled step's
+        // activation to the host path, whose download inside the step-graph capture kept the step from ever replaying.
+        if (typeof(T) != typeof(float))
+        { AliasDiag($"{opName}-resident SKIP gate1 residentStep={ResidentStepActive} T={typeof(T).Name}"); return false; }
         if (!TryGetBackend(out var backend) || !input.IsContiguous || input.Length != output.Length)
         { AliasDiag($"{opName}-resident SKIP gate2 contig={input.IsContiguous} inLen={input.Length} outLen={output.Length}"); return false; }
         try

@@ -87,6 +87,53 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
         Assert.Equal(0, s.OverflowSteps);
     }
 
+    // A loss-scaled step on the GPU is captured into the step graph and replayed like an unscaled one: the unscale, the
+    // finiteness check and the scale update are device kernels inside the graph. Two parameters (a bias as well as the
+    // weight) and Adam, as a network's step has.
+    [SkippableTheory]
+    [InlineData(OptimizerType.SGD, PrecisionMode.Float32)]
+    [InlineData(OptimizerType.Adam, PrecisionMode.Float32)]
+    [InlineData(OptimizerType.Adam, PrecisionMode.Float16)]
+    [InlineData(OptimizerType.Adam, PrecisionMode.BFloat16)]
+    public void ScaledGpuStep_IsCapturedAndReplayed(OptimizerType optimizer, PrecisionMode autocast)
+    {
+        SkipUnlessAvailable(onGpu: true);
+        var engine = _fixture.Engine!;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Data(In * Out, 0.37, 0.1))).Gpu();
+            var bias = new Tensor<float>(new[] { Out }, new Vector<float>(Data(Out, 0.5, 0.2))).Gpu();
+            var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(Data(Rows * In, 0.21, 0.3)));
+            var ct = new Tensor<float>(new[] { Rows, Out }, new Vector<float>(Data(Rows * Out, 0.13, 0.7)));
+            ICompiledTrainingPlan<float> plan;
+            // The step runs under the caller's autocast scope, as a mixed-precision training step does.
+            using var precision = autocast == PrecisionMode.Float32 ? null : new AutocastScope(autocast);
+            using (var scope = GraphMode.Enable())
+            {
+                var z = engine.Tanh(engine.FusedLinear(x, w, bias, FusedActivationType.None));
+                engine.ReduceSum(engine.TensorMultiply(z, ct), null);
+                plan = scope.CompileTraining(new[] { w, bias });
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(optimizer, learningRate: 0.01f);
+                ((ICompiledTrainingPlanLossScaling)plan).ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f });
+                long before = CompiledTrainingPlan<float>.GraphReplayCount;
+                for (int s = 0; s < 10; s++) plan.Step();
+                long replays = CompiledTrainingPlan<float>.GraphReplayCount - before;
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                Assert.True(replays > 0,
+                    $"a loss-scaled GPU step never replayed its graph (capture failure: {compiled.GraphCaptureFailureReason ?? "(none)"})");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
     [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
