@@ -40763,7 +40763,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var refreshIndices = CaptureIndexProducers(indices, "TensorScatterAdd"); var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -43658,7 +43658,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// A captured gather or index-copy reads its indices when the plan runs, but the plan schedules only its float
+    /// A captured indexed op (gather, take, index-copy, index-add, scatter-add) reads its indices when the plan runs, but the plan schedules only its float
     /// operands: indices that integer ops of the same trace still have to produce (an arange plus an offset, a broadcast sum of
     /// row and column offsets) would be read before they are computed, and the first step would index with zeros.
     /// Returns what recomputes those indices, for the op's replay to run before it reads them, or null when the
@@ -43667,7 +43667,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     /// <exception cref="NotSupportedException">The indices come from an in-place integer write, or from an op of
     /// another element type recorded in the same trace: neither can be recomputed in isolation.</exception>
-    private static Action<IEngine>? CaptureIndexProducers(Tensor<int> indices, string opName)
+    internal static Action<IEngine>? CaptureIndexProducers(Tensor<int> indices, string opName)
     {
         if (indices.LazySource is not ILazyNode root || root.IsRealized) return null;
 

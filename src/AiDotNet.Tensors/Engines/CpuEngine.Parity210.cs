@@ -467,9 +467,10 @@ public partial class CpuEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
+                var refreshIndices = CaptureIndexProducers(indices, "TensorTake");
                 var ct = tensor; var ci = indices;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorTake", tensor, (int[])indices._shape.Clone(),
-                    (eng, output) => { var r = eng.TensorTake(ct, ci); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorTake(ct, ci); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.TakeBackward, new object[] { ci, (int[])ct._shape.Clone() });
             }
         }
@@ -516,9 +517,10 @@ public partial class CpuEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
+                var refreshIndices = CaptureIndexProducers(indices, "TensorTakeAlongDim");
                 var ct = tensor; var ci = indices; var cd = dim;
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorTakeAlongDim", tensor, (int[])indices._shape.Clone(),
-                    (eng, output) => { var r = eng.TensorTakeAlongDim(ct, ci, cd); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorTakeAlongDim(ct, ci, cd); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.TakeAlongDimBackward, new object[] { ci, cd });
             }
         }
@@ -2437,9 +2439,10 @@ public partial class CpuEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
+                var refreshIndices = CaptureIndexProducers(indices, "TensorIndexAdd");
                 var ct = tensor; var ca = axis; var ci = indices; var cs = source;
                 return scope.RecordBinary(LazyNodeType.Custom, "TensorIndexAdd", tensor, source, (int[])tensor._shape.Clone(),
-                    (eng, output) => { var r = eng.TensorIndexAdd(ct, ca, ci, cs); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorIndexAdd(ct, ca, ci, cs); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.IndexAddBackward, new object[] { ca, ci });
             }
         }
