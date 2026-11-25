@@ -54,6 +54,13 @@ internal sealed class ClosureObjectiveGuard<T>
     internal int LeafCount => _leaves.Length;
 
     /// <summary>
+    /// The external leaves the plan reads, in the order <see cref="TryRebind"/> copies a later step's data into them.
+    /// A caller that saves and restores them around a replay takes them from here instead of signing the trace a second
+    /// time (a full <see cref="ObjectiveSignature.Build"/> walk of every node's captured state). Do not modify.
+    /// </summary>
+    internal object[] Leaves => _leaves;
+
+    /// <summary>
     /// Probes a later objective using this trace's audited output shapes. The caller must still compare the complete
     /// returned signature before rebinding leaves or replaying a plan; this method never copies leaves or executes it.
     /// </summary>
