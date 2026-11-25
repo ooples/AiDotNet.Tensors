@@ -483,7 +483,9 @@ public sealed class DeviceMemoryReclaimTests
     public void Vulkan_AbandonedBuffer_IsFreedByTheNextAllocation()
     {
         VulkanBackend? backend = null;
-        try { backend = VulkanBackend.Instance; } catch { }
+        // Initialized here: IsAvailable alone reads false until some Vulkan test has initialized the shared instance, so
+        // run first this skipped on a machine with a device.
+        try { backend = VulkanBackend.Instance; if (!backend.Initialize()) backend = null; } catch { }
         Skip.If(backend is null || !backend.IsAvailable, "No Vulkan device.");
         VulkanGpuBuffer.PendingFrees.Drain();
 

@@ -3,13 +3,16 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
 /// The 16-bit float kernels of the C-family backends (OpenCL, CUDA, HIP), appended to the integer program so they
 /// compile and load with it. Conversions are done on the bits, so they need no half extension and round the same way
-/// on every device: to nearest, ties to even, as the host conversions do.
+/// on every device: to nearest, ties to even, as the host conversions do. On OpenCL the arithmetic is done on the bits
+/// too (the packed kernels' binary32 library): an OpenCL device may flush binary32 subnormals with no build option to
+/// keep them (AMD's does), and a BFloat16 below 2^-126 widens to one, so 0x0001 + 0x0001 came out 0.
 /// </summary>
 internal static class GpuNarrowFloatKernelSource
 {
@@ -140,11 +143,18 @@ NF_FN float nf_gelu(float x)
     return 0.5f * x * (1.0f + NF_TANH(z));
 }
 ");
+        if (openCl) source.Append(BitExactLibrary());
         foreach (var type in Types)
         {
             string t = Suffix(type);
             string widen = "nf_w_" + t;
             string narrow = "nf_n_" + t;
+            if (openCl)
+            {
+                AppendBitExact(source, type);
+                continue;
+            }
+
             foreach (var operation in BinaryOperations)
             {
                 source.Append("IK_KERNEL ").Append(Binary(operation, type))
@@ -169,5 +179,54 @@ NF_FN float nf_gelu(float x)
                 .Append("    float s = 0.0f;\n    for (int j = 0; j < k; j++) s += ").Append(widen).Append("(a[row * k + j]) * ").Append(widen)
                 .Append("(b[j * n + col]);\n    c[i] = ").Append(narrow).Append("(s);\n}\n");
         }
+    }
+
+    // The packed kernels' binary32 library up to its gelu (which needs clamp and tanh), spelled as C: a functional cast
+    // becomes a C cast and uint the program's u32t.
+    private static string BitExactLibrary()
+    {
+        string text = KernelSourceResources.Read("PackedKernels.float.c");
+        text = text.Substring(0, text.IndexOf("float pk_gelu(", StringComparison.Ordinal));
+        text = Regex.Replace(text, @"\b(uint|int)\(", "($1)(");
+        text = Regex.Replace(text, @"\buint\b", "u32t");
+        return Regex.Replace(text, @"^(u32t|int|float|bool) (pk_\w+)\(", "NF_FN $1 $2(", RegexOptions.Multiline);
+    }
+
+    // The OpenCL kernels: add, subtract, multiply, relu and the matrix product's accumulation on the bits, as the packed
+    // kernels compute them; negate is a sign flip and gelu (a transcendental, checked to a tolerance) stays native.
+    private static void AppendBitExact(StringBuilder source, GpuElementType type)
+    {
+        string t = Suffix(type);
+        string widen = "pk_w_" + t, narrow = "pk_n_" + t;
+        foreach (var operation in BinaryOperations)
+        {
+            string value = operation switch
+            {
+                GpuNarrowFloatBinaryOperation.Add => "pk_fadd(" + widen + "(a[i]), " + widen + "(b[i]))",
+                GpuNarrowFloatBinaryOperation.Subtract => "pk_fadd(" + widen + "(a[i]), " + widen + "(b[i]) ^ 0x80000000u)",
+                _ => "pk_fmul(" + widen + "(a[i]), " + widen + "(b[i]))",
+            };
+            source.Append("IK_KERNEL ").Append(Binary(operation, type))
+                .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+                .Append("    if (i < size) o[i] = (u16t)").Append(narrow).Append('(').Append(value).Append(");\n}\n");
+        }
+
+        // The largest pattern below the sign bit that is not a NaN: infinity.
+        string top = type == GpuElementType.Float16 ? "0x7C00u" : "0x7F80u";
+        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Negate, type))
+            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+            .Append("    if (i < size) o[i] = (u16t)(a[i] ^ 0x8000u);\n}\n");
+        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Relu, type))
+            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+            .Append("    if (i < size) o[i] = (u16t)pk_relu(a[i], ").Append(top).Append(");\n}\n");
+        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Gelu, type))
+            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+            .Append("    if (i < size) o[i] = nf_n_").Append(t).Append("(nf_gelu(nf_w_").Append(t).Append("(a[i])));\n}\n");
+        // Each product and sum rounded to binary32 in the host's order, as the host's float loop does.
+        source.Append("IK_KERNEL ").Append(MatrixMultiply(type))
+            .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* c, const int m, const int n, const int k)\n{\n")
+            .Append("    const int i = IK_GID;\n    if (i >= m * n) return;\n    const int row = i / n;\n    const int col = i - row * n;\n")
+            .Append("    u32t s = 0u;\n    for (int j = 0; j < k; j++) s = pk_fadd(s, pk_fmul(").Append(widen).Append("(a[row * k + j]), ")
+            .Append(widen).Append("(b[j * n + col])));\n    c[i] = (u16t)").Append(narrow).Append("(s);\n}\n");
     }
 }

@@ -1129,11 +1129,15 @@ __kernel void parity_int_binary(__global const int* restrict a, __global const i
         case 6: { long g = parity_gcd(x, v); long m = g == 0 ? 0 : x / g * v; r = m < 0 ? -m : m; break; }
         default:
             if (v == 0) { parity_flag(flag, (ulong)i, 1); return; }
+            // The operands are sign-extended int32, so a compiler may divide in 32 bits, where int.MinValue / -1
+            // overflows (AMD's gave int.MaxValue): a divisor of -1 is a negation.
+            if (v == -1) { r = -x; break; }
             r = x / v;
             if (x % v != 0 && ((x < 0) != (v < 0))) r -= 1;
             break;
     }
-    y[i] = (int)r;
+    // Wrapped to int32 as the CPU's unchecked cast does; a signed narrowing out of range is implementation-defined.
+    y[i] = as_int((uint)r);
 }
 
 __kernel void parity_int_not(__global const int* restrict a, __global int* restrict y, int n)
