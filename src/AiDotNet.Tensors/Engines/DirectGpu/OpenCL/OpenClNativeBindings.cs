@@ -120,6 +120,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public const uint CL_KERNEL_WORK_GROUP_SIZE = 0x11B0;
 
+        /// <summary>clGetKernelWorkGroupInfo: the local memory one group of the kernel uses (its static __local arrays plus any
+        /// local arguments already set), a cl_ulong.</summary>
+        public const uint CL_KERNEL_LOCAL_MEM_SIZE = 0x11B2;
+
         /// <summary>clGetKernelInfo: the number of arguments the kernel declares.</summary>
         public const uint CL_KERNEL_NUM_ARGS = 0x1191;
         public const uint CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE = 0x11B3;
@@ -833,6 +837,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             catch (EntryPointNotFoundException)
             {
                 return -1;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        /// <summary>A cl_ulong clGetKernelWorkGroupInfo value, or zero when the driver does not report it.</summary>
+        public static ulong GetKernelWorkGroupInfoULong(IntPtr kernel, IntPtr device, uint paramName)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(8);
+            try
+            {
+                return GetKernelWorkGroupInfo(kernel, device, paramName, (UIntPtr)8, buffer, out _) == CL_SUCCESS
+                    ? (ulong)Marshal.ReadInt64(buffer)
+                    : 0;
             }
             finally
             {
