@@ -56,10 +56,11 @@ public class CudaVisibleDevicesTests
     [SkippableFact]
     public void The_vulkan_backend_opens_no_context_on_a_hidden_gpu()
     {
-        string? setting = Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES");
-        Skip.If(setting is null, "CUDA_VISIBLE_DEVICES is not set.");
+        // The hardware first: a lane without two NVIDIA GPUs (lavapipe, a single-GPU runner) cannot run this at all.
         var all = NvidiaSmi("--query-gpu=uuid --format=csv,noheader");
         Skip.If(all is null || all.Length < 2, "Needs nvidia-smi and two or more NVIDIA GPUs.");
+        string? setting = Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES");
+        Skip.If(setting is null, "CUDA_VISIBLE_DEVICES is not set.");
         var visible = CudaVisibleDevices.VisibleNvidiaUuids;
         Skip.If(visible is null || visible.Count >= TestRequire.NotNull(all, "all").Length, "CUDA_VISIBLE_DEVICES does not hide a GPU here.");
         var hidden = TestRequire.NotNull(all, "all").Select(u => u.Trim()).Where(u => !TestRequire.NotNull(visible, "visible").Contains(u.Substring(4).Replace("-", "").ToLowerInvariant())).ToArray();
