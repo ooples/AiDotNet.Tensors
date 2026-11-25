@@ -39,11 +39,11 @@ public partial class DirectGpuTensorEngine
 
     // Replaced (not cleared: ConditionalWeakTable has no Clear on .NET Framework) when the engine is disposed.
     private ConditionalWeakTable<object, Bf16DeviceWeight> _bf16Weights = new();
-    // Every live device copy this engine made, most recently used first: the eviction order under a budget, and the
-    // list Dispose frees. A copy whose weight has been collected is released at the next prune or eviction, so its
-    // bytes stay counted until then.
+    // Every device copy this engine made, most recently used first: the eviction order under a budget, and the list
+    // Dispose frees. The list holds its copies strongly, so a copy whose weight has been collected is released by the
+    // next upload (ReleaseCollectedBf16Copies), before any live copy is evicted, or by Dispose; until then its bytes
+    // stay counted in Bf16WeightDeviceBytes.
     private readonly LinkedList<Bf16DeviceWeight> _bf16Lru = new();
-    private int _bf16WeightCopiesPruneAt = 64;
     private readonly object _bf16WeightsLock = new();
     private long _bf16WeightBytesUploaded, _bf16WeightDeviceBytes, _bf16WeightEvictions, _bf16WeightDeviceBudget;
 
@@ -89,6 +89,18 @@ public partial class DirectGpuTensorEngine
         Interlocked.Add(ref _bf16WeightDeviceBytes, -entry.Bytes);
     }
 
+    // Caller holds _bf16WeightsLock. Releases the copies whose weight has been collected. Linear in the copies held; it
+    // runs once per upload, and an upload copies the whole weight to the device.
+    private void ReleaseCollectedBf16Copies()
+    {
+        for (var node = _bf16Lru.First; node is not null;)
+        {
+            var next = node.Next;
+            if (!node.Value.Key.TryGetTarget(out _)) ReleaseBf16Copy(node.Value, queued: true);
+            node = next;
+        }
+    }
+
     /// <summary>
     /// Frees every bf16 device copy. Engine teardown only: the engine is closed to ops, so no widen can read a copy
     /// after it is freed. Without this a copy outlived the engine until its weight was collected, holding device memory
@@ -129,6 +141,9 @@ public partial class DirectGpuTensorEngine
                 if (bytes is null) return false;
                 // The weight was re-registered (a new pool handle) or the backend changed: the old copy is dead.
                 if (entry is not null) ReleaseBf16Copy(entry, queued: true);
+                // Copies of weights that have been collected go first: neither the budget nor an unbounded engine should
+                // keep a dropped model's weights on the device while it uploads another's.
+                ReleaseCollectedBf16Copies();
                 long size = 4L * ((bytes.Length + 3) / 4);
                 long budget = Bf16WeightDeviceBudgetBytes;
                 if (budget > 0)
@@ -153,17 +168,6 @@ public partial class DirectGpuTensorEngine
                 _bf16Weights.Add(t, entry);
                 Interlocked.Add(ref _bf16WeightDeviceBytes, size);
                 Interlocked.Add(ref _bf16WeightBytesUploaded, 2L * t.Length);
-                if (_bf16Lru.Count >= _bf16WeightCopiesPruneAt)
-                {
-                    // Copies whose weight has been collected.
-                    for (var node = _bf16Lru.First; node is not null;)
-                    {
-                        var next = node.Next;
-                        if (!node.Value.Key.TryGetTarget(out _)) ReleaseBf16Copy(node.Value, queued: true);
-                        node = next;
-                    }
-                    _bf16WeightCopiesPruneAt = Math.Max(64, 2 * _bf16Lru.Count);
-                }
             }
             else if (entry.Node is not null && !ReferenceEquals(_bf16Lru.First, entry.Node))
             {

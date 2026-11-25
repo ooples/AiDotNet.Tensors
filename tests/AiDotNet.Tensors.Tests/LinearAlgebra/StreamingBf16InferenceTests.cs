@@ -2,7 +2,9 @@
 
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -111,6 +113,7 @@ public class StreamingBf16InferenceTests
         try { gpu = new DirectGpuTensorEngine(); }
         catch { Skip.If(true, "No GPU backend"); return; }
         if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true }) { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies"); return; }
         var cpu = new CpuEngine();
         var x = Filled(new[] { M, K }, 1, v => v);
         var dir = Configure();
@@ -143,5 +146,50 @@ public class StreamingBf16InferenceTests
             Assert.Equal(2L * (4 * (K * N + N)), gpu.Bf16WeightBytesUploaded - uploaded0);
         }
         finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
+    /// <summary>
+    /// A bf16 copy whose weight has been collected is released by the next upload, on an unbounded engine too. The copies
+    /// are held strongly (the eviction list), so without that release a dropped model's copies stayed on the device until
+    /// the engine was disposed.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_bf16_copy_of_a_collected_weight_is_released_by_the_next_upload()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true }) { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies"); return; }
+        var x = Filled(new[] { M, K }, 1, v => v);
+        var dir = Configure();
+        try
+        {
+            long pair = 4L * ((2 * K * N + 3) / 4) + 4L * ((2 * N + 3) / 4);   // one layer's device copies
+            long before = gpu.Bf16WeightDeviceBytes;
+            RunDroppedLayer(gpu, x);
+            Assert.Equal(before + pair, gpu.Bf16WeightDeviceBytes);
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            var w = Stream(Filled(new[] { K, N }, 5, v => v));
+            var b = Stream(Filled(new[] { N }, 6, v => v));
+            gpu.FusedLinear(x, w, b, FusedActivationType.None);
+            Assert.Equal(before + pair, gpu.Bf16WeightDeviceBytes);   // the dropped layer's copies were released
+            Assert.Equal(0, gpu.Bf16WeightEvictions);                  // released as dead, not evicted: no budget
+            GC.KeepAlive(w);
+            GC.KeepAlive(b);
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
+    // A layer whose weights are unreachable once this returns.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void RunDroppedLayer(DirectGpuTensorEngine gpu, Tensor<float> x)
+    {
+        var w = Stream(Filled(new[] { K, N }, 2, v => v));
+        var b = Stream(Filled(new[] { N }, 3, v => v));
+        gpu.FusedLinear(x, w, b, FusedActivationType.None);
     }
 }
