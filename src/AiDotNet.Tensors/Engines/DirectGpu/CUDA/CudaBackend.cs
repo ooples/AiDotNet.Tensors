@@ -10368,7 +10368,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // as CpuEngine.Dropout does), then apply it with scale = 1. When not training / rate <= 0 the
         // mask kernel keeps everything at scale 1, so output == input (identity), matching the CPU path.
         float keepProb = training ? (1.0f - dropoutRate) : 1.0f;
-        DropoutMask(mask, size, keepProb, seed);
+        // The mask kernel's two-round hash does not separate nearby seeds (see GpuSeed).
+        DropoutMask(mask, size, keepProb, GpuSeed.Mix(seed));
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);

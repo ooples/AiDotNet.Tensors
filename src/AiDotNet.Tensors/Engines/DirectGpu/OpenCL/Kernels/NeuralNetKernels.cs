@@ -628,13 +628,18 @@ __kernel void dropout_forward(
         return;
     }
 
-    // Simple LCG random number generator
-    ulong state = seed + (ulong)idx * 6364136223846793005UL;
-    state = state * 6364136223846793005UL + 1442695040888963407UL;
-    float rand = (float)(state >> 33) / (float)(1UL << 31);
+    // The counter hash of dropout_mask: one step of a linear congruential generator from seed + idx * multiplier is
+    // a lattice, whose neighbouring elements and nearby seeds are not independent draws. The host mixes the seed.
+    uint counter = (uint)idx;
+    uint key = (uint)(seed ^ (seed >> 32));
+    ulong prod = (ulong)counter * 0xCD9E8D57u;
+    counter = (uint)(prod >> 32) ^ key ^ (uint)prod;
+    prod = (ulong)counter * 0xCD9E8D57u;
+    counter = (uint)(prod >> 32) ^ (key + 1u) ^ (uint)prod;
+    float rand = (float)(counter >> 8) * (1.0f / 16777216.0f);
 
     float scale = 1.0f / (1.0f - dropoutRate);
-    if (rand < dropoutRate) {
+    if (rand >= 1.0f - dropoutRate) {
         output[idx] = 0.0f;
         mask[idx] = 0.0f;
     } else {

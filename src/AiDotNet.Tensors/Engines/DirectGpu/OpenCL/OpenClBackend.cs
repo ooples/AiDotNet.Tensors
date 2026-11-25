@@ -9175,7 +9175,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
             k.SetArg(arg++, size);
             k.SetArg(arg++, dropoutRate);
-            k.SetArg(arg++, seed);
+            k.SetArg(arg++, GpuSeed.Mix(seed));
             k.SetArg(arg++, training ? 1 : 0);
 
             k.Execute1D(size, Math.Min(256, size));
