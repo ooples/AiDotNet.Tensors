@@ -134,6 +134,73 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         return BitConverter.ToSingle(BitConverter.GetBytes(bits & unchecked((int)0xFFFF0000)), 0);
     }
 
+    // A GEMM fan-out runs each slice on a leased stream, and the cast-operands autocast takes a separate path there: its
+    // 16-bit operand scratch is allocated, written and freed in the slice stream's order, and the slice runs the classic
+    // GemmEx rather than the measured route. Each slice must still multiply the rounded operands.
+    [SkippableTheory]
+    [InlineData(PrecisionMode.Float16)]
+    [InlineData(PrecisionMode.BFloat16)]
+    public void CastOperands_RoundsTheOperandsTo16Bits_InEveryGemmFanoutSlice(PrecisionMode precision)
+    {
+        Skip.If(!_fixture.IsAvailable, "No GPU device.");
+        var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
+        Skip.If(engine.GetBackend() is not CudaBackend, "Matmul autocast is CUDA's.");
+        var cuda = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
+        Skip.If(!cuda.IsCublasAvailable, "The cast-operands GEMM is cuBLAS's.");
+        using var scheduler = engine.GetStreamScheduler();
+        Skip.If(scheduler is null, "The backend has no stream scheduler.");
+        // Alpha 0.5 keeps the whole-batch direct-PTX path (alpha 1, beta 0) out of the way.
+        const int M = 48, N = 40, K = 64, Batch = 4;
+        const float Alpha = 0.5f;
+        var hostA = Data(Batch * M * K, 0.731, 0.2);
+        var hostB = Data(Batch * K * N, 0.293, 0.5);
+        Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
+        var sliceStreams = new System.Collections.Generic.List<IntPtr>();
+        cuda.FanoutSliceStreamObserver = s => sliceStreams.Add(s);
+        try
+        {
+            using var a = cuda.AllocateBuffer(hostA);
+            using var b = cuda.AllocateBuffer(hostB);
+            using var c = cuda.AllocateBuffer(Batch * M * N);
+            long declines = cuda.AutocastCastDeclinesForTest;
+            using (engine.EnterMatMulAutocast(precision, MatMulAutocastMode.CastOperands))
+                cuda.BatchedGemmFanout(a, b, c, M, N, K, Batch, scheduler!, Alpha);
+            Assert.Equal(declines, cuda.AutocastCastDeclinesForTest);   // cast, not the fast fallback
+            Assert.Equal(Batch, sliceStreams.Count);
+            Assert.True(new System.Collections.Generic.HashSet<IntPtr>(sliceStreams).Count > 1,
+                "every slice ran on one stream, so the fan-out path was not exercised");
+            var got = cuda.DownloadBuffer(c);
+            double roundedErr = 0, exactErr = 0;
+            for (int z = 0; z < Batch; z++)
+                for (int i = 0; i < M; i++)
+                    for (int j = 0; j < N; j++)
+                    {
+                        double rounded = 0, exact = 0, magnitude = 0;
+                        for (int t = 0; t < K; t++)
+                        {
+                            float x = hostA[(z * M + i) * K + t], y = hostB[(z * K + t) * N + j];
+                            double product = (double)round(x) * round(y);
+                            rounded += product;
+                            magnitude += Math.Abs(product);
+                            exact += (double)x * y;
+                        }
+                        rounded *= Alpha; exact *= Alpha; magnitude *= Alpha;
+                        double value = got[(z * M + i) * N + j];
+                        double bound = K * Math.Pow(2, -23) * magnitude + 1e-30;
+                        Assert.True(Math.Abs(value - rounded) <= bound,
+                            $"{precision} slice {z} [{i},{j}]: {value:R} is {Math.Abs(value - rounded):E2} from the rounded-operand product {rounded:R} (bound {bound:E2})");
+                        roundedErr += Math.Abs(value - rounded);
+                        exactErr += Math.Abs(value - exact);
+                    }
+            Assert.True(exactErr > 10 * roundedErr,
+                $"{precision}: distance to the exact product {exactErr:E2} is not well above the distance to the rounded-operand product {roundedErr:E2}");
+        }
+        finally
+        {
+            cuda.FanoutSliceStreamObserver = null;
+        }
+    }
+
     // The default autocast (CastOperands) is PyTorch's: every product is that of the operands rounded to 16 bits, on a
     // small GEMM as on a large one. The fast compute type only permits 16-bit math, and cuBLAS kept FP32 kernels for
     // small shapes (a 16-32-8 MLP's GEMMs came back FP32-exact on GA102), so a model's precision depended on its batch.
