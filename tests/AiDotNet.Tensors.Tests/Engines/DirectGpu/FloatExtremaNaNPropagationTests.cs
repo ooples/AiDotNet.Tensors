@@ -39,7 +39,17 @@ public sealed class FloatExtremaNaNPropagationTests
         return list;
     }
 
-    private static void Check(Func<float[], (float Max, float Min)> extrema, string where)
+    private static float FromBits(int bits) => BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+
+    private static int Bits(float value) => BitConverter.ToInt32(BitConverter.GetBytes(value), 0);
+
+    // Two NaNs that are neither float.NaN nor each other, to tell which one a result carries.
+    private static readonly float FirstNaN = FromBits(0x7FC00A01);
+    private static readonly float LaterNaN = FromBits(0x7FC00B02);
+
+    // With canonicalNaN the range is poisoned with a NaN that is not float.NaN and the result must be float.NaN's
+    // bit pattern: the device full reductions' contract (ExactFloatKernels).
+    private static void Check(Func<float[], (float Max, float Min)> extrema, string where, bool canonicalNaN = false)
     {
         foreach (int size in Sizes)
         {
@@ -58,10 +68,15 @@ public sealed class FloatExtremaNaNPropagationTests
             foreach (int position in Positions(size))
             {
                 var poisoned = (float[])values.Clone();
-                poisoned[position] = float.NaN;
+                poisoned[position] = canonicalNaN ? FirstNaN : float.NaN;
                 var result = extrema(poisoned);
                 Assert.True(float.IsNaN(result.Max), $"{where}: max of {size} elements with a NaN at {position} is {result.Max:R}.");
                 Assert.True(float.IsNaN(result.Min), $"{where}: min of {size} elements with a NaN at {position} is {result.Min:R}.");
+                if (canonicalNaN)
+                {
+                    Assert.True(Bits(result.Max) == Bits(float.NaN), $"{where}: max of {size} elements with a NaN at {position} has bits 0x{Bits(result.Max):X8}.");
+                    Assert.True(Bits(result.Min) == Bits(float.NaN), $"{where}: min of {size} elements with a NaN at {position} has bits 0x{Bits(result.Min):X8}.");
+                }
             }
 
             // Infinities are ordinary values: only a NaN is contagious.
@@ -102,6 +117,7 @@ public sealed class FloatExtremaNaNPropagationTests
     private static IDirectGpuBackend? Create(Device device, out IDisposable? owned)
     {
         owned = null;
+        Exception? initializationFailure = null;
         try
         {
             if (device == Device.WebGpu)
@@ -120,14 +136,18 @@ public sealed class FloatExtremaNaNPropagationTests
             }
 
             var openCl = new OpenClBackend();
-            if (!openCl.IsAvailable)
+            if (openCl.IsAvailable)
             {
-                openCl.Dispose();
-                return null;
+                owned = openCl;
+                return openCl;
             }
 
-            owned = openCl;
-            return openCl;
+            // A device that is there but whose backend failed to come up (a kernel that no longer compiles) is a
+            // failure of the code under test; only an absent device is a reason to skip.
+            if (openCl.InitializationState == GpuBackendInitializationState.Failed)
+                initializationFailure = openCl.InitializationException
+                    ?? new InvalidOperationException("The OpenCL backend failed to initialize.");
+            openCl.Dispose();
         }
         catch (Exception unavailable) when (unavailable is DllNotFoundException or InvalidOperationException
             or NotSupportedException or TypeInitializationException)
@@ -135,6 +155,11 @@ public sealed class FloatExtremaNaNPropagationTests
             System.Diagnostics.Trace.TraceInformation("{0} is not available on this host: {1}", device, unavailable);
             return null;
         }
+
+        // Outside the try: its filter would turn this into a skip.
+        if (initializationFailure is not null)
+            throw new InvalidOperationException("An OpenCL device was detected, but the OpenCL backend failed to initialize.", initializationFailure);
+        return null;
     }
 
     [SkippableTheory]
@@ -151,7 +176,7 @@ public sealed class FloatExtremaNaNPropagationTests
             {
                 using var buffer = backend.AllocateBuffer(values);
                 return (backend.Max(buffer, values.Length), backend.Min(buffer, values.Length));
-            }, device.ToString());
+            }, device.ToString(), canonicalNaN: true);
         }
     }
 
@@ -168,12 +193,20 @@ public sealed class FloatExtremaNaNPropagationTests
             cleanMax[r] = max;
             switch (r % 5)
             {
-                case 0: data[r * width] = float.NaN; poisoned[r] = true; break;
-                case 1: data[r * width + width / 2] = float.NaN; poisoned[r] = true; break;
-                case 2: data[r * width + width - 1] = float.NaN; poisoned[r] = true; break;
+                case 0:
+                    data[r * width + width - 1] = LaterNaN;
+                    data[r * width] = FirstNaN;
+                    poisoned[r] = true;
+                    break;
+                case 1:
+                    data[r * width + width - 1] = LaterNaN;
+                    data[r * width + width / 2] = FirstNaN;
+                    poisoned[r] = true;
+                    break;
+                case 2: data[r * width + width - 1] = FirstNaN; poisoned[r] = true; break;
                 case 3: break;
                 default:
-                    for (int c = 0; c < width; c++) data[r * width + c] = float.NaN;
+                    for (int c = 0; c < width; c++) data[r * width + c] = c == 0 ? FirstNaN : LaterNaN;
                     poisoned[r] = true;
                     break;
             }
@@ -187,7 +220,12 @@ public sealed class FloatExtremaNaNPropagationTests
         for (int r = 0; r < poisoned.Length; r++)
         {
             if (poisoned[r])
+            {
                 Assert.True(float.IsNaN(actual[r]), $"{where}: row {r} of width {width} holds a NaN but its max is {actual[r]:R}.");
+                // The row's first NaN, bits included: not a canonical NaN, and not a later one.
+                Assert.True(Bits(actual[r]) == Bits(FirstNaN),
+                    $"{where}: row {r} of width {width} has NaN bits 0x{Bits(actual[r]):X8}, expected the first NaN's 0x{Bits(FirstNaN):X8}.");
+            }
             else
                 Assert.True(actual[r] == cleanMax[r], $"{where}: row {r} of width {width} is {actual[r]:R}, expected {cleanMax[r]:R}.");
         }
