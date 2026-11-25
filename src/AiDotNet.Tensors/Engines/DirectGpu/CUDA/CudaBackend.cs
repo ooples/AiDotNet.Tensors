@@ -944,7 +944,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             zero = 0;
                             CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
                         });
-                    ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+                    bool isWddm = OperatingSystem.IsWindows()
+                        && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success
+                            || tccMode == 0);
+                    ulong initFreeBytes = totalMem;
+                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success && queriedFree > 0)
+                        initFreeBytes = queriedFree;
+                    if (isWddm)
+                    {
+                        _bufferPool.MaxPooledElements = ComputeDefaultWddmHostPoolMaxElements(
+                            _bufferPool.MaxPooledElements, initFreeBytes);
+                    }
+                    ulong threshold = ComputeDefaultMemPoolReleaseThreshold(
+                        totalMem, initFreeBytes, isWddm,
+                        Environment.GetEnvironmentVariable("AIDOTNET_CUDA_MEMPOOL_RELEASE_THRESHOLD_MB")); // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                     if (poolAttrStatus != CudaResult.Success)
                     {
@@ -2271,13 +2284,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         }
 
-        // Pressured: run pending finalizers so dereferenced transient GPU buffers are released,
-        // then reclaim any completed deferred frees. Two collects bracket the finalizer wait so
-        // objects promoted to the finalizer queue on the first pass are reclaimed on the second.
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        // Pressured: collect unreachable managed wrappers AND drain the finalizer queue (which raw
+        // GC.Collect alone leaves queued in _pendingFinalizerFrees), then release idle buffers cached
+        // in _bufferPool and _asyncMemPool back to the driver so cuMemGetInfo sees the reclaimed bytes
+        // and Windows WDDM does not spill over physical VRAM into shared PCIe system memory.
+        ReclaimUnreachableForRetry();
         DrainDeferredFrees(blockOldest: false);
+        if (!IsCapturingOnThisThread && !_backendStreamCaptureActive)
+        {
+            ((IDeviceMemoryPressure)this).ReleaseCachedBuffers();
+        }
 
         // Effectiveness check: a workload legitimately resident below the threshold reclaims ~nothing;
         // back off exponentially so the per-step GC tax amortizes away. A sweep that frees >=1% of the
@@ -2296,10 +2312,34 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private int _reclaimCooldownRemaining;
     private int _reclaimBackoffSteps = 1;
 
-    /// <summary>
-    /// Unconditionally releases device memory held only by unreachable managed objects: runs the pending
-    /// finalizers (which free or enqueue their buffers) and drains the completed deferred frees back to the pool.
-    /// </summary>
+    private const ulong MinWddmMemPoolReleaseThresholdBytes = 256UL << 20;
+    private const long MinWddmHostPoolMaxBytes = 64L << 20;
+
+    internal static ulong ComputeDefaultMemPoolReleaseThreshold(
+        ulong totalBytes, ulong freeBytes, bool isWddm, string? envOverrideMb)
+    {
+        if (!string.IsNullOrWhiteSpace(envOverrideMb)
+            && long.TryParse(envOverrideMb.Trim(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long overrideMb))
+        {
+            if (overrideMb < 0) return ulong.MaxValue;
+            return (ulong)overrideMb * (1UL << 20);
+        }
+        if (!isWddm || totalBytes == 0)
+            return ulong.MaxValue;
+        ulong effectiveFree = freeBytes > 0 && freeBytes <= totalBytes ? freeBytes : totalBytes;
+        ulong bounded = Math.Min(totalBytes / 2, effectiveFree / 2);
+        return Math.Max(MinWddmMemPoolReleaseThresholdBytes, Math.Min(bounded, totalBytes));
+    }
+
+    internal static long ComputeDefaultWddmHostPoolMaxElements(long currentMaxElements, ulong freeBytes)
+    {
+        if (currentMaxElements <= 0 || freeBytes == 0)
+            return currentMaxElements;
+        long wddmCapBytes = Math.Max(MinWddmHostPoolMaxBytes, (long)Math.Min(freeBytes / 4, (ulong)long.MaxValue));
+        long wddmCapElements = wddmCapBytes / sizeof(float);
+        return Math.Min(currentMaxElements, wddmCapElements);
+    }
     /// <summary>Free and total device memory (cuMemGetInfo), or false when unavailable.</summary>
     internal bool TryGetDeviceMemory(out ulong free, out ulong total)
     {
