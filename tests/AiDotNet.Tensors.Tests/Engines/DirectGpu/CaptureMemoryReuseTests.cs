@@ -47,7 +47,7 @@ public class CaptureMemoryReuseTests
 
         var addresses = new List<IntPtr>();
         IntPtr graph = backend.CaptureGraph(() => Body(backend, acc, ones, addresses));
-        Assert.NotEqual(IntPtr.Zero, graph);
+        Assert.True(graph != IntPtr.Zero, "capture failed: " + ((IGpuGraphCapture)backend).LastCaptureFailure);
         try
         {
             // Every scratch buffer after the first reuses the memory the previous one released: one block, not eight.
@@ -76,7 +76,7 @@ public class CaptureMemoryReuseTests
         var addresses = new List<IntPtr>();
         var keep = new List<IGpuBuffer>();
         IntPtr graph = backend.CaptureGraph(() => Body(backend, acc, ones, addresses, keep));
-        Assert.NotEqual(IntPtr.Zero, graph);
+        Assert.True(graph != IntPtr.Zero, "capture failed: " + ((IGpuGraphCapture)backend).LastCaptureFailure);
         try
         {
             // Nothing was released while capturing, so nothing may be handed out twice.
