@@ -16,6 +16,12 @@ namespace AiDotNet.Tensors.Engines;
 /// device (a 6.9B-parameter mixture-of-experts model: 27.6 GB against a 24 GB card) and re-uploaded on every re-materialization. Here the weight's
 /// bf16 bytes are uploaded once (2 bytes per element) and each op that reads it gets an fp32 temporary widened on the
 /// device. Widening is exact, so the op sees exactly the values the CPU engine sees for the same weight.
+/// <para>
+/// <see cref="Bf16WeightDeviceBudgetBytes"/> bounds the device bytes these copies hold. Unbounded, a model whose bf16
+/// weights exceed the card cannot run at all (the same model: 13.85 GB of bf16 weights against a 12 GB card). Bounded,
+/// the least recently used copies are released to admit a new one, and an evicted weight is uploaded again from the
+/// host store on its next use. Values are unchanged; only the upload traffic grows.
+/// </para>
 /// </summary>
 public partial class DirectGpuTensorEngine
 {
@@ -25,17 +31,21 @@ public partial class DirectGpuTensorEngine
         internal IDirectGpuBackend Backend = null!;
         internal long PoolHandle;
         internal int Length;
+        internal long Bytes;
         internal bool Released;
+        internal WeakReference<object> Key = null!;
+        internal LinkedListNode<Bf16DeviceWeight>? Node;
     }
 
     // Replaced (not cleared: ConditionalWeakTable has no Clear on .NET Framework) when the engine is disposed.
     private ConditionalWeakTable<object, Bf16DeviceWeight> _bf16Weights = new();
-    // Every device copy this engine made, so Dispose can free the ones whose weights are still alive. Weak: a copy
-    // lives as long as its weight (the table's value), and a dead weight's copy is freed by the buffer's finalizer.
-    private readonly List<WeakReference<Bf16DeviceWeight>> _bf16WeightCopies = new();
+    // Every live device copy this engine made, most recently used first: the eviction order under a budget, and the
+    // list Dispose frees. A copy whose weight has been collected is released at the next prune or eviction, so its
+    // bytes stay counted until then.
+    private readonly LinkedList<Bf16DeviceWeight> _bf16Lru = new();
     private int _bf16WeightCopiesPruneAt = 64;
     private readonly object _bf16WeightsLock = new();
-    private long _bf16WeightBytesUploaded;
+    private long _bf16WeightBytesUploaded, _bf16WeightDeviceBytes, _bf16WeightEvictions, _bf16WeightDeviceBudget;
 
     /// <summary>The bf16 device copy this engine holds for <paramref name="weight"/>, or null (diagnostics, tests).</summary>
     internal IGpuBuffer? Bf16DeviceCopyOf(object weight)
@@ -45,17 +55,50 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
-    /// Frees every bf16 device copy whose weight is still alive. Engine teardown only: the engine is closed to ops, so
-    /// no widen can read a copy after it is freed. Without this a copy outlived the engine until its weight was
-    /// collected, holding device memory on a backend the engine shares with others.
+    /// Device bytes the bf16 copies of streamed weights may hold; 0 (the default) means unbounded. Over the budget, the
+    /// least recently used copies are released before a new one is uploaded. A single weight larger than the budget is
+    /// still uploaded, after every other copy is released. A lowered budget takes effect at the next upload.
+    /// </summary>
+    public long Bf16WeightDeviceBudgetBytes
+    {
+        get => Interlocked.Read(ref _bf16WeightDeviceBudget);
+        set
+        {
+            if (value < 0) throw new ArgumentOutOfRangeException(nameof(value), "The budget must be 0 (unbounded) or positive.");
+            Interlocked.Exchange(ref _bf16WeightDeviceBudget, value);
+        }
+    }
+
+    /// <summary>Device bytes currently held by bf16 copies of streamed weights.</summary>
+    public long Bf16WeightDeviceBytes => Interlocked.Read(ref _bf16WeightDeviceBytes);
+
+    /// <summary>bf16 weight copies released to stay within <see cref="Bf16WeightDeviceBudgetBytes"/>.</summary>
+    public long Bf16WeightEvictions => Interlocked.Read(ref _bf16WeightEvictions);
+
+    // Caller holds _bf16WeightsLock. Every widen from a copy is launched under the lock, so after this none can be
+    // launched; one already queued may still read it, so the buffer is released in queue order.
+    private void ReleaseBf16Copy(Bf16DeviceWeight entry, bool queued)
+    {
+        if (entry.Node is not null) { _bf16Lru.Remove(entry.Node); entry.Node = null; }
+        if (entry.Key.TryGetTarget(out var key) && _bf16Weights.TryGetValue(key, out var current) && ReferenceEquals(current, entry))
+            _bf16Weights.Remove(key);
+        if (entry.Released) return;
+        entry.Released = true;
+        if (queued) DisposeBufferAfterQueuedUse(entry.Backend, entry.Bits);
+        else entry.Bits.Dispose();
+        Interlocked.Add(ref _bf16WeightDeviceBytes, -entry.Bytes);
+    }
+
+    /// <summary>
+    /// Frees every bf16 device copy. Engine teardown only: the engine is closed to ops, so no widen can read a copy
+    /// after it is freed. Without this a copy outlived the engine until its weight was collected, holding device memory
+    /// on a backend the engine shares with others.
     /// </summary>
     private void ReleaseBf16DeviceWeights()
     {
         lock (_bf16WeightsLock)
         {
-            foreach (var weak in _bf16WeightCopies)
-                if (weak.TryGetTarget(out var entry) && !entry.Released) { entry.Released = true; entry.Bits.Dispose(); }
-            _bf16WeightCopies.Clear();
+            while (_bf16Lru.First is { } node) ReleaseBf16Copy(node.Value, queued: false);
             _bf16Weights = new ConditionalWeakTable<object, Bf16DeviceWeight>();
         }
     }
@@ -84,32 +127,48 @@ public partial class DirectGpuTensorEngine
             {
                 var bytes = WeightRegistry.TryReadBf16Store(t);
                 if (bytes is null) return false;
+                // The weight was re-registered (a new pool handle) or the backend changed: the old copy is dead.
+                if (entry is not null) ReleaseBf16Copy(entry, queued: true);
+                long size = 4L * ((bytes.Length + 3) / 4);
+                long budget = Bf16WeightDeviceBudgetBytes;
+                if (budget > 0)
+                    while (_bf16Lru.Last is { } oldest && Bf16WeightDeviceBytes + size > budget)
+                    {
+                        ReleaseBf16Copy(oldest.Value, queued: true);
+                        Interlocked.Increment(ref _bf16WeightEvictions);
+                    }
                 // Uploaded as the raw bit pattern: the copy does not interpret the packed 32-bit words.
                 var packed = new float[(bytes.Length + 3) / 4];
                 Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);
-                if (entry is not null)
-                {
-                    // The weight was re-registered (a new pool handle) or the backend changed: the old copy is dead.
-                    // Disposed under the lock, where every widen from it is launched, so none can read it after.
-                    _bf16Weights.Remove(t);
-                    entry.Released = true;
-                    entry.Bits.Dispose();
-                }
                 entry = new Bf16DeviceWeight
                 {
                     Bits = backend.AllocateBuffer(packed),
                     Backend = backend,
                     PoolHandle = t.StreamingPoolHandle,
                     Length = t.Length,
+                    Bytes = size,
+                    Key = new WeakReference<object>(t),
                 };
+                entry.Node = _bf16Lru.AddFirst(entry);
                 _bf16Weights.Add(t, entry);
-                _bf16WeightCopies.Add(new WeakReference<Bf16DeviceWeight>(entry));
-                if (_bf16WeightCopies.Count >= _bf16WeightCopiesPruneAt)
-                {
-                    _bf16WeightCopies.RemoveAll(w => !w.TryGetTarget(out var e) || e.Released);
-                    _bf16WeightCopiesPruneAt = Math.Max(64, 2 * _bf16WeightCopies.Count);
-                }
+                Interlocked.Add(ref _bf16WeightDeviceBytes, size);
                 Interlocked.Add(ref _bf16WeightBytesUploaded, 2L * t.Length);
+                if (_bf16Lru.Count >= _bf16WeightCopiesPruneAt)
+                {
+                    // Copies whose weight has been collected.
+                    for (var node = _bf16Lru.First; node is not null;)
+                    {
+                        var next = node.Next;
+                        if (!node.Value.Key.TryGetTarget(out _)) ReleaseBf16Copy(node.Value, queued: true);
+                        node = next;
+                    }
+                    _bf16WeightCopiesPruneAt = Math.Max(64, 2 * _bf16Lru.Count);
+                }
+            }
+            else if (entry.Node is not null && !ReferenceEquals(_bf16Lru.First, entry.Node))
+            {
+                _bf16Lru.Remove(entry.Node);
+                _bf16Lru.AddFirst(entry.Node);
             }
             var fp32 = backend.AllocateBuffer(t.Length);
             widen.WidenBf16ToFp32(entry.Bits, fp32, t.Length);

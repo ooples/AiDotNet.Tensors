@@ -1218,3 +1218,7 @@ static AiDotNet.Tensors.Engines.Compilation.LossScaleState.operator ==(AiDotNet.
 ~override AiDotNet.Tensors.Engines.Compilation.LossScaleState.ToString() -> string
 static AiDotNet.Tensors.Engines.AiDotNetEngine.UseInCurrentContext(AiDotNet.Tensors.Engines.IEngine! engine) -> System.IDisposable!
 static AiDotNet.Tensors.LinearAlgebra.WeightRegistry.StreamingExecutionTraining.get -> bool?
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBudgetBytes.get -> long
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBudgetBytes.set -> void
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightDeviceBytes.get -> long
+AiDotNet.Tensors.Engines.DirectGpuTensorEngine.Bf16WeightEvictions.get -> long

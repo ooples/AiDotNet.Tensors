@@ -97,4 +97,51 @@ public class StreamingBf16InferenceTests
         }
         finally { gpu.Dispose(); }
     }
+
+    /// <summary>
+    /// A device byte budget on the bf16 weight copies: three layers whose bf16 copies need more than the budget run with
+    /// the least recently used copies evicted and re-uploaded on reuse, and every output equals the unbounded result.
+    /// Without the budget the engine kept every copy (device bytes above the budget, no evictions), so a model whose bf16
+    /// weights exceed the card could not run.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_bf16_weight_budget_evicts_least_recently_used_copies_and_keeps_results()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        var cpu = new CpuEngine();
+        var x = Filled(new[] { M, K }, 1, v => v);
+        var dir = Configure();
+        try
+        {
+            const int layers = 3;
+            var w = new Tensor<float>[layers];
+            var b = new Tensor<float>[layers];
+            var expected = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++)
+            {
+                expected[l] = cpu.FusedLinear(x, Filled(new[] { K, N }, 2 + l, v => v), Filled(new[] { N }, 7 + l, v => v), FusedActivationType.None);
+                w[l] = Stream(Filled(new[] { K, N }, 2 + l, v => v));
+                b[l] = Stream(Filled(new[] { N }, 7 + l, v => v));
+            }
+            long pair = 4L * ((2 * K * N + 3) / 4) + 4L * ((2 * N + 3) / 4);   // one layer's device copies
+            gpu.Bf16WeightDeviceBudgetBytes = 2 * pair;
+            long evictions0 = gpu.Bf16WeightEvictions, uploaded0 = gpu.Bf16WeightBytesUploaded;
+            foreach (int l in new[] { 0, 1, 2, 0 })
+            {
+                var y = gpu.FusedLinear(x, w[l], b[l], FusedActivationType.None);
+                for (int i = 0; i < M * N; i++)
+                    Assert.True(Math.Abs(y.GetFlat(i) - expected[l].GetFlat(i)) <= 1e-5,
+                        $"layer {l} [{i}] {y.GetFlat(i)} vs {expected[l].GetFlat(i)}");
+                Assert.True(gpu.Bf16WeightDeviceBytes <= 2 * pair,
+                    $"after layer {l}: {gpu.Bf16WeightDeviceBytes} device bytes held, budget {2 * pair}");
+            }
+            // Layer 2 evicts layer 0's pair; layer 0 again evicts layer 1's pair and is uploaded a second time.
+            Assert.Equal(4, gpu.Bf16WeightEvictions - evictions0);
+            Assert.Equal(2L * (4 * (K * N + N)), gpu.Bf16WeightBytesUploaded - uploaded0);
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
 }
