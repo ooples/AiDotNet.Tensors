@@ -897,7 +897,7 @@ void main() {
         {
             if (dropoutRate < 0f || dropoutRate >= 1f)
                 throw new ArgumentOutOfRangeException(nameof(dropoutRate), $"dropoutRate must be in [0, 1), got {dropoutRate}.");
-            DropoutMask(mask, size, 1f - dropoutRate, seed);
+            DropoutMask(mask, size, 1f - dropoutRate, GpuSeed.Mix(seed));
             Multiply(input, mask, output, size);
         }
         else

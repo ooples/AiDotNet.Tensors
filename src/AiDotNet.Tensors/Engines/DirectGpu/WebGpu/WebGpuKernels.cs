@@ -7599,22 +7599,24 @@ fn mulhi(a: u32, b: u32) -> u32 {
     return hh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
 }
 
-fn philox_round(ctr0: u32, ctr1: u32, key0: u32, key1: u32) -> vec4<u32> {
+// One Philox4x32 round: words 0 and 2 are multiplied, and the high halves are mixed with words 1 and 3 and the key.
+// Without words 1 and 3 the round is not a bijection of the counter and its outputs are biased (a 30% dropout mask
+// kept 67.3% of its elements).
+fn philox_round(c: vec4<u32>, key0: u32, key1: u32) -> vec4<u32> {
     let M0: u32 = 0xD2511F53u;
     let M1: u32 = 0xCD9E8D57u;
-    let lo0 = ctr0 * M0;
-    let hi0 = mulhi(ctr0, M0);
-    let lo1 = ctr1 * M1;
-    let hi1 = mulhi(ctr1, M1);
-    return vec4<u32>(hi1 ^ key0, lo1, hi0 ^ key1, lo0);
+    let lo0 = c.x * M0;
+    let hi0 = mulhi(c.x, M0);
+    let lo1 = c.z * M1;
+    let hi1 = mulhi(c.z, M1);
+    return vec4<u32>(hi1 ^ c.y ^ key0, lo1, hi0 ^ c.w ^ key1, lo0);
 }
 
 fn philox4x32(counter: vec4<u32>, key: vec2<u32>) -> vec4<u32> {
     var c = counter;
     var k = key;
     for (var i: u32 = 0u; i < 10u; i = i + 1u) {
-        let r = philox_round(c.x, c.z, k.x, k.y);
-        c = r;
+        c = philox_round(c, k.x, k.y);
         k.x = k.x + 0x9E3779B9u;
         k.y = k.y + 0xBB67AE85u;
     }
