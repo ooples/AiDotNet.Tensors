@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using Xunit;
@@ -25,11 +26,13 @@ public sealed class DropoutMaskIndependenceTests
         OpenCl,
         Vulkan,
         WebGpu,
+        Cuda,
     }
 
-    private static IDirectGpuBackend? Create(Device device, out IDisposable? owned)
+    private static IDirectGpuBackend? Create(Device device, out IDisposable? owned, out Exception? initializationFailure)
     {
         owned = null;
+        initializationFailure = null;
         try
         {
             if (device == Device.WebGpu)
@@ -47,7 +50,34 @@ public sealed class DropoutMaskIndependenceTests
                 return vulkan.Initialize() && vulkan.IsGlslCompilerAvailable ? vulkan : null;
             }
 
+            if (device == Device.Cuda)
+            {
+                if (!CudaBackend.IsCudaAvailable) return null;
+                // The driver and NVRTC are present, so a backend that is not available failed to initialize.
+                var cuda = new CudaBackend();
+                if (!cuda.IsAvailable)
+                {
+                    cuda.Dispose();
+                    initializationFailure = new InvalidOperationException(
+                        "CUDA was detected, but backend initialization failed.");
+                    return null;
+                }
+
+                owned = cuda;
+                return cuda;
+            }
+
             var openCl = new OpenClBackend();
+            // A device whose kernels did not compile is a failure, not an absent device: skipping it would hide a
+            // compile error in the dropout kernel itself.
+            if (openCl.InitializationState == GpuBackendInitializationState.Failed)
+            {
+                initializationFailure = new InvalidOperationException(
+                    "OpenCL was detected, but backend initialization failed.", openCl.InitializationException);
+                openCl.Dispose();
+                return null;
+            }
+
             if (!openCl.IsAvailable)
             {
                 openCl.Dispose();
@@ -90,9 +120,12 @@ public sealed class DropoutMaskIndependenceTests
     [InlineData(Device.OpenCl)]
     [InlineData(Device.Vulkan)]
     [InlineData(Device.WebGpu)]
+    [InlineData(Device.Cuda)]
     public void Masks_are_independent_across_seeds_and_along_the_buffer(Device device)
     {
-        var backend = Create(device, out var owned);
+        var backend = Create(device, out var owned, out var initializationFailure);
+        if (initializationFailure is not null)
+            throw new InvalidOperationException($"{device} is present but did not initialize.", initializationFailure);
         Skip.If(backend is null, $"{device} is not available on this host.");
         using (owned)
         {
