@@ -25,6 +25,9 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     private readonly IEngine _engine;
     private readonly ILazyNode[] _order;   // producers-first topological order
     private readonly Tensor<float> _output;
+    // Forward results the trace declared observable (GradientRecording.RetainOutput) and their storage aliases: the plan
+    // computes them every step and never frees or pages them, so each holds the latest step's value.
+    private readonly HashSet<Tensor<float>> _retained;
     private TensorStorageLeaseSet? _storageLeases;
     private int _disposed;
 
@@ -79,11 +82,13 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     /// the free-mode backward. Sampled only while <see cref="DirectGpuTensorEngine.TrackOwnedResultBytes"/> is on.</summary>
     internal long PeakBackwardResidentBytesForTest => _peakBackwardResidentBytes;
 
-    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging)
+    private MixedPrecisionCompiledPlan(IEngine engine, ILazyNode[] order, Tensor<float> output, bool paging,
+        HashSet<Tensor<float>>? retained)
     {
         _engine = engine;
         _order = order;
         _output = output;
+        _retained = retained ?? new HashSet<Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         _paging = paging;
 
         var storageLeases = new TensorStorageLeaseSet();
@@ -127,7 +132,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         foreach (var node in _order)
         {
             var o = FloatOutputOf(node);
-            if (o is not null && !ReferenceEquals(o, _output)) floatOutputs.Add(o);
+            if (o is not null && !ReferenceEquals(o, _output) && !_retained.Contains(o)) floatOutputs.Add(o);
         }
 
         var lastFwdUse = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
@@ -173,11 +178,10 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
             {
                 GraphMode.SetCurrent(scope);
                 var loss = forward();
-                if (scope.HasRetainedOutputs)
-                    throw new NotSupportedException("Mixed-precision compiled plans do not support retained outputs.");
+                var retained = scope.HasRetainedOutputs ? scope.RetainedOutputClosure<float>() : null;
 
                 scope.MarkCompiled();
-                return Compile(loss, engine);
+                return Compile(loss, engine, retained);
             }
         }
         finally
@@ -197,19 +201,30 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     {
         if (finalOutput is null) throw new ArgumentNullException(nameof(finalOutput));
         engine ??= AiDotNetEngine.Current;
+        HashSet<Tensor<float>>? retained = null;
         if (GraphMode.Current is { HasRetainedOutputs: true } retainedScope
             && finalOutput.LazySource is ILazyNode retainedRoot && retainedScope.Nodes.Contains(retainedRoot))
-            throw new NotSupportedException("Mixed-precision compiled plans do not support retained outputs.");
+            retained = retainedScope.RetainedOutputClosure<float>();
+        return Compile(finalOutput, engine, retained);
+    }
 
+    private static MixedPrecisionCompiledPlan Compile(Tensor<float> finalOutput, IEngine engine, HashSet<Tensor<float>>? retained)
+    {
         if (finalOutput.LazySource is not ILazyNode root)
             throw new InvalidOperationException("finalOutput has no lazy source — nothing to compile.");
 
-        var order = TopoOrder(root).ToArray();
+        // A retained result off the loss's path (an observation the loss does not read) is computed by the plan too:
+        // its producers join the replayed order. The backward skips them (no gradient reaches them).
+        var roots = new List<ILazyNode> { root };
+        if (retained is not null)
+            foreach (var tensor in retained)
+                if (tensor.LazySource is ILazyNode producer && !roots.Contains(producer)) roots.Add(producer);
+        var order = TopoOrder(roots).ToArray();
 
         // Detach outputs so AsWritableSpan/AsSpan during replay don't re-trigger Realize.
         foreach (var n in order) n.ClearOutputLazySource();
 
-        var plan = new MixedPrecisionCompiledPlan(engine, order, finalOutput, PagingEnabledDefault);
+        var plan = new MixedPrecisionCompiledPlan(engine, order, finalOutput, PagingEnabledDefault, retained);
 
         // Direct Compile callers may still be inside the scope that produced this root. The
         // plan now owns an independent lease snapshot, so terminate only that matching trace.
@@ -346,7 +361,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         foreach (var node in _order)
         {
             var o = FloatOutputOf(node);
-            if (o is not null && !ReferenceEquals(o, _output)) floatOutputs.Add(o);
+            if (o is not null && !ReferenceEquals(o, _output) && !_retained.Contains(o)) floatOutputs.Add(o);
         }
 
         var lastFwdUse = new Dictionary<Tensor<float>, int>(ReferenceEqualityComparer<Tensor<float>>.Instance);
@@ -831,12 +846,12 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     }
 
     /// <summary>Iterative post-order DFS — producers-first (each node after its inputs).</summary>
-    private static List<ILazyNode> TopoOrder(ILazyNode root)
+    private static List<ILazyNode> TopoOrder(IReadOnlyList<ILazyNode> roots)
     {
         var order = new List<ILazyNode>();
         var state = new Dictionary<ILazyNode, int>();
         var stack = new Stack<ILazyNode>();
-        stack.Push(root);
+        for (int r = roots.Count - 1; r >= 0; r--) stack.Push(roots[r]);
         while (stack.Count > 0)
         {
             var node = stack.Peek();
