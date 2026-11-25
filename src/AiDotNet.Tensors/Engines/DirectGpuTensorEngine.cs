@@ -414,6 +414,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private ulong NextStochasticSeed() =>
         unchecked((ulong)System.Threading.Interlocked.Increment(ref _stochasticSeedCounter) * 0x9E3779B97F4A7C15UL);
 
+    /// <summary>
+    /// Where the engine's stochastic ops (dropout) are in their seed sequence. A compiled plan that runs a forward
+    /// action a second time (an activation-checkpoint recompute) puts the position back to where the first run started,
+    /// so the second run draws what the first drew, as <c>torch.utils.checkpoint</c> does with
+    /// <c>preserve_rng_state</c>.
+    /// </summary>
+    internal long StochasticSeedPosition
+    {
+        get => System.Threading.Interlocked.Read(ref _stochasticSeedCounter);
+        set => System.Threading.Interlocked.Exchange(ref _stochasticSeedCounter, value);
+    }
+
     // CSR buffer cache for sparse tensors — avoids re-uploading static sparse matrices every call.
     // Key: CsrCacheKey (SparseTensor + Backend reference pair) to avoid cross-backend buffer reuse.
     private readonly ConcurrentDictionary<CsrCacheKey, CsrGpuCache> _csrBufferCache = new();

@@ -59,6 +59,72 @@ public sealed class CompiledCheckpointSegmentDeviceTests : IClassFixture<DirectG
         }
     }
 
+    /// <summary>
+    /// A dropout inside a segment is recomputed in the backward, and must drop what its forward dropped (PyTorch's
+    /// checkpoint restores the RNG state for the same reason): the segment's output, kept from the forward, was computed
+    /// with the forward's mask. With w = 1, loss = sum(dropout(w) * c) and its gradient is the kept mask times c, so one
+    /// SGD step moves the weights by learningRate * loss in total exactly when both used one mask.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void CheckpointSegment_WithDropout_BackpropagatesTheMaskItsForwardDrew(bool segmented)
+    {
+        RequireDevice();
+        var engine = _fixture.Engine ?? throw new InvalidOperationException("The fixture has no engine.");
+        var prior = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            const int n = 4096;
+            const float learningRate = 1e-3f;
+            var weights = new Tensor<float>(new[] { 1, n });
+            var ones = new Tensor<float>(new[] { 1, n });
+            var column = new Tensor<float>(new[] { 1, n });
+            for (int i = 0; i < n; i++)
+            {
+                weights[i] = 1f;
+                ones[i] = 1f;
+                column[i] = 1f + (i % 97) / 97f;   // distinct enough that two masks give two sums
+            }
+
+            CompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(new[] { weights }))
+            {
+                GraphMode.CheckpointSegmentScope segment = segmented ? GraphMode.BeginCheckpointSegment() : default;
+                var scaled = engine.TensorMultiply(weights, ones);
+                var dropped = engine.Dropout(scaled, 0.5, true, out _);
+                var output = engine.TensorMultiply(dropped, column);
+                segment.Dispose();
+                var loss = engine.ReduceSum(output, null);
+                plan = (CompiledTrainingPlan<float>)scope.CompileTraining(new[] { weights }, loss);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: learningRate);
+                Assert.Equal(segmented ? 1 : 0, plan.CheckpointSegmentCount);
+                for (int step = 0; step < 3; step++)
+                {
+                    var before = weights.ToArray();
+                    float loss = plan.Step().ToArray()[0];
+                    var after = weights.ToArray();
+                    // loss = sum(w * mask * c) / keep and the gradient is mask * c / keep, so with the same mask
+                    // sum(w * gradient) is the loss.
+                    double fromUpdate = 0;
+                    for (int i = 0; i < n; i++) fromUpdate += (double)before[i] * (before[i] - after[i]) / learningRate;
+                    Assert.True(loss > 0, "the dropout dropped everything");
+                    Assert.True(Math.Abs(fromUpdate - loss) <= 2e-3 * loss,
+                        $"step {step}: the loss {loss:R} used one mask and the update another (sum(w * gradient) = {fromUpdate:R})");
+                }
+                if (segmented) Assert.True(plan.CheckpointRecomputeRuns > 0, "the segment was never recomputed");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
     [SkippableFact]
     public void CheckpointSegment_ThatReadsItsStateAfterUpdatingIt_IsRefused()
     {

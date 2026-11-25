@@ -5991,7 +5991,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool heldByCheckpoint = false;
             if (checkpoint is not null)
             {
-                CheckpointBeforeForwardAction(i, backend, capturingBody);
+                CheckpointBeforeForwardAction(i, de, backend, capturingBody);
                 if (checkpointPool is not null) heldByCheckpoint = CheckpointHoldsForwardAction(i, checkpointPool);
             }
             long rs = 0;
