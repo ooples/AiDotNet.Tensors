@@ -3546,10 +3546,14 @@ fn max_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.outer_size) {
         // The CPU ReduceMax scan, exact on the bits (ExactFloatKernels): from -inf (not -3.4e38), take a value only when
-        // strictly greater, so a NaN is skipped, an all-NaN row gives -inf and the first of equal maxima is kept.
+        // strictly greater, so the first of equal maxima is kept. A NaN anywhere in the row is the row's result.
         var max_bits: u32 = 0xFF800000u;
         for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
             let v = bitcast<u32>(input[idx * params.reduce_size + j]);
+            if (xf_isnan(v)) {
+                max_bits = 0x7FC00000u;
+                break;
+            }
             if (xf_gt(v, max_bits)) {
                 max_bits = v;
             }

@@ -1979,11 +1979,12 @@ kernel void max_axis(
 {
     if (gid < outer_size) {
         // The CPU ReduceMax scan, exact on the bits (ExactFloatKernels): from -inf, take a value only when strictly
-        // greater, so a NaN is skipped, an all-NaN row gives -inf and the first of equal maxima (-0 before +0) is kept.
+        // greater, so the first of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result.
         uint max_val = 0xFF800000u;
         uint offset = gid * reduce_size;
         for (uint i = 0; i < reduce_size; i++) {
             uint v = as_type<uint>(input[offset + i]);
+            if (xf_isnan(v)) { max_val = 0x7FC00000u; break; }
             if (xf_gt(v, max_val)) max_val = v;
         }
         output[gid] = as_type<float>(max_val);

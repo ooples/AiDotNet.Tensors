@@ -1028,8 +1028,8 @@ extern ""C"" __global__ __launch_bounds__(256) void arg_extreme_axis_rows(
 // Reduce-max along the innermost (contiguous) axis: output[outer] = max over the axisSize block.
 // Mirrors argmax_axis but emits the max VALUE (not its index). Consumers: GumbelSoftmax / softmax-max
 // subtraction, MelSpectrogram log-floor normalization, BinCount range sizing.
-// The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when strictly greater, so a NaN is
-// skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+// The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when strictly greater, so the first
+// of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result, as for NumPy and PyTorch.
 extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const float* input, float* output, int outerSize, int axisSize)
 {
@@ -1039,16 +1039,17 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
     unsigned int best = 0xFF800000u;
     for (int i = 0; i < axisSize; i++) {
+        if (xf_isnan(row[i])) { best = 0x7FC00000u; break; }
         if (xf_gt(row[i], best)) best = row[i];
     }
     output[outer] = __uint_as_float(best);
 }
 
 // max_axis for long rows: one block per row, coalesced strided reads and a shared-memory reduction, with exactly
-// max_axis's result (the CPU ReduceMax scan): NaN is skipped, an all-NaN row gives -inf, and of equal maxima the first
-// is kept (-0 before +0). Each thread scans its strided elements in order with the strictly-greater bit compare and
-// keeps the index of its pick; the reduction takes the other side's pick when it is strictly greater, or equal with a
-// lower index, so the block agrees with one in-order scan.
+// max_axis's result (the CPU ReduceMax scan): a NaN anywhere in the row is the row's result, and of equal maxima the
+// first is kept (-0 before +0). Each thread scans its strided elements in order with the strictly-greater bit compare
+// and keeps the index of its pick; the reduction takes the other side's pick when it is a NaN, or strictly greater, or
+// equal with a lower index (a NaN of its own is never given up), so the block agrees with one in-order scan.
 extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
     const float* __restrict__ input, float* __restrict__ output, int outerSize, int axisSize)
 {
@@ -1064,6 +1065,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
     for (long long i = threadIdx.x; i < axisSize; i += blockDim.x)
     {
         unsigned int v = row[i];
+        if (xf_isnan(v)) { best = 0x7FC00000u; bestAt = (int)i; break; }
         if (xf_gt(v, best)) { best = v; bestAt = (int)i; }
     }
     bestBits[threadIdx.x] = best;
@@ -1075,7 +1077,8 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis_rows(
         {
             unsigned int mine = bestBits[threadIdx.x], other = bestBits[threadIdx.x + stride];
             int mineAt = bestIndex[threadIdx.x], otherAt = bestIndex[threadIdx.x + stride];
-            if (xf_gt(other, mine) || (!xf_gt(mine, other) && otherAt < mineAt))
+            if (!xf_isnan(mine)
+                && (xf_isnan(other) || xf_gt(other, mine) || (!xf_gt(mine, other) && otherAt < mineAt)))
             {
                 bestBits[threadIdx.x] = other;
                 bestIndex[threadIdx.x] = otherAt;

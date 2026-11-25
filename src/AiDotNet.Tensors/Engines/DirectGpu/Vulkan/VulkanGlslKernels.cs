@@ -1526,10 +1526,14 @@ void main() {
     uint outer = gl_GlobalInvocationID.x;
     if (outer >= outerSize) return;
     // The CPU ReduceMax scan, exact on the bits: from -inf (not -3.4e38), take a value only when strictly greater, so
-    // a NaN is skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+    // the first of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result.
     uint value = 0xFF800000u;
     uint offset = outer * reduceSize;
-    for (uint j = 0u; j < reduceSize; ++j) { uint v = floatBitsToUint(a[offset + j]); if (xf_gt(v, value)) value = v; }
+    for (uint j = 0u; j < reduceSize; ++j) {
+        uint v = floatBitsToUint(a[offset + j]);
+        if (xf_isnan(v)) { value = 0x7FC00000u; break; }
+        if (xf_gt(v, value)) value = v;
+    }
     b[outer] = uintBitsToFloat(value);
 }";
 

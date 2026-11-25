@@ -35992,7 +35992,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int lenIn = materializedInput.Length;
                         for (int i = 0; i < lenIn; i++)
                         {
-                            if (numOps.GreaterThan(inputData[i], outSpan[outFlat]))
+                            if (numOps.GreaterThan(inputData[i], outSpan[outFlat]) || IsFirstNaN(numOps, inputData[i], outSpan[outFlat]))
                             {
                                 outSpan[outFlat] = inputData[i];
                                 idxArr[outFlat] = i;
@@ -36027,7 +36027,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int inner = 0; inner < innerSize; inner++)
                 {
                     T best = srcArr[input.ReductionStorageIndex(o, 0, inner, axis)]; int bestIdx = 0;
-                    for (int a = 1; a < axisSize; a++) { T v = srcArr[input.ReductionStorageIndex(o, a, inner, axis)]; if (ops.GreaterThan(v, best)) { best = v; bestIdx = a; } }
+                    for (int a = 1; a < axisSize; a++) { T v = srcArr[input.ReductionStorageIndex(o, a, inner, axis)]; if (ops.GreaterThan(v, best) || IsFirstNaN(ops, v, best)) { best = v; bestIdx = a; } }
                     rArr[o * innerSize + inner] = best;
                     maxIndices[o * innerSize + inner] = bestIdx;
                 }
@@ -36045,8 +36045,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fData = (float[])(object)fDataLease.Array;
                 float maxVal = float.NegativeInfinity;
                 int maxIdx = 0;
+                // A NaN anywhere is the result (NumPy, PyTorch, the device kernels): it is taken once, then kept.
                 for (int i = 0; i < input.Length; i++)
-                    if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
+                    if (fData[i] > maxVal || (float.IsNaN(fData[i]) && !float.IsNaN(maxVal))) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
                 return TensorAllocator.Rent<T>(FullReductionShape(1, keepDims),
@@ -36089,7 +36090,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int maxLen = input.Length;
         for (int i = 0; i < maxLen; i++)
         {
-            if (numOps.GreaterThan(inputData[i], outputData[maxOutFlat]))
+            if (numOps.GreaterThan(inputData[i], outputData[maxOutFlat]) || IsFirstNaN(numOps, inputData[i], outputData[maxOutFlat]))
             {
                 outputData[maxOutFlat] = inputData[i];
                 maxIndices[maxOutFlat] = i;
@@ -36300,6 +36301,16 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Whether <paramref name="candidate"/> is the first NaN a maximum scan meets. A scan takes a value that is strictly
+    /// greater or that is the first NaN, and a held NaN is never given up (no value is greater than it), so a NaN
+    /// anywhere in the reduced range is the result, as for NumPy, PyTorch and the device kernels, and the recorded
+    /// index is the first NaN's.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsFirstNaN<T>(INumericOperations<T> ops, T candidate, T held)
+        => ops.IsNaN(candidate) && !ops.IsNaN(held);
+
+    /// <summary>
     /// The value a ReduceMax cell starts from: negative infinity for float and double, otherwise the type's MinValue.
     /// The float seed used to be float.MinValue (-3.4e38), so a row of -infinity (or of NaN, which never replaces the
     /// seed) reduced to -3.4e38 instead of -infinity.
@@ -36341,7 +36352,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int a = 0; a < axisSize; a++)
                     {
                         int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; double held = dst[ob + j]; if (v > held || (double.IsNaN(v) && !double.IsNaN(held))) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
                     }
                 }
             }, deterministicSafe: true);
@@ -36360,7 +36371,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int a = 0; a < axisSize; a++)
                     {
                         int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; float held = dst[ob + j]; if (v > held || (float.IsNaN(v) && !float.IsNaN(held))) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
                     }
                 }
             }, deterministicSafe: true);

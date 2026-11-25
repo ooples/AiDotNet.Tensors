@@ -155,6 +155,123 @@ public sealed class FloatExtremaNaNPropagationTests
         }
     }
 
+    // Rows of several widths with a NaN first, in the middle, last, nowhere, and everywhere.
+    private static float[] Rows(int rows, int width, out bool[] poisoned, out float[] cleanMax)
+    {
+        var data = Values(rows * width, 7 * rows + width);
+        poisoned = new bool[rows];
+        cleanMax = new float[rows];
+        for (int r = 0; r < rows; r++)
+        {
+            float max = float.NegativeInfinity;
+            for (int c = 0; c < width; c++) max = Math.Max(max, data[r * width + c]);
+            cleanMax[r] = max;
+            switch (r % 5)
+            {
+                case 0: data[r * width] = float.NaN; poisoned[r] = true; break;
+                case 1: data[r * width + width / 2] = float.NaN; poisoned[r] = true; break;
+                case 2: data[r * width + width - 1] = float.NaN; poisoned[r] = true; break;
+                case 3: break;
+                default:
+                    for (int c = 0; c < width; c++) data[r * width + c] = float.NaN;
+                    poisoned[r] = true;
+                    break;
+            }
+        }
+
+        return data;
+    }
+
+    private static void CheckRows(float[] actual, bool[] poisoned, float[] cleanMax, string where, int width)
+    {
+        for (int r = 0; r < poisoned.Length; r++)
+        {
+            if (poisoned[r])
+                Assert.True(float.IsNaN(actual[r]), $"{where}: row {r} of width {width} holds a NaN but its max is {actual[r]:R}.");
+            else
+                Assert.True(actual[r] == cleanMax[r], $"{where}: row {r} of width {width} is {actual[r]:R}, expected {cleanMax[r]:R}.");
+        }
+    }
+
+    [Theory]
+    [InlineData(10, 1)]
+    [InlineData(10, 7)]
+    [InlineData(10, 300)]
+    [InlineData(5, 4097)]
+    public void Cpu_engine_row_max_is_nan_for_a_row_that_holds_one(int rows, int width)
+    {
+        var engine = new CpuEngine();
+        var data = Rows(rows, width, out var poisoned, out var cleanMax);
+
+        var single = new Tensor<float>(new[] { rows, width }, new Vector<float>(data));
+        CheckRows(engine.ReduceMax(single, new[] { 1 }, keepDims: false).AsSpan().ToArray(), poisoned, cleanMax, "CpuEngine float", width);
+
+        var wide = new double[data.Length];
+        for (int i = 0; i < data.Length; i++) wide[i] = data[i];
+        var doubles = engine.ReduceMax(new Tensor<double>(new[] { rows, width }, new Vector<double>(wide)), new[] { 1 }, keepDims: false).AsSpan();
+        var narrowed = new float[rows];
+        for (int r = 0; r < rows; r++) narrowed[r] = (float)doubles[r];
+        CheckRows(narrowed, poisoned, cleanMax, "CpuEngine double", width);
+
+        // The reduced axis first: every column that holds a NaN is NaN.
+        var transposed = new float[data.Length];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < width; c++)
+                transposed[c * rows + r] = data[r * width + c];
+        var columns = new Tensor<float>(new[] { width, rows }, new Vector<float>(transposed));
+        CheckRows(engine.ReduceMax(columns, new[] { 0 }, keepDims: false).AsSpan().ToArray(), poisoned, cleanMax, "CpuEngine axis 0", width);
+
+        // The index a NaN result reports is that of the row's first NaN.
+        engine.ReduceMax(single, new[] { 1 }, keepDims: false, out int[] indices);
+        for (int r = 0; r < rows; r++)
+        {
+            if (!poisoned[r]) continue;
+            int first = -1;
+            for (int c = 0; c < width && first < 0; c++) if (float.IsNaN(data[r * width + c])) first = r * width + c;
+            Assert.Equal(first, indices[r]);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(Device.OpenCl, 10, 1)]
+    [InlineData(Device.OpenCl, 10, 7)]
+    [InlineData(Device.OpenCl, 10, 300)]
+    [InlineData(Device.OpenCl, 5, 4097)]
+    [InlineData(Device.Vulkan, 10, 7)]
+    [InlineData(Device.Vulkan, 10, 300)]
+    [InlineData(Device.Vulkan, 5, 4097)]
+    [InlineData(Device.WebGpu, 10, 7)]
+    [InlineData(Device.WebGpu, 10, 300)]
+    [InlineData(Device.WebGpu, 5, 4097)]
+    public void Device_row_max_is_nan_for_a_row_that_holds_one(Device device, int rows, int width)
+    {
+        var backend = Create(device, out var owned);
+        Skip.If(backend is null, $"{device} is not available on this host.");
+        using (owned)
+        {
+            var data = Rows(rows, width, out var poisoned, out var cleanMax);
+            using var input = backend.AllocateBuffer(data);
+            using var output = backend.AllocateBuffer(rows);
+            backend.MaxAxis(input, output, rows, width);
+            var actual = new float[rows];
+            backend.DownloadBuffer(output, actual);
+            CheckRows(actual, poisoned, cleanMax, device.ToString(), width);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(10, 7)]
+    [InlineData(10, 300)]
+    [InlineData(5, 4097)]
+    public void Gpu_engine_row_max_is_nan_for_a_row_that_holds_one(int rows, int width)
+    {
+        Skip.IfNot(AiDotNetEngine.Current is DirectGpuTensorEngine, "The process engine is not a GPU engine.");
+        var data = Rows(rows, width, out var poisoned, out var cleanMax);
+        var tensor = new Tensor<float>(new[] { rows, width }, new Vector<float>(data));
+        var actual = AiDotNetEngine.Current.ReduceMax(tensor, new[] { 1 }, keepDims: false).AsSpan().ToArray();
+        CheckRows(actual, poisoned, cleanMax, "DirectGpuTensorEngine", width);
+    }
+
     [SkippableFact]
     public void Gpu_engine_max_and_min_are_nan_when_any_element_is()
     {

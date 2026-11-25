@@ -234,11 +234,13 @@ __kernel void max_axis(
     const int outerIdx = get_global_id(0);
     if (outerIdx >= outerSize) return;
 
-    // The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when it is strictly greater, so a
-    // NaN is skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+    // The CPU ReduceMax scan, exact on the bit patterns: from -inf, take a value only when it is strictly greater, so
+    // the first of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result, as for NumPy
+    // and PyTorch.
     __global const uint* row = (__global const uint*)input + (size_t)outerIdx * reduceSize;
     uint best = 0xFF800000u;
     for (int i = 0; i < reduceSize; i++) {
+        if (xf_isnan(row[i])) { best = 0x7FC00000u; break; }
         if (xf_gt(row[i], best)) best = row[i];
     }
     output[outerIdx] = as_float(best);
