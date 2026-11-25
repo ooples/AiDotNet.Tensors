@@ -150,7 +150,7 @@ public static class AiDotNetEngine
                 AutoDetectAndConfigureGpu(_deferredVerbose);
             }
 #pragma warning disable CA1031 // A failed probe leaves the CPU engine in place, as it did at module load.
-            catch (Exception)
+            catch (Exception) when (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend == GpuBackendType.None)
 #pragma warning restore CA1031
             {
                 // AutoDetectAndConfigureGpu already falls back to CPU on its own failures; this guards the rest.
@@ -449,12 +449,17 @@ public static class AiDotNetEngine
             // is a self-validation gate, not a CPU force — a working GPU is still
             // adopted.
             gpuEngine.Dispose();
-            EmitLog(supportsGpu
-                ? "[AiDotNet] GPU detected but failed its correctness self-check, using CPU"
-                : "[AiDotNet] GPU not available, using CPU", verbose);
+            string why = supportsGpu
+                ? "GPU detected but failed its correctness self-check"
+                : "GPU not available";
+            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var required && required != GpuBackendType.None)
+                throw new InvalidOperationException(
+                    $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}: " +
+                    $"{why}; refusing to fall back to the CPU.");
+            EmitLog($"[AiDotNet] {why}, using CPU", verbose);
             return false;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend == GpuBackendType.None)
         {
             EmitLog($"[AiDotNet] Failed to initialize DirectGpu: {ex.Message}", verbose);
             EmitLog("[AiDotNet] Falling back to CPU", verbose);

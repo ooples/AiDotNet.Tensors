@@ -1233,3 +1233,7 @@ static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.PollWindow.get -> S
 static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.PollWindow.set -> void
 static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.Policy.get -> AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitPolicy
 static AiDotNet.Tensors.Engines.DirectGpu.GpuHostWaitOptions.Policy.set -> void
+AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions
+static AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend.get -> AiDotNet.Tensors.Engines.GpuBackendType
+static AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend.set -> void
+AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine.CudaInitializationFailure.get -> string?
