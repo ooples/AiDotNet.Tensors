@@ -643,7 +643,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe bool TryStageUploadBytes(IntPtr destination, void* src, ulong byteSize)
     {
-        if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
+        if (byteSize == 0 || _backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
             return false;
         int bytes = checked((int)byteSize);
         DrainStagedUploads(blockAll: false);
@@ -895,6 +895,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
             // A buffer may only free against a live context, and only against the lifetime it was allocated in.
             lock (ContextLifecycleLock) _contextGeneration = AddContextHolder(_cudaContext);
+            _pinnedPool.BindContext(_cudaContext, _contextGeneration);
             RegisterDevicePeer();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _mainStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
@@ -6252,6 +6253,35 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return new CudaSyncPoint(this, _defaultStream);
     }
 
+    // A transfer larger than a pooled pinned block (over 1 GiB) copies synchronously from the managed array, after
+    // the stream's earlier work: correct, but without overlap, so it says so once.
+    private static int s_unpooledTransferWarned;
+
+    private static void WarnUnpooledTransfer(long byteCount)
+    {
+        if (Interlocked.Exchange(ref s_unpooledTransferWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning($"CUDA: a {byteCount}-byte host transfer exceeds a pooled pinned block "
+                + $"({CudaPinnedBufferPool.MaxBucketBytes} bytes); it is copied synchronously, without overlap.");
+    }
+
+    private unsafe void UploadUnpooled(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream, long byteCount)
+    {
+        WarnUnpooledTransfer(byteCount);
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled upload)");
+        fixed (float* src = data)
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, (ulong)byteCount),
+                "cuMemcpyHtoD(unpooled upload)");
+    }
+
+    private unsafe void DownloadUnpooled(IGpuBuffer buffer, float[] destination, IGpuStream stream, long byteCount)
+    {
+        WarnUnpooledTransfer(byteCount);
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled download)");
+        fixed (float* dst = destination)
+            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemcpyDtoH((IntPtr)dst, buffer.Handle, (ulong)byteCount),
+                "cuMemcpyDtoH(unpooled download)");
+    }
+
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
     {
@@ -6263,7 +6293,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = data.Length * sizeof(float);
+        if (data.Length == 0) return;
+        long byteCount = (long)data.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            UploadUnpooled(data, buffer, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         // Use pinned host memory for true async DMA transfer.
         // Unlike a fixed block, pinned memory stays resident without synchronization,
@@ -6360,7 +6397,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = data.Length * sizeof(float);
+        if (data.Length == 0) return;
+        long byteCount = (long)data.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            UploadUnpooled(data, buffer, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         var pinnedPtr = _pinnedPool.Rent(byteSize);
         try
@@ -6397,7 +6441,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Destination ({destination.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = destination.Length * sizeof(float);
+        if (destination.Length == 0) return;
+        long byteCount = (long)destination.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            DownloadUnpooled(buffer, destination, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         var pinnedPtr = _pinnedPool.Rent(byteSize);
         try

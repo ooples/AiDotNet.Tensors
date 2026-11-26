@@ -20,6 +20,24 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     [DllImport("libcuda.so.1", EntryPoint = "cuMemHostAlloc")]
     private static extern CudaResult cuMemHostAllocLinux(out IntPtr pp, ulong bytesize, uint flags);
 
+    /// <summary>Portable page-locked memory (cuMemHostAlloc, PORTABLE), with no single-context fallback.</summary>
+    internal static CudaResult AllocatePortablePinnedHostOnly(out IntPtr ptr, ulong byteSize)
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? cuMemHostAllocWin(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE)
+            : cuMemHostAllocLinux(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE);
+
+    // The context lifetime the pool's blocks belong to (BindContext); a block returned after the pool is disposed
+    // is freed only while that lifetime lasts.
+    private IntPtr _context;
+    private long _contextGeneration;
+
+    /// <summary>Ties the pool to its backend's context registration.</summary>
+    internal void BindContext(IntPtr context, long generation)
+    {
+        _context = context;
+        _contextGeneration = generation;
+    }
+
     internal static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
     {
         try
@@ -54,6 +72,9 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     public IntPtr Rent(int sizeInBytes)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CudaPinnedBufferPool));
+        if (sizeInBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sizeInBytes), sizeInBytes,
+                "A pinned block needs a positive size (an int byte count that overflowed is negative).");
         // Over 1 GiB the next power of two does not fit an int (the int rounding wrapped to int.MinValue, and the
         // allocation then asked the driver for ~1.8e19 bytes). Such a block is not a pool bucket: refuse it here.
         if (BucketSize(sizeInBytes) > MaxBucketBytes)
@@ -84,9 +105,11 @@ internal sealed class CudaPinnedBufferPool : IDisposable
             return;
         if (_disposed)
         {
-            // The pool is gone: the block is not lost to the process, it is freed (it is portable, so no context is needed).
-            CuBlasNative.cuMemFreeHost(ptr);
-            if (BucketSize(sizeInBytes) <= MaxBucketBytes) GpuMemoryStats.RecordFree("cuda_pinned_host", BucketSize(sizeInBytes));
+            // The pool is gone: the block is freed while its context lifetime lasts (otherwise that context's
+            // destruction already took it back, and a driver call against it would be an access violation).
+            if (CudaBackend.ReleaseHostInLiveContext(ptr, _context, _contextGeneration, unregister: false) == CudaResult.Success
+                && sizeInBytes > 0 && BucketSize(sizeInBytes) <= MaxBucketBytes)
+                GpuMemoryStats.RecordFree("cuda_pinned_host", BucketSize(sizeInBytes));
             return;
         }
 
