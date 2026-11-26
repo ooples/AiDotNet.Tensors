@@ -673,74 +673,29 @@ public sealed partial class HipBackend : IGatedDeltaNetBackwardBackend, IGatedDe
             throw new InvalidOperationException(
                 $"GatedDeltaNet headDim ({headDim}) exceeds max ({Kernels.HipGatedDeltaNetKernels.MaxHeadDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
-        if (!_kernelCache.TryGetValue("gated_delta_scan_recompute", out var recompute) ||
-            !_kernelCache.TryGetValue("gated_delta_scan_backward", out var backward))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward");
+        if (!_kernelCache.TryGetValue(GatedDeltaNetCheckpoint.KernelName, out var backward))
+            throw new GpuCapabilityUnavailableException("HIP kernel not found: " + GatedDeltaNetCheckpoint.KernelName);
 
-        long trajLenLong = (long)batch * numHeads * seqLen * headDim * headDim;
-        if (trajLenLong > int.MaxValue)
-            throw new InvalidOperationException(
-                $"GatedDeltaNet trajectory buffer size ({trajLenLong}) exceeds int.MaxValue.");
-        int trajLen = (int)trajLenLong;
-        // Disposed below and fully written by the recompute kernel: uncharged and uninitialized.
-        IGpuBuffer trajScratch;
-        using (DeviceMemoryReclaim.EnterScopedScratch()) trajScratch = AllocateBufferUninitialized(trajLen);
-        using var trajBuf = trajScratch;
-        // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
-        // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
-        bool det = GpuDeterminism.IsActive;
-        IntPtr dqKernel = IntPtr.Zero, reduceKernel = IntPtr.Zero;
-        if (det && (!_kernelCache.TryGetValue("gated_delta_scan_dq", out dqKernel)
-                    || !_kernelCache.TryGetValue("gated_delta_scan_reduce", out reduceKernel)))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: gated_delta_scan_dq / gated_delta_scan_reduce");
-        int n = batch * seqLen * modelDim;
-        if (!det)
-        {
-            Fill(dQ, 0f, n);
-            Fill(dK, 0f, n);
-            Fill(dAlpha, 0f, batch * seqLen * numHeads);
-            Fill(dBeta, 0f, batch * seqLen * numHeads);
-        }
-        uint total = (uint)(batch * numHeads * headDim);
-        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        // Checkpointed, deterministic BPTT (GatedDeltaNetCheckpoint): O(sqrt(seqLen)) state memory per head instead of
+        // the seqLen * headDim^2 trajectory, every gradient element written, nothing to clear first.
+        var (chunk, headStride, workLen) = GatedDeltaNetCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        // Disposed below and fully written before it is read: uncharged and uninitialized.
+        IGpuBuffer workScratch;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) workScratch = AllocateBufferUninitialized(workLen);
+        using var work = workScratch;
+        uint groups = (uint)(batch * numHeads);
+        uint block = (uint)GatedDeltaNetCheckpoint.GroupSize(headDim, DefaultBlockSize);
 
-        IntPtr pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle, ptr = trajBuf.Handle;
-        int decay = decayFirst ? 1 : 0;
-        void** ra = stackalloc void*[12];
-        ra[0] = &pk; ra[1] = &pv; ra[2] = &pa; ra[3] = &pb; ra[4] = &ptr;
-        ra[5] = &batch; ra[6] = &seqLen; ra[7] = &modelDim; ra[8] = &numHeads; ra[9] = &headDim;
-        ra[10] = &keyScale; ra[11] = &decay;
-        LaunchKernel(recompute, grid, (uint)DefaultBlockSize, ra);
-
-        IntPtr pdo = dOut.Handle, pq = q.Handle;
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle;
+        IntPtr pw = work.Handle;
         IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
-        uint nGrid = ((uint)n + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
-        using var partials = det ? AllocateBuffer(checked(2 * n)) : null;
-        IntPtr pp = partials?.Handle ?? IntPtr.Zero;
-        if (det)
-        {
-            void** qa = stackalloc void*[8];
-            qa[0] = &pdo; qa[1] = &ptr; qa[2] = &pdq;
-            qa[3] = &batch; qa[4] = &seqLen; qa[5] = &modelDim; qa[6] = &numHeads; qa[7] = &headDim;
-            LaunchKernel(dqKernel, nGrid, (uint)DefaultBlockSize, qa);
-        }
-
-        IntPtr pslot = det ? pp : pdq;
-        int detFlag = det ? 1 : 0;
-        void** ba = stackalloc void*[20];
-        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &ptr;
-        ba[7] = &pslot; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
+        int decay = decayFirst ? 1 : 0;
+        void** ba = stackalloc void*[21];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pa; ba[5] = &pb; ba[6] = &pw;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pda; ba[11] = &pdb;
         ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
-        ba[17] = &detFlag; ba[18] = &keyScale; ba[19] = &decay;
-        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
-
-        if (det)
-        {
-            void** rd = stackalloc void*[10];
-            rd[0] = &ptr; rd[1] = &pp; rd[2] = &pdk; rd[3] = &pda; rd[4] = &pdb;
-            rd[5] = &batch; rd[6] = &seqLen; rd[7] = &modelDim; rd[8] = &numHeads; rd[9] = &headDim;
-            LaunchKernel(reduceKernel, nGrid, (uint)DefaultBlockSize, rd);
-        }
+        ba[17] = &chunk; ba[18] = &headStride; ba[19] = &keyScale; ba[20] = &decay;
+        LaunchKernel(backward, groups, block, ba);
     }
 
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
