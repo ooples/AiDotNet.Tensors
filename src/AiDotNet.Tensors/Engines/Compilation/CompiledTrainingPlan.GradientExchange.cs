@@ -43,8 +43,11 @@ internal sealed class GradientExchange<T>
     internal GradientExchange(Tensor<T>[] parameters, Tensor<T>[] gradients,
         Engines.DirectGpu.IGpuBuffer?[] deviceGradients, Engines.DirectGpu.IDirectGpuBackend? backend,
         Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss, float[]?[][] staging,
-        Engines.DirectGpu.IGradientHostStaging? pinned = null, Engines.DirectGpu.IGpuBuffer? flat = null)
+        Engines.DirectGpu.IGradientHostStaging? pinned = null, Engines.DirectGpu.IGpuBuffer? flat = null,
+        GradientAccumulation<T>? accumulation = null, string? deferRefusal = null)
     {
+        _accumulation = accumulation;
+        _deferRefusal = accumulation is null ? deferRefusal ?? "the plan keeps no gradient accumulator" : deferRefusal;
         _pinned = pinned;
         _loss = loss;
         _deviceLoss = deviceLoss;
@@ -57,6 +60,107 @@ internal sealed class GradientExchange<T>
         foreach (var g in gradients) total += g.Length;
         TotalLength = checked((int)total);
         _flat = flat is not null && backend is not null && flat.Size >= TotalLength ? flat : null;
+    }
+
+    // The plan's accumulator across deferred steps (see DeferUpdate), and why this step cannot defer (null: it can).
+    private readonly GradientAccumulation<T>? _accumulation;
+    private readonly string? _deferRefusal;
+    private bool _combined;
+
+    /// <summary>Whether <see cref="DeferUpdate"/> ran on this step: the plan skips its update and keeps the gradients.</summary>
+    internal bool UpdateDeferred { get; private set; }
+
+    /// <summary>The steps whose gradients the accumulator holds (deferred and not yet combined).</summary>
+    public int AccumulatedSteps => _accumulation?.Steps ?? 0;
+
+    /// <summary>Why this step's update cannot be deferred, or null when it can.</summary>
+    public string? DeferUnavailableReason => _deferRefusal;
+
+    /// <summary>
+    /// Gradient accumulation without a reduction (PyTorch DDP's <c>no_sync</c>): adds this step's gradients, multiplied
+    /// by <paramref name="weight"/>, to the plan's accumulator, and the plan then skips this step's clip and optimizer
+    /// update (its step count and learning-rate schedule do not advance; the loss is still published). The first
+    /// deferred step sets the accumulator to <c>g * weight</c>, each later one adds <c>g * weight</c> to it; the multiply
+    /// and the add are separate roundings (no fused multiply-add), so the sum is bitwise the eager
+    /// <c>acc = g1 * w1; acc += gm * wm</c>. The step's own gradient buffers are left scaled. A later step ends the
+    /// accumulation with <see cref="CombineAccumulated"/> before its exchange.
+    /// </summary>
+    /// <param name="weight">The step's weight (for a token-weighted mean, its valid-token count), rounded to the
+    /// gradient type.</param>
+    public void DeferUpdate(double weight)
+    {
+        if (_deferRefusal is { } why) throw new InvalidOperationException("This step's update cannot be deferred: " + why + ".");
+        if (UpdateDeferred || _combined)
+            throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
+        if (double.IsNaN(weight) || double.IsInfinity(weight))
+            throw new ArgumentOutOfRangeException(nameof(weight), "The weight must be finite.");
+        var acc = _accumulation!;
+        acc.EnsureLayout(_gradients, _deviceGradients, _backend);
+        bool first = acc.Steps == 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (length == 0) continue;
+            if (_deviceGradients[i] is { } buffer)
+            {
+                var held = acc.Device[i]!;
+                Backend.Scale(buffer, buffer, (float)weight, length);
+                if (first) Backend.Copy(buffer, held, length);
+                else Backend.Add(held, buffer, held, length);
+            }
+            else
+            {
+                var held = acc.Host[i]!;
+                using var lease = _gradients[i].LeaseWritable();
+                var g = lease.Span.Slice(0, length);
+                GradientAccumulation<T>.ScaleInPlace(g, weight);
+                if (first) g.CopyTo(held);
+                else GradientAccumulation<T>.AddInto(held, g, held);
+            }
+        }
+        acc.Steps++;
+        UpdateDeferred = true;
+    }
+
+    /// <summary>
+    /// Ends a gradient accumulation: replaces this step's gradients with
+    /// <c>acc * <paramref name="accumulatedScale"/> + g * <paramref name="weight"/></c> (the accumulator is scaled in
+    /// place first, then this step's gradient, then the two are added: the eager <c>acc *= 1/N; acc += g * (n/N)</c>,
+    /// each a separate rounding), and empties the accumulator. The exchange then reduces the combined gradients as it
+    /// would any step's, and the plan's update runs on them.
+    /// </summary>
+    public void CombineAccumulated(double accumulatedScale, double weight)
+    {
+        if (_accumulation is not { Steps: > 0 } acc)
+            throw new InvalidOperationException("There are no accumulated gradients to combine.");
+        if (UpdateDeferred || _combined)
+            throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
+        if (double.IsNaN(accumulatedScale) || double.IsInfinity(accumulatedScale) || double.IsNaN(weight) || double.IsInfinity(weight))
+            throw new ArgumentOutOfRangeException(nameof(weight), "The scales must be finite.");
+        acc.EnsureLayout(_gradients, _deviceGradients, _backend);
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (length == 0) continue;
+            if (_deviceGradients[i] is { } buffer)
+            {
+                var held = acc.Device[i]!;
+                Backend.Scale(held, held, (float)accumulatedScale, length);
+                Backend.Scale(buffer, buffer, (float)weight, length);
+                Backend.Add(held, buffer, buffer, length);
+            }
+            else
+            {
+                var held = acc.Host[i]!;
+                using var lease = _gradients[i].LeaseWritable();
+                var g = lease.Span.Slice(0, length);
+                GradientAccumulation<T>.ScaleInPlace(held, accumulatedScale);
+                GradientAccumulation<T>.ScaleInPlace(g, weight);
+                GradientAccumulation<T>.AddInto(held, g, g);
+            }
+        }
+        acc.Steps = 0;
+        _combined = true;
     }
 
     /// <summary>Whether host transfers go through one contiguous device buffer (see the field).</summary>
@@ -370,9 +474,180 @@ internal sealed class GradientExchange<T>
     }
 }
 
+/// <summary>
+/// A compiled plan's gradient accumulator across steps whose update was deferred (<see
+/// cref="GradientExchange{T}.DeferUpdate"/>): one buffer per exchanged gradient, on the device where the gradient is a
+/// device buffer and on the host otherwise, owned by the plan and kept across accumulation windows.
+/// </summary>
+internal sealed class GradientAccumulation<T> : IDisposable
+{
+    internal Engines.DirectGpu.IGpuBuffer?[] Device = Array.Empty<Engines.DirectGpu.IGpuBuffer?>();
+    internal T[]?[] Host = Array.Empty<T[]?>();
+    private int[] _lengths = Array.Empty<int>();
+    private Engines.DirectGpu.IDirectGpuBackend? _backend;
+
+    /// <summary>The deferred steps the buffers hold (0: none; the buffers' contents are then stale).</summary>
+    internal int Steps { get; set; }
+
+    /// <summary>
+    /// Makes the buffers match this step's gradients: the same count and lengths as the held steps' (a different layout
+    /// while steps are held drops them and throws), each where this step's gradient is. A held buffer whose gradient
+    /// moved between the host and the device moves with it.
+    /// </summary>
+    internal void EnsureLayout(Tensor<T>[] gradients, Engines.DirectGpu.IGpuBuffer?[] device,
+        Engines.DirectGpu.IDirectGpuBackend? backend)
+    {
+        bool same = _lengths.Length == gradients.Length;
+        for (int i = 0; same && i < gradients.Length; i++) same = _lengths[i] == gradients[i].Length;
+        if (!same)
+        {
+            bool held = Steps > 0;
+            Release();
+            if (held)
+                throw new InvalidOperationException(
+                    "The gradients changed layout during a gradient accumulation; the accumulated steps were dropped.");
+            _lengths = new int[gradients.Length];
+            for (int i = 0; i < gradients.Length; i++) _lengths[i] = gradients[i].Length;
+            Device = new Engines.DirectGpu.IGpuBuffer?[gradients.Length];
+            Host = new T[]?[gradients.Length];
+        }
+        if (_backend is not null && !ReferenceEquals(backend, _backend))
+        {
+            // Another backend cannot read these buffers: the held values go to the host first.
+            for (int i = 0; i < Device.Length; i++) MoveToHost(i);
+            _backend = null;
+        }
+        for (int i = 0; i < gradients.Length; i++)
+        {
+            int length = _lengths[i];
+            if (length == 0) continue;
+            if (device[i] is not null && backend is not null)
+            {
+                if (Device[i] is not null) continue;
+                Engines.DirectGpu.IGpuBuffer buffer;
+                // The plan's own memory for its life: never a loan of idle step memory.
+                using (Engines.DirectGpu.CUDA.CudaBackend.NoIdleLoans())
+                    buffer = backend.AllocateBuffer(length);
+                if (Steps > 0 && Host[i] is { } values)
+                {
+                    var upload = new float[length];
+                    Array.Copy((float[])(object)values, upload, length);
+                    backend.UploadBufferInPlace(upload, buffer);
+                }
+                Device[i] = buffer;
+                Host[i] = null;
+                _backend = backend;
+            }
+            else
+            {
+                if (Device[i] is not null) MoveToHost(i);
+                Host[i] ??= new T[length];
+            }
+        }
+    }
+
+    private void MoveToHost(int i)
+    {
+        if (Device[i] is not { } buffer) return;
+        var values = new T[_lengths[i]];
+        if (Steps > 0)
+        {
+            var host = new float[buffer.Size];
+            _backend!.DownloadBuffer(buffer, host);
+            Array.Copy(host, (float[])(object)values, values.Length);
+        }
+        buffer.Dispose();
+        Device[i] = null;
+        Host[i] = values;
+    }
+
+    // values *= factor (rounded to T), element by element: one rounding per element.
+    [Helpers.ScalarKernel("Element-wise scale of a host-resident accumulated gradient; float and double are specialized")]
+    internal static void ScaleInPlace(Span<T> values, double factor)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            float s = (float)factor;
+            for (int k = 0; k < values.Length; k++)
+            {
+                ref float f = ref System.Runtime.CompilerServices.Unsafe.As<T, float>(ref values[k]);
+                f *= s;
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            for (int k = 0; k < values.Length; k++)
+            {
+                ref double d = ref System.Runtime.CompilerServices.Unsafe.As<T, double>(ref values[k]);
+                d *= factor;
+            }
+        }
+        else
+        {
+            var ops = Helpers.MathHelper.GetNumericOperations<T>();
+            T s = ops.FromDouble(factor);
+            for (int k = 0; k < values.Length; k++) values[k] = ops.Multiply(values[k], s);
+        }
+    }
+
+    // destination = a + b, element by element (destination may be either operand).
+    [Helpers.ScalarKernel("Element-wise add of host-resident accumulated gradients; float and double are specialized")]
+    internal static void AddInto(Span<T> a, Span<T> b, Span<T> destination)
+    {
+        if (typeof(T) == typeof(float))
+        {
+            for (int k = 0; k < destination.Length; k++)
+                System.Runtime.CompilerServices.Unsafe.As<T, float>(ref destination[k]) =
+                    System.Runtime.CompilerServices.Unsafe.As<T, float>(ref a[k])
+                    + System.Runtime.CompilerServices.Unsafe.As<T, float>(ref b[k]);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            for (int k = 0; k < destination.Length; k++)
+                System.Runtime.CompilerServices.Unsafe.As<T, double>(ref destination[k]) =
+                    System.Runtime.CompilerServices.Unsafe.As<T, double>(ref a[k])
+                    + System.Runtime.CompilerServices.Unsafe.As<T, double>(ref b[k]);
+        }
+        else
+        {
+            var ops = Helpers.MathHelper.GetNumericOperations<T>();
+            for (int k = 0; k < destination.Length; k++) destination[k] = ops.Add(a[k], b[k]);
+        }
+    }
+
+    /// <summary>Drops the held steps and frees the buffers.</summary>
+    internal void Release()
+    {
+        foreach (var buffer in Device) buffer?.Dispose();
+        Device = Array.Empty<Engines.DirectGpu.IGpuBuffer?>();
+        Host = Array.Empty<T[]?>();
+        _lengths = Array.Empty<int>();
+        _backend = null;
+        Steps = 0;
+    }
+
+    public void Dispose() => Release();
+}
+
 internal sealed partial class CompiledTrainingPlan<T>
 {
     private Action<GradientExchange<T>>? _gradientExchange;
+
+    // The accumulator for deferred updates (gradient accumulation through the exchange), made on the first exchange.
+    private GradientAccumulation<T>? _gradientAccumulation;
+
+    // Whether the last exchange deferred its step's update (the plan then skipped the clip and the optimizer).
+    private bool _lastStepUpdateDeferred;
+
+    // The epilogue-only graph a split step launches instead of the update graph when the exchange deferred the update:
+    // it publishes the loss and the progress word without counting an applied step.
+    private IntPtr _epilogueGraphExec;
+
+    /// <summary>Steps whose exchange deferred the update (their gradients were accumulated instead).</summary>
+    internal long DeferredUpdateCount { get; private set; }
+
+    /// <summary>The deferred steps whose gradients the plan's accumulator holds now.</summary>
+    internal int AccumulatedGradientSteps => _gradientAccumulation?.Steps ?? 0;
 
     // The exchange's host staging (see GradientExchange): one slot per exchanged gradient, kept across steps.
     private readonly float[]?[][] _exchangeStaging = { Array.Empty<float[]?>(), Array.Empty<float[]?>() };
@@ -403,6 +678,9 @@ internal sealed partial class CompiledTrainingPlan<T>
         {
             if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
             _gradientExchange = exchange;
+            // Accumulated gradients belong to the exchange that deferred them.
+            _gradientAccumulation?.Release();
+            _lastStepUpdateDeferred = false;
             // The weight-buffer alternation would need a second pair of graphs; one buffer set keeps the split simple.
             if (exchange is not null) _pingPongRejected = true;
         }
@@ -410,9 +688,11 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     // deviceAuthoritative: the step just ran as a graph, which writes the gradients' device buffers without the
     // host version bookkeeping an eager op keeps, so a bound device buffer is the current gradient.
-    private void ExchangeGradients(bool deviceAuthoritative)
+    // Returns whether the exchange deferred the step's update (the caller then skips the clip and the optimizer).
+    private bool ExchangeGradients(bool deviceAuthoritative)
     {
-        if (_gradientExchange is not { } exchange) return;
+        _lastStepUpdateDeferred = false;
+        if (_gradientExchange is not { } exchange) return false;
         var engine = _engine.As<Engines.DirectGpuTensorEngine>();
         var backend = engine?.GetBackend();
         var parameters = new List<Tensor<T>>(_parameters.Length);
@@ -435,9 +715,21 @@ internal sealed partial class CompiledTrainingPlan<T>
         for (int kind = 0; kind < _exchangeStaging.Length; kind++)
             if (_exchangeStaging[kind].Length != gradients.Count) _exchangeStaging[kind] = new float[]?[gradients.Count];
         var deviceArray = device.ToArray();
-        exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
-            _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray)));
+        _gradientAccumulation ??= new GradientAccumulation<T>();
+        string? deferRefusal = _lossScaling is not null
+            ? "loss scaling is configured (a deferred step's overflow check is not supported)"
+            : null;
+        var step = new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
+            _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray),
+            _gradientAccumulation, deferRefusal);
+        exchange(step);
         GradientExchangeCount++;
+        if (step.UpdateDeferred)
+        {
+            DeferredUpdateCount++;
+            _lastStepUpdateDeferred = true;
+        }
+        return step.UpdateDeferred;
     }
 
     /// <summary>
@@ -537,7 +829,17 @@ internal sealed partial class CompiledTrainingPlan<T>
     private void DestroyUpdateGraph(Engines.DirectGpuTensorEngine? gte)
     {
         var update = _updateGraphExec;
-        _updateGraphExec = IntPtr.Zero;   // cleared first: a destroy that throws must not leave it to be destroyed again
-        if (update != IntPtr.Zero && gte is not null) gte.DestroyGpuGraph(update);
+        var epilogue = _epilogueGraphExec;
+        // Cleared first: a destroy that throws must not leave a handle to be destroyed again.
+        _updateGraphExec = IntPtr.Zero;
+        _epilogueGraphExec = IntPtr.Zero;
+        try
+        {
+            if (update != IntPtr.Zero && gte is not null) gte.DestroyGpuGraph(update);
+        }
+        finally
+        {
+            if (epilogue != IntPtr.Zero && gte is not null) gte.DestroyGpuGraph(epilogue);
+        }
     }
 }

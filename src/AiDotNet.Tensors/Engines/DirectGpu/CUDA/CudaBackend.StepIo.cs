@@ -510,13 +510,14 @@ public sealed partial class CudaBackend
             _backend.LaunchKernel(prologueKernel, blocks, 256, launchArgs);
         }
 
-        public void CaptureEpilogue(IGpuBuffer? loss, int lossCount)
+        public void CaptureEpilogue(IGpuBuffer? loss, int lossCount, bool countsStep = true)
         {
             if (!_backend._kernelCache.TryGetValue("step_io_epilogue", out var epilogueKernel))
                 throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_epilogue");
             if (lossCount < 0 || lossCount > StepIoLossCapacity) throw new ArgumentOutOfRangeException(nameof(lossCount));
             ulong stateAddress = (ulong)_state!.Handle.ToInt64(), resultsAddress = (ulong)_resultsDevice.ToInt64();
-            IntPtr guard = _guard?.Handle ?? IntPtr.Zero, lossPtr = loss?.Handle ?? IntPtr.Zero;
+            // No guard: the kernel then counts no applied step and leaves the guard for the next update to read.
+            IntPtr guard = countsStep ? _guard?.Handle ?? IntPtr.Zero : IntPtr.Zero, lossPtr = loss?.Handle ?? IntPtr.Zero;
             int count = loss is null ? 0 : lossCount;
             void** launchArgs = stackalloc void*[5];
             launchArgs[0] = &stateAddress; launchArgs[1] = &resultsAddress; launchArgs[2] = &guard;
