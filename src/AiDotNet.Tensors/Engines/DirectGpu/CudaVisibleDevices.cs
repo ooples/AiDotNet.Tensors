@@ -27,8 +27,9 @@ internal static class CudaVisibleDevices
 
     /// <summary>
     /// Resolves the variable's value: through the CUDA driver when it is present (it applies the variable itself, so
-    /// indices, full or prefix UUIDs and MIG names all mean what they mean to CUDA), else from the full <c>GPU-</c> UUIDs
-    /// in the value. Indices cannot be mapped without the driver; then nothing is filtered.
+    /// indices and full or prefix UUIDs mean what they mean to CUDA), else from the full <c>GPU-</c> UUIDs in the value.
+    /// Indices cannot be mapped without the driver, and MIG instances not at all (a MIG UUID never matches a whole
+    /// device's); then nothing is filtered, which is reported.
     /// </summary>
     internal static HashSet<string>? Resolve(string? value, Func<List<string>?> cudaVisibleUuids)
     {

@@ -495,8 +495,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    private static int s_shortReplayWarned;
-
     internal readonly struct SeedReplayScope : IDisposable
     {
         private readonly DirectGpuTensorEngine? _previousEngine;
@@ -508,14 +506,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _previous = previous;
             _previousIndex = previousIndex;
         }
+        /// <summary>
+        /// Throws when the replay drew fewer seeds than were recorded: the recompute took another path than its forward,
+        /// so a draw it skipped shifted every later one onto a seed recorded for another op.
+        /// </summary>
+        public void EnsureAllDrawn()
+        {
+            if (t_seedReplay is { } replay && t_seedReplayIndex != replay.Count)
+                throw new InvalidOperationException(
+                    $"A replayed forward drew {t_seedReplayIndex} of the {replay.Count} stochastic seeds its recorded run drew: "
+                    + "the recompute is not the same computation as the forward it repeats.");
+        }
+
         public void Dispose()
         {
-            // Fewer draws than recorded: the recompute took another path than its forward. Its draws so far were the
-            // forward's, so the result is not wrong by itself, but the mismatch is reported once.
-            if (t_seedReplay is { } replay && t_seedReplayIndex < replay.Count
-                && System.Threading.Interlocked.Exchange(ref s_shortReplayWarned, 1) == 0)
-                System.Diagnostics.Trace.TraceWarning(
-                    $"A replayed forward drew {t_seedReplayIndex} of the {replay.Count} stochastic seeds its recorded run drew.");
             t_seedReplayEngine = _previousEngine;
             t_seedReplay = _previous;
             t_seedReplayIndex = _previousIndex;

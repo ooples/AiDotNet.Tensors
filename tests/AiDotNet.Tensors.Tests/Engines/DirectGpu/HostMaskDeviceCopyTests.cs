@@ -30,4 +30,36 @@ public sealed class HostMaskDeviceCopyTests
         Assert.Equal(0, gpu.LiveHostMaskDeviceCopiesForTests);
         GC.KeepAlive(mask);
     }
+
+    /// <summary>
+    /// A mask whose device copy was made on a backend that has since closed is refreshed on another engine. The stale
+    /// buffer used to be released through the closed backend's queued free, which threw, before the copy was cleared,
+    /// so every later use of the mask threw the same way.
+    /// </summary>
+    [SkippableFact]
+    public void A_masks_copy_from_a_closed_backend_is_replaced_on_another_engine()
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend? first;
+        try { first = AiDotNet.Tensors.Engines.DirectGpu.DirectGpuBackendFactory.CreateNew(); }
+        catch { first = null; }
+        Skip.If(first is null, "No GPU backend");
+        var x = new Tensor<float>(new[] { 2, 3 });
+        for (int i = 0; i < x.Length; i++) x.SetFlat(i, i);
+        var mask = new Tensor<bool>(new[] { 2, 3 });
+        mask.SetFlat(1, true);
+        var a = new DirectGpuTensorEngine(new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(first!, borrowsBackend: true));
+        Assert.Equal(-1f, a.TensorMaskedFill(x, mask, -1f).GetFlat(1));
+        first!.Dispose();   // the backend closes under the engine that made the copy
+
+        DirectGpuTensorEngine b;
+        try { b = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No second GPU engine"); return; }
+        using (b)
+        {
+            Assert.Equal(-1f, b.TensorMaskedFill(x, mask, -1f).GetFlat(1));
+            Assert.Equal(-1f, b.TensorMaskedFill(x, mask, -1f).GetFlat(1));
+        }
+        GC.KeepAlive(a);
+        GC.KeepAlive(mask);
+    }
 }

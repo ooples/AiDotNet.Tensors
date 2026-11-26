@@ -115,9 +115,10 @@ public partial class DirectGpuTensorEngine
                 // Made on another backend: its buffer is that context's memory, possibly already closed, so it is
                 // disposed directly (which checks for a live context itself). A fresh copy is made on this one.
                 var stale = copy.Buffer;
+                var previous = copy.Backend;
                 copy.Buffer = null;
                 copy.Backend = null;
-                stale.Dispose();
+                ReleaseHostMaskBuffer(previous, stale);
             }
             if (copy.Buffer is not null && copy.Capacity != n)
                 throw new InvalidOperationException("A host mask's device copy cannot be resized.");
@@ -161,13 +162,12 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // A host-mask copy's buffer: freed after the work queued on its backend while that backend is live and this engine's
-    // own; otherwise (another engine's backend, possibly closed, or this one closing) disposed directly, which checks for
+    // A host-mask copy's buffer: freed after the work queued on its backend while that backend is live, whichever engine
+    // it belongs to (its kernels may still read the buffer); disposed directly once the backend is gone, which checks for
     // a live context itself. The fields are cleared before this runs, so a failure cannot leave a freed buffer behind.
-    private void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
+    private static void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
     {
-        if (owner is not null && !IsDisposed && _directGpu?.Backend is { } own
-            && ReferenceEquals(CrossBackendTensors.Unwrap(own), CrossBackendTensors.Unwrap(owner)))
+        if (owner is not null && owner.IsAvailable)
         {
             try { DisposeBufferAfterQueuedUse(owner, buffer); return; }
             catch (ObjectDisposedException) { /* closed meanwhile: dispose directly below */ }

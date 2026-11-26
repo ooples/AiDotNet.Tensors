@@ -28,12 +28,6 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
         return new PinnedGradientStaging(this, host, floats);
     }
 
-    /// <summary>
-    /// Frees (or unregisters) page-locked host memory in <paramref name="context"/>, only while it is still the
-    /// registration <paramref name="generation"/> named and the runtime is not tearing down: a driver call against a
-    /// destroyed context, or during teardown, is an access violation no catch traps. Returns null when it was skipped
-    /// (the context's destruction, or the process's exit, takes the memory back).
-    /// </summary>
     /// <summary>Releases skipped because their context was gone or the runtime was tearing down (tests).</summary>
     internal static long HostReleasesSkipped;
 
@@ -46,6 +40,12 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
     /// </summary>
     internal static bool HostReleaseReturnedMemory(CudaResult? released) => released is null || released == CudaResult.Success;
 
+    /// <summary>
+    /// Frees (or unregisters) page-locked host memory in <paramref name="context"/>, only while it is still the
+    /// registration <paramref name="generation"/> named and the runtime is not tearing down: a driver call against a
+    /// destroyed context, or during teardown, is an access violation no catch traps. Returns null when it was skipped
+    /// (the context's destruction, or the process's exit, takes the memory back).
+    /// </summary>
     internal static CudaResult? ReleaseHostInLiveContext(IntPtr host, IntPtr context, long generation, bool unregister)
     {
         if (host == IntPtr.Zero) return null;

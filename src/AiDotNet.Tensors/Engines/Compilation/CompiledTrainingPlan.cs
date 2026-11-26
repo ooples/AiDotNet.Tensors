@@ -569,8 +569,17 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal (bool OptimizerState, bool StorageLeases, int PinnedHandles, bool WeightNormWorkspace) ReleasableStateForTests
         => (_optimizerRuntimeState is not null, _storageLeases is not null, _pinnedHandles.Count, _weightNormWorkspace is not null);
 
-    /// <summary>The stages <see cref="Dispose"/> ran, in order (tests).</summary>
-    internal List<string> TeardownStagesForTests { get; } = new();
+    /// <summary>Test hook: runs after the step graph's destroy, before the others', so a test can fail the teardown there.</summary>
+    internal Action? TestFaultAfterStepGraphDestroy;
+
+    /// <summary>The captured graphs' handles (tests).</summary>
+    internal (IntPtr Step, IntPtr Odd, IntPtr Update) GraphHandlesForTests => (_stepGraphExec, _stepGraphExecOdd, _updateGraphExec);
+
+    /// <summary>The stages <see cref="Dispose"/> ran, in order, while <see cref="RecordTeardownStagesForTests"/> is set.</summary>
+    internal List<string>? TeardownStagesForTests { get; private set; }
+
+    /// <summary>Records each plan's teardown stages (tests).</summary>
+    internal static volatile bool RecordTeardownStagesForTests;
 
     /// <summary>The stages <see cref="Dispose"/> runs, in order.</summary>
     internal static readonly string[] TeardownStages =
@@ -595,25 +604,26 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_disposed) return;
         _disposed = true;
         List<Exception>? failures = null;
-        void Stage(Action release)
+        if (RecordTeardownStagesForTests) TeardownStagesForTests = new List<string>();
+        void Stage(string name, Action release)
         {
-            TeardownStagesForTests.Add(TeardownStages[TeardownStagesForTests.Count]);
+            TeardownStagesForTests?.Add(name);
             try { release(); }
             catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
         }
-        Stage(LandGradientsOnHost);
+        Stage("land gradients", LandGradientsOnHost);
         // Land captured counters/parameter ages while the old moment storage is still owned.
-        Stage(ReclaimIdleStepMemory);
+        Stage("reclaim idle memory", ReclaimIdleStepMemory);
         // The captured graphs read the checkpoint and loss-scale buffers and the pinned host arrays: retire them first,
         // so no graph is left referencing freed memory.
-        Stage(InvalidateCapturedStepGraph);
-        Stage(DisposeCheckpointBuffers);
-        Stage(() => { _lossScaleDevice?.Dispose(); _lossScaleDevice = null; });
+        Stage("invalidate graphs", InvalidateCapturedStepGraph);
+        Stage("checkpoint buffers", DisposeCheckpointBuffers);
+        Stage("loss scale", () => { _lossScaleDevice?.Dispose(); _lossScaleDevice = null; });
         if (StepTiming.Enabled)
             try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
                 System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }
             catch { }
-        Stage(() =>
+        Stage("pinned handles", () =>
         {
             foreach (var handle in _pinnedHandles)
             {
@@ -626,11 +636,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
-        Stage(ReleasePinnedExchangeStaging);
-        Stage(LeaveSharedMoments);
-        Stage(DisposeGpuOptimizerBuffers);
-        Stage(() => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });
-        Stage(DisposeRemainingStepState);
+        Stage("exchange staging", ReleasePinnedExchangeStaging);
+        Stage("shared moments", LeaveSharedMoments);
+        Stage("optimizer buffers", DisposeGpuOptimizerBuffers);
+        Stage("pooled moments", () => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });
+        Stage("step state", DisposeRemainingStepState);
         TeardownCompletedForTests = true;
         // The finalizer stays armed when a stage failed: a graph whose teardown threw is still its to destroy.
         if (failures is null) { GC.SuppressFinalize(this); return; }
@@ -1805,6 +1815,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var even = _stepGraphExec;
             _stepGraphExec = IntPtr.Zero;
             if (even != IntPtr.Zero) gte.DestroyGpuGraph(even);
+            TestFaultAfterStepGraphDestroy?.Invoke();
             var odd = _stepGraphExecOdd;
             _stepGraphExecOdd = IntPtr.Zero;
             if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd);

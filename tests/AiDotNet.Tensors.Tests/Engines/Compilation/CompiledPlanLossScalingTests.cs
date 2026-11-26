@@ -242,4 +242,49 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             AiDotNetEngine.Current = previous;
         }
     }
+
+    /// <summary>
+    /// A teardown that fails after destroying the step graph must not leave its handle set: the plan's finalizer, armed
+    /// because a stage failed, would destroy that graph a second time. The handles used to be cleared only after every
+    /// destroy had returned.
+    /// </summary>
+    [SkippableFact]
+    public void A_graph_teardown_that_fails_midway_leaves_no_destroyed_handle_behind()
+    {
+        SkipUnlessAvailable(onGpu: true);
+        var engine = _fixture.Engine!;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Data(In * Out, 0.37, 0.1))).Gpu();
+            var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(Data(Rows * In, 0.21, 0.3)));
+            var ct = new Tensor<float>(new[] { Rows, Out }, new Vector<float>(Data(Rows * Out, 0.13, 0.7)));
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.ReduceSum(engine.TensorMultiply(engine.Tanh(engine.TensorMatMul(x, w)), ct), null);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            var compiled = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.01f);
+            for (int s = 0; s < 6; s++) plan.Step();
+            Skip.If(compiled.GraphHandlesForTests.Step == IntPtr.Zero,
+                $"The step was not captured ({compiled.GraphCaptureFailureReason ?? "no reason given"}).");
+
+            bool fired = false;
+            compiled.TestFaultAfterStepGraphDestroy = () =>
+            {
+                if (fired) return;
+                fired = true;
+                throw new InvalidOperationException("injected destroy fault");
+            };
+            Assert.Throws<InvalidOperationException>(() => plan.Dispose());
+            Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Step);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
 }

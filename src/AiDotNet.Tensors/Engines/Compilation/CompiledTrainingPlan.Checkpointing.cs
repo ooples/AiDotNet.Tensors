@@ -589,8 +589,11 @@ internal sealed partial class CompiledTrainingPlan<T>
                     de?.SetCurrentScratchAction(recomputeKeyBase + a);
                     if (pool is not null) pool.HoldLeasesIn = _checkpoint.HeldRecompute[k];
                     if (de is not null)
-                        using (de.ReplayStochasticSeeds(_checkpoint.SeedsDrawnByForwardAction[a]))
+                        using (var replay = de.ReplayStochasticSeeds(_checkpoint.SeedsDrawnByForwardAction[a]))
+                        {
                             forward[a](engine);
+                            replay.EnsureAllDrawn();
+                        }
                     else
                         forward[a](engine);
                     if (pool is not null) pool.HoldLeasesIn = null;

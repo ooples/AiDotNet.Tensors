@@ -68,7 +68,10 @@ public sealed class CompiledTrainingPlanDisposeTests
         Assert.True(held.OptimizerState, "the trained plan holds no optimizer state, so the test would prove nothing");
 
         FailOnce(plan);
-        var ex = Assert.Throws<InvalidOperationException>(() => plan.Dispose());
+        CompiledTrainingPlan<float>.RecordTeardownStagesForTests = true;
+        InvalidOperationException ex;
+        try { ex = Assert.Throws<InvalidOperationException>(() => plan.Dispose()); }
+        finally { CompiledTrainingPlan<float>.RecordTeardownStagesForTests = false; }
         Assert.Equal("injected reclaim fault", ex.Message);
         // Every stage ran, in order, and the state they release is gone.
         Assert.Equal(CompiledTrainingPlan<float>.TeardownStages, plan.TeardownStagesForTests);

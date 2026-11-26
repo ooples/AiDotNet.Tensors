@@ -713,15 +713,29 @@ public sealed partial class CudaBackend
                 return;
             }
             using var _ = PushContext();
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuStreamSynchronize(_stream),
-                "cuStreamSynchronize (graph destroy)");
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuGraphExecDestroy(graphExec),
-                "cuGraphExecDestroy");
+            try
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuStreamSynchronize(_stream),
+                    "cuStreamSynchronize (graph destroy)");
+            }
+            finally
+            {
+                // Destroyed and unpinned even when the wait failed: the caller has already let go of the handle, so
+                // nothing else would ever destroy this graph or release what it pins.
+                try
+                {
+                    CuBlasNative.CheckCudaResult(
+                        CudaNativeBindings.cuGraphExecDestroy(graphExec),
+                        "cuGraphExecDestroy");
+                }
+                finally
+                {
+                    ReleaseDirectPtxGraphPins(graphExec);
+                    RetireGraphMemoryPool(graphExec);
+                }
+            }
         }
-        ReleaseDirectPtxGraphPins(graphExec);
-        RetireGraphMemoryPool(graphExec);
     }
 
     /// <summary>

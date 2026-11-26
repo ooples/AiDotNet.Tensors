@@ -66,29 +66,37 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
         public void Dispose()
         {
             if (_pinned == IntPtr.Zero) return;
-            if (_backend.IsAvailable)
+            try
             {
-                try
+                if (_backend.IsAvailable)
                 {
-                    using (_backend.PushContext())
+                    try
                     {
-                        // The copy may still be writing the pinned bytes; they are freed only once it is done.
-                        if (_event is { } evt && _unread) evt.Synchronize();
-                        _event?.Dispose();
+                        using (_backend.PushContext())
+                        {
+                            // The copy may still be writing the pinned bytes; they are freed only once it is done.
+                            if (_event is { } evt && _unread) evt.Synchronize();
+                            _event?.Dispose();
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The backend finished its teardown meanwhile: its queue is gone, so no copy is still writing.
                     }
                 }
-                catch (ObjectDisposedException)
-                {
-                    // The backend finished its teardown meanwhile: its queue is gone, so no copy is still writing.
-                }
             }
-            // The backend went first: its queue is gone, so no copy can still be writing. The bytes are freed while
-            // their context lives (another backend may hold the shared primary context); otherwise it took them.
-            _event = null;
-            var released = ReleaseHostInLiveContext(_pinned, _context, _contextGeneration, unregister: false);
-            if (released is { } r && r != CudaResult.Success)
-                System.Diagnostics.Trace.TraceWarning("Readback: cuMemFreeHost returned " + r + ".");
-            _pinned = IntPtr.Zero;
+            finally
+            {
+                // Also after a wait that failed (a sticky device fault stops the queue): the bytes are not left behind.
+                // The backend went first: its queue is gone, so no copy can still be writing. The bytes are freed while
+                // their context lives (another backend may hold the shared primary context); otherwise it took them.
+                _event = null;
+                var pinned = _pinned;
+                _pinned = IntPtr.Zero;
+                var released = ReleaseHostInLiveContext(pinned, _context, _contextGeneration, unregister: false);
+                if (released is { } r && r != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning("Readback: cuMemFreeHost returned " + r + ".");
+            }
         }
     }
 }

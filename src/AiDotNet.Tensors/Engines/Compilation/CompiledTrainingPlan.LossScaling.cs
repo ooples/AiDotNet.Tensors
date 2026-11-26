@@ -337,16 +337,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
                 tracker = 0;
             }
         }
+        // Inside a capture the seed fill below would be recorded into the graph as a constant: the host scale never
+        // advances there (the captured scaler runs on the device), so reaching this is a bug, refused before any state
+        // changes rather than leaving the host scale and the seed apart.
+        var seedOwner = _lossGradSeed._gpuBackend;
+        if (scale != state.Scale && seedOwner is Engines.DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing())
+            throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
         _lossScaleHost = new LossScaleState(scale, tracker, overflows, state.Steps + 1);
         // A captured step graph copies the device seed into the loss gradient in its prologue and nothing in it rewrites
         // the seed when the scale is advanced here, on the host: rewrite it, or the next replay scales the gradients by
         // the old scale while the unscale divides by the new one.
         if (scale != state.Scale && _lossGradSeed.TryGetGpuBuffer() is { } seed && _lossGradSeed._gpuBackend is { } seedBackend)
         {
-            // Inside a capture the fill would be recorded into the graph as a constant: the host scale never advances
-            // there (the captured scaler runs on the device), so reaching this is a bug, reported rather than recorded.
-            if (seedBackend is Engines.DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
-                throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
             using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
             seedBackend.Fill(seed, scale, _lossGradSeed.Length);
         }

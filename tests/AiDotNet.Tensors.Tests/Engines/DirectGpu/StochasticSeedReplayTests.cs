@@ -104,4 +104,25 @@ public sealed class StochasticSeedReplayTests
             }
         }
     }
+
+    [SkippableFact]
+    public void A_recompute_that_draws_fewer_seeds_than_its_forward_is_refused()
+    {
+        var engine = TryEngine();
+        Skip.If(engine is null, "No GPU engine can be constructed here");
+        using (engine)
+        {
+            var recorded = new List<long>();
+            using (engine!.RecordStochasticSeeds(recorded))
+            {
+                engine.NextStochasticSeedForTests();
+                engine.NextStochasticSeedForTests();
+            }
+            using (var replay = engine.ReplayStochasticSeeds(recorded))
+            {
+                engine.NextStochasticSeedForTests();
+                Assert.Throws<System.InvalidOperationException>(() => replay.EnsureAllDrawn());
+            }
+        }
+    }
 }

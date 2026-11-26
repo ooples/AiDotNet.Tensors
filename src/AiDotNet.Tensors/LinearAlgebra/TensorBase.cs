@@ -752,6 +752,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (orphaned is null) return;
         try { Helpers.PooledArrayRecycling.Notify(orphaned); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming drop: releasing device copies failed: {0}", error); }
+        // Only now offered to the restore pool: a restore that rents it from there gets fresh cache entries, which a
+        // notification arriving after the rent would evict under it.
+        ParkDroppedRestoreArray(orphaned);
     }
 
     // Serializes this tensor's streaming write-back against its drop. Without it, a write-back reading the resident
@@ -870,12 +873,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // full-precision device copy for the engine's life, outside any budget. Only an array nothing else can read:
         // checked before the restore pool can take it.
         if (OrphanedArray(claimedStorage, droppedData) is { } orphaned) Cold().OrphanedByStreamingDrop = orphaned;
+        // The restore pool takes the array after that (ReleaseDeviceCopiesOfOrphanedArray), not here inside the gate.
         // Reclamation must not turn a successful storage swap into a failed transaction.
         try { claimedStorage.DisposeClaimedOwners(); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming storage cleanup failed: {0}", error); }
         try { DisposeStreamingMmapOwner(); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming mapping cleanup failed: {0}", error); }
-        ParkDroppedRestoreArray(claimedStorage, droppedData);
         return true;
     }
 
@@ -904,12 +907,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
     }
 
-    private void ParkDroppedRestoreArray(TensorStorage<T> claimedStorage, Vector<T> droppedData)
+    private static void ParkDroppedRestoreArray(object orphaned)
     {
         try
         {
-            if (!StreamingRestoreBuffers<T>.Supported) return;
-            if (OrphanedArray(claimedStorage, droppedData) is not { } array) return;
+            if (!StreamingRestoreBuffers<T>.Supported || orphaned is not T[] array) return;
             StreamingRestoreBuffers<T>.Park(array);
         }
         catch (Exception error)

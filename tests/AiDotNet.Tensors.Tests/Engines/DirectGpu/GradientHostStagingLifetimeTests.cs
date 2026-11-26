@@ -39,7 +39,7 @@ public class GradientHostStagingLifetimeTests
     // count nothing (before, it called cuMemFreeHost against the destroyed context and counted the free). When some
     // other engine in the process still holds the primary context, the release frees and counts instead.
     [SkippableFact]
-    public void StagingDisposedAfterItsContextIsGone_MakesNoFree()
+    public void StagingDisposedAfterItsOwner_IsUncounted_AndSkipsTheFreeOnlyWhenTheContextIsGone()
     {
         Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
         var owner = new CudaBackend();
@@ -56,7 +56,6 @@ public class GradientHostStagingLifetimeTests
         Assert.Equal(before - (long)Floats * sizeof(float), PinnedCurrent());
         // Gone: the release was skipped before any driver call. Live (another engine holds the primary context): freed.
         Assert.Equal(live ? skippedBefore : skippedBefore + 1, System.Threading.Interlocked.Read(ref CudaBackend.HostReleasesSkipped));
-        Console.WriteLine($"context live after the owner's dispose: {live}");
     }
 
     // A transfer larger than a pooled pinned block (1 GiB) copies synchronously instead of throwing (the pool refuses

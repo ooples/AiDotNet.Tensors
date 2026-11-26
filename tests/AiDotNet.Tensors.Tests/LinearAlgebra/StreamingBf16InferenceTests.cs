@@ -302,4 +302,31 @@ public class StreamingBf16InferenceTests
         }
         finally { gpu.Dispose(); Cleanup(dir); }
     }
+
+    /// <summary>
+    /// A recycled array's device copy is released from whatever thread recycled it, with no GPU op lease held there.
+    /// The release used to borrow the backend through the leased path, which throws under strict leases after the
+    /// cache entry was already removed, so the buffer was never freed and the exception escaped into the recycler.
+    /// </summary>
+    [SkippableFact]
+    public void Recycling_an_array_releases_its_device_copy_without_a_lease()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        try
+        {
+            var x = Filled(new[] { 1, 64 }, 1, v => v);
+            var w = Filled(new[] { 64, 32 }, 2, v => v);
+            gpu.FusedLinear(x, w, null, FusedActivationType.None);
+            int cached = gpu.CachedTensorCount;
+            var array = w.GetBackingArrayForCacheLookupUnsafe();
+            Assert.NotNull(array);
+            gpu.StrictGpuLeases = true;
+            AiDotNet.Tensors.Helpers.PooledArrayRecycling.Notify(array!);
+            Assert.Equal(cached - 1, gpu.CachedTensorCount);
+        }
+        finally { gpu.StrictGpuLeases = false; gpu.Dispose(); }
+    }
 }

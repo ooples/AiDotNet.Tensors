@@ -153,8 +153,10 @@ public static class AiDotNetEngine
             t_completingDeferred = true;
             try
             {
-                // Before the engine loads the OpenCL runtime, which reads these once.
-                DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
+                // Before the engine loads the OpenCL runtime, which reads these once; not in a process that disabled
+                // the GPU, which loads no runtime (and whose child processes would inherit them).
+                if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU")))
+                    DirectGpu.OpenCL.OpenClRuntimeDefaults.Apply();
                 AutoDetectAndConfigureGpu(_deferredVerbose);
             }
 #pragma warning disable CA1031 // A failed probe leaves the CPU engine in place, as it did at module load.
@@ -230,6 +232,7 @@ public static class AiDotNetEngine
             // the thread-static read off the hot path while no override exists anywhere.
             if (Volatile.Read(ref _threadOverrides) != 0 && _threadEngine.Value is { } local) return local;
             if (Volatile.Read(ref _deferredDetection) != 0 && !t_completingDeferred) CompleteDeferredGpuDetection();
+            if (_gpuCircuitBroken) ThrowIfTrippedUnderRequirement();
             return ReadCurrent();
         }
         set
@@ -377,8 +380,9 @@ public static class AiDotNetEngine
     /// <returns>True if GPU was successfully configured, false otherwise.</returns>
     public static bool AutoDetectAndConfigureGpu(bool verbose)
     {
-        // An explicit call is the detection; nothing is owed after it.
-        if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0);
+        // An explicit call is the detection; nothing is owed after it. Cleared only on the paths that complete: one that
+        // refuses (a required backend the opt-out or the breaker rules out) leaves it owed, so Current refuses too.
+        void Detected() { if (!t_completingDeferred) Volatile.Write(ref _deferredDetection, 0); }
 
         // Honor the AIDOTNET_DISABLE_GPU opt-out HERE, not only at module-init. Callers such as the
         // AiModelBuilder facade re-enter this method on every BuildAsync (its default, no-GPU-config
@@ -390,6 +394,7 @@ public static class AiDotNetEngine
                 throw new InvalidOperationException(
                     $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {requiredWhileDisabled}, "
                     + "but AIDOTNET_DISABLE_GPU disables GPU detection; unset one of them.");
+            Detected();
             if (Current.Is<DirectGpuTensorEngine>())
             {
                 SwitchToCpuEngine();
@@ -407,9 +412,12 @@ public static class AiDotNetEngine
                 throw new InvalidOperationException(
                     $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {requiredWhileBroken}, "
                     + "but the GPU circuit breaker has tripped (a sticky device fault): the GPU cannot be used again in this process.");
+            Detected();
             SwitchToCpuEngine();
             return false;
         }
+        Detected();
+        ReleaseSupersededGpu(null);   // superseded engines whose ops have finished since the last adoption
 
         // Reuse the already-adopted, working GPU engine instead of reconstructing the CUDA context,
         // cuBLAS handle, and ~47 kernel modules on every call. The AiModelBuilder facade re-enters this
@@ -752,11 +760,13 @@ public static class AiDotNetEngine
     // still running is kept in _supersededGpus and released by a later adoption or ReleaseGpu.
     private static void ReleaseSupersededGpu(DirectGpuTensorEngine? engine)
     {
+        // Taken out of the list while they are tried, so two callers never close and reopen the same engine.
         System.Collections.Generic.List<DirectGpuTensorEngine> pending;
         lock (_adoptionLock)
         {
             if (engine is not null && !_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
             pending = new System.Collections.Generic.List<DirectGpuTensorEngine>(_supersededGpus);
+            _supersededGpus.Clear();
         }
         foreach (var candidate in pending)
         {
@@ -771,7 +781,7 @@ public static class AiDotNetEngine
                 System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
                 released = false;
             }
-            if (released) lock (_adoptionLock) _supersededGpus.Remove(candidate);
+            if (!released) lock (_adoptionLock) if (!_supersededGpus.Contains(candidate)) _supersededGpus.Add(candidate);
         }
     }
 
@@ -806,6 +816,19 @@ public static class AiDotNetEngine
     }
 
     private static volatile bool _gpuCircuitBroken;
+    private static volatile string? _tripDescription;
+
+    // Current, once the breaker has tripped: the CPU engine the trip published is not handed out while a backend is
+    // required, unless the caller installed an engine of its own since. Lock-free (two volatile reads), so it holds
+    // however the requirement, the trip and any detection call are ordered.
+    private static void ThrowIfTrippedUnderRequirement()
+    {
+        var required = global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend;
+        if (required == GpuBackendType.None || Volatile.Read(ref _callerAssigned)) return;
+        throw new InvalidOperationException(
+            $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}, but the GPU circuit breaker "
+            + $"tripped on {_tripDescription ?? "a device fault"}: the GPU cannot be used again in this process.");
+    }
 
     /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
     internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
@@ -814,9 +837,14 @@ public static class AiDotNetEngine
     internal static void OpenGpuCircuitBreakerForTests() => _gpuCircuitBroken = true;
 
     /// <summary>Parks <paramref name="engine"/> as the engine an earlier adoption left (tests).</summary>
-    internal static void ParkGpuForTests(DirectGpuTensorEngine? engine)
+    internal static DirectGpuTensorEngine? ParkGpuForTests(DirectGpuTensorEngine? engine)
     {
-        lock (_adoptionLock) _adoptedGpu = engine;
+        lock (_adoptionLock)
+        {
+            var previous = _adoptedGpu;
+            _adoptedGpu = engine;
+            return previous;
+        }
     }
 
     // An engine detection would reuse (the current one, a parked one, or another thread's) runs on the required backend,
@@ -846,6 +874,9 @@ public static class AiDotNetEngine
             return;
         }
 
+        // Read by Current while a backend is required (ThrowIfTrippedUnderRequirement): written before the flag, and no
+        // lock is taken here, since this runs inside CUDA error paths that may hold the context or detection locks.
+        _tripDescription = $"{operation} (CUDA error {cudaErrorCode})";
         _gpuCircuitBroken = true;
         try
         {
@@ -862,19 +893,6 @@ public static class AiDotNetEngine
                     PublishCurrent(new CpuEngine());
                     // The library installed this CPU engine, even when the GPU it replaced was the caller's.
                     Volatile.Write(ref _callerAssigned, false);
-                }
-            }
-            // A required backend: the CPU engine just published must not be handed out as if it met the requirement.
-            // Current owes a detection again, which rethrows this failure (CompleteDeferredGpuDetection).
-            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var required && required != GpuBackendType.None)
-            {
-                lock (_deferredLock)
-                {
-                    var tripped = new InvalidOperationException(
-                        $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}, but the GPU circuit "
-                        + $"breaker tripped on {operation} (CUDA error {cudaErrorCode}): the GPU cannot be used again in this process.");
-                    _requiredDetectionFailure = (System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tripped), required);
-                    Volatile.Write(ref _deferredDetection, 1);
                 }
             }
         }
