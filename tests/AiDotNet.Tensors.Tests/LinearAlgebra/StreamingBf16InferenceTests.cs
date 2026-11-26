@@ -369,8 +369,10 @@ public class StreamingBf16InferenceTests
             // The views above share w's storage, so w cannot be dropped now; a weight registration dropped pages in.
             var cold = Stream(Filled(new[] { K, N }, 2, v => v));
             Assert.True(cold.DataVector.Length != cold.Length);
+            long beforePageIn = WeightRegistry.OwnerShedPassesOnThisThread;
             var paged = cold.Reshape(K * N);
-            Assert.True(WeightRegistry.OwnerShedPassesOnThisThread > before, "a view that paged the weight in ran no shed pass");
+            // Two passes: the page-in's own (Materialize), and the view's when it ends its use.
+            Assert.True(WeightRegistry.OwnerShedPassesOnThisThread >= beforePageIn + 2, "a view that paged the weight in ran no shed pass");
             Assert.Equal(Filled(new[] { K, N }, 2, v => v).ToArray(), paged.ToArray());
         }
         finally { Cleanup(dir); }

@@ -455,7 +455,8 @@ public partial class CpuEngine
         // would make the weight itself a view (which the pool never writes back or sheds) and could change its length.
         if (tensor.Lifetime == WeightLifetime.Streaming && tensor.StreamingPoolHandle >= 0)
             throw new InvalidOperationException(
-                "TensorAsStridedInPlace cannot re-stride a registered streaming weight; take a view of it (AsStrided) instead.");
+                "TensorAsStridedInPlace cannot re-stride a registered streaming weight; build the strided view in another tensor " +
+                "(TensorSetInPlace with this weight as the source) instead.");
         // A view of the tensor's own storage; its constructor checks the layout stays inside the storage.
         using var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
         tensor.AdoptFrom(view);
