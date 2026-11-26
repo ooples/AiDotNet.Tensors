@@ -1224,7 +1224,7 @@ jobs:
   coverage:
     name: CUDA coverage upload
     needs: cuda
-    if: ${{ always() && github.event_name != 'pull_request' && !inputs.ratchets_only && (needs.cuda.result == 'success' || needs.cuda.result == 'failure') }}
+    if: ${{ always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && !inputs.ratchets_only && !inputs.suite_filter && (needs.cuda.result == 'success' || needs.cuda.result == 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1243,6 +1243,8 @@ jobs:
         run: echo "any=$(find '${{ runner.temp }}/cuda-coverage' -name coverage.cobertura.xml 2>/dev/null | head -1 | wc -l)" >> "$GITHUB_OUTPUT"
       - name: Upload CUDA coverage to Codecov
         if: ${{ steps.found.outputs.any == '1' }}
+        # A Codecov outage is not a CUDA failure: the nightly stays green on the suites' own result.
+        continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml

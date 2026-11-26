@@ -164,4 +164,135 @@ public class CudaFallbackReportingTests
     [InlineData(GpuBackendType.Unknown)]
     public void RequiredBackend_RejectsBackendsDetectionCannotSelect(GpuBackendType backend)
         => Assert.Throws<ArgumentOutOfRangeException>(() => GpuBackendOptions.RequiredBackend = backend);
+
+    /// <summary>
+    /// The opt-out variable and a tripped circuit breaker used to switch to the CPU silently, even with a backend
+    /// required: the substitution the requirement exists to forbid.
+    /// </summary>
+    [Fact]
+    public void RequiredBackend_WithGpuDisabledOrTheCircuitOpen_Throws_InsteadOfSwitchingToTheCpu()
+    {
+        var saved = AiDotNetEngine.Current;
+        var previousRequired = GpuBackendOptions.RequiredBackend;
+        string? previousDisable = Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU");
+        try
+        {
+            GpuBackendOptions.RequiredBackend = GpuBackendType.Hip;
+            Environment.SetEnvironmentVariable("AIDOTNET_DISABLE_GPU", "1");
+            var disabled = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
+            Assert.Contains("AIDOTNET_DISABLE_GPU", disabled.Message);
+
+            Environment.SetEnvironmentVariable("AIDOTNET_DISABLE_GPU", null);
+            AiDotNetEngine.OpenGpuCircuitBreakerForTests();
+            var broken = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
+            Assert.Contains("circuit breaker", broken.Message);
+        }
+        finally
+        {
+            AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            Environment.SetEnvironmentVariable("AIDOTNET_DISABLE_GPU", previousDisable);
+            GpuBackendOptions.RequiredBackend = previousRequired;
+            AiDotNetEngine.Current = saved;
+        }
+    }
+
+    /// <summary>
+    /// A parked engine on a backend the requirement rules out used to be overwritten by the new adoption and never
+    /// released, holding its device context for the life of the process.
+    /// </summary>
+    [SkippableFact]
+    public void An_adoption_that_supersedes_a_parked_engine_on_another_backend_releases_it()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU") is { Length: > 0 }, "GPU detection is disabled.");
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA device to adopt.");
+        var saved = AiDotNetEngine.Current;
+        var previousRequired = GpuBackendOptions.RequiredBackend;
+        DirectGpuTensorEngine? parked = null;
+        try
+        {
+            GpuBackendOptions.RequiredBackend = GpuBackendType.None;
+            var openCl = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL);
+            Skip.If(openCl is null || !openCl.BackendName.StartsWith("OpenCL", StringComparison.Ordinal), "No OpenCL device to park.");
+            parked = new DirectGpuTensorEngine(new DirectGpuEngine(openCl!));
+            AiDotNetEngine.Current = new CpuEngine();
+            AiDotNetEngine.ParkGpuForTests(parked);
+
+            GpuBackendOptions.RequiredBackend = GpuBackendType.Cuda;
+            Assert.True(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
+            Assert.True(AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var adopted));
+            Assert.NotSame(parked, adopted);
+            Assert.True(parked.IsDisposed, "the superseded OpenCL engine was left open");
+        }
+        finally
+        {
+            GpuBackendOptions.RequiredBackend = previousRequired;
+            AiDotNetEngine.Current = saved;
+            if (parked is { IsDisposed: false }) parked.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A tripped circuit breaker publishes the CPU engine. With a backend required, every later read of Current used to
+    /// hand that engine out; it now throws the trip.
+    /// </summary>
+    [Fact]
+    public void A_tripped_circuit_breaker_under_a_required_backend_makes_Current_throw()
+    {
+        var saved = AiDotNetEngine.Current;
+        var previousRequired = GpuBackendOptions.RequiredBackend;
+        try
+        {
+            GpuBackendOptions.RequiredBackend = GpuBackendType.Hip;
+            AiDotNetEngine.TripGpuCircuitBreaker("test", 700);
+            var ex = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+            Assert.Contains("circuit", ex.Message);
+        }
+        finally
+        {
+            GpuBackendOptions.RequiredBackend = previousRequired;
+            AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            AiDotNetEngine.Current = saved;
+        }
+    }
+
+    /// <summary>
+    /// A superseded engine still running an op is not freed under it, and not dropped either: ReleaseGpu releases it
+    /// once the op is done.
+    /// </summary>
+    [SkippableFact]
+    public void A_superseded_engine_with_an_op_running_is_released_later_not_leaked()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU") is { Length: > 0 }, "GPU detection is disabled.");
+        Skip.IfNot(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "No CUDA device to adopt.");
+        var saved = AiDotNetEngine.Current;
+        var previousRequired = GpuBackendOptions.RequiredBackend;
+        DirectGpuTensorEngine? parked = null;
+        try
+        {
+            GpuBackendOptions.RequiredBackend = GpuBackendType.None;
+            var openCl = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL);
+            Skip.If(openCl is null || !openCl.BackendName.StartsWith("OpenCL", StringComparison.Ordinal), "No OpenCL device to park.");
+            parked = new DirectGpuTensorEngine(new DirectGpuEngine(openCl!));
+            AiDotNetEngine.Current = new CpuEngine();
+            AiDotNetEngine.ParkGpuForTests(parked);
+            int pendingBefore = AiDotNetEngine.SupersededGpusPendingForTests;
+
+            GpuBackendOptions.RequiredBackend = GpuBackendType.Cuda;
+            using (parked.EnterGpuOp())
+            {
+                Assert.True(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
+                Assert.False(parked.IsDisposed, "the superseded engine was freed under a running op");
+                Assert.Equal(pendingBefore + 1, AiDotNetEngine.SupersededGpusPendingForTests);
+            }
+            AiDotNetEngine.ReleaseGpu();
+            Assert.True(parked.IsDisposed, "the superseded engine was never released");
+            Assert.Equal(pendingBefore, AiDotNetEngine.SupersededGpusPendingForTests);
+        }
+        finally
+        {
+            GpuBackendOptions.RequiredBackend = previousRequired;
+            AiDotNetEngine.Current = saved;
+            if (parked is { IsDisposed: false }) parked.Dispose();
+        }
+    }
 }

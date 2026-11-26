@@ -302,6 +302,19 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         AdvanceHostLossScale(LastStepSkippedNonFiniteGradients);
     }
 
+    /// <summary>Advances the scale on the host as a step's verdict would and returns the new scale (tests).</summary>
+    internal float AdvanceHostLossScaleForTests(bool nonFinite)
+    {
+        MoveLossScaleToHost();
+        AdvanceHostLossScale(nonFinite);
+        return _lossScaleHost.Scale;
+    }
+
+    /// <summary>The loss-gradient seed's device values, or null when it is not on the device (tests).</summary>
+    internal float[]? ReadDeviceLossSeedForTests()
+        => _lossGradSeed.TryGetGpuBuffer() is { } seed && _lossGradSeed._gpuBackend is { } backend
+            ? backend.DownloadBuffer(seed) : null;
+
     private void AdvanceHostLossScale(bool nonFinite)
     {
         var options = _lossScaling ?? throw new InvalidOperationException("Loss scaling is off.");
@@ -329,7 +342,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         // the seed when the scale is advanced here, on the host: rewrite it, or the next replay scales the gradients by
         // the old scale while the unscale divides by the new one.
         if (scale != state.Scale && _lossGradSeed.TryGetGpuBuffer() is { } seed && _lossGradSeed._gpuBackend is { } seedBackend)
+        {
+            // Inside a capture the fill would be recorded into the graph as a constant: the host scale never advances
+            // there (the captured scaler runs on the device), so reaching this is a bug, reported rather than recorded.
+            if (seedBackend is Engines.DirectGpu.IGpuGraphCapture capture && capture.IsStreamCapturing())
+                throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
+            using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
             seedBackend.Fill(seed, scale, _lossGradSeed.Length);
+        }
     }
 
     private void UnscaleLossScaledGradientsOnHost()

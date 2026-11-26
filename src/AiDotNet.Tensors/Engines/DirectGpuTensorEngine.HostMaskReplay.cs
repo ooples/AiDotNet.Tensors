@@ -41,13 +41,11 @@ public partial class DirectGpuTensorEngine
                 if (!weak.TryGetTarget(out var copy)) continue;
                 lock (copy)
                 {
-                    if (copy.Buffer is { } buffer)
-                    {
-                        if (copy.Backend is { } owner) DisposeBufferAfterQueuedUse(owner, buffer);
-                        else buffer.Dispose();
-                    }
+                    var buffer = copy.Buffer;
+                    var owner = copy.Backend;
                     copy.Buffer = null;
                     copy.Backend = null;
+                    if (buffer is not null) ReleaseHostMaskBuffer(owner, buffer);
                 }
             }
             _hostMaskCopyList.Clear();
@@ -114,10 +112,12 @@ public partial class DirectGpuTensorEngine
                 throw new NotSupportedException("A host mask changed inside a graph capture; its device copy cannot be refreshed there.");
             if (copy.Buffer is not null && !ReferenceEquals(copy.Backend, backend))
             {
-                // Made on another backend: its buffer is that context's memory. A fresh copy is made on this one.
-                if (copy.Backend is { } previous) DisposeBufferAfterQueuedUse(previous, copy.Buffer);
-                else copy.Buffer.Dispose();
+                // Made on another backend: its buffer is that context's memory, possibly already closed, so it is
+                // disposed directly (which checks for a live context itself). A fresh copy is made on this one.
+                var stale = copy.Buffer;
                 copy.Buffer = null;
+                copy.Backend = null;
+                stale.Dispose();
             }
             if (copy.Buffer is not null && copy.Capacity != n)
                 throw new InvalidOperationException("A host mask's device copy cannot be resized.");
@@ -159,5 +159,19 @@ public partial class DirectGpuTensorEngine
                 throw new InvalidOperationException("A captured host-mask device buffer was released or replaced.");
             RefreshHostMaskDeviceCopy(backend, copy, source);
         }
+    }
+
+    // A host-mask copy's buffer: freed after the work queued on its backend while that backend is live and this engine's
+    // own; otherwise (another engine's backend, possibly closed, or this one closing) disposed directly, which checks for
+    // a live context itself. The fields are cleared before this runs, so a failure cannot leave a freed buffer behind.
+    private void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
+    {
+        if (owner is not null && !IsDisposed && _directGpu?.Backend is { } own
+            && ReferenceEquals(CrossBackendTensors.Unwrap(own), CrossBackendTensors.Unwrap(owner)))
+        {
+            try { DisposeBufferAfterQueuedUse(owner, buffer); return; }
+            catch (ObjectDisposedException) { /* closed meanwhile: dispose directly below */ }
+        }
+        buffer.Dispose();
     }
 }

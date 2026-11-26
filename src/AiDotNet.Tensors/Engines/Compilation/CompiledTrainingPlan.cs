@@ -552,6 +552,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // graph) and the memory they pin.
     ~CompiledTrainingPlan()
     {
+        if (TrackFinalizationForTests) FinalizedPlansForTests.TryAdd(IdForTests, true);
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExec);
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExecOdd);
         _stepGraphOwner?.RetireIndexGraphBindings(_updateGraphExec);
@@ -562,6 +563,27 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Set once every stage of <see cref="Dispose"/> has run, whether or not one of them threw (tests).</summary>
     internal bool TeardownCompletedForTests { get; private set; }
+
+    /// <summary>What the plan holds that Dispose releases on every lane: optimizer state, storage leases, pinned
+    /// handles, the weight-norm workspace (tests).</summary>
+    internal (bool OptimizerState, bool StorageLeases, int PinnedHandles, bool WeightNormWorkspace) ReleasableStateForTests
+        => (_optimizerRuntimeState is not null, _storageLeases is not null, _pinnedHandles.Count, _weightNormWorkspace is not null);
+
+    /// <summary>The stages <see cref="Dispose"/> ran, in order (tests).</summary>
+    internal List<string> TeardownStagesForTests { get; } = new();
+
+    /// <summary>The stages <see cref="Dispose"/> runs, in order.</summary>
+    internal static readonly string[] TeardownStages =
+    {
+        "land gradients", "reclaim idle memory", "invalidate graphs", "checkpoint buffers", "loss scale",
+        "pinned handles", "exchange staging", "shared moments", "optimizer buffers", "pooled moments", "step state",
+    };
+
+    // Which plans' finalizers ran, by id, while a test tracks them.
+    private static long s_nextIdForTests;
+    internal long IdForTests { get; } = System.Threading.Interlocked.Increment(ref s_nextIdForTests);
+    internal static volatile bool TrackFinalizationForTests;
+    internal static readonly System.Collections.Concurrent.ConcurrentDictionary<long, bool> FinalizedPlansForTests = new();
 
     /// <summary>
     /// Releases the plan. Every stage runs even when an earlier one throws, so one failure cannot leak the captured
@@ -575,6 +597,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         List<Exception>? failures = null;
         void Stage(Action release)
         {
+            TeardownStagesForTests.Add(TeardownStages[TeardownStagesForTests.Count]);
             try { release(); }
             catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
         }
@@ -1773,15 +1796,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
         // while the graphs that pin the second buffers still keep them alive.
         ReleasePingPong();
+        bool hadGraph = _stepGraphExec != IntPtr.Zero;
+        // Each handle is cleared before its destroy: a destroy that throws then leaves no field naming a graph that was
+        // already destroyed, which the finalizer (armed while a teardown stage fails) would destroy a second time.
         if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
             && gte.GetBackend() is Engines.DirectGpu.IGpuGraphCapture { SupportsGraphCapture: true } cb)
         {
-            if (_stepGraphExec != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExec);
-            if (_stepGraphExecOdd != IntPtr.Zero) gte.DestroyGpuGraph(_stepGraphExecOdd);
+            var even = _stepGraphExec;
+            _stepGraphExec = IntPtr.Zero;
+            if (even != IntPtr.Zero) gte.DestroyGpuGraph(even);
+            var odd = _stepGraphExecOdd;
+            _stepGraphExecOdd = IntPtr.Zero;
+            if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd);
             DestroyUpdateGraph(gte);
         }
         _updateGraphExec = IntPtr.Zero;
-        bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;

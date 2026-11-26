@@ -274,4 +274,32 @@ public class StreamingBf16InferenceTests
         }
         finally { gpu.Dispose(); Cleanup(dir); }
     }
+
+    /// <summary>
+    /// Dropping a streamed weight releases a device copy cached under its array only when nothing else can still read
+    /// the array. Another tensor over the same data keeps it: freeing its device copy then would be a use-after-free.
+    /// </summary>
+    [SkippableFact]
+    public void A_streaming_drop_keeps_the_device_copy_of_an_array_another_tensor_still_reads()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        const int In = 64, Out = 32;
+        var dir = Configure();
+        try
+        {
+            var x = Filled(new[] { 1, In }, 1, v => v);
+            var shared = Filled(new[] { In, Out }, 3, v => v);
+            var peer = new Tensor<float>(new[] { In, Out }, shared.DataVector);   // a second storage over the same data
+            Skip.IfNot(ReferenceEquals(peer.DataVector, shared.DataVector), "The constructor copied the vector.");
+            var expected = gpu.FusedLinear(x, peer, null, FusedActivationType.None).ToArray();
+            int cached = gpu.CachedTensorCount;
+            Stream(shared);
+            Assert.Equal(cached, gpu.CachedTensorCount);
+            Assert.Equal(expected, gpu.FusedLinear(x, peer, null, FusedActivationType.None).ToArray());
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
 }

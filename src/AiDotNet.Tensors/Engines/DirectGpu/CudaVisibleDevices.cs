@@ -34,7 +34,14 @@ internal static class CudaVisibleDevices
     {
         if (value is null) return null;
         // MIG instances have UUIDs of their own, which never match a Vulkan device's whole-GPU UUID: not filtered.
-        if (value.IndexOf("MIG-", StringComparison.OrdinalIgnoreCase) >= 0) return Unresolved(value);
+        if (value.IndexOf("MIG-", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            // A MIG instance is a slice of a device, not a device: the backends that select by device UUID cannot apply it.
+            System.Diagnostics.Trace.TraceWarning(
+                $"CUDA_VISIBLE_DEVICES='{value}' names MIG instances; backends that select NVIDIA devices by device UUID "
+                + "(Vulkan) cannot be restricted to a MIG instance and see every device.");
+            return null;
+        }
         if (cudaVisibleUuids() is { } fromDriver) return new HashSet<string>(fromDriver, StringComparer.Ordinal);
         var fromValue = new HashSet<string>(StringComparer.Ordinal);
         foreach (var raw in value.Split(','))

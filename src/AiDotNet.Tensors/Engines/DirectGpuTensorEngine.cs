@@ -449,7 +449,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Until the returned scope is disposed, the seeds this thread's stochastic ops draw on this engine are appended to
     /// <paramref name="into"/> (cleared first): the draws of a forward action a checkpoint recompute will repeat. Only
     /// this thread's draws are recorded, so ops other threads run on the engine meanwhile, which advance the shared
-    /// sequence between this thread's draws, do not shift what the recompute replays.
+    /// sequence between this thread's draws, do not shift what the recompute replays. An op that draws its seeds on
+    /// worker threads of its own is not covered: every stochastic op draws on the thread that calls it.
     /// </summary>
     internal SeedRecordScope RecordStochasticSeeds(System.Collections.Generic.List<long> into)
     {
@@ -494,6 +495,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    private static int s_shortReplayWarned;
+
     internal readonly struct SeedReplayScope : IDisposable
     {
         private readonly DirectGpuTensorEngine? _previousEngine;
@@ -507,6 +510,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         public void Dispose()
         {
+            // Fewer draws than recorded: the recompute took another path than its forward. Its draws so far were the
+            // forward's, so the result is not wrong by itself, but the mismatch is reported once.
+            if (t_seedReplay is { } replay && t_seedReplayIndex < replay.Count
+                && System.Threading.Interlocked.Exchange(ref s_shortReplayWarned, 1) == 0)
+                System.Diagnostics.Trace.TraceWarning(
+                    $"A replayed forward drew {t_seedReplayIndex} of the {replay.Count} stochastic seeds its recorded run drew.");
             t_seedReplayEngine = _previousEngine;
             t_seedReplay = _previous;
             t_seedReplayIndex = _previousIndex;
@@ -1381,9 +1390,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 if (_persistentBufferCache.TryRemove(array, out var pe))
                 {
-                    // Queued kernels may still read it: freed after them.
-                    if (TryGetBackend(out var owner)) DisposeBufferAfterQueuedUse(owner, pe.Buffer);
-                    else pe.Dispose();
+                    // Queued kernels may still read it: freed after them, on the engine's own backend. Not through
+                    // TryGetBackend: this runs on whatever thread recycled the array, outside any GPU op, where that
+                    // answers a recording wrapper, nothing under GraphMode, or throws under strict leases.
+                    ReleaseAfterQueuedWork(pe.Buffer);
                 }
                 _tensorVersions.TryRemove(array, out _);
                 _persistentWeightHostVersion.TryRemove(array, out _);
@@ -1987,6 +1997,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             DisposeBufferAfterQueuedUse(backend, _state.Buffer);
         }
+    }
+
+    // Frees a buffer of this engine's own (unwrapped) backend after the work already queued on it, from any thread:
+    // a buffer of a backend that is already gone is disposed directly, which checks for a live context itself.
+    private void ReleaseAfterQueuedWork(IGpuBuffer buffer)
+    {
+        if (_directGpu?.Backend is { } own && !IsDisposed)
+        {
+            try
+            {
+                DisposeBufferAfterQueuedUse(CrossBackendTensors.Unwrap(own), buffer);
+                return;
+            }
+            catch (ObjectDisposedException) { /* the backend closed meanwhile: dispose directly below */ }
+        }
+        buffer.Dispose();
     }
 
     private static void DisposeBufferAfterQueuedUse(IDirectGpuBackend backend, IGpuBuffer buffer)

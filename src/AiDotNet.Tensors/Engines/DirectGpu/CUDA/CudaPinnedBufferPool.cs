@@ -107,7 +107,8 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         {
             // The pool is gone: the block is freed while its context lifetime lasts (otherwise that context's
             // destruction already took it back, and a driver call against it would be an access violation).
-            if (CudaBackend.ReleaseHostInLiveContext(ptr, _context, _contextGeneration, unregister: false) == CudaResult.Success
+            if (CudaBackend.HostReleaseReturnedMemory(
+                    CudaBackend.ReleaseHostInLiveContext(ptr, _context, _contextGeneration, unregister: false))
                 && sizeInBytes > 0 && BucketSize(sizeInBytes) <= MaxBucketBytes)
                 GpuMemoryStats.RecordFree("cuda_pinned_host", BucketSize(sizeInBytes));
             return;
@@ -126,8 +127,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         }
         else
         {
-            CuBlasNative.cuMemFreeHost(ptr);
-            GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
+            FreeCounted(ptr, bucketSize);
         }
     }
 
@@ -142,6 +142,14 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         int shift = 0;
         while (value > 0) { value >>= 1; shift++; }
         return 1L << shift;
+    }
+
+    // A block freed while the pool is live (its backend's context current): counted only when the free succeeded.
+    private static void FreeCounted(IntPtr ptr, long bucketSize)
+    {
+        var freed = CuBlasNative.cuMemFreeHost(ptr);
+        if (freed == CudaResult.Success) GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
+        else System.Diagnostics.Trace.TraceWarning("Pinned pool: cuMemFreeHost returned " + freed + "; the block stays counted.");
     }
 
     private static int NextPowerOfTwo(int value)
@@ -164,10 +172,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         foreach (var kvp in _buckets)
         {
             while (kvp.Value.TryPop(out var ptr))
-            {
-                CuBlasNative.cuMemFreeHost(ptr);
-                GpuMemoryStats.RecordFree("cuda_pinned_host", kvp.Key);
-            }
+                FreeCounted(ptr, kvp.Key);
         }
         _buckets.Clear();
     }

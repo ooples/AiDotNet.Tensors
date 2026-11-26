@@ -703,6 +703,7 @@ public static class AiDotNetEngine
     /// <exception cref="InvalidOperationException">Called from inside an op on the engine.</exception>
     public static bool ReleaseGpu(TimeSpan drainTimeout)
     {
+        ReleaseSupersededGpu(null);   // superseded engines whose ops have finished since
         DirectGpuTensorEngine? engine;
         lock (_adoptionLock)
         {
@@ -742,23 +743,40 @@ public static class AiDotNetEngine
         return true;
     }
 
+    // Parked engines another adoption replaced that still had ops running: retried by every later adoption and by
+    // ReleaseGpu, so none is dropped with its context open.
+    private static readonly System.Collections.Generic.List<DirectGpuTensorEngine> _supersededGpus = new();
+
     // A parked engine another adoption replaced (its backend no longer meets RequiredBackend): nothing publishes it, so
-    // it is closed once the ops that read it before the swap have drained. Ops still running after the wait keep it
-    // open, reported, and it is left to its finalizer rather than freed under them.
-    private static void ReleaseSupersededGpu(DirectGpuTensorEngine engine)
+    // it is closed now when no op is using it. It does not wait (the caller may hold the detection lock): one with ops
+    // still running is kept in _supersededGpus and released by a later adoption or ReleaseGpu.
+    private static void ReleaseSupersededGpu(DirectGpuTensorEngine? engine)
     {
-        try
+        System.Collections.Generic.List<DirectGpuTensorEngine> pending;
+        lock (_adoptionLock)
         {
-            if (engine.TryCloseAndDispose(TimeSpan.FromSeconds(5))) return;
-            engine.ReopenAfterTimedOutClose();
-            System.Diagnostics.Trace.TraceWarning(
-                $"[AiDotNet] A superseded GPU engine ({engine.Name}) still had ops running after 5 s; it was not released.");
+            if (engine is not null && !_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
+            pending = new System.Collections.Generic.List<DirectGpuTensorEngine>(_supersededGpus);
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or TimeoutException)
+        foreach (var candidate in pending)
         {
-            System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
+            bool released;
+            try
+            {
+                released = candidate.IsDisposed || candidate.TryCloseAndDispose(TimeSpan.Zero);
+                if (!released) candidate.ReopenAfterTimedOutClose();
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or TimeoutException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
+                released = false;
+            }
+            if (released) lock (_adoptionLock) _supersededGpus.Remove(candidate);
         }
     }
+
+    /// <summary>Superseded engines not yet released because ops were still running on them (tests).</summary>
+    internal static int SupersededGpusPendingForTests { get { lock (_adoptionLock) return _supersededGpus.Count; } }
 
     // Puts an engine whose release did not happen back in the parked slot, unless another adoption took it meanwhile.
     private static void Repark(DirectGpuTensorEngine engine)
@@ -791,6 +809,15 @@ public static class AiDotNetEngine
 
     /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
     internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
+
+    /// <summary>Opens the circuit breaker without the demotion a device fault performs (tests).</summary>
+    internal static void OpenGpuCircuitBreakerForTests() => _gpuCircuitBroken = true;
+
+    /// <summary>Parks <paramref name="engine"/> as the engine an earlier adoption left (tests).</summary>
+    internal static void ParkGpuForTests(DirectGpuTensorEngine? engine)
+    {
+        lock (_adoptionLock) _adoptedGpu = engine;
+    }
 
     // An engine detection would reuse (the current one, a parked one, or another thread's) runs on the required backend,
     // if one is required: reusing a CUDA engine while HIP is required is the silent substitution the option forbids.
@@ -835,6 +862,19 @@ public static class AiDotNetEngine
                     PublishCurrent(new CpuEngine());
                     // The library installed this CPU engine, even when the GPU it replaced was the caller's.
                     Volatile.Write(ref _callerAssigned, false);
+                }
+            }
+            // A required backend: the CPU engine just published must not be handed out as if it met the requirement.
+            // Current owes a detection again, which rethrows this failure (CompleteDeferredGpuDetection).
+            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var required && required != GpuBackendType.None)
+            {
+                lock (_deferredLock)
+                {
+                    var tripped = new InvalidOperationException(
+                        $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}, but the GPU circuit "
+                        + $"breaker tripped on {operation} (CUDA error {cudaErrorCode}): the GPU cannot be used again in this process.");
+                    _requiredDetectionFailure = (System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tripped), required);
+                    Volatile.Write(ref _deferredDetection, 1);
                 }
             }
         }

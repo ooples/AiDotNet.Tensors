@@ -432,7 +432,8 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     private void DestroyUpdateGraph(Engines.DirectGpuTensorEngine? gte)
     {
-        if (_updateGraphExec != IntPtr.Zero && gte is not null) gte.DestroyGpuGraph(_updateGraphExec);
-        _updateGraphExec = IntPtr.Zero;
+        var update = _updateGraphExec;
+        _updateGraphExec = IntPtr.Zero;   // cleared first: a destroy that throws must not leave it to be destroyed again
+        if (update != IntPtr.Zero && gte is not null) gte.DestroyGpuGraph(update);
     }
 }

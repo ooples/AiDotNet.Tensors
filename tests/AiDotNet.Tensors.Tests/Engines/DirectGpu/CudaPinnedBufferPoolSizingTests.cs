@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using Xunit;
 
@@ -39,19 +40,47 @@ public class CudaPinnedBufferPoolSizingTests
         Assert.Throws<ArgumentOutOfRangeException>(() => pool.Rent(request));
     }
 
-    // After the pool is disposed, a returned block is freed only in a live context lifetime. A pool bound to none (or
-    // to one that was destroyed) makes no driver call and changes no accounting: the context's destruction took the
-    // memory back. Before, it called cuMemFreeHost regardless and recorded the free.
-    [Fact]
-    public void Return_AfterDispose_WithoutALiveContext_MakesNoDriverCall()
+    // After the pool is disposed, a returned block is freed only in a live context lifetime; when that context is
+    // gone it took the block, so the block is no longer counted either way. Before, a skipped release left it counted.
+    [SkippableFact]
+    public void Return_AfterDispose_UncountsTheBlock_WhetherFreedOrTakenByTheContext()
     {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        var owner = new CudaBackend();
+        IntPtr context = owner.ContextHandle;
+        long generation = owner.ContextGeneration;
         var pool = new CudaPinnedBufferPool();
-        pool.BindContext((IntPtr)0x1234, generation: long.MaxValue);   // never a registered generation
+        pool.BindContext(context, generation);
+        IntPtr block;
+        Assert.Equal(CudaResult.Success, CuBlasNative.cuCtxPushCurrent(context));
+        try { block = pool.Rent(4096); }
+        finally { CuBlasNative.cuCtxPopCurrent(out _); }
         pool.Dispose();
+        owner.Dispose();
         long before = PinnedCurrent();
-        pool.Return((IntPtr)0x1000, 4096);   // not a real block: a driver free of it would fail or fault
-        Assert.Equal(before, PinnedCurrent());
-        Assert.Null(CudaBackend.ReleaseHostInLiveContext((IntPtr)0x1000, (IntPtr)0x1234, long.MaxValue, unregister: false));
+        pool.Return(block, 4096);
+        Assert.Equal(before - 4096, PinnedCurrent());
+    }
+
+    // A free that fails (here: an address that is no block) leaves the block counted, in the full-bucket branch.
+    [SkippableFact]
+    public void Return_ToAFullBucket_CountsAFreeOnlyWhenItSucceeded()
+    {
+        Skip.IfNot(CudaBackend.IsCudaAvailable, "CUDA driver or NVRTC is unavailable.");
+        using var keeper = new CudaBackend();
+        using var pool = new CudaPinnedBufferPool();
+        pool.BindContext(keeper.ContextHandle, keeper.ContextGeneration);
+        Assert.Equal(CudaResult.Success, CuBlasNative.cuCtxPushCurrent(keeper.ContextHandle));
+        try
+        {
+            var blocks = new IntPtr[8];
+            for (int i = 0; i < blocks.Length; i++) blocks[i] = pool.Rent(4096);
+            foreach (var b in blocks) pool.Return(b, 4096);   // the bucket is full
+            long before = PinnedCurrent();
+            pool.Return((IntPtr)0x1000, 4096);   // not a block: its free fails
+            Assert.Equal(before, PinnedCurrent());
+        }
+        finally { CuBlasNative.cuCtxPopCurrent(out _); }
     }
 
     private static long PinnedCurrent()

@@ -216,6 +216,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     internal IntPtr ContextHandle => _cudaContext;
     private int _cuDevice;   // the CUdevice whose primary context this backend holds
     private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts, AddContextHolder)
+    /// <summary>This backend's context registration generation (see LiveContexts).</summary>
+    internal long ContextGeneration => _contextGeneration;
 
     /// <summary>True while this backend's CUDA context has not been destroyed (engine disposal destroys it; the
     /// backend object and its buffers can outlive it). Anything that would touch the device - a download included -
@@ -6257,8 +6259,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // the stream's earlier work: correct, but without overlap, so it says so once.
     private static int s_unpooledTransferWarned;
 
+    /// <summary>How many transfers took the unpooled synchronous path (tests).</summary>
+    internal static long UnpooledTransferCount;
+
     private static void WarnUnpooledTransfer(long byteCount)
     {
+        Interlocked.Increment(ref UnpooledTransferCount);
         if (Interlocked.Exchange(ref s_unpooledTransferWarned, 1) == 0)
             System.Diagnostics.Trace.TraceWarning($"CUDA: a {byteCount}-byte host transfer exceeds a pooled pinned block "
                 + $"({CudaPinnedBufferPool.MaxBucketBytes} bytes); it is copied synchronously, without overlap.");
@@ -6267,19 +6273,27 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private unsafe void UploadUnpooled(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream, long byteCount)
     {
         WarnUnpooledTransfer(byteCount);
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled upload)");
+        // Queued on the caller's stream (ordered after its work, whatever its flags) and waited for before the array
+        // is unpinned: a pageable copy on the legacy stream may return before its DMA lands.
         fixed (float* src = data)
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, (ulong)byteCount),
-                "cuMemcpyHtoD(unpooled upload)");
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyHtoDAsync(buffer.Handle, (IntPtr)src, (ulong)byteCount, stream.Handle),
+                "cuMemcpyHtoDAsync(unpooled upload)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled upload)");
+        }
     }
 
     private unsafe void DownloadUnpooled(IGpuBuffer buffer, float[] destination, IGpuStream stream, long byteCount)
     {
         WarnUnpooledTransfer(byteCount);
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled download)");
         fixed (float* dst = destination)
-            CuBlasNative.CheckCudaResult(CuBlasNative.cuMemcpyDtoH((IntPtr)dst, buffer.Handle, (ulong)byteCount),
-                "cuMemcpyDtoH(unpooled download)");
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyDtoHAsync((IntPtr)dst, buffer.Handle, (ulong)byteCount, stream.Handle),
+                "cuMemcpyDtoHAsync(unpooled download)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled download)");
+        }
     }
 
     /// <inheritdoc/>

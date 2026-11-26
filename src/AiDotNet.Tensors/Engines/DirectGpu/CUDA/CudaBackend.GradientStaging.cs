@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
+using System.Threading;
 using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -33,14 +34,28 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
     /// destroyed context, or during teardown, is an access violation no catch traps. Returns null when it was skipped
     /// (the context's destruction, or the process's exit, takes the memory back).
     /// </summary>
+    /// <summary>Releases skipped because their context was gone or the runtime was tearing down (tests).</summary>
+    internal static long HostReleasesSkipped;
+
+    /// <summary>Releases that reached the driver (tests).</summary>
+    internal static long HostReleasesAttempted;
+
+    /// <summary>
+    /// Whether a release's bytes are gone from the process: freed, or skipped because the context (or the process)
+    /// took them. Accounting decrements on either; a failed free leaves them counted.
+    /// </summary>
+    internal static bool HostReleaseReturnedMemory(CudaResult? released) => released is null || released == CudaResult.Success;
+
     internal static CudaResult? ReleaseHostInLiveContext(IntPtr host, IntPtr context, long generation, bool unregister)
     {
-        if (host == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return null;
+        if (host == IntPtr.Zero) return null;
+        if (IsRuntimeTearingDown || ProcessExiting) { Interlocked.Increment(ref HostReleasesSkipped); return null; }
         lock (ContextLifecycleLock)   // no destroy between the check and the call
         {
-            if (!IsLiveContext(context, generation)) return null;
+            if (!IsLiveContext(context, generation)) { Interlocked.Increment(ref HostReleasesSkipped); return null; }
             var pushed = CuBlasNative.cuCtxPushCurrent(context);
             if (pushed != CudaResult.Success) return pushed;
+            Interlocked.Increment(ref HostReleasesAttempted);
             try { return unregister ? CudaNativeBindings.cuMemHostUnregister(host) : CuBlasNative.cuMemFreeHost(host); }
             finally { CuBlasNative.cuCtxPopCurrent(out _); }
         }
@@ -173,7 +188,7 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
             var released = ReleaseHostInLiveContext(host, _context, _contextGeneration, _registered);
             if (released is { } result && result != CudaResult.Success)
                 System.Diagnostics.Trace.TraceWarning("Gradient staging: releasing the page-locked memory returned " + result + ".");
-            if (!_registered && released == CudaResult.Success)
+            if (!_registered && HostReleaseReturnedMemory(released))
                 GpuMemoryStats.RecordFree("cuda_pinned_host", (long)_floats * sizeof(float));
         }
     }

@@ -199,4 +199,47 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             AiDotNetEngine.Current = previous;
         }
     }
+
+    /// <summary>
+    /// A captured step graph copies the device loss-gradient seed into the loss gradient in its prologue. A scale the
+    /// host advanced (a step unscaled without a device scaler, the gradient-exchange path) was not written back to that
+    /// seed, so the next replay scaled the gradients by the old scale while the unscale divided by the new one.
+    /// </summary>
+    [SkippableFact]
+    public void A_host_side_scale_change_rewrites_the_device_seed_a_captured_graph_reads()
+    {
+        SkipUnlessAvailable(onGpu: true);
+        var engine = _fixture.Engine!;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Data(In * Out, 0.37, 0.1))).Gpu();
+            var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(Data(Rows * In, 0.21, 0.3)));
+            var ct = new Tensor<float>(new[] { Rows, Out }, new Vector<float>(Data(Rows * Out, 0.13, 0.7)));
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.ReduceSum(engine.TensorMultiply(engine.Tanh(engine.TensorMatMul(x, w)), ct), null);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.01f);
+                ((ICompiledTrainingPlanLossScaling)plan).ConfigureLossScaling(new LossScalingOptions { InitialScale = 1024f });
+                for (int s = 0; s < 3; s++) plan.Step();
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                Skip.If(compiled.ReadDeviceLossSeedForTests() is null, "The loss-gradient seed is not on the device.");
+
+                float backedOff = compiled.AdvanceHostLossScaleForTests(nonFinite: true);
+                Assert.Equal(512f, backedOff);
+                var seed = compiled.ReadDeviceLossSeedForTests()!;
+                Assert.All(seed, v => Assert.Equal(backedOff, v));
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
 }

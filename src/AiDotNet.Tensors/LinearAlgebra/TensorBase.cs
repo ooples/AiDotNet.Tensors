@@ -226,6 +226,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         internal StreamingInt4Weight? StreamingInt4;
         internal IDisposable? StreamingMmapOwner;
         internal object? StreamingTransitionGate;
+        // The array a streaming drop orphaned, handed to the device caches once the gate is released.
+        internal object? OrphanedByStreamingDrop;
         internal long StreamingPoolHandle = -1;
         internal long StreamingReservedBytes;
         internal bool StreamingDropDeferred;
@@ -730,7 +732,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// A failed soft drop leaves the original storage untouched for a later retry.</returns>
     internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
     {
-        lock (StreamingTransitionGate) return TryDropStorageForStreamingGated(throwOnSharedRefcount);
+        bool dropped;
+        lock (StreamingTransitionGate) dropped = TryDropStorageForStreamingGated(throwOnSharedRefcount);
+        ReleaseDeviceCopiesOfOrphanedArray();
+        return dropped;
+    }
+
+    /// <summary>
+    /// After a streaming drop, outside the transition gate: the array the drop orphaned (nothing else can read it: the
+    /// same test the restore pool applies) may still have a device copy an engine cached under it, the fp32 weight
+    /// buffer a GPU forward uploaded before the weight was streamed. Releasing it here keeps the engines' locks out of
+    /// the gate; the caller may still hold the weight registry's lock, so the order is registry, then engine caches.
+    /// </summary>
+    private void ReleaseDeviceCopiesOfOrphanedArray()
+    {
+        var cold = _cold;
+        if (cold is null) return;
+        var orphaned = System.Threading.Interlocked.Exchange(ref cold.OrphanedByStreamingDrop, null);
+        if (orphaned is null) return;
+        try { Helpers.PooledArrayRecycling.Notify(orphaned); }
+        catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming drop: releasing device copies failed: {0}", error); }
     }
 
     // Serializes this tensor's streaming write-back against its drop. Without it, a write-back reading the resident
@@ -775,7 +796,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         finally
         {
-            if (taken) System.Threading.Monitor.Exit(gate);
+            if (taken)
+            {
+                System.Threading.Monitor.Exit(gate);
+                ReleaseDeviceCopiesOfOrphanedArray();
+            }
         }
     }
 
@@ -840,14 +865,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _storage = replacementStorage;
         InvalidateGpuBindingAfterStorageReplacement();
         // A device copy an engine cached under the dropped array (the fp32 weight buffer a GPU forward uploaded before
-        // the weight was streamed, a layer's lazy-init forward for one) belongs to that array, not to the store: release
-        // it, or every streamed weight keeps its full-precision device copy for the engine's life, outside any budget.
-        try
-        {
-            if (claimedStorage.TryGetBackingArrayIdentity(out var droppedArray, out _) && droppedArray is not null)
-                Helpers.PooledArrayRecycling.Notify(droppedArray);
-        }
-        catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming drop: releasing device copies failed: {0}", error); }
+        // the weight was streamed, a layer's lazy-init forward for one) belongs to that array, not to the store: it is
+        // released once the gate is (ReleaseDeviceCopiesOfOrphanedArray), or every streamed weight keeps its
+        // full-precision device copy for the engine's life, outside any budget. Only an array nothing else can read:
+        // checked before the restore pool can take it.
+        if (OrphanedArray(claimedStorage, droppedData) is { } orphaned) Cold().OrphanedByStreamingDrop = orphaned;
         // Reclamation must not turn a successful storage swap into a failed transaction.
         try { claimedStorage.DisposeClaimedOwners(); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming storage cleanup failed: {0}", error); }
@@ -863,15 +885,31 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// downloaded into it. The pool itself only takes arrays a restore created, and holds them back until no
     /// gradient tape is active.
     /// </summary>
+    // The dropped array when nothing else can still read it: the claimed storage was the only one wrapping it, it spans
+    // the whole array (not a segment of a larger, shared one), and no GPU result is still due to be downloaded into it.
+    private T[]? OrphanedArray(TensorStorage<T> claimedStorage, Vector<T> droppedData)
+    {
+        try
+        {
+            if (System.Threading.Volatile.Read(ref droppedData.LiveStorages) != 1) return null;
+            if (!claimedStorage.TryGetBackingArrayIdentity(out var array, out int offset) || array is null) return null;
+            if (offset != 0 || array.Length != Length) return null;
+            if (Helpers.HostSync.IsPending(array)) return null;
+            return array;
+        }
+        catch (Exception error)
+        {
+            System.Diagnostics.Trace.TraceWarning("Streaming drop: ownership check failed: {0}", error);
+            return null;
+        }
+    }
+
     private void ParkDroppedRestoreArray(TensorStorage<T> claimedStorage, Vector<T> droppedData)
     {
         try
         {
             if (!StreamingRestoreBuffers<T>.Supported) return;
-            if (System.Threading.Volatile.Read(ref droppedData.LiveStorages) != 1) return;
-            if (!claimedStorage.TryGetBackingArrayIdentity(out var array, out int offset) || array is null) return;
-            if (offset != 0 || array.Length != Length) return;
-            if (Helpers.HostSync.IsPending(array)) return;
+            if (OrphanedArray(claimedStorage, droppedData) is not { } array) return;
             StreamingRestoreBuffers<T>.Park(array);
         }
         catch (Exception error)

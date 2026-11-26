@@ -105,7 +105,7 @@ public sealed partial class CudaBackend : IOverlappedUploadBackend
         CudaNativeBindings.cuStreamSynchronize(_stream);
         foreach (var slot in target.Slots)
         {
-            if (slot.Pinned != IntPtr.Zero) CuBlasNative.cuMemFreeHost(slot.Pinned);
+            ReleaseHostInLiveContext(slot.Pinned, _cudaContext, _contextGeneration, unregister: false);
             slot.Staging?.Dispose();
             if (slot.Uploaded != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(slot.Uploaded);
             if (slot.Consumed != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(slot.Consumed);
