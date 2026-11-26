@@ -52,7 +52,7 @@ internal sealed partial class CompiledTrainingPlan<T> : IInferencePrivateGradien
         && _engine.Unwrap().GetType() == typeof(DirectGpuTensorEngine)
         && _workspaceExplicitGraphDisable && !_graphPreparationStarted && _graphStepDisabled
         && _graphStepEligible && !HasLiveStepGraph && _residentBodyRanLast && !_residentStepFailed
-        && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null
+        && _dataForwardReplay is null && _checkpointing is null && _checkpoint is null
         && !_isFrozenWeights && _lastBackwardReads is not null && _forwardSteps is not null
         && _scratchPool is not null && !_scratchPool.HasOutstandingWorkspaceLeases
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers;

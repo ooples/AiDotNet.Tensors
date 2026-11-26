@@ -134,6 +134,26 @@ internal static class GpuNarrowFloatLayout
     /// and no buffer is typed as the other 16-bit float type or holds fewer than its share of elements. A raw byte
     /// buffer carries no element type and is checked against its byte capacity.
     /// </summary>
+    /// <summary>
+    /// The argument check of <see cref="IGpuNarrowFloatRounding.RoundToNarrowFloat"/>: a 16-bit float type and two
+    /// buffers that each hold <paramref name="count"/> 32-bit floats.
+    /// </summary>
+    public static void RequireRounding(GpuElementType type, IGpuBuffer source, IGpuBuffer destination, int count)
+    {
+        if (!IsNarrowFloat(type))
+            throw new System.ArgumentException($"Rounding is to a 16-bit float type, got {type}.", nameof(type));
+        if (source is null) throw new System.ArgumentNullException(nameof(source));
+        if (destination is null) throw new System.ArgumentNullException(nameof(destination));
+        if (count < 0) throw new System.ArgumentOutOfRangeException(nameof(count), $"A negative element count ({count}).");
+        long bytes = (long)count * sizeof(float);
+        if (bytes > source.SizeInBytes)
+            throw new System.ArgumentOutOfRangeException(nameof(count),
+                $"{count} floats are outside a source buffer of {source.SizeInBytes} bytes.");
+        if (bytes > destination.SizeInBytes)
+            throw new System.ArgumentOutOfRangeException(nameof(count),
+                $"{count} floats are outside a destination buffer of {destination.SizeInBytes} bytes.");
+    }
+
     public static void Require(string operation, GpuElementType type, int count, params (IGpuBuffer Buffer, int Elements)[] buffers)
     {
         if (!IsNarrowFloat(type))

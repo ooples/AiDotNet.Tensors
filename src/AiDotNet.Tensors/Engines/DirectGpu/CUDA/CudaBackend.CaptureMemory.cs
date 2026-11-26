@@ -45,6 +45,8 @@ public sealed partial class CudaBackend
 
         internal bool IsRetired { get { lock (_lock) return _parked is null; } }
 
+        internal int ParkedCount { get { lock (_lock) return _parked?.Count ?? 0; } }
+
         /// <summary>True when the capture used no buffer at all (nothing to keep alive).</summary>
         internal bool IsEmpty { get { lock (_lock) return _parked is { Count: 0 } && _pinned is { Count: 0 }; } }
 
@@ -101,6 +103,52 @@ public sealed partial class CudaBackend
             return Current is { } capturing && capturing.TryPark(release);
         }
 
+        // Memory this capture allocated and released while still capturing, for its later allocations (by capacity).
+        private readonly SortedDictionary<int, Stack<CudaGpuBuffer>> _free = new();
+        private long _freeBytes;
+
+        /// <summary>Bytes released within the capture and not handed out again (diagnostics).</summary>
+        internal long FreeBytes { get { lock (_lock) return _freeBytes; } }
+
+        /// <summary>Keeps <paramref name="lease"/> (a released capture allocation) for this capture's later allocations;
+        /// false once retired (the caller releases it).</summary>
+        internal bool TryAddFree(CudaGpuBuffer lease)
+        {
+            lock (_lock)
+            {
+                if (_parked is null) return false;
+                if (!_free.TryGetValue(lease.Capacity, out var stack)) _free[lease.Capacity] = stack = new Stack<CudaGpuBuffer>();
+                stack.Push(lease);
+                _freeBytes += (long)lease.Capacity * sizeof(float);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// The smallest memory this capture released that holds <paramref name="size"/> elements, at most twice that
+        /// (so a small request does not strand a large block), rented at that size; null when there is none.
+        /// </summary>
+        internal CudaGpuBuffer? TryRentFree(int size)
+        {
+            CudaGpuBuffer? lease = null;
+            lock (_lock)
+            {
+                if (_parked is null || _free.Count == 0) return null;
+                long limit = 2L * size;
+                foreach (var entry in _free)
+                {
+                    if (entry.Key < size) continue;
+                    if (entry.Key > limit) break;
+                    lease = entry.Value.Pop();
+                    if (entry.Value.Count == 0) _free.Remove(entry.Key);
+                    _freeBytes -= (long)lease.Capacity * sizeof(float);
+                    break;
+                }
+            }
+            lease?.MarkRented(size);
+            return lease;
+        }
+
         /// <summary>The buffers pinned so far (empty once retired).</summary>
         internal object[] PinnedSnapshot()
         {
@@ -111,16 +159,28 @@ public sealed partial class CudaBackend
         internal void Retire()
         {
             List<Action>? parked;
+            var free = new List<CudaGpuBuffer>();
             lock (_lock)
             {
                 parked = _parked;
                 _parked = null;
                 _pinned = null;
+                foreach (var stack in _free.Values) free.AddRange(stack);
+                _free.Clear();
+                _freeBytes = 0;
             }
             if (parked is null) return;
             foreach (var release in parked)
             {
-                try { release(); } catch { /* one buffer's free must not strand the rest */ }
+                // One buffer's free must not strand the rest.
+                try { release(); }
+                catch (Exception ex) { System.Diagnostics.Trace.TraceWarning($"A capture's parked buffer could not be freed: {ex.GetType().Name}."); }
+            }
+            // Memory released within the capture and never handed out again goes with the graph.
+            foreach (var lease in free)
+            {
+                try { lease.Release(); }
+                catch (Exception ex) { System.Diagnostics.Trace.TraceWarning($"A capture's released memory could not be freed: {ex.GetType().Name}."); }
             }
         }
     }
@@ -166,6 +226,25 @@ public sealed partial class CudaBackend
             s_graphMemoryPools[graphExec] = pool;
         }
         previous?.Retire();
+    }
+
+    // Pools of graphs dropped on a context the circuit breaker found corrupted. Kept reachable on purpose: their
+    // buffers' finalizers would otherwise queue frees that a later context push drains into that context.
+    private static readonly List<CaptureMemoryPool> s_forgottenGraphMemoryPools = new();
+
+    // Drops a captured graph from the tracking without any native call, for a context the circuit breaker found
+    // corrupted: a destroy or free there can fault the process, and the exit of the process reclaims the memory. Its
+    // pins are kept too (releasing one can unload a module), and its pool stays rooted (see above).
+    private void ForgetCapturedGraph(IntPtr graphExec)
+    {
+        lock (s_graphMemoryLock)
+        {
+            if (s_graphMemoryPools.TryGetValue(graphExec, out var pool))
+            {
+                s_graphMemoryPools.Remove(graphExec);
+                s_forgottenGraphMemoryPools.Add(pool);
+            }
+        }
     }
 
     private static void RetireGraphMemoryPool(IntPtr graphExec)
@@ -221,12 +300,33 @@ public sealed partial class CudaBackend
         foreach (var pool in pools) pool.Retire();
     }
 
+    private static bool s_captureMemoryDiag => global::AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.GraphStepTraceEnabled;
+
+    /// <summary>Diagnostic: what a capture pinned -- memory it allocated vs memory that existed before it.</summary>
+    private void LogCaptureMemory(CaptureMemoryPool pool)
+    {
+        long allocatedCount = 0, allocatedBytes = 0, existingCount = 0, existingBytes = 0;
+        foreach (var pinned in pool.PinnedSnapshot())
+        {
+            if (pinned is not IGpuBuffer buffer) continue;
+            bool inCapture = buffer is CudaGpuBuffer cb && cb.AllocatedInCapture;
+            if (inCapture) { allocatedCount++; allocatedBytes += buffer.SizeInBytes; }
+            else { existingCount++; existingBytes += buffer.SizeInBytes; }
+        }
+        AiDotNet.Tensors.Engines.AiDotNetEngine.LogDiagnostic(
+            $"[CAPTURE-MEM] allocated_in_capture={allocatedCount} bytes={allocatedBytes} " +
+            $"pinned_existing={existingCount} bytes={existingBytes} parked_releases={pool.ParkedCount} " +
+            $"reusable_free_bytes={pool.FreeBytes}");
+    }
+
     /// <summary>
     /// Runs a capture body with a fresh graph-private pool, then gives the pool to the graph the body produced
     /// (<paramref name="graphOf"/> returns it), or retires the pool at once when no graph survives.
     /// </summary>
     private TResult CaptureWithPrivateMemory<TResult>(Func<TResult> body, Func<TResult, IntPtr> graphOf)
     {
+        // Before the pool opens: moved loans get ordinary memory, not graph-private memory.
+        SuspendIdleLoans();
         var pool = new CaptureMemoryPool();
         bool attached = false;
         try
@@ -245,6 +345,7 @@ public sealed partial class CudaBackend
                 CaptureMemoryPool.Current = previous;
             }
             IntPtr graphExec = graphOf(result);
+            if (s_captureMemoryDiag) LogCaptureMemory(pool);
             if (graphExec != IntPtr.Zero && !pool.IsEmpty)
             {
                 AttachGraphMemoryPool(graphExec, pool);
@@ -255,6 +356,7 @@ public sealed partial class CudaBackend
         finally
         {
             if (!attached) pool.Retire();
+            ResumeIdleLoans();
         }
     }
 }

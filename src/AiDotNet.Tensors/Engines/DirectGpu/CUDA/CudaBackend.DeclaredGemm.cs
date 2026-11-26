@@ -202,6 +202,8 @@ public sealed partial class CudaBackend
     private bool? TryDeclaredGemmBiasActivation(IGpuBuffer a, IGpuBuffer w, IGpuBuffer bias, IGpuBuffer c, int m, int n,
         int k, bool relu)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return null;
         if (!s_declaredKernels || !DeclaredKernelsEnabled || m <= 0 || n <= 0 || k <= 0) return null;
         var args = new CudaGemmArgs(DeclaredFamily.Gemm, a, w, c, 1, m, n, k);
         var chosen = GemmSlot.Resolve(args.Shape(), args);
@@ -270,6 +272,8 @@ public sealed partial class CudaBackend
     private bool TryDeclaredGemm(DeclaredFamily family, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int batch, int m, int n,
         int k, float alpha, float beta)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (alpha != 1f || beta != 0f || batch <= 0 || m <= 0 || n <= 0 || k <= 0 ||
             !s_declaredKernels || !DeclaredKernelsEnabled)
             return false;

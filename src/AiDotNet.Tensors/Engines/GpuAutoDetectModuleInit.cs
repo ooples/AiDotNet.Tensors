@@ -66,9 +66,9 @@ internal static class GpuAutoDetectModuleInit
             // want CPU (numerical reproducibility, fp64 on consumer GPUs
             // that throttle double precision, benchmarking baselines)
             // set this before process startup.
-            var disable = Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU");
-            if (!string.IsNullOrEmpty(disable))
-                return;
+            // Set, the detection is still owed rather than skipped: the first read of Current runs it, and it returns
+            // at once on the variable, unless GpuBackendOptions.RequiredBackend was set by then, which it refuses
+            // instead of handing out the CPU engine the requirement rules out.
 
             // AutoDetectAndConfigureGpu already wraps DirectGpuTensorEngine
             // construction in try/catch and falls back to CPU on failure,

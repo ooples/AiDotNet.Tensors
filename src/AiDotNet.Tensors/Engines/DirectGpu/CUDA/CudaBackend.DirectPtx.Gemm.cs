@@ -29,6 +29,8 @@ public sealed partial class CudaBackend
     internal bool TryDirectPtxGemm(
         IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int k, int n)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!IsDirectPtxFusedLinearEnabled) return false;
         if (!PtxGemmKernel.IsSupportedShape(m, k, n))
         {

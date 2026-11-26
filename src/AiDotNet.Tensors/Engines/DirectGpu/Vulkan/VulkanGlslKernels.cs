@@ -1460,15 +1460,23 @@ void main() {
         for (uint i = 0u; i < size; ++i) value += a[i];
         b[0] = value;
     } else if (op == 1u) {
-        // The CPU scan, exact on the bits (ExactFloatKernels): from -inf, take a value only when strictly greater, so a
-        // NaN is skipped and an all-NaN input gives -inf. max() flushed subnormals and its seed was -3.4e38, not -inf.
+        // Exact on the bits (ExactFloatKernels): from -inf, take a value only when strictly greater; a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels.
+        // max() flushed subnormals and its seed was -3.4e38, not -inf.
         uint value = 0xFF800000u;
-        for (uint i = 0u; i < size; ++i) { uint v = floatBitsToUint(a[i]); if (xf_gt(v, value)) value = v; }
-        b[0] = uintBitsToFloat(value);
+        bool sawNaN = false;
+        for (uint i = 0u; i < size; ++i) {
+            uint v = floatBitsToUint(a[i]);
+            if (xf_isnan(v)) sawNaN = true; else if (xf_gt(v, value)) value = v;
+        }
+        b[0] = uintBitsToFloat(sawNaN ? 0xFFC00000u : value);
     } else if (op == 2u) {
         uint value = 0x7F800000u;
-        for (uint i = 0u; i < size; ++i) { uint v = floatBitsToUint(a[i]); if (xf_lt(v, value)) value = v; }
-        b[0] = uintBitsToFloat(value);
+        bool sawNaN = false;
+        for (uint i = 0u; i < size; ++i) {
+            uint v = floatBitsToUint(a[i]);
+            if (xf_isnan(v)) sawNaN = true; else if (xf_lt(v, value)) value = v;
+        }
+        b[0] = uintBitsToFloat(sawNaN ? 0xFFC00000u : value);
     } else if (op == 3u) {
         float mean = 0.0;
         for (uint i = 0u; i < size; ++i) mean += a[i];
@@ -1518,10 +1526,14 @@ void main() {
     uint outer = gl_GlobalInvocationID.x;
     if (outer >= outerSize) return;
     // The CPU ReduceMax scan, exact on the bits: from -inf (not -3.4e38), take a value only when strictly greater, so
-    // a NaN is skipped, an all-NaN row gives -inf, and the first of equal maxima (-0 before +0) is kept.
+    // the first of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result.
     uint value = 0xFF800000u;
     uint offset = outer * reduceSize;
-    for (uint j = 0u; j < reduceSize; ++j) { uint v = floatBitsToUint(a[offset + j]); if (xf_gt(v, value)) value = v; }
+    for (uint j = 0u; j < reduceSize; ++j) {
+        uint v = floatBitsToUint(a[offset + j]);
+        if (xf_isnan(v)) { value = v; break; }
+        if (xf_gt(v, value)) value = v;
+    }
     b[outer] = uintBitsToFloat(value);
 }";
 

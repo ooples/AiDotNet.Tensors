@@ -2925,6 +2925,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <inheritdoc/>
         public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
+            // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+            using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -2980,6 +2982,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
         {
+            // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+            using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -3272,6 +3276,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
         {
+            // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+            using var autocast = _gemmAutocast.Round(this, ref A, (long)batchCount * M * K, ref B, (long)batchCount * K * N);
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -3695,6 +3701,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, int mode,
             float alpha = 0f)
         {
+            // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+            using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
             var C = AllocateBuffer(M * N);
             try
             {
@@ -4562,13 +4570,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float Max(IGpuBuffer A, int size)
         {
-            return ReduceScalar("reduce_max", A, size, float.MinValue);
+            return CanonicalNaN(ReduceScalar("reduce_max", A, size, float.MinValue));
         }
 
         public float Min(IGpuBuffer A, int size)
         {
-            return ReduceScalar("reduce_min", A, size, float.MaxValue);
+            return CanonicalNaN(ReduceScalar("reduce_min", A, size, float.MaxValue));
         }
+
+        // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU. The kernel writes it for every range it
+        // reduces, but a single element needs no pass and came back as the element itself, payload included.
+        private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
 
         private float ReduceScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
         {
@@ -5376,6 +5388,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void GemmAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
             float alpha, float beta, IGpuStream stream)
         {
+            // Matmul autocast rounds the operands on the backend's own queue, which a GEMM on another stream's queue
+            // would not be ordered after: under a casting scope the product runs in order, on that queue.
+            if (_gemmAutocast.CastType is not null)
+            {
+                Gemm(A, B, C, M, N, K, alpha, beta);
+                return;
+            }
+
             if (_context == null)
                 throw new GpuCapabilityUnavailableException("OpenCL context not available");
 
@@ -7321,7 +7341,7 @@ KERNEL VARIANTS (A/B testing):
                 int tileInW = TILE_OUT * strideW + (kernelW - 1) * dilationW;
                 int sharedMemSize = tileInH * tileInW * sizeof(float);
                 k.SetLocalArg(arg++, sharedMemSize);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle); // no bias: the epilogue flags are 0 (the filter stands in; see ConvEpilogueBias)
                 k.SetArg(arg++, 0);
 
                 int numTilesX = (outWidth + TILE_OUT - 1) / TILE_OUT;
@@ -7351,7 +7371,7 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, padW);
                 k.SetArg(arg++, dilationH);
                 k.SetArg(arg++, dilationW);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle); // no bias: the epilogue flags are 0 (the filter stands in; see ConvEpilogueBias)
                 k.SetArg(arg++, 0);
 
                 k.ExecutePlanes(outWidth, outHeight, batch * outChannels);
@@ -9175,7 +9195,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
             k.SetArg(arg++, size);
             k.SetArg(arg++, dropoutRate);
-            k.SetArg(arg++, seed);
+            k.SetArg(arg++, GpuSeed.Mix(seed));
             k.SetArg(arg++, training ? 1 : 0);
 
             k.Execute1D(size, Math.Min(256, size));

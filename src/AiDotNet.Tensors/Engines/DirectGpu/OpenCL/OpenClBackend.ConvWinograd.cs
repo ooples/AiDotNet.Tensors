@@ -375,7 +375,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             var kernel = WinogradKernel(WinogradF23KernelTemplate.Output, m, y);
             uint arg = 2;
-            kernel.SetArg(arg++, BufferHandle(bias ?? y));
+            kernel.SetArg(arg++, BufferHandle(bias ?? m));
             kernel.SetArg(arg++, n); kernel.SetArg(arg++, k); kernel.SetArg(arg++, outH); kernel.SetArg(arg++, outW);
             kernel.SetArg(arg++, tilesH); kernel.SetArg(arg++, tilesW); kernel.SetArg(arg++, epilogue);
             RunWinograd(kernel, (long)k * n * tilesH * tilesW);

@@ -293,6 +293,24 @@ internal sealed partial class StepScratchPool
         foreach (var buffer in Transient.Values) result.Remove(buffer);
     }
 
+    /// <summary>
+    /// The buffers idle between two runs of a captured step: forward output slots (as
+    /// <see cref="CollectTransferableForwardSlots"/>), the transient scratch and the free leased buffers. Every one is
+    /// written by the step before the step reads it, so between runs nothing reads it. A buffer held by a lease, a span
+    /// lease or a slot outside that set is left out.
+    /// </summary>
+    internal void CollectIdleBetweenRuns(int forwardActions, Func<IGpuBuffer, bool> eligible, HashSet<IGpuBuffer> result)
+    {
+        CollectTransferableForwardSlots(forwardActions, eligible, result);
+        foreach (var buffer in Transient.Values) if (eligible(buffer)) result.Add(buffer);
+        foreach (var buffer in _free) if (eligible(buffer)) result.Add(buffer);
+        foreach (var slot in Slots)
+            if ((int)(slot.Key >> 32) >= forwardActions || _pinned.Contains(slot.Key)) result.Remove(slot.Value);
+        foreach (var (_, buffer) in _leases) result.Remove(buffer);
+        foreach (var buffer in _spanning.Keys) result.Remove(buffer);
+        foreach (var buffer in _lent.Keys) result.Remove(buffer);
+    }
+
     internal long TransferForwardSlots(HashSet<IGpuBuffer> buffers, IDirectGpuBackend backend,
         CompiledTransientWorkspaceBroker broker, out int transferred)
     {
@@ -337,7 +355,17 @@ internal sealed partial class StepScratchPool
     internal int PinnedCount => _assignmentChanges;
 
     /// <summary>Whether slot <paramref name="key"/> of the running action is leased.</summary>
-    internal bool Leases(long key) => (Action >= FirstLeasedAction || _spanKeys.Contains(key)) && !_pinned.Contains(key);
+    internal bool Leases(long key)
+        => (Action >= FirstLeasedAction || _spanKeys.Contains(key) || HoldLeasesIn is not null) && !_pinned.Contains(key);
+
+    /// <summary>
+    /// While set, every slot the running action leases is held across actions, as a span lease, and added to this list,
+    /// until the plan ends it (<see cref="EndSpanLease"/>) or keeps it (<see cref="PinSpanLease"/>). The plan sets it
+    /// around an action of an activation-checkpoint segment: the forward actions whose outputs only the segment reads,
+    /// and the actions that recompute them for the segment's backward. Their buffers live for a stretch of actions the
+    /// plan knows and the pool does not.
+    /// </summary>
+    internal List<IGpuBuffer>? HoldLeasesIn { get; set; }
 
     /// <summary>The device buffers the pool holds: kept slots, the transient arena and free leased buffers.</summary>
     internal int BufferCount => Slots.Count + Transient.Count + _retiredTransient.Count + _free.Count + _leases.Count + _spanning.Count;
@@ -455,7 +483,12 @@ internal sealed partial class StepScratchPool
             // The caller zeroes a lease it does not overwrite, so a co-owned buffer's contents never show.
             buffer = AllocateNew(backend, length, fullyWritten: true);
         }
-        if (_spanKeys.Contains(key)) _spanning[buffer] = key;   // a forward output: held until its last reader
+        if (HoldLeasesIn is { } held)
+        {
+            _spanning[buffer] = key;   // a checkpoint segment's buffer: held until the plan ends or keeps it
+            held.Add(buffer);
+        }
+        else if (_spanKeys.Contains(key)) _spanning[buffer] = key;   // a forward output: held until its last reader
         else _leases.Add((key, buffer));
         _leasedThisRun.Add(buffer);
         Keys[buffer] = key;

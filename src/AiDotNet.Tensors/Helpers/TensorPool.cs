@@ -69,13 +69,38 @@ public static class TensorPool
 
     /// <summary>
     /// Overrides <see cref="ForceFreshAllocations"/> for the calling thread until the returned scope is disposed.
-    /// Scopes nest; disposing restores the previous value.
+    /// Scopes nest; disposing restores the previous value. The library's own intra-op worker threads run the calling
+    /// thread's ops under the same override; threads the caller starts do not inherit it.
     /// </summary>
     public static IDisposable ForceFreshAllocationsScope(bool forceFresh)
     {
         var previous = _threadForceFresh;
         _threadForceFresh = forceFresh ? 1 : -1;
         return new FreshScope(previous);
+    }
+
+    /// <summary>
+    /// The calling thread's override (0: none), and a chunk body that runs under it on whichever thread executes it.
+    /// The library's intra-op workers (<see cref="PersistentParallelExecutor"/>) run each chunk under the dispatching
+    /// thread's override, as PyTorch's <c>at::parallel_for</c> carries the caller's thread-local state into its
+    /// workers: an op's allocations follow the policy of the thread that issued the op, whichever thread makes them.
+    /// Threads the caller starts itself do not inherit it (also PyTorch's rule for its thread-local modes).
+    /// </summary>
+    internal static int ThreadFreshOverride => _threadForceFresh;
+
+    internal static Action<int> UnderThreadFreshOverride(int value, Action<int> body) => chunk =>
+    {
+        int previous = SwapThreadFreshOverride(value);
+        try { body(chunk); }
+        finally { _threadForceFresh = previous; }
+    };
+
+    /// <summary>Sets the calling thread's override and returns the one it replaces (restore it when done).</summary>
+    internal static int SwapThreadFreshOverride(int value)
+    {
+        var previous = _threadForceFresh;
+        _threadForceFresh = value;
+        return previous;
     }
 
     private sealed class FreshScope : IDisposable

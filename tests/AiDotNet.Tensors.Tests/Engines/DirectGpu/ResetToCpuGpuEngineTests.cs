@@ -99,7 +99,7 @@ public class ResetToCpuGpuEngineTests
     public void Tripping_the_breaker_over_a_caller_assigned_gpu_clears_the_caller_choice()
     {
         Skip.If(AiDotNetEngine.GpuCircuitBroken, "The breaker already tripped in this process.");
-        var saved = AiDotNetEngine.Current;
+        var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
         var gpu = new DirectGpuTensorEngine();
         try
         {
@@ -115,7 +115,7 @@ public class ResetToCpuGpuEngineTests
         finally
         {
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
-            AiDotNetEngine.Current = saved;
+            AiDotNetEngine.RestoreCurrentForTests(savedSlot);
             gpu.Dispose();
         }
     }

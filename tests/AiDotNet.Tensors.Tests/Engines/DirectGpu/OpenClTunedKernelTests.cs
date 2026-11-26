@@ -481,6 +481,7 @@ public sealed class OpenClTunedKernelTests
             // its built-in form, which admits a 1x1 stride-1 unpadded convolution whose pixel count is a multiple of 4.
             bool pointwise = bt > 1 && k == 1 && s == 1 && p == 0 && OpenClBackend.IsClBlastAvailable;
             bool pointwiseRb = k == 1 && s == 1 && p == 0 && oh * ow % 4 == 0;
+            // The fused Winograd route also needs its local memory to fit the device (it does not on a 32 KB gfx90c).
             // The small-channel direct route admits at most four input channels.
             bool smallChannel = c <= 4;
             // The centre-tap route admits a 1 x 1 input and output through an odd, undilated, half-padded filter.
@@ -489,7 +490,8 @@ public sealed class OpenClTunedKernelTests
             // input through a tap: stride 1, undilated, same-size output, h - 1 <= p <= k - h and likewise across.
             bool smallMap = h <= 2 && w <= 2 && h * w > 1 && d == 1 && EveryPairOnATap(h, oh, s, p, k) && EveryPairOnATap(w, ow, s, p, k);
             Assert.Equal(backend.Conv2DForwardSlot.CandidateIds.Count, Applicable(backend.Conv2DForwardSlot, args.Shape()).Count
-                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? 0 : 3) + (bt == 1 ? 0 : 1)
+                + (k > 7 ? 1 : 0) + (WinogradF23Pipeline.AdmitsShape(args.Shape()) ? (backend.WinogradFusedRunsHere ? 0 : 1) : 3)
+                + (bt == 1 ? 0 : 1)
                 + (pointwise ? 0 : 1) + (pointwiseRb ? 0 : 1) + (smallChannel ? 0 : 1) + (centerTap ? 0 : 1) + (smallMap ? 0 : 1));
         }
     }

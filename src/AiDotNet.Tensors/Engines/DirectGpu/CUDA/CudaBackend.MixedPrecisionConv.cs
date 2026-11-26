@@ -28,6 +28,9 @@ public sealed partial class CudaBackend : IGpuMixedPrecisionConvBackend, INative
     bool IGpuMixedPrecisionConvBackend.SupportsHalfConv
         => CudaDispatchPolicy.UseCudnnForConv;
 
+    /// <summary>Tests: the device's compute capability major version.</summary>
+    internal int ComputeCapabilityMajorForTest => _ccMajor;
+
     /// <summary>
     /// cuDNN runs the 16-bit convolutions on tensor cores (math type TensorOp) where the device has them: compute
     /// capability 7.0+ for FP16 (BF16's own 8.0 floor is <see cref="IGpuMixedPrecisionConvBackend.SupportsBFloat16Conv"/>).

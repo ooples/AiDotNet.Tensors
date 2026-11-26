@@ -30,8 +30,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <item><c>sign(x)</c>: 1 for x &gt; 0, -1 for x &lt; 0, otherwise +0. That covers both zeros and NaN.</item>
 /// <item><c>abs(x)</c>: the sign bit cleared. <c>-x</c>: the sign bit flipped (IEEE negate, which amin = -max(-x)
 /// relies on).</item>
-/// <item>max reductions: from -inf, a value is taken only when strictly greater, so NaN is skipped and an all-NaN
-/// input gives -inf; arg-max / arg-min start at the first element, so the first of equal extrema wins.</item>
+/// <item>max and min reductions (full and per axis): from the infinity, a value is taken only when strictly better,
+/// and a NaN anywhere in the reduced range is the result, as for NumPy and PyTorch. A per-axis maximum returns its
+/// first NaN's bits, a full reduction <c>float.NaN</c>'s. arg-max / arg-min start at the first element, so the first
+/// of equal extrema wins, a leading NaN is kept and a later one skipped; max pooling keeps its own rule.</item>
 /// <item>where/select: the condition is true when it is not ±0 (NaN counts as true). The chosen operand is passed
 /// through bit for bit.</item>
 /// </list>

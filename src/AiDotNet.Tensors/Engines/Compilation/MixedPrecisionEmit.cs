@@ -27,24 +27,29 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 internal static class MixedPrecisionEmit
 {
     /// <summary>
-    /// Opt-in master switch for FP16 ACTIVATION STORAGE (the buffer-level win), distinct from the
-    /// shipped FP16-compute autocast. Read once: <c>AIDOTNET_FP16_ACTIVATIONS=1</c>. It is separate from
-    /// the autocast flag because emitting <see cref="Tensor{Half}"/> activation nodes produces a
-    /// mixed-dtype graph that ONLY a mixed-dtype-aware backward (<see cref="MixedPrecisionGraphBackward"/>)
-    /// can consume — the single-type fused <c>CompiledTrainingPlan&lt;float&gt;</c> must NOT see it. So a
-    /// caller turns this on exactly when it drives the mixed-dtype path. Default off ⇒ existing autocast
-    /// (FP16 compute / FP32 storage) and the fused plan are byte-identical.
+    /// Set by <see cref="MixedPrecisionCompiledPlan"/> while it traces (and by tests): only then do the engine's graph
+    /// branches record Half activation nodes, which that plan's mixed-dtype backward consumes. Every other trace,
+    /// the compiled training plan's included, records the single-type float graph. Per thread, as a trace is: a
+    /// mixed-precision trace on one thread must not make another thread's concurrent trace record Half nodes.
     /// </summary>
-    /// <summary>Test-only override; null ⇒ read the env var. Not part of the public API.</summary>
-    internal static bool? TestOverrideEnabled;
+    [ThreadStatic] internal static bool? TestOverrideEnabled;
 
-    // AIDOTNET_FP16_ACTIVATIONS routes to the separate (capture-incompatible) MixedPrecisionCompiledPlan in
-    // AiDotNet; AIDOTNET_FP16_CAPTURE instead keeps the normal CompiledTrainingPlan but emits the same Half
-    // activation nodes, which that plan now consumes via its heterogeneous forward/backward (FP16-in-capture,
-    // task #30). Either enables the FP16-activation EMISSION here; the routing differs at the AiDotNet caller.
-    public static bool Fp16ActivationStorageEnabled =>
-        TestOverrideEnabled ?? (Environment.GetEnvironmentVariable("AIDOTNET_FP16_ACTIVATIONS") == "1"
-                                || Environment.GetEnvironmentVariable("AIDOTNET_FP16_CAPTURE") == "1");
+    // AIDOTNET_FP16_ACTIVATIONS / AIDOTNET_FP16_CAPTURE switched the removed environment-gated FP16 training path. A
+    // process that still sets them would silently train in FP32, so it is told once.
+    static MixedPrecisionEmit()
+    {
+        foreach (var name in new[] { "AIDOTNET_FP16_ACTIVATIONS", "AIDOTNET_FP16_CAPTURE" })
+        {
+            if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name))) continue;
+            System.Diagnostics.Trace.TraceWarning(
+                $"{name} was removed and has no effect: compiled training plans record the FP32 graph. For FP16 "
+                + $"activation storage compile with {nameof(MixedPrecisionCompiledPlan)}; for FP16 compute use an "
+                + "FP16 autocast scope.");
+        }
+    }
+
+    /// <summary>Whether Half activation nodes are being recorded (<see cref="TestOverrideEnabled"/>).</summary>
+    public static bool Fp16ActivationStorageEnabled => TestOverrideEnabled == true;
 
     /// <summary>
     /// True when graph tracing should emit FP16 activation buffers: an FP16 autocast scope is active.

@@ -3,10 +3,12 @@ using System;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 /// <summary>
-/// Resolves the CUDA context host-wait policy shared by the production backend, legacy
-/// cuBLAS/cuDNN context, and standalone direct-PTX runtime. Latency-sensitive tensor dispatch
-/// defaults to <c>CU_CTX_SCHED_SPIN</c>; callers that prefer lower idle CPU use can select another
-/// driver policy explicitly.
+/// Resolves the CUDA host-wait policy (<see cref="GpuHostWaitPolicy"/>) shared by the production backend, legacy
+/// cuBLAS/cuDNN context, and standalone direct-PTX runtime: the context scheduling flag a context is created with and
+/// the way stream waits block. The typed <see cref="GpuHostWaitOptions.Policy"/> decides it. The deprecated
+/// <c>AIDOTNET_CUDA_CONTEXT_SCHEDULING</c> environment variable is honored, with a warning, only while the typed policy
+/// has never been set. The default, <see cref="GpuHostWaitPolicy.PollThenBlock"/>, keeps <c>CU_CTX_SCHED_SPIN</c> for
+/// latency-sensitive dispatch and has stream waits block once they outlast a short poll.
 /// </summary>
 internal static class CudaContextScheduling
 {
@@ -16,18 +18,123 @@ internal static class CudaContextScheduling
     internal const uint Yield = 2u;
     internal const uint Blocking = 4u;
 
-    internal static uint ResolveFromEnvironment() =>
-        Resolve(Environment.GetEnvironmentVariable(EnvironmentVariable));
+    /// <summary>
+    /// The scheduling flag a new context is created with (<see cref="EffectivePolicy"/>). A misspelled deprecated
+    /// environment value, when it is the one that decides, throws: a caller error, not a missing device.
+    /// </summary>
+    // The policy whose flag the first CUDA context was created with (-1: no context yet).
+    // Every distinct scheduling flag a context was created with, as a bit set (bit = the flag value), so a policy set
+    // A, then B, then A again is still reported against the contexts created under B.
+    private static int s_contextFlagsUsed;
+    private static int s_policyChangeWarned;
 
-    internal static uint Resolve(string? value) => value?.Trim().ToLowerInvariant() switch
+    internal static uint ResolveContextFlags()
     {
-        null or "" or "spin" => Spin,
-        "auto" => Auto,
-        "yield" => Yield,
-        "blocking" => Blocking,
+        uint flags = Flags(ResolveContextPolicy());
+        int bit = 1 << (int)(flags & 0x7);
+        int seen;
+        do { seen = System.Threading.Volatile.Read(ref s_contextFlagsUsed); }
+        while ((seen & bit) == 0 && System.Threading.Interlocked.CompareExchange(ref s_contextFlagsUsed, seen | bit, seen) != seen);
+        return flags;
+    }
+
+    /// <summary>
+    /// Called when <see cref="GpuHostWaitOptions.Policy"/> is set: a context that already exists keeps the scheduling
+    /// flag it was created with, which is reported once rather than ignored silently.
+    /// </summary>
+    internal static void NotePolicySet(GpuHostWaitPolicy policy)
+    {
+        int used = System.Threading.Volatile.Read(ref s_contextFlagsUsed);
+        int other = used & ~(1 << (int)(Flags(policy) & 0x7));
+        if (other == 0) return;
+        if (System.Threading.Interlocked.Exchange(ref s_policyChangeWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning(
+                $"{nameof(GpuHostWaitOptions)}.{nameof(GpuHostWaitOptions.Policy)} was set to {policy} after CUDA contexts were "
+                + $"created with another scheduling flag; existing contexts keep theirs. Stream "
+                + "waits use the new policy; set it before the first GPU engine to change the flag too.");
+    }
+
+    private static GpuHostWaitPolicy ResolveContextPolicy()
+    {
+        if (!GpuHostWaitOptions.IsPolicySet)
+        {
+            string? value = Environment.GetEnvironmentVariable(EnvironmentVariable);
+            if (!string.IsNullOrWhiteSpace(value)) _ = ParseLegacy(value!);   // throws on a misspelling
+        }
+        return EffectivePolicy;
+    }
+
+    /// <summary>The context scheduling flag a deprecated environment value names (empty: the default policy's).</summary>
+    internal static uint Resolve(string? value) => Flags(ResolvePolicy(value));
+
+    /// <summary>The policy a deprecated environment value names (empty: the default policy).</summary>
+    internal static GpuHostWaitPolicy ResolvePolicy(string? value)
+        => string.IsNullOrWhiteSpace(value) ? GpuHostWaitPolicy.PollThenBlock : ParseLegacy(value!);
+
+    private static GpuHostWaitPolicy ParseLegacy(string value) => value.Trim().ToLowerInvariant() switch
+    {
+        "spin" => GpuHostWaitPolicy.Spin,
+        "auto" => GpuHostWaitPolicy.Auto,
+        "yield" => GpuHostWaitPolicy.Yield,
+        "blocking" => GpuHostWaitPolicy.BlockingSync,
+        "poll-then-block" or "pollthenblock" => GpuHostWaitPolicy.PollThenBlock,
         _ => throw new InvalidOperationException(
-            $"{EnvironmentVariable} must be one of: spin, auto, yield, blocking.")
+            $"{EnvironmentVariable} must be one of: spin, auto, yield, blocking, poll-then-block. It is deprecated: "
+            + $"set {nameof(GpuHostWaitOptions)}.{nameof(GpuHostWaitOptions.Policy)} instead.")
     };
+
+    /// <summary>The <c>CU_CTX_SCHED_*</c> flag a policy creates its context with.</summary>
+    internal static uint Flags(GpuHostWaitPolicy policy) => policy switch
+    {
+        GpuHostWaitPolicy.Yield => Yield,
+        GpuHostWaitPolicy.BlockingSync => Blocking,
+        GpuHostWaitPolicy.Auto => Auto,
+        // PollThenBlock spins in the driver's own short waits; its stream waits block once the poll window has passed.
+        _ => Spin,
+    };
+
+    // The deprecated environment variable's policy, read once: 0 unread, 1 none (unset or not a policy name), else
+    // 2 + the policy.
+    private static int s_environmentPolicy;
+    private static int s_warned;
+
+    /// <summary>
+    /// The policy in effect: <see cref="GpuHostWaitOptions.Policy"/> once it has been set; before that the deprecated
+    /// environment variable's when it names one (warned once), else the typed default.
+    /// </summary>
+    internal static GpuHostWaitPolicy EffectivePolicy
+    {
+        get
+        {
+            if (GpuHostWaitOptions.IsPolicySet) return GpuHostWaitOptions.Policy;
+            int state = System.Threading.Volatile.Read(ref s_environmentPolicy);
+            if (state == 0)
+            {
+                string? value = Environment.GetEnvironmentVariable(EnvironmentVariable);
+                state = 1;
+                // A misspelled value fails the backend's construction (ResolveContextFlags); here it reads as unset.
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    try { state = 2 + (int)ParseLegacy(value!); }
+                    catch (InvalidOperationException) { state = 1; }
+                }
+                System.Threading.Volatile.Write(ref s_environmentPolicy, state);
+            }
+            if (state < 2) return GpuHostWaitOptions.Policy;
+            if (System.Threading.Interlocked.Exchange(ref s_warned, 1) == 0)
+                System.Diagnostics.Trace.TraceWarning(
+                    $"{EnvironmentVariable} is deprecated and will be removed: set {nameof(GpuHostWaitOptions)}."
+                    + $"{nameof(GpuHostWaitOptions.Policy)} instead, which wins over it once set.");
+            return (GpuHostWaitPolicy)(state - 2);
+        }
+    }
+
+    /// <summary>Tests: forgets the environment variable's cached reading and the warning.</summary>
+    internal static void ResetEnvironmentCacheForTests()
+    {
+        System.Threading.Volatile.Write(ref s_environmentPolicy, 0);
+        System.Threading.Volatile.Write(ref s_warned, 0);
+    }
 
     internal static string Describe(uint flags) => flags switch
     {

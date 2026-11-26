@@ -29,10 +29,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private bool HasTunedKernel(string name) => _kernelCache.ContainsKey(name);
 
-        // A built kernel whose compiled work-group limit (CL_KERNEL_WORK_GROUP_SIZE) admits a groupSize-item group, so a
-        // candidate with a fixed launch shape is never offered a device whose limit would reject the launch.
+        // A built kernel whose compiled work-group limit (CL_KERNEL_WORK_GROUP_SIZE) admits a groupSize-item group and whose
+        // local memory fits the device's, so a candidate with a fixed launch shape is never offered a device whose limits
+        // would reject the launch.
         private bool HasTunedKernel(string name, int groupSize)
-            => _kernelCache.TryGetValue(name, out var kernel) && (ulong)groupSize <= kernel.MaxWorkGroupSize;
+            => _kernelCache.TryGetValue(name, out var kernel) && (ulong)groupSize <= kernel.MaxWorkGroupSize
+                && kernel.FitsDeviceLocalMemory;
 
         private static TunedShape RowShape(int rows, int n) => TunedShape.Of2(TunedKernelDType.Float32, rows, n);
 

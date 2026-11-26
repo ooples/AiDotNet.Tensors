@@ -683,13 +683,13 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
               @builtin(workgroup_id) wid: vec3<u32>) {
     let idx = gid.x;
     let local_idx = lid.x;
-    let IDENTITY_BITS = 0xFF800000u;   // -inf: what a NaN or an absent element contributes
+    let IDENTITY_BITS = 0xFF800000u;   // -inf: what an absent element contributes
 
     if (idx < params.size) {
-        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
-        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+        // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0xFFC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -697,7 +697,7 @@ fn max_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_gt(shared_bits[local_idx + stride], shared_bits[local_idx]));
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_isnan(shared_bits[local_idx + stride]) || xf_gt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }
@@ -716,10 +716,10 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
     let IDENTITY_BITS = 0x7F800000u;   // +inf
 
     if (idx < params.size) {
-        // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the identity (the CPU scan never
-        // takes one), and no float compare can flush a subnormal. Ties keep the left operand.
+        // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+        // merge below), and no float compare can flush a subnormal. Ties keep the left operand.
         let v = bitcast<u32>(input[idx]);
-        shared_bits[local_idx] = select(v, IDENTITY_BITS, xf_isnan(v));
+        shared_bits[local_idx] = select(v, 0xFFC00000u, xf_isnan(v));
     } else {
         shared_bits[local_idx] = IDENTITY_BITS;
     }
@@ -727,7 +727,7 @@ fn min_reduce(@builtin(global_invocation_id) gid: vec3<u32>,
 
     for (var stride: u32 = 128u; stride > 0u; stride = stride >> 1u) {
         if (local_idx < stride) {
-            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_lt(shared_bits[local_idx + stride], shared_bits[local_idx]));
+            shared_bits[local_idx] = select(shared_bits[local_idx], shared_bits[local_idx + stride], xf_isnan(shared_bits[local_idx + stride]) || xf_lt(shared_bits[local_idx + stride], shared_bits[local_idx]));
         }
         workgroupBarrier();
     }
@@ -3546,10 +3546,14 @@ fn max_axis(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.outer_size) {
         // The CPU ReduceMax scan, exact on the bits (ExactFloatKernels): from -inf (not -3.4e38), take a value only when
-        // strictly greater, so a NaN is skipped, an all-NaN row gives -inf and the first of equal maxima is kept.
+        // strictly greater, so the first of equal maxima is kept. A NaN anywhere in the row is the row's result.
         var max_bits: u32 = 0xFF800000u;
         for (var j: u32 = 0u; j < params.reduce_size; j = j + 1u) {
             let v = bitcast<u32>(input[idx * params.reduce_size + j]);
+            if (xf_isnan(v)) {
+                max_bits = v;
+                break;
+            }
             if (xf_gt(v, max_bits)) {
                 max_bits = v;
             }
@@ -7599,22 +7603,24 @@ fn mulhi(a: u32, b: u32) -> u32 {
     return hh + (lh >> 16u) + (hl >> 16u) + (mid >> 16u);
 }
 
-fn philox_round(ctr0: u32, ctr1: u32, key0: u32, key1: u32) -> vec4<u32> {
+// One Philox4x32 round: words 0 and 2 are multiplied, and the high halves are mixed with words 1 and 3 and the key.
+// Without words 1 and 3 the round is not a bijection of the counter and its outputs are biased (a 30% dropout mask
+// kept 67.3% of its elements).
+fn philox_round(c: vec4<u32>, key0: u32, key1: u32) -> vec4<u32> {
     let M0: u32 = 0xD2511F53u;
     let M1: u32 = 0xCD9E8D57u;
-    let lo0 = ctr0 * M0;
-    let hi0 = mulhi(ctr0, M0);
-    let lo1 = ctr1 * M1;
-    let hi1 = mulhi(ctr1, M1);
-    return vec4<u32>(hi1 ^ key0, lo1, hi0 ^ key1, lo0);
+    let lo0 = c.x * M0;
+    let hi0 = mulhi(c.x, M0);
+    let lo1 = c.z * M1;
+    let hi1 = mulhi(c.z, M1);
+    return vec4<u32>(hi1 ^ c.y ^ key0, lo1, hi0 ^ c.w ^ key1, lo0);
 }
 
 fn philox4x32(counter: vec4<u32>, key: vec2<u32>) -> vec4<u32> {
     var c = counter;
     var k = key;
     for (var i: u32 = 0u; i < 10u; i = i + 1u) {
-        let r = philox_round(c.x, c.z, k.x, k.y);
-        c = r;
+        c = philox_round(c, k.x, k.y);
         k.x = k.x + 0x9E3779B9u;
         k.y = k.y + 0xBB67AE85u;
     }

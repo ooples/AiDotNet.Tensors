@@ -729,8 +729,8 @@ extern ""C"" __global__ __launch_bounds__(256) void compute_mean_var(
 }
 
 // Max along the last axis of [outerSize, axisSize]: the CPU ReduceMax scan, exact on the bit patterns
-// (ExactFloatKernels). From -inf, a value is taken only when strictly greater, so a NaN is skipped, an all-NaN row
-// gives -inf, and the first of equal maxima (-0 before +0) is kept.
+// (ExactFloatKernels). From -inf, a value is taken only when strictly greater, so the first of equal maxima (-0 before
+// +0) is kept. A NaN anywhere in the row is the row's result, as for NumPy and PyTorch.
 extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const float* input, float* output, int outerSize, int axisSize)
 {
@@ -740,6 +740,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_axis(
     const unsigned int* row = reinterpret_cast<const unsigned int*>(input) + (size_t)outer * axisSize;
     unsigned int best = 0xFF800000u;
     for (int i = 0; i < axisSize; i++) {
+        if (xf_isnan(row[i])) { best = row[i]; break; }
         if (xf_gt(row[i], best)) best = row[i];
     }
     output[outer] = __uint_as_float(best);

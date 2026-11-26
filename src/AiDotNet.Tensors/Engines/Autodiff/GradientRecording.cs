@@ -23,7 +23,8 @@ public static class GradientRecording
     /// <remarks>Only declared results keep their buffers; ordinary intermediates remain eligible for fusion and reuse.
     /// On an eager tape this has the same effect as <see cref="GradientTape{T}.Retain"/>. Retention does not retain
     /// a gradient or copy the value to the host. The same tensor receives each compiled step's latest value.
-    /// Mixed-precision compiled plans do not support retained outputs and reject them during compilation.</remarks>
+    /// A mixed-precision compiled plan keeps them too: it never frees or pages a retained result, and computes one the
+    /// loss does not read.</remarks>
     /// <typeparam name="T">The result's element type.</typeparam>
     /// <param name="output">A result produced by the active training forward.</param>
     /// <exception cref="ArgumentNullException"><paramref name="output"/> is null.</exception>

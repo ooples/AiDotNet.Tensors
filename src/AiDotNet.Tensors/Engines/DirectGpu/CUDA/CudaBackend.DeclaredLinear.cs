@@ -48,6 +48,8 @@ public sealed partial class CudaBackend
     private bool TryDeclaredFusedLinear(IGpuBuffer input, IGpuBuffer weight, IGpuBuffer bias, IGpuBuffer output,
         int batch, int inFeatures, int outFeatures, CodegenActivationKind activation)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (batch <= 0 || inFeatures <= 0 || outFeatures <= 0) return false;
         var lower = _lowerFusedLinearUnsplit ??= LowerFusedLinearUnsplit;
         return TryRunDeclaredProgram(FusedLinearKey(batch, inFeatures, outFeatures, activation), s_buildFusedLinear,
@@ -87,6 +89,8 @@ public sealed partial class CudaBackend
         IGpuBuffer saved, IGpuBuffer gradInput, IGpuBuffer gradWeight, IGpuBuffer gradBias,
         int batch, int inFeatures, int outFeatures, CodegenActivationKind activation)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (batch <= 0 || inFeatures <= 0 || outFeatures <= 0 || !DeclaredKernelsEnabled) return false;
         // A cached delegate: the method group would allocate one per call.
         var build = _buildFusedLinearBackward ??= BuildFusedLinearBackward;

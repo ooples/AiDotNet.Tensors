@@ -27,7 +27,8 @@ internal sealed partial class CompiledTrainingPlan<T>
     private bool CanShareTransientWorkspace(DirectGpuTensorEngine engine) => ShareTransientWorkspaceForTests
         && typeof(T) == typeof(float) && _workspaceExplicitGraphDisable && !_graphPreparationStarted
         && _graphStepDisabled && _graphStepEligible && !HasLiveStepGraph
-        && !_residentStepFailed && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null
+        && !_residentStepFailed && _dataForwardReplay is null && _checkpointing is null
+        && _checkpoint is null
         && !_isFrozenWeights && _lastBackwardReads is not null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
         && !engine.InferenceCaptureActive && !Gpu.AutocastScope.IsEnabled && Gpu.DeferredScope.Current?.IsRecording != true;
@@ -47,7 +48,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     private bool CanCoOwnStepScratch(DirectGpuTensorEngine engine) => SharedStepScratch.Enabled
         && typeof(T) == typeof(float) && !_workspaceSharingBodyAllowed
         && !(_workspaceExplicitGraphDisable && _graphStepDisabled)
-        && _dataForwardReplay is null && _fp16HeteroOrder is null && _checkpointing is null && _forwardSteps is not null
+        && _dataForwardReplay is null && _checkpointing is null && _checkpoint is null && _forwardSteps is not null
         && ForwardStepObserver is null && StepProbe is null && !SanitizeForwardBuffers
         && !engine.InferenceCaptureActive && Gpu.DeferredScope.Current?.IsRecording != true;
 
@@ -179,6 +180,19 @@ internal sealed partial class CompiledTrainingPlan<T>
                 foreach (var item in nested) if (!InspectSaved(item)) return false;
                 return true;
             }
+            // A fused-attention node saves the row log-sum-exp its forward wrote for its backward.
+            if (saved is DirectGpuTensorEngine.FusedAttentionRecordedNode attention)
+            {
+                ProtectBuffer(attention.Lse?._gpuBuffer);
+                return true;
+            }
+            // A fused readout's mutation guard holds the readout weight and bias.
+            if (saved is CpuEngine.ReadoutMutationGuard<T> readout)
+            {
+                Protect(readout.Weight);
+                Protect(readout.Bias);
+                return true;
+            }
             // A fused node's saved inner backward (ConvChannelEpilogueBackward keeps the convolution's): a static method
             // captures nothing. A closure may hold buffers, so it stays opaque below.
             if (saved is Delegate { Target: null }) return true;
@@ -186,8 +200,10 @@ internal sealed partial class CompiledTrainingPlan<T>
             if (saved is ChannelsLastSlot slot) return InspectSaved(slot.Input);
             // An opaque saved-state owner may hide native pointers. Refuse it rather than presume its buffers died.
             var type = saved.GetType();
-            return type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
+            bool plain = type.IsPrimitive || type.IsEnum || saved is string || saved is int[] || saved is long[]
                 || saved is float[] || saved is double[] || saved is bool[] || saved is int[][];
+            if (!plain) _workspaceOpaqueSavedType = type.FullName;
+            return plain;
         }
         foreach (var step in _forwardSteps!) _workspaceProduced.Add(step.OutputBuffer);
         foreach (var parameter in _parameters) { Protect(parameter); Protect(parameter.Grad); }
@@ -220,6 +236,9 @@ internal sealed partial class CompiledTrainingPlan<T>
             if (step.SavedState is { } saved)
                 foreach (var item in saved) if (!InspectSaved(item)) return false;
         }
+        // Step-I/O inputs: a replay skips the copy into a buffer that still holds the same input.
+        if (_stepIoLeaves is { } ioLeaves) foreach (var leaf in ioLeaves) Protect(leaf);
+        if (_stepIoBuffers is { } ioBuffers) foreach (var buffer in ioBuffers) ProtectBuffer(buffer);
         // Owning tensor buffers are outside this loan contract even if a pool happens to name them.
         foreach (var tensor in _workspaceTensors)
             if (tensor._gpuBuffer is { } buffer && (tensor._ownsGpuBuffer || tensor._storage.OwnsGpuBuffer(buffer)))
@@ -239,4 +258,129 @@ internal sealed partial class CompiledTrainingPlan<T>
         return ReferenceEquals(root, buffer) && buffer.Handle != IntPtr.Zero
             && !_workspaceProtectedRoots.Contains(root) && !_workspaceProtectedHandles.Contains(root.Handle);
     }
+
+    // Idle step memory lent to the backend between captured steps (IIdleDeviceMemoryLender).
+    private IIdleDeviceMemoryLender? _idleLender;
+
+    /// <summary>Bytes this plan lent after its last step, once an allocation asked for them (tests and diagnostics).</summary>
+    internal long IdleLentBytesLastStep { get; private set; }
+
+    /// <summary>
+    /// After a captured step: lends the step buffers nothing reads before the next replay writes them to the backend,
+    /// so validation and eager inference between steps allocate from them instead of growing the device footprint.
+    /// They come back (moving whatever still uses them) when the next step begins (<see cref="ReclaimIdleStepMemory"/>).
+    /// They are found only when an allocation between steps needs memory the backend's pool cannot serve: finding them
+    /// walks every step of the plan (about 2 ms a step for a 16-layer LM), host time that was spent after every step,
+    /// while the device waited, even when nothing allocated before the next one.
+    /// </summary>
+    private void LendIdleStepMemory()
+    {
+        IdleLentBytesLastStep = 0;
+        if (s_idleLendDiag)
+            AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} enabled={LendIdleStepMemoryEnabled} graph={HasLiveStepGraph} " +
+                $"pool={_scratchPool is not null} forward_steps={_forwardSteps is not null}");
+        if (!LendIdleStepMemoryEnabled || _idleLendingFailed || !HasLiveStepGraph || _scratchPool is not { } pool || _forwardSteps is null
+            || !_engine.TryGet<DirectGpuTensorEngine>(out var engine)
+            || engine.GetBackend() is not IIdleDeviceMemoryLender lender)
+            return;
+        _collectIdleStepMemory ??= CollectIdleStepMemory;
+        lender.LendIdleOnDemand(this, _collectIdleStepMemory);
+        _idleLender = lender;
+    }
+
+    private Func<IReadOnlyCollection<IGpuBuffer>?>? _collectIdleStepMemory;
+
+    // The lender asks (an allocation between this plan's steps found nothing pooled). Rebuilt on every ask: what
+    // outlives a step (a rebased readout, a retained output) can change between steps. The ask runs on the allocating
+    // thread, under the lender's lock: it takes the plan's step lock without waiting (the plan's own thread may hold it
+    // while it changes what is protected) and lends nothing when that fails, or when collecting throws, rather than
+    // fail an unrelated allocation.
+    private IReadOnlyCollection<IGpuBuffer>? CollectIdleStepMemory()
+    {
+        if (!System.Threading.Monitor.TryEnter(_stepSync)) return null;
+        try
+        {
+            if (_disposed) return null;
+            return CollectIdleStepMemoryCore();
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException)
+        {
+            if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: {ex.GetType().Name}: {ex.Message}");
+            System.Diagnostics.Trace.TraceWarning(
+                $"Compiled plan {_planId} could not lend its idle step memory ({ex.GetType().Name}); the allocation is served without it.");
+            return null;
+        }
+        finally
+        {
+            System.Threading.Monitor.Exit(_stepSync);
+        }
+    }
+
+    private IReadOnlyCollection<IGpuBuffer>? CollectIdleStepMemoryCore()
+    {
+        if (_scratchPool is not { } pool || _forwardSteps is null) return null;
+        if (!TryProtectStepPersistentBuffers())
+        {
+            if (s_idleLendDiag) AiDotNetEngine.LogDiagnostic($"[IDLE-LEND] plan={_planId} refused: an opaque saved state {_workspaceOpaqueSavedType}");
+            return null;
+        }
+        _workspaceCandidates.Clear();
+        // Scratch another plan co-owns (SharedStepScratch) is never lent: that plan's replay writes it. What is lent is
+        // marked so that no other plan takes it until the loan ends (ReclaimIdleStepMemory).
+        var shared = _engine.As<DirectGpuTensorEngine>()?.SharedStepScratch;
+        pool.CollectIdleBetweenRuns(_forwardActions.Length,
+            buffer => IsStepTransient(buffer) && shared?.HasOtherOwner(buffer, pool) != true, _workspaceCandidates);
+        var idle = new IGpuBuffer[_workspaceCandidates.Count];
+        _workspaceCandidates.CopyTo(idle);
+        _workspaceCandidates.Clear();
+        var marked = _idleMarkedLent ??= new HashSet<IGpuBuffer>(Autodiff.ReferenceEqualityComparer<IGpuBuffer>.Instance);
+        foreach (var buffer in idle) if (marked.Add(buffer)) SharedStepScratch.MarkLent(buffer);
+        long bytes = 0;
+        foreach (var buffer in idle) bytes += buffer.SizeInBytes;
+        IdleLentBytesLastStep = bytes;
+        return idle;
+    }
+
+    /// <summary>Test hook: runs first in <see cref="ReclaimIdleStepMemory"/>, so a test can make it fail.</summary>
+    internal Action? TestFaultInIdleReclaim;
+
+    /// <summary>Takes back the memory <see cref="LendIdleStepMemory"/> lent: before a step, an invalidation or disposal.</summary>
+    /// <remarks>A loan that cannot be moved (no memory for it, or it was baked into a graph) still reads memory the next
+    /// replay overwrites: the plan then stops replaying its graph and lending, and trains eagerly from here on.</remarks>
+    private void ReclaimIdleStepMemory()
+    {
+        TestFaultInIdleReclaim?.Invoke();
+        if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is not { } lender) return;
+        try
+        {
+            lender.ReclaimIdle(this);
+            if (System.Threading.Interlocked.Exchange(ref _idleMarkedLent, null) is { } lent)
+                foreach (var buffer in lent) SharedStepScratch.ClearLent(buffer);
+        }
+        catch (Exception ex)
+        {
+            _idleLendingFailed = true;
+            InvalidateCapturedStepGraph();
+            _graphStepDisabled = true;
+            RecordGraphCaptureFailure("a buffer borrowed from this plan's idle step memory could not be moved back ("
+                + ex.GetType().Name + "); this plan trains eagerly from now on");
+            throw;
+        }
+    }
+
+    // Set once a reclaim failed: the plan lends nothing again (and what it lent stays marked, so no plan takes it).
+    private bool _idleLendingFailed;
+    private HashSet<IGpuBuffer>? _idleMarkedLent;
+
+    /// <summary>Tests: the buffers this plan has lent since its last step began, and its step scratch.</summary>
+    internal IReadOnlyCollection<IGpuBuffer> IdleLentBuffersForTest
+        => (IReadOnlyCollection<IGpuBuffer>?)_idleMarkedLent ?? Array.Empty<IGpuBuffer>();
+
+    internal StepScratchPool? ScratchPoolForTest => _scratchPool;
+
+    private string? _workspaceOpaqueSavedType;
+    private static bool s_idleLendDiag => CompiledTrainingDiagnostics.TraceIdleLoans;
+
+    /// <summary>Process switch for tests that need the backend's own allocations between steps.</summary>
+    internal static bool LendIdleStepMemoryEnabled { get; set; } = true;
 }

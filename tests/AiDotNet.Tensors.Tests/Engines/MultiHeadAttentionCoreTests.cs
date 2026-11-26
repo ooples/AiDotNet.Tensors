@@ -125,6 +125,37 @@ public class MultiHeadAttentionCoreTests
         AssertCloseDouble(dk, grads[k].ToArray(), "dK");
         AssertCloseDouble(dv, grads[v].ToArray(), "dV");
     }
+
+    /// <summary>
+    /// The decomposed path is captured by an inference trace and the plan replays it on new values. A causal call used to
+    /// pass a boolean mask to ScaledDotProductAttention, an input of another element type, so the trace refused it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public async Task Double_DecomposedPath_InferencePlan_ReplaysTheReference(
+        int batch, int seqQ, int seqK, int heads, int hd, int vd, bool causal)
+    {
+        await Task.Yield();
+        Tensor<double> ToDouble(Tensor<float> t) => new(Array.ConvertAll(t.ToArray(), x => (double)x), t.Shape.ToArray());
+        var (qf, kf, vf, _) = Inputs(batch, seqQ, seqK, heads, hd, vd, seed: 7);
+        Tensor<double> q = ToDouble(qf), k = ToDouble(kf), v = ToDouble(vf);
+        var engine = new CpuEngine();
+
+        CompiledInferencePlan<double> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            var traced = engine.MultiHeadAttentionCore(q, k, v, heads, causal: causal);
+            plan = scope.CompileInference(traced, new[] { q, k, v });
+        }
+        using (plan)
+        {
+            var (q2, k2, v2, _) = Inputs(batch, seqQ, seqK, heads, hd, vd, seed: 8);
+            plan.SetInputs(new[] { ToDouble(q2), ToDouble(k2), ToDouble(v2) });
+            var expected = Reference(q2, k2, v2, null, heads, causal, out _, out _, out _);
+            AssertCloseDouble(expected, plan.Execute().ToArray(), "replayed output");
+        }
+    }
+
     /// <summary>Self-attention on one tensor: its gradient is the sum of the query, key and value contributions.</summary>
     [Fact]
     public async Task SameTensorAsQueryKeyAndValue_SumsAllThreeGradients()

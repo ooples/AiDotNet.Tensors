@@ -539,6 +539,12 @@ __kernel void copy_2d_strided4(__global const float* src, __global float* dst, i
     vstore4(vload4(0, src + (long)row * srcCols + 4 * q), 0, dst + (long)row * destTotalCols + destColOffset + 4 * q);
 }
 // Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
+// bf16 -> fp32 (exact): element i is the low (even i) or high (odd i) 16 bits of 32-bit word i / 2.
+__kernel void bf16_to_float(__global const uint* words, __global float* output, int n) {
+    int gid = get_global_id(0); if (gid >= n) return;
+    uint w = words[gid >> 1];
+    output[gid] = as_float(((gid & 1) ? (w >> 16) : (w & 0xFFFFu)) << 16);
+}
 __kernel void int32_to_float(__global const int* raw, __global float* output, int n) {
     int gid = get_global_id(0); if (gid >= n) return;
     output[gid] = (float)raw[gid];
@@ -750,7 +756,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "int32_to_float", "scatter_positions", "rwkv7_forward", "hsoftmax_paths",
+            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "copy_2d_strided4", "iota_pad", "bf16_to_float", "int32_to_float", "scatter_positions", "rwkv7_forward", "hsoftmax_paths",
             "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "stft_backward_frames", "stft_backward_signal", "stft_backward_window", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }

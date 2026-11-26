@@ -74,7 +74,7 @@ internal sealed class DirectPtxRuntime : IDisposable
 
     internal DirectPtxRuntime(int deviceOrdinal = 0)
     {
-        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
+        uint contextScheduling = CudaContextScheduling.ResolveContextFlags();
         Check(CuBlasNative.cuInit(0), "cuInit");
         Check(CuBlasNative.cuDeviceGet(out int device, deviceOrdinal), "cuDeviceGet");
 

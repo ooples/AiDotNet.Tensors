@@ -71,6 +71,8 @@ public class ObjectiveSignatureCaptureTests
 
     /// <summary>Signs one recorded unary node over <paramref name="input"/> whose execute delegate is
     /// <paramref name="execute"/>.</summary>
+    private static readonly CpuEngine SigningEngine = new();
+
     private static ObjectiveSignature SignUnary(
         Tensor<float> input, Action<IEngine, Tensor<float>> execute, Tensor<float>[]? parameters = null,
         object[]? savedState = null)
@@ -80,6 +82,11 @@ public class ObjectiveSignatureCaptureTests
         Tensor<float> input, Action<IEngine, Tensor<float>> execute, Tensor<float>[]? parameters,
         object[]? savedState, out object[] leaves)
     {
+        // The probe records no engine op, so the scope keeps the ambient engine, and the signature includes its type.
+        // The process-wide engine is shared with tests running in parallel (many install a GPU engine for their
+        // duration), so two signs of the same trace differed when one landed inside such a window ("compiled
+        // CpuEngine, now DirectGpuTensorEngine"). This thread's own engine, installed for the sign only, is not.
+        using var engine = AiDotNetEngine.UseInCurrentContext(SigningEngine);
         using var scope = GraphMode.EnableProbe();
         scope.RecordUnary(LazyNodeType.Custom, "CaptureOp", input, input.Shape.ToArray(), execute, savedState: savedState);
         return ObjectiveSignature.Build(scope.Nodes, parameters ?? Array.Empty<Tensor<float>>(), out leaves);
@@ -212,6 +219,25 @@ public class ObjectiveSignatureCaptureTests
         Assert.Empty(rowLeaves);
         Assert.Equal(row, rowAgain);
         Assert.NotEqual(row, column);
+    }
+
+    private sealed class OtherEngine : CpuEngine { }
+
+    // What another test running in parallel does: installs a different process-wide engine between two signs.
+    [Fact]
+    public void A_process_wide_engine_change_between_signs_does_not_change_the_signature()
+    {
+        var w = Filled(4, 3, 1);
+        Action<IEngine, Tensor<float>> execute = (e, o) => o.SetFlat(0, 1f);
+        var first = SignUnary(w.Reshape(1, 12), execute, new[] { w }, null, out _);
+        var previous = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = new OtherEngine();
+            var second = SignUnary(w.Reshape(1, 12), execute, new[] { w }, null, out _);
+            Assert.True(first.Equals(second), first.DescribeDifference(second));
+        }
+        finally { AiDotNetEngine.Current = previous; }
     }
 
     [Fact]

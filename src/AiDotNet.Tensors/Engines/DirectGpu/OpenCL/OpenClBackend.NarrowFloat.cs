@@ -8,8 +8,30 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 // kernels generated with the integer program (GpuNarrowFloatKernelSource), which CUDA and HIP also run: they compute in
 // FP32 once and round to nearest even, as the host does. The older half add and gelu kernels do not, so they are not
 // behind this interface.
-public sealed partial class OpenClBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply, IGpuNarrowFloatReductions
+public sealed partial class OpenClBackend : IGpuNarrowFloatElementwise, IGpuNarrowFloatMatrixMultiply, IGpuNarrowFloatReductions,
+    IGpuNarrowFloatRounding, IGemmAutocastBackend
 {
+    private readonly GemmOperandAutocast _gemmAutocast = new();
+
+    /// <inheritdoc/>
+    IDisposable IGemmAutocastBackend.EnterGemmAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode)
+        => _gemmAutocast.Enter(precision, mode);
+
+    /// <inheritdoc/>
+    bool IGpuNarrowFloatRounding.SupportsRoundToNarrowFloat(GpuElementType type) => NarrowFloatKernelsReady(type);
+
+    /// <inheritdoc/>
+    void IGpuNarrowFloatRounding.RoundToNarrowFloat(GpuElementType type, IGpuBuffer source, IGpuBuffer destination, int count)
+    {
+        GpuNarrowFloatLayout.RequireRounding(type, source, destination, count);
+        var kernel = IntegerKernel(GpuNarrowFloatKernelSource.Round(type));
+        if (count == 0) return;
+        kernel.SetArg(0, IntegerHandle(source));
+        kernel.SetArg(1, IntegerHandle(destination));
+        kernel.SetArg(2, count);
+        kernel.Execute1D(count, CalculateOptimalWorkGroupSize1D(count));
+    }
+
     private bool NarrowFloatKernelsReady(GpuElementType type)
         => GpuNarrowFloatLayout.IsNarrowFloat(type) && EnsureIntegerKernels() is not null;
 
