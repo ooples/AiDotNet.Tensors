@@ -1164,8 +1164,11 @@ public static partial class WeightRegistry
     public static void MaterializeForForward<T>(Tensor<T> weight, Engines.IEngine? engine = null)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
+        // The engine is resolved only for a weight the skip can apply to: Current may complete a deferred GPU
+        // detection, which a weight Materialize would restore anyway must not cost.
         if (weight.Lifetime == WeightLifetime.Streaming && weight.StreamingPoolHandle >= 0
-            && !weight.IsWritableMmapAliased && ServedFromBf16DeviceCopy(weight, engine ?? Engines.AiDotNetEngine.Current))
+            && !weight.IsWritableMmapAliased && CouldServeFromBf16DeviceCopy(weight)
+            && ServedFromBf16DeviceCopy(weight, engine ?? Engines.AiDotNetEngine.Current))
         {
             // Not restored, but used: the bf16 store stays hot in the pool (a re-upload after a device eviction reads
             // it), and evictions elsewhere drop their owners as Materialize's resident path does.
@@ -1339,11 +1342,22 @@ public static partial class WeightRegistry
 
     // Whether the current engine serves this weight from a bf16 device copy (DirectGpuTensorEngine.TryBf16StreamingWeight
     // takes the same contiguous float bf16-store weights).
-    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight, Engines.IEngine? engine)
+    private static bool CouldServeFromBf16DeviceCopy<T>(Tensor<T> weight)
         => typeof(T) == typeof(float) && weight.StreamingStoreEncoding == StreamingEncoding.Bf16
-            && weight.IsContiguous && weight._storageOffset == 0
-            && engine.As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true }
-            && HasBf16Store(weight);
+            && weight.IsContiguous && weight._storageOffset == 0;
+
+    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight, Engines.IEngine? engine)
+        => engine.As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true } && HasBf16Store(weight);
+
+    /// <summary>
+    /// Marks <paramref name="weight"/>'s resident copy in use until <see cref="EndOwnerUse"/>, so owner shedding and
+    /// eviction drains leave it: for a caller that pages it in and then reads its storage (a view's construction).
+    /// Returns the handle to end, or -1 for a tensor that is not a registered streaming weight.
+    /// </summary>
+    internal static long BeginOwnerUse<T>(Tensor<T> weight) => EnterMaterializedOwnerUse(weight);
+
+    /// <summary>Ends a use <see cref="BeginOwnerUse{T}"/> began.</summary>
+    internal static void EndOwnerUse(long handle) => ExitMaterializedOwnerUse(handle);
 
     /// <summary>
     /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry

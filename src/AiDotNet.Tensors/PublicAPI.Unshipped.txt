@@ -1322,3 +1322,4 @@ static AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.TraceGra
 static AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.TraceGraphSteps.set -> void
 static AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.TraceIdleLoans.get -> bool
 static AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.TraceIdleLoans.set -> void
+static AiDotNet.Tensors.LinearAlgebra.WeightRegistry.MaterializeForForward<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! weight, AiDotNet.Tensors.Engines.IEngine? engine = null) -> void

@@ -255,15 +255,27 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         // A streaming weight whose storage was dropped (paged out, or left on the device by MaterializeForForward)
-        // pages back in first: the view shares the storage and is no streaming weight itself, so it could not.
-        if (Lifetime == WeightLifetime.Streaming) EnsureStorageResident();
-        // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
-        // vector/storage snapshot and family registration under the detach lock; otherwise a
-        // concurrent writer could swap storage between evaluation of the two constructor args.
-        var view = HasCowAliasFamily
-            ? CreateViewInCowAliasFamily(
-                () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
-            : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        // pages back in first: the view shares the storage and is no streaming weight itself, so it could not. The
+        // resident copy is marked in use until the view holds the storage, so another thread's owner shedding cannot
+        // drop it in between. A resident weight's view takes neither (the common case: a bias reshaped every forward).
+        bool dropped = Lifetime == WeightLifetime.Streaming && _data.Length != Length;
+        long ownerUse = dropped ? WeightRegistry.BeginOwnerUse(this) : -1;
+        Tensor<T> view;
+        try
+        {
+            if (dropped) EnsureStorageResident();
+            // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
+            // vector/storage snapshot and family registration under the detach lock; otherwise a
+            // concurrent writer could swap storage between evaluation of the two constructor args.
+            view = HasCowAliasFamily
+                ? CreateViewInCowAliasFamily(
+                    () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
+                : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        }
+        finally
+        {
+            WeightRegistry.EndOwnerUse(ownerUse);
+        }
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 

@@ -314,12 +314,16 @@ public class StreamingBf16InferenceTests
             // A view of a weight the forward left on the device pages it back in (a view shares the storage, and the
             // constructor used to find it empty): here the transposed weight's product on the GPU.
             WeightRegistry.MaterializeForForward(w[5], gpu);
+            Assert.True(w[5].DataVector.Length != w[5].Length, "the forward restored a host copy of the weight");
             var viaView = gpu.TensorMatMul(x, w[5].Transpose(new[] { 1, 0 }).Transpose(new[] { 1, 0 })).ToArray();
             var direct = cpu.TensorMatMul(x, w[5]).ToArray();
             for (int i = 0; i < direct.Length; i++)
                 Assert.True(Math.Abs(viaView[i] - direct[i]) <= 2e-2f * (1f + Math.Abs(direct[i])), $"view [{i}]: {viaView[i]} vs {direct[i]}");
-            WeightRegistry.MaterializeForForward(w[6], gpu);
-            Assert.Equal(cpu.TensorMatMul(x, w[6]).ToArray(), cpu.TensorMatMul(x, w[6].Reshape(k * n).Reshape(k, n)).ToArray());
+            // The engine defaults to the current one.
+            using (AiDotNetEngine.UseInCurrentContext(gpu)) WeightRegistry.MaterializeForForward(w[6]);
+            Assert.True(w[6].DataVector.Length != w[6].Length, "the forward restored a host copy of the weight");
+            var reshaped = w[6].Reshape(k * n).Reshape(k, n);   // built while the weight is dropped
+            Assert.Equal(cpu.TensorMatMul(x, w[6]).ToArray(), cpu.TensorMatMul(x, reshaped).ToArray());
             // A host read of a weight the forward left on the device pages it back in.
             Assert.Equal(new CpuEngine().FusedLinear(x, w[3], b[3], FusedActivationType.None).ToArray(), expected[3]);
             for (int e = 0; e < experts; e++)
