@@ -4,11 +4,12 @@ This end-to-end benchmark measures how changes to AiDotNet.Tensors affect traini
 
 | Recorded run | Results you can read on GitHub | Raw reports |
 | --- | --- | --- |
-| **November 20, current protocol** (AiDotNet `37597f19`, Tensors 0.151.0 from NuGet) | [Summary table](evidence/2026-11-20.md) · [Summary CSV](evidence/2026-11-20-summary.csv) · [Every launch](evidence/2026-11-20.csv) | [Every report, receipt and log](evidence/2026-11-20.zip) |
+| **November 21–26, current** (AiDotNet `9dc1c828`, Tensors 0.151.0 from NuGet): main comparison and large datasets | [Results and how to read them](https://github.com/ooples/AiDotNet/blob/d831cfbf75b45739632bbd8070b9f740fda15a0c/benchmarks/AiDotNet.PyTorchParity/README.md#results-from-november-2126-2026) · [Large-data results](https://github.com/ooples/AiDotNet/blob/d831cfbf75b45739632bbd8070b9f740fda15a0c/benchmarks/AiDotNet.PyTorchParity/README.md#large-datasets---scale) | [Every report, receipt and log](https://github.com/ooples/AiDotNet/blob/d831cfbf75b45739632bbd8070b9f740fda15a0c/benchmarks/AiDotNet.PyTorchParity/evidence) |
+| November 20, superseded (AiDotNet `37597f19`): PyTorch's LSTM and GRU ran eagerly | [Summary table](evidence/2026-11-20.md) · [Summary CSV](evidence/2026-11-20-summary.csv) · [Every launch](evidence/2026-11-20.csv) | [Every report, receipt and log](evidence/2026-11-20.zip) |
 | November 13, archived | [Training and inference CSV](evidence/2026-11-13.csv) | [88 reports and run settings](evidence/2026-11-13.zip) |
 | November 19, archived | [Training and inference CSV](evidence/2026-11-19.csv) | [88 reports, process receipts, fingerprints and step-one checks](evidence/2026-11-19.zip) |
 
-Use the November 20 run for any performance claim. [Why the two archived runs are not evidence](#the-archived-runs) explains the problems with the older ones. The [17-second LSTM video benchmark](../lstm-video/README.md) has its own training code and recordings.
+Use the November 21–26 runs for any performance claim. The snapshot pins `9dc1c828`, the measured code; their results and raw evidence were published one commit later, in AiDotNet `d831cfbf`, which also merges later AiDotNet master changes that these runs did not measure. The November 20 run compared the LSTM and GRU only against eager PyTorch, because `torch.compile` skips recurrent modules unless `allow_rnn` is set. [Why the two archived runs are not evidence](#the-archived-runs) explains the problems with the older ones. The [17-second LSTM video benchmark](../lstm-video/README.md) has its own training code and recordings.
 
 ## Try one model
 
@@ -35,7 +36,17 @@ The first run fetches the pinned AiDotNet source and builds it in Release. The p
 python parity/model-families/run.py
 ```
 
-This reproduces the November 20 run. It runs the pinned revision's own `run_matrix.py`, so the protocol is the one in that revision: five launches; AiDotNet against three PyTorch configurations on CUDA and two on CPU; the comparison against the fastest configuration for each row; and a first-update correctness check before any timing. The pinned [runner](https://github.com/ooples/AiDotNet/blob/37597f19895ccd76df9bae55064677bcd4807c88/benchmarks/AiDotNet.PyTorchParity/run_matrix.py) defines the configurations, flags and outputs, and the AiDotNet benchmark README describes them. Use `--devices cpu` or `--devices cuda` for one device, `--models cnn resnet18` for a subset, and `--launches N` to change the number of launches. Use `--work PATH` to put checkouts, builds, compiler caches and results on a drive with room. The runner refuses to start on battery power. Close other GPU and CPU-heavy programs: the summary flags rows whose launches started on a busy machine.
+This reproduces the November 21–26 runs (`--snapshot 2026-11-26`, the default; `--snapshot 2026-11-20` reproduces the superseded one). It runs the pinned revision's own `run_matrix.py`, so the protocol is the one in that revision: five launches; AiDotNet against every applicable PyTorch configuration, including ones that compile the LSTM and GRU; the comparison against the fastest configuration for each row; and a first-update correctness check before any timing. The pinned [runner](https://github.com/ooples/AiDotNet/blob/9dc1c8287faa0ea46236985b9dd5e268a09d51bf/benchmarks/AiDotNet.PyTorchParity/run_matrix.py) defines the configurations, flags and outputs, and the AiDotNet benchmark README describes them. Use `--devices cpu` or `--devices cuda` for one device, `--models cnn resnet18` for a subset, and `--launches N` to change the number of launches. Use `--work PATH` to put checkouts, builds, compiler caches and results on a drive with room. The runner refuses to start on battery power. Close other GPU and CPU-heavy programs: the summary flags rows whose launches started on a busy machine.
+
+## Large datasets
+
+The 2026-11-26 snapshot adds a large-data mode. Every model trains whole epochs over real data (EMNIST Digits and CINIC-10) and over 1,000,000-sample synthetic datasets, and both frameworks report test accuracy after every epoch. The datasets take about 5.5 GB and are built and checksum-verified on the first run:
+
+```shell
+python parity/model-families/run.py --devices cuda --launches 3 --scale D:/parity-data
+```
+
+A full CUDA run takes about 20 hours on a GTX 1660 Ti. If your GPU computes wrong values at its boost clocks, as the recording laptop's does, lock the clock first (`nvidia-smi -lgc 1200,1200` as administrator) and add `--gpu-clock-lock 1200`. The runner then refuses to start unless the lock is in effect. `--scale-torch-from SUMMARY_CSV` limits each row to the PyTorch configuration that was fastest in a main-comparison summary. The [AiDotNet benchmark README](https://github.com/ooples/AiDotNet/blob/d831cfbf75b45739632bbd8070b9f740fda15a0c/benchmarks/AiDotNet.PyTorchParity/README.md#large-datasets---scale) describes the protocol, the results, the ViT fix the runs led to, and the GPU clock lock.
 
 To rebuild the November 20 tables from its raw reports (Python standard library and the pinned AiDotNet source):
 
@@ -45,7 +56,9 @@ python parity/model-families/prepare.py --snapshot 2026-11-20
 python <printed directory>/AiDotNet/benchmarks/AiDotNet.PyTorchParity/run_matrix.py --summarize archive-20
 ```
 
-## What the November 20 run showed
+## What the superseded November 20 run showed
+
+These are the November 20 numbers. The current results are linked at the top of this page.
 
 The machine was a Ryzen 7 4800H laptop on AC power, with a 6 GB GTX 1660 Ti, NVIDIA driver 617.42, Windows 11, .NET 10 and PyTorch 2.14.1+cu126. Each row compares AiDotNet with PyTorch's fastest configuration for that row. GRU, ViT and MobileNetV2 carry ⚑ on every row because their parameter counts differ slightly (`parameters-differ`).
 

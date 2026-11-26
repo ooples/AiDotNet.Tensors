@@ -94,6 +94,119 @@ public abstract class GpuSyncPoint : IDisposable
         return new CombinedSyncPoint(syncPoints);
     }
 
+    internal static GpuSyncPoint[] CreateSharedLeaseGroup(GpuSyncPoint inner, int count)
+    {
+        if (inner is null)
+        {
+            throw new ArgumentNullException(nameof(inner));
+        }
+
+        if (count <= 0)
+        {
+            inner.Dispose();
+            return System.Array.Empty<GpuSyncPoint>();
+        }
+
+        if (count == 1)
+        {
+            return new[] { inner };
+        }
+
+        var core = new SharedSyncPointCore(inner, count);
+        var leases = new GpuSyncPoint[count];
+        for (int i = 0; i < count; i++)
+        {
+            leases[i] = new SharedSyncPointLease(core);
+        }
+
+        return leases;
+    }
+
+    private sealed class SharedSyncPointCore
+    {
+        public readonly GpuSyncPoint Inner;
+        private int _refCount;
+
+        public SharedSyncPointCore(GpuSyncPoint inner, int refCount)
+        {
+            Inner = inner;
+            _refCount = refCount;
+        }
+
+        public void Release()
+        {
+            if (System.Threading.Interlocked.Decrement(ref _refCount) == 0)
+            {
+                Inner.Dispose();
+            }
+        }
+    }
+
+    private sealed class SharedSyncPointLease : GpuSyncPoint
+    {
+        private SharedSyncPointCore? _core;
+
+        public SharedSyncPointLease(SharedSyncPointCore core)
+        {
+            _core = core;
+        }
+
+        public override bool IsComplete
+        {
+            get
+            {
+                var core = System.Threading.Volatile.Read(ref _core);
+                return core is null || core.Inner.IsComplete;
+            }
+        }
+
+        public override IGpuStream? Stream => System.Threading.Volatile.Read(ref _core)?.Inner.Stream;
+
+        public override IGpuEvent? Event => System.Threading.Volatile.Read(ref _core)?.Inner.Event;
+
+        public override void Wait()
+        {
+            var core = System.Threading.Volatile.Read(ref _core)
+                ?? throw new ObjectDisposedException(nameof(SharedSyncPointLease));
+            core.Inner.Wait();
+        }
+
+        public override bool Poll()
+        {
+            var core = System.Threading.Volatile.Read(ref _core)
+                ?? throw new ObjectDisposedException(nameof(SharedSyncPointLease));
+            return core.Inner.Poll();
+        }
+
+        public override void MakeStreamWait(IGpuStream stream)
+        {
+            var core = System.Threading.Volatile.Read(ref _core)
+                ?? throw new ObjectDisposedException(nameof(SharedSyncPointLease));
+            core.Inner.MakeStreamWait(stream);
+        }
+
+        public override float GetElapsedTime(GpuSyncPoint startPoint)
+        {
+            var core = System.Threading.Volatile.Read(ref _core)
+                ?? throw new ObjectDisposedException(nameof(SharedSyncPointLease));
+            var unwrappedStart = startPoint is SharedSyncPointLease startLease && startLease._core is { } startCore
+                ? startCore.Inner
+                : startPoint;
+            return core.Inner.GetElapsedTime(unwrappedStart);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            var core = System.Threading.Interlocked.Exchange(ref _core, null);
+            if (core is not null && disposing)
+            {
+                core.Release();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+
     protected virtual void Dispose(bool disposing)
     {
         if (!_disposed)

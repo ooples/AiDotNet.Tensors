@@ -25,6 +25,10 @@ internal sealed class CudaStepArena : IDisposable
 
     private const long Alignment = 256;
     private const int MaxReplans = 4;
+    // Multi-gigabyte training steps are already served in O(1) by the stream-ordered GpuBufferPool;
+    // carving a single multi-GB contiguous cuMemAlloc block risks double-buffering VRAM and WDDM
+    // PCIe paging whenever a step dynamically branches or replans.
+    internal readonly long MaxPlannedBytes = 512L * 1024 * 1024;
 
     private readonly IntPtr _context;
     private readonly long _contextGeneration;
@@ -100,10 +104,12 @@ internal sealed class CudaStepArena : IDisposable
         // out only when its extent meets none of them, so the one starting last before a slot's end is the only one
         // that can overlap it. One live set for the block, in place of a list per slot of every slot sharing its
         // memory, which grows with the square of a step's same-size temporaries.
+        private const long UnclaimedStart = long.MinValue;
         private readonly object _gate = new();
         private readonly List<long> _liveStart = new();
         private readonly List<long> _liveEnd = new();
         private readonly List<int> _liveSlot = new();
+        private readonly long[] _slotStart;
 
         internal Block(IntPtr ptr, IntPtr context, long contextGeneration, int slots)
         {
@@ -111,6 +117,8 @@ internal sealed class CudaStepArena : IDisposable
             Context = context;
             ContextGeneration = contextGeneration;
             SlotLive = new int[slots];
+            _slotStart = new long[slots];
+            for (int i = 0; i < slots; i++) _slotStart[i] = UnclaimedStart;
         }
 
         /// <summary>Marks <paramref name="slot"/> live over [start, end) unless it is live or a live slot meets it.</summary>
@@ -127,6 +135,11 @@ internal sealed class CudaStepArena : IDisposable
                     _liveStart.Insert(insert, start);
                     _liveEnd.Insert(insert, end);
                     _liveSlot.Insert(insert, slot);
+                    _slotStart[slot] = start;
+                }
+                else
+                {
+                    _slotStart[slot] = UnclaimedStart;
                 }
                 Volatile.Write(ref SlotLive[slot], 1);
                 return true;
@@ -138,11 +151,21 @@ internal sealed class CudaStepArena : IDisposable
         {
             lock (_gate)
             {
-                int i = _liveSlot.IndexOf(slot);
-                if (i < 0) return;
-                _liveStart.RemoveAt(i);
-                _liveEnd.RemoveAt(i);
-                _liveSlot.RemoveAt(i);
+                long start = _slotStart[slot];
+                if (start == UnclaimedStart) return;
+                int i = FirstStartAtOrAfter(start);
+                while (i < _liveStart.Count && _liveStart[i] == start)
+                {
+                    if (_liveSlot[i] == slot)
+                    {
+                        _slotStart[slot] = UnclaimedStart;
+                        _liveStart.RemoveAt(i);
+                        _liveEnd.RemoveAt(i);
+                        _liveSlot.RemoveAt(i);
+                        return;
+                    }
+                    i++;
+                }
             }
         }
 
@@ -330,44 +353,121 @@ internal sealed class CudaStepArena : IDisposable
 
     private void BuildPlan()
     {
+        long clockSnapshot;
         lock (_lock)
         {
             _recorded.Clear();   // still out at the step's end: they stay on the pool
             _mode = Mode.Off;    // no more returns are recorded; Replaying once the plan is in place below
+            clockSnapshot = _clock;
         }
         int n = _sizes.Count;
+        if (n == 0 || clockSnapshot <= 0 || clockSnapshot > int.MaxValue) { _mode = Mode.Off; return; }
+
         var bytes = new long[n];
-        var order = new List<int>(n);
+        var offset = new long[n];
+        var events = new int[(int)clockSnapshot];
+        int placedCount = 0;
         for (int i = 0; i < n; i++)
         {
+            offset[i] = -1;
             bytes[i] = ((long)_sizes[i] * sizeof(float) + Alignment - 1) / Alignment * Alignment;
-            if (_returnedAt[i] >= 0) order.Add(i);
-        }
-        // Largest first, each at the lowest offset free of every placed slot whose lifetime overlaps its own.
-        order.Sort((a, b) => bytes[b].CompareTo(bytes[a]));
-        var offset = new long[n];
-        for (int i = 0; i < n; i++) offset[i] = -1;
-        var placed = new List<int>(order.Count);
-        var busy = new List<(long Start, long End)>();
-        long total = 0;
-        foreach (int i in order)
-        {
-            busy.Clear();
-            foreach (int j in placed)
-                if (_allocatedAt[j] < _returnedAt[i] && _allocatedAt[i] < _returnedAt[j])
-                    busy.Add((offset[j], offset[j] + bytes[j]));
-            busy.Sort((a, b) => a.Start.CompareTo(b.Start));
-            long at = 0;
-            foreach (var (start, end) in busy)
+            long allocAt = _allocatedAt[i];
+            long retAt = _returnedAt[i];
+            if (retAt < 0) continue;
+            if (bytes[i] <= 0)
             {
-                if (at + bytes[i] <= start) break;
-                if (end > at) at = end;
+                offset[i] = 0;
+                placedCount++;
+                continue;
             }
-            offset[i] = at;
-            placed.Add(i);
-            if (at + bytes[i] > total) total = at + bytes[i];
+            if (allocAt >= 0 && allocAt < retAt && retAt < clockSnapshot)
+            {
+                events[(int)allocAt] = i + 1;
+                events[(int)retAt] = -(i + 1);
+                placedCount++;
+            }
         }
-        if (placed.Count == 0) { _mode = Mode.Off; return; }
+        if (placedCount == 0) { _mode = Mode.Off; return; }
+
+        // Chronological sweep-line allocator with immediate free-interval coalescing and frontier
+        // retraction: replaces the O(n^2 log n) pairwise overlap scan with O(n * activeGaps),
+        // keeping every overlapping [allocatedAt, returnedAt) pair strictly disjoint.
+        var freeGaps = new List<(long Start, long End)>(32);
+        long frontier = 0;
+        long total = 0;
+        for (int t = 0; t < events.Length; t++)
+        {
+            int ev = events[t];
+            if (ev == 0) continue;
+            if (ev > 0)
+            {
+                int slot = ev - 1;
+                long need = bytes[slot];
+                int bestIdx = -1;
+                long bestLen = long.MaxValue;
+                for (int g = 0; g < freeGaps.Count; g++)
+                {
+                    long len = freeGaps[g].End - freeGaps[g].Start;
+                    if (len >= need && len < bestLen)
+                    {
+                        bestLen = len;
+                        bestIdx = g;
+                        if (len == need) break;
+                    }
+                }
+                if (bestIdx >= 0)
+                {
+                    var gap = freeGaps[bestIdx];
+                    offset[slot] = gap.Start;
+                    if (bestLen == need) freeGaps.RemoveAt(bestIdx);
+                    else freeGaps[bestIdx] = (gap.Start + need, gap.End);
+                }
+                else
+                {
+                    offset[slot] = frontier;
+                    frontier += need;
+                    if (frontier > total) total = frontier;
+                }
+            }
+            else
+            {
+                int slot = (-ev) - 1;
+                long start = offset[slot];
+                long end = start + bytes[slot];
+                int idx = FirstGapAtOrAfter(freeGaps, start);
+                bool leftAdj = idx > 0 && freeGaps[idx - 1].End == start;
+                bool rightAdj = idx < freeGaps.Count && end == freeGaps[idx].Start;
+                if (leftAdj && rightAdj)
+                {
+                    freeGaps[idx - 1] = (freeGaps[idx - 1].Start, freeGaps[idx].End);
+                    freeGaps.RemoveAt(idx);
+                }
+                else if (leftAdj)
+                {
+                    freeGaps[idx - 1] = (freeGaps[idx - 1].Start, end);
+                }
+                else if (rightAdj)
+                {
+                    freeGaps[idx] = (start, freeGaps[idx].End);
+                }
+                else if (end == frontier)
+                {
+                    frontier = start;
+                }
+                else
+                {
+                    freeGaps.Insert(idx, (start, end));
+                }
+
+                while (freeGaps.Count > 0 && freeGaps[freeGaps.Count - 1].End == frontier)
+                {
+                    frontier = freeGaps[freeGaps.Count - 1].Start;
+                    freeGaps.RemoveAt(freeGaps.Count - 1);
+                }
+            }
+        }
+        if (total == 0) total = Alignment;
+        if (total > MaxPlannedBytes) { _mode = Mode.Off; return; }
 
         // A slot that outlives its recorded lifetime (into a later step, or past its recorded return) must not be
         // aliased: the block's live set (Block.TryClaim) refuses any slot whose memory a live slot still holds.
@@ -386,6 +486,18 @@ internal sealed class CudaStepArena : IDisposable
         _next = 0;
         _aborted = false;
         _mode = Mode.Replaying;
+    }
+
+    private static int FirstGapAtOrAfter(List<(long Start, long End)> gaps, long value)
+    {
+        int lo = 0, hi = gaps.Count;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (gaps[mid].Start < value) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
     }
 
     // The current block stops serving; its memory is freed once every slot it handed out is dead.

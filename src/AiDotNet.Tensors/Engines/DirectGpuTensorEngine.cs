@@ -2194,6 +2194,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return pe.Buffer;
             }
         }
+        if (_pendingPersistentRoles.TryGetValue(backingArray, out var pendingRole))
+        {
+            var uploaded = GetOrCacheWeightBuffer(backend, backingArray, pendingRole.Role, hostVersion);
+            if (uploaded.Buffer.Handle != IntPtr.Zero && uploaded.Buffer.Size == backingArray.Length)
+            {
+                return uploaded.Buffer;
+            }
+        }
         lock (_activationCacheLock)
         {
             if (_activationCache.TryGetValue(backingArray, out var ae)
@@ -2251,9 +2259,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
+    /// <summary>A contiguous slice (nonzero offset) or strided view of device data: materialize on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
-        => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view), out result);
+    {
+        // A contiguous offset-0 tensor is no slice the overload below copies. Resolving a base for it would upload
+        // and cache a second full buffer of a resident input (its pending persistent role) only to be declined.
+        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0))
+        {
+            result = default;
+            return false;
+        }
+        return TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view), out result);
+    }
 
     /// <summary>As above, from an explicit <paramref name="baseBuffer"/> holding the viewed STORAGE in storage order.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, out OwnedBuffer result)
@@ -3536,6 +3553,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
         else buffer.Dispose();
+        if (TensorScope.Current is not null) TensorScope.Untrack(vector);
     }
 
     internal void DetachToTensorLifetime(IEnumerable<object> keys)
@@ -5796,7 +5814,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
-        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true));
+        if (TensorScope.Current is not null) TensorScope.TrackTensor(vector, this, tensor);
         return tensor;
     }
 
@@ -31410,10 +31428,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size) =>
-        backend is IStreamOrderedScratch cuda
+    private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size)
+    {
+        using var _ = Engines.DirectGpu.DeviceMemoryReclaim.EnterScopedScratch();
+        return backend is IStreamOrderedScratch cuda
             ? cuda.AllocateStreamOrderedScratchBuffer(size)
             : backend.AllocateBuffer(size);
+    }
 
     private Tensor<T>? TryDeviceSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
@@ -31495,12 +31516,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool allocated = false, handedOff = false;
         try
         {
-            var input = UploadTensorRaw(backend, tensor);
+            using var input = GetOrAllocateBuffer(backend, tensor);
             // TileAxis writes every element; inside a compiled step's action this is a pooled buffer, not a graph
             // allocation node.
             output = AllocateFullyWrittenOutputBuffer(backend, total);
             allocated = true;
-            backend.TileAxis(input, output.Buffer, outer, axisSize, inner, repeats);
+            backend.TileAxis(input.Buffer, output.Buffer, outer, axisSize, inner, repeats);
+            input.DisposeAfterQueuedUse(backend);
             var outShape = (int[])tensor.Shape._dims.Clone();
             outShape[axis] = checked(axisSize * repeats);
             var result = DeferTensorResult<T>(backend, output.Buffer, total, outShape);

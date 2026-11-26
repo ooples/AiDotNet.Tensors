@@ -1,0 +1,161 @@
+{
+  "torchCompileMode": "reduce-overhead",
+  "torchCompileRnn": true,
+  "repeats": 5,
+  "takes": [
+    {
+      "AiDotNet": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.3047204,
+          "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+        },
+        "step": 4096,
+        "seconds": 2.5731944,
+        "correct": 302,
+        "loss": 0.10775187611579895
+      },
+      "PyTorch": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.304720401763916,
+          "device": "NVIDIA GeForce GTX 1660 Ti",
+          "version": "2.14.1+cu126"
+        },
+        "step": 4096,
+        "seconds": 12.744432899999083,
+        "correct": 301,
+        "loss": 0.06712711602449417
+      },
+      "torch_over_aidotnet": 4.9527672297122525,
+      "torchCompiledGraphs": 2
+    },
+    {
+      "AiDotNet": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.3047204,
+          "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+        },
+        "step": 4096,
+        "seconds": 2.5684066,
+        "correct": 302,
+        "loss": 0.10775187611579895
+      },
+      "PyTorch": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.304720401763916,
+          "device": "NVIDIA GeForce GTX 1660 Ti",
+          "version": "2.14.1+cu126"
+        },
+        "step": 4096,
+        "seconds": 12.256296999999904,
+        "correct": 301,
+        "loss": 0.06712711602449417
+      },
+      "torch_over_aidotnet": 4.771945765907899,
+      "torchCompiledGraphs": 2
+    },
+    {
+      "AiDotNet": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.3047204,
+          "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+        },
+        "step": 4096,
+        "seconds": 2.6375744,
+        "correct": 302,
+        "loss": 0.10775187611579895
+      },
+      "PyTorch": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.304720401763916,
+          "device": "NVIDIA GeForce GTX 1660 Ti",
+          "version": "2.14.1+cu126"
+        },
+        "step": 4096,
+        "seconds": 11.922617499993066,
+        "correct": 301,
+        "loss": 0.06712711602449417
+      },
+      "torch_over_aidotnet": 4.520296185765629,
+      "torchCompiledGraphs": 2
+    },
+    {
+      "AiDotNet": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.3047204,
+          "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+        },
+        "step": 4096,
+        "seconds": 2.5597764,
+        "correct": 302,
+        "loss": 0.10775187611579895
+      },
+      "PyTorch": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.304720401763916,
+          "device": "NVIDIA GeForce GTX 1660 Ti",
+          "version": "2.14.1+cu126"
+        },
+        "step": 4096,
+        "seconds": 12.060483200009912,
+        "correct": 301,
+        "loss": 0.06712711602449417
+      },
+      "torch_over_aidotnet": 4.711537773381266,
+      "torchCompiledGraphs": 2
+    },
+    {
+      "AiDotNet": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.3047204,
+          "device": "Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)"
+        },
+        "step": 4096,
+        "seconds": 2.5992349,
+        "correct": 302,
+        "loss": 0.10775187611579895
+      },
+      "PyTorch": {
+        "initial": {
+          "parameters": 25482,
+          "initial": 37,
+          "firstLoss": 2.304720401763916,
+          "device": "NVIDIA GeForce GTX 1660 Ti",
+          "version": "2.14.1+cu126"
+        },
+        "step": 4096,
+        "seconds": 12.087037799996324,
+        "correct": 301,
+        "loss": 0.06712711602449417
+      },
+      "torch_over_aidotnet": 4.650229111649865,
+      "torchCompiledGraphs": 2
+    }
+  ],
+  "median_seconds": {
+    "AiDotNet": 2.5731944,
+    "PyTorch": 12.087037799996324
+  },
+  "torch_over_aidotnet_median": 4.711537773381266,
+  "torch_over_aidotnet_range": [
+    4.520296185765629,
+    4.9527672297122525
+  ]
+}

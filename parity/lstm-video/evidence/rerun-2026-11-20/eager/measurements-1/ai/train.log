@@ -1,0 +1,2 @@
+[AiDotNet] GPU offload allocator registered (CUDA) - weights/optimizer moments can be GPU-resident
+[AiDotNet] GPU acceleration enabled: Direct GPU Engine (CUDA NVIDIA GeForce GTX 1660 Ti)
