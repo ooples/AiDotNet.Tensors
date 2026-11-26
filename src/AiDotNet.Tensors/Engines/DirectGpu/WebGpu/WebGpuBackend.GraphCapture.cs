@@ -14,6 +14,7 @@ public sealed partial class WebGpuBackend : IGpuGraphCapture
     GraphNodeCounts? IGpuGraphCapture.LastCaptureNodeCounts => null;
 
     bool IGpuGraphCapture.IsStreamCapturing() => false;
+    bool IGpuGraphCapture.CaptureActiveOnThisThread => false;
 
     int IGpuGraphCapture.StreamCaptureStatusRaw() => 0;
 

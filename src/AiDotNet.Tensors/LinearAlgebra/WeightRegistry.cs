@@ -1,8 +1,8 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
-using AiDotNet.Tensors.Engines;
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
@@ -1165,7 +1165,8 @@ public static partial class WeightRegistry
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         // The engine is resolved only for a weight the skip can apply to: Current may complete a deferred GPU
-        // detection, which a weight Materialize would restore anyway must not cost.
+        // detection, which a weight Materialize would restore anyway must not cost. (A writable mmap alias has no
+        // bf16 store, so HasBf16Store already refuses it; the check states Materialize's own early return.)
         if (weight.Lifetime == WeightLifetime.Streaming && weight.StreamingPoolHandle >= 0
             && !weight.IsWritableMmapAliased && CouldServeFromBf16DeviceCopy(weight)
             && ServedFromBf16DeviceCopy(weight, engine ?? Engines.AiDotNetEngine.Current))
@@ -1176,6 +1177,11 @@ public static partial class WeightRegistry
             lock (_lock) { poolRef = _streamingPool; }
             poolRef?.MarkAccessed(weight.StreamingPoolHandle);
             DrainOwnerDropsAfterEviction();
+            // A host copy that is resident anyway (a host read, or a drop deferred at registration) counts against
+            // the owner budget and is refreshed in its LRU, as Materialize's resident path does: otherwise a copy no
+            // Materialize tracked stayed for good, and a tracked one was shed first while its forward used it.
+            if (weight.DataVector.Length == weight.Length)
+                NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
             return;
         }
         Materialize(weight);

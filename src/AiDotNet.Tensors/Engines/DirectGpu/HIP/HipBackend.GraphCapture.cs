@@ -13,6 +13,7 @@ public sealed partial class HipBackend : IGpuGraphCapture
     GraphNodeCounts? IGpuGraphCapture.LastCaptureNodeCounts => null;
 
     bool IGpuGraphCapture.IsStreamCapturing() => false;
+    bool IGpuGraphCapture.CaptureActiveOnThisThread => false;
 
     int IGpuGraphCapture.StreamCaptureStatusRaw() => 0;
 

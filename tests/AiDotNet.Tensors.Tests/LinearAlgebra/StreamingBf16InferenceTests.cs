@@ -300,8 +300,14 @@ public class StreamingBf16InferenceTests
             using (AiDotNetEngine.UseInCurrentContext(gpu))
                 for (int e = 0; e < experts; e++)
                 {
-                    WeightRegistry.MaterializeForForward(w[e], gpu);
-                    WeightRegistry.MaterializeForForward(b[e], gpu);
+                    // A layer makes its weights ready before its op takes a lease: the query must need none.
+                    gpu.StrictGpuLeases = true;
+                    try
+                    {
+                        WeightRegistry.MaterializeForForward(w[e], gpu);
+                        WeightRegistry.MaterializeForForward(b[e], gpu);
+                    }
+                    finally { gpu.StrictGpuLeases = false; }
                     outputs[e] = gpu.FusedLinear(x, w[e], b[e], FusedActivationType.None);
                     _ = outputs[e].GetFlat(0);
                 }
@@ -324,6 +330,12 @@ public class StreamingBf16InferenceTests
             Assert.True(w[6].DataVector.Length != w[6].Length, "the forward restored a host copy of the weight");
             var reshaped = w[6].Reshape(k * n).Reshape(k, n);   // built while the weight is dropped
             Assert.Equal(cpu.TensorMatMul(x, w[6]).ToArray(), cpu.TensorMatMul(x, reshaped).ToArray());
+            // So does an in-place strided view of its storage.
+            WeightRegistry.MaterializeForForward(w[7], gpu);
+            Assert.True(w[7].DataVector.Length != w[7].Length, "the forward restored a host copy of the weight");
+            var strided = new Tensor<float>(new[] { 1 });
+            cpu.TensorSetInPlace(strided, w[7], 0, new[] { k, n }, new[] { n, 1 });
+            Assert.Equal(cpu.TensorMatMul(x, w[7]).ToArray(), cpu.TensorMatMul(x, strided).ToArray());
             // A host read of a weight the forward left on the device pages it back in.
             Assert.Equal(new CpuEngine().FusedLinear(x, w[3], b[3], FusedActivationType.None).ToArray(), expected[3]);
             for (int e = 0; e < experts; e++)
@@ -333,6 +345,45 @@ public class StreamingBf16InferenceTests
                     Assert.True(Math.Abs(got[i] - expected[e][i]) <= 2e-2f * (1f + Math.Abs(expected[e][i])),
                         $"expert {e} [{i}]: {got[i]} vs {expected[e][i]}");
             }
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
+    /// <summary>
+    /// A host copy that is resident when a forward reaches its weight on the GPU stays the owner budget's most recent
+    /// use, as it is after Materialize: the next copy made resident sheds an older owner, not the one the forward is
+    /// using. The forward used to leave it at the budget's oldest place.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_forward_over_a_resident_bf16_weight_keeps_it_most_recent_in_the_owner_budget()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true }) { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies"); return; }
+        const int k = 64, n = 64;   // 16 KiB of fp32 per weight
+        long oneWeight = 4L * k * n;
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-bf16-owners-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 4 * oneWeight,   // the owner budget (half) holds two fp32 copies
+            StreamingStoreDtype = StreamingStoreDtype.Bf16,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var a = Stream(Filled(new[] { k, n }, 1, v => v));
+            var b = Stream(Filled(new[] { k, n }, 2, v => v));
+            var c = Stream(Filled(new[] { k, n }, 3, v => v));
+            WeightRegistry.ReleaseToPool(a); WeightRegistry.ReleaseToPool(b); WeightRegistry.ReleaseToPool(c);
+            WeightRegistry.Materialize(a);
+            WeightRegistry.Materialize(b);
+            WeightRegistry.MaterializeForForward(a, gpu);   // a is in use again: the most recent
+            WeightRegistry.Materialize(c);                  // over budget: the oldest, b, is shed
+            Assert.True(a.DataVector.Length == a.Length, "the owner the forward used was shed");
+            Assert.True(b.DataVector.Length != b.Length, "the oldest owner was kept");
         }
         finally { gpu.Dispose(); Cleanup(dir); }
     }

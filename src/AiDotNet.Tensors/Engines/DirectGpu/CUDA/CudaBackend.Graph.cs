@@ -821,6 +821,9 @@ public sealed partial class CudaBackend
             CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)byteCount, _stream), "cuMemcpyDtoDAsync(graph)");
     }
 
+    // This backend's side-stream capture, or any capture scope on this thread: managed state only.
+    bool IGpuGraphCapture.CaptureActiveOnThisThread => _backendStreamCaptureActive || IsCapturingOnThisThread;
+
     /// <summary>True while this backend's stream is mid-capture (diagnostics).</summary>
     public bool IsStreamCapturing()
     {

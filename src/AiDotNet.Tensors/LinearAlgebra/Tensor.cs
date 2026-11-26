@@ -254,12 +254,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
-        // A streaming weight whose storage was dropped (paged out, or left on the device by MaterializeForForward)
-        // pages back in first: the view shares the storage and is no streaming weight itself, so it could not. The
-        // resident copy is marked in use until the view holds the storage, so another thread's owner shedding cannot
-        // drop it in between. A resident weight's view takes neither (the common case: a bias reshaped every forward).
+        // A streaming weight's storage is marked in use until the view holds it, so another thread's owner shedding
+        // cannot drop it between the check below and the view's construction. One whose storage was dropped (paged
+        // out, or left on the device by MaterializeForForward) pages back in first: the view shares the storage and
+        // is no streaming weight itself, so it could not.
+        long ownerUse = Lifetime == WeightLifetime.Streaming ? WeightRegistry.BeginOwnerUse(this) : -1;
         bool dropped = Lifetime == WeightLifetime.Streaming && _data.Length != Length;
-        long ownerUse = dropped ? WeightRegistry.BeginOwnerUse(this) : -1;
         Tensor<T> view;
         try
         {

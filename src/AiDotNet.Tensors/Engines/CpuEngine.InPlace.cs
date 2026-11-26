@@ -451,9 +451,16 @@ public partial class CpuEngine
         if (stride is null) throw new ArgumentNullException(nameof(stride));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorAsStridedInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorAsStridedInPlace");
-        // A view of the tensor's own storage; its constructor checks the layout stays inside the storage.
-        using var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
-        tensor.AdoptFrom(view);
+        // A view of the tensor's own storage; its constructor checks the layout stays inside the storage. A streaming
+        // weight whose storage was dropped pages in first, marked in use until the view holds the storage.
+        long ownerUse = WeightRegistry.BeginOwnerUse(tensor);
+        try
+        {
+            WeightRegistry.Materialize(tensor);
+            using var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
+            tensor.AdoptFrom(view);
+        }
+        finally { WeightRegistry.EndOwnerUse(ownerUse); }
     }
 
     /// <inheritdoc/>
@@ -473,8 +480,15 @@ public partial class CpuEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
-        using var view = new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage);
-        tensor.AdoptFrom(view);
+        // A streaming source whose storage was dropped pages in first, marked in use until the view holds the storage.
+        long ownerUse = WeightRegistry.BeginOwnerUse(source);
+        try
+        {
+            WeightRegistry.Materialize(source);
+            using var view = new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage);
+            tensor.AdoptFrom(view);
+        }
+        finally { WeightRegistry.EndOwnerUse(ownerUse); }
     }
 
     /// <inheritdoc/>
