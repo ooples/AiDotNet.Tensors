@@ -135,7 +135,7 @@ internal static class DifferentiableOps
     internal static object?[]? _indexedSparseGrads;
 
     /// <summary>Sets the indexed sparse-gradient array for the current backward pass.</summary>
-    internal static void SetIndexedSparseGrads(object?[] sparseGrads) => _indexedSparseGrads = sparseGrads;
+    internal static void SetIndexedSparseGrads(object?[]? sparseGrads) => _indexedSparseGrads = sparseGrads;
 
     /// <summary>Clears the indexed sparse-gradient array after backward completes.</summary>
     internal static void ClearIndexedSparseGrads() => _indexedSparseGrads = null;

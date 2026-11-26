@@ -842,49 +842,27 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
         if (modelDim != numHeads * headDim || headDim > 256)
             throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
-        int hh = headDim * headDim;
-        long totalLong = checked((long)batch * numHeads * headDim);
-        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
-        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed Vulkan launch/buffer limits.");
-        int total = (int)totalLong;
-        int n = batch * seqLen * modelDim;
-        // Inside a batch the dispatches below are only recorded; disposing the scratch here would return it to the pool
-        // for another allocation to take before they run. The queued release holds it until the batch has completed.
+        // Checkpointed, deterministic BPTT (GatedDeltaNetCheckpoint): O(sqrt(seqLen)) state memory per head instead of
+        // the seqLen * headDim^2 trajectory, every gradient element written, nothing to clear first.
+        var (chunk, headStride, workLen) = GatedDeltaNetCheckpoint.Plan(batch, seqLen, numHeads, headDim);
+        int group = VulkanRecurrenceKernels.GatedDeltaCheckpointGroupSize;
+        int dispatch = checked(batch * numHeads * group);
+        // Inside a batch the dispatch below is only recorded; disposing the workspace here would return it to the pool
+        // for another allocation to take before it runs. The queued release holds it until the batch has completed.
         var release = (IQueuedBufferRelease)this;
         // Released below (queued past the batch): not charged toward the reclaim collections.
-        IGpuBuffer traj;
-        using (DeviceMemoryReclaim.EnterScopedScratch()) traj = AllocateBuffer((int)trajLenLong);
-        IGpuBuffer? partials = null;
+        IGpuBuffer work;
+        using (DeviceMemoryReclaim.EnterScopedScratch()) work = AllocateBuffer(workLen);
         try
         {
-            var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim };
-            // The rule kernels (recompute, backward) also take the key scale's bits and the decay-first flag.
-            var rulePc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim,
-                (uint)GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1u : 0u };
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaRecompute, new[] { k, v, alpha, beta, traj }, total, rulePc);
-            if (GpuDeterminism.IsActive)
-            {
-                // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every
-                // gradient element is written, so nothing needs clearing first.
-                partials = AllocateBuffer(checked(2 * n));
-                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaDq, new[] { dOut, traj, dQ }, n, pc);
-                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackwardDeterministic,
-                    new[] { dOut, q, k, v, alpha, beta, traj, partials, dV }, total, rulePc);
-                GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaReduce, new[] { traj, partials, dK, dAlpha, dBeta }, n, pc);
-                return;
-            }
-            Fill(dQ, 0f, n);
-            Fill(dK, 0f, n);
-            Fill(dAlpha, 0f, batch * seqLen * numHeads);
-            Fill(dBeta, 0f, batch * seqLen * numHeads);
-            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackward,
-                new[] { dOut, q, k, v, alpha, beta, traj, dQ, dK, dV, dAlpha, dBeta }, total, rulePc);
+            var pc = new[] { (uint)batch, (uint)seqLen, (uint)modelDim, (uint)numHeads, (uint)headDim, (uint)chunk,
+                (uint)headStride, (uint)GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1u : 0u };
+            GlslNaryOp(VulkanRecurrenceKernels.GatedDeltaBackwardCheckpointed,
+                new[] { dOut, q, k, v, alpha, beta, work, dQ, dK, dV, dAlpha, dBeta }, dispatch, pc, group);
         }
         finally
         {
-            release.ReleaseAfterQueuedWork(traj);
-            if (partials is not null) release.ReleaseAfterQueuedWork(partials);
+            release.ReleaseAfterQueuedWork(work);
         }
     }
 
