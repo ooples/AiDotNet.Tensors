@@ -191,6 +191,95 @@ internal sealed class GradientExchange<T>
         _readStaged = false;
     }
 
+    /// <summary>
+    /// Page-locks caller-owned host memory (for example a shared-memory region every rank maps) as a staging area for
+    /// <see cref="DownloadInto"/> and <see cref="UploadRangeFrom"/>, through the backend that holds the device
+    /// gradients. Null, with the reason, where that is not possible (no device backend, a non-float plan, a backend
+    /// without registration, or the driver refused). The caller disposes the result, which unregisters the memory,
+    /// before the memory goes away.
+    /// </summary>
+    public Engines.DirectGpu.IGradientHostStaging? TryRegisterHostStaging(IntPtr host, int floats, out string? failure)
+    {
+        if (typeof(T) != typeof(float)) { failure = "the plan is not float"; return null; }
+        if (_backend is not Engines.DirectGpu.IGradientHostStagingSource source)
+        {
+            failure = _backend is null ? "the step has no device backend" : "the backend has no page-locked staging";
+            return null;
+        }
+        return source.TryRegisterGradientHostStaging(host, floats, out failure);
+    }
+
+    /// <summary>
+    /// Copies every gradient, in plan order, into <paramref name="target"/> from float <paramref name="hostOffset"/>:
+    /// one async copy per device gradient on the compute stream (after the backward), then a single wait; host
+    /// gradients are copied directly.
+    /// </summary>
+    public void DownloadInto(Engines.DirectGpu.IGradientHostStaging target, int hostOffset)
+    {
+        if (target is null) throw new ArgumentNullException(nameof(target));
+        if (typeof(T) != typeof(float)) throw new NotSupportedException("Staged transfers are float only.");
+        if (hostOffset < 0 || (long)hostOffset + TotalLength > target.Host.Length)
+            throw new ArgumentOutOfRangeException(nameof(hostOffset), "The gradients do not fit the staging area.");
+        int offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is { } buffer) target.EnqueueDownload(buffer, hostOffset + offset, length);
+            offset += length;
+        }
+        target.WaitForTransfers();
+        var host = target.Host;
+        offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is null)
+            {
+                using var lease = _gradients[i].LeaseArray();
+                ((float[])(object)lease.Array).AsSpan(0, length).CopyTo(host.Slice(hostOffset + offset, length));
+            }
+            offset += length;
+        }
+    }
+
+    /// <summary>
+    /// Writes the flat gradient range [<paramref name="flatOffset"/>, <paramref name="flatOffset"/> +
+    /// <paramref name="count"/>) (plan order, as <see cref="DownloadInto"/> lays it out) back from
+    /// <paramref name="source"/> at float <paramref name="hostOffset"/> + <paramref name="flatOffset"/>. Device parts
+    /// are queued on the compute stream, ordered before the update; the host memory must not change until
+    /// <see cref="Engines.DirectGpu.IGradientHostStaging.WaitForTransfers"/> returns.
+    /// </summary>
+    public void UploadRangeFrom(Engines.DirectGpu.IGradientHostStaging source, int hostOffset, int flatOffset, int count)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (typeof(T) != typeof(float)) throw new NotSupportedException("Staged transfers are float only.");
+        if (flatOffset < 0 || count < 0 || (long)flatOffset + count > TotalLength)
+            throw new ArgumentOutOfRangeException(nameof(count), "The range is outside the gradients.");
+        int end = flatOffset + count;
+        int start = 0;
+        for (int i = 0; i < _gradients.Length && start < end; i++)
+        {
+            int length = _gradients[i].Length;
+            int lo = Math.Max(start, flatOffset), hi = Math.Min(start + length, end);
+            if (lo < hi)
+            {
+                if (_deviceGradients[i] is { } buffer)
+                {
+                    source.EnqueueUploadAt(buffer, lo - start, hostOffset + lo, hi - lo);
+                }
+                else
+                {
+                    using var lease = _gradients[i].LeaseWritable();
+                    var destination = lease.Span;
+                    var from = source.Host.Slice(hostOffset + lo, hi - lo);
+                    for (int k = 0; k < from.Length; k++)
+                        destination[lo - start + k] = System.Runtime.CompilerServices.Unsafe.As<float, T>(ref from[k]);
+                }
+            }
+            start += length;
+        }
+    }
+
     /// <summary>Writes the reduced gradients back where <see cref="Read"/> found them.</summary>
     public void Write(T[] source)
     {

@@ -22,6 +22,10 @@ internal interface IGradientHostStaging : System.IDisposable
     /// into the start of <paramref name="buffer"/>, ordered before the work queued on the compute stream after it.</summary>
     void EnqueueUpload(IGpuBuffer buffer, int offset, int count);
 
+    /// <summary>Queues a copy of <paramref name="count"/> floats of <see cref="Host"/> at <paramref name="hostOffset"/>
+    /// into <paramref name="buffer"/> at float <paramref name="bufferOffset"/>, ordered like <see cref="EnqueueUpload"/>.</summary>
+    void EnqueueUploadAt(IGpuBuffer buffer, int bufferOffset, int hostOffset, int count);
+
     /// <summary>Waits until every queued transfer has finished (downloads are readable, the area is free to write).</summary>
     void WaitForTransfers();
 }
@@ -32,4 +36,12 @@ internal interface IGradientHostStagingSource
     /// <summary>A page-locked staging area for <paramref name="floats"/> floats, or null where the backend has none
     /// (callers then use the per-buffer download and upload).</summary>
     IGradientHostStaging? TryCreateGradientHostStaging(int floats);
+
+    /// <summary>
+    /// Page-locks <paramref name="floats"/> floats of the caller's host memory at <paramref name="host"/> in place
+    /// (for example a shared-memory region other processes also map) and returns it as a staging area; disposing it
+    /// unregisters the memory, which stays the caller's. Null, with the reason in <paramref name="failure"/>, where the
+    /// backend cannot register host memory.
+    /// </summary>
+    IGradientHostStaging? TryRegisterGradientHostStaging(System.IntPtr host, int floats, out string? failure);
 }

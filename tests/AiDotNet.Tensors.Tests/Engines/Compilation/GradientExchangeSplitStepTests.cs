@@ -258,8 +258,11 @@ public class GradientExchangeSplitStepTests
             const int hidden = 8;
             var xs = Values(Batch * In, 1, 2f);
             var ts = Values(Batch * Out, 2, 2f);
-            (List<float> Losses, List<float> ExchangedLosses, float[] Weights, int Staged) Run(bool staged)
+            // mode 0: per-buffer Read/Write; 1: the plan's page-locked staging; 2: caller-owned host memory registered in
+            // place, written back in two ranges (as a 2-rank shared-memory exchange writes each partition from its owner).
+            (List<float> Losses, List<float> ExchangedLosses, float[] Weights, int Staged) Run(int mode)
             {
+                bool staged = mode == 1;
                 var x = Rows(xs, In, 0, Batch);
                 var t = Rows(ts, Out, 0, Batch);
                 var w1 = new Tensor<float>(new[] { In, hidden }, new Vector<float>(Values(In * hidden, 5, 0.4f)));
@@ -279,9 +282,37 @@ public class GradientExchangeSplitStepTests
                     var compiled = (CompiledTrainingPlan<float>)plan;
                     plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
                     plan.SetMaxGradNorm(1.0);
+                    IntPtr external = IntPtr.Zero;
+                    AiDotNet.Tensors.Engines.DirectGpu.IGradientHostStaging? registered = null;
                     compiled.SetGradientExchange(exchange =>
                     {
                         Assert.Equal(In * hidden + hidden * Out, exchange.TotalLength);
+                        if (mode == 2)
+                        {
+                            int total = exchange.TotalLength;
+                            if (external == IntPtr.Zero)
+                            {
+                                // Page-aligned, a page-multiple long, with the gradients at a nonzero offset.
+                                external = System.Runtime.InteropServices.Marshal.AllocHGlobal(3 * 4096);
+                                long aligned = ((long)external + 4095) / 4096 * 4096;
+                                registered = exchange.TryRegisterHostStaging((IntPtr)aligned, 2 * 1024, out string? why);
+                                if (registered is null && cuda) Assert.Fail("registration failed on CUDA: " + why);
+                            }
+                            if (registered is not null)
+                            {
+                                const int at = 100;
+                                exchange.DownloadInto(registered, at);
+                                exchanged.Add(exchange.ReadLoss());
+                                stagedSteps++;
+                                var h = registered.Host;
+                                for (int i = 0; i < total; i++) h[at + i] = h[at + i] * 0.5f + (i % 7) * 1e-3f;
+                                int half = total / 2 + 3;
+                                exchange.UploadRangeFrom(registered, at, half, total - half);
+                                exchange.UploadRangeFrom(registered, at, 0, half);
+                                registered.WaitForTransfers();
+                                return;
+                            }
+                        }
                         if (staged && exchange.TryReadStaged(out Span<float> g, out float loss))
                         {
                             stagedSteps++;
@@ -298,12 +329,15 @@ public class GradientExchangeSplitStepTests
                     });
                     for (int s = 0; s < Steps; s++) losses.Add(plan.Step().ToArray()[0]);
                     Assert.Equal(cuda, compiled.HasSplitStepGraph);
+                    registered?.Dispose();
+                    if (external != IntPtr.Zero) System.Runtime.InteropServices.Marshal.FreeHGlobal(external);
                 }
                 return (losses, exchanged, w1.ToArray().Concat(w2.ToArray()).ToArray(), stagedSteps);
             }
 
-            var perBuffer = Run(staged: false);
-            var pageLocked = Run(staged: true);
+            var perBuffer = Run(0);
+            var pageLocked = Run(1);
+            var external = Run(2);
             Console.WriteLine($"cuda={cuda} stagedSteps={pageLocked.Staged} "
                 + $"maxDiff={perBuffer.Weights.Zip(pageLocked.Weights, (a, b) => Math.Abs(a - b)).Max():G4}");
             // CUDA has the page-locked staging (every step, warm-up and replay); other backends and the host fall back.
@@ -312,6 +346,11 @@ public class GradientExchangeSplitStepTests
             Assert.Equal(perBuffer.ExchangedLosses, pageLocked.ExchangedLosses);
             Assert.Equal(pageLocked.Losses, pageLocked.ExchangedLosses);
             Assert.Equal(perBuffer.Weights, pageLocked.Weights);
+            // Registered caller memory, written back in two ranges: bitwise too (CUDA registers; elsewhere it falls back).
+            Assert.Equal(cuda ? Steps : 0, external.Staged);
+            Assert.Equal(perBuffer.Losses, external.Losses);
+            Assert.Equal(perBuffer.ExchangedLosses, external.ExchangedLosses);
+            Assert.Equal(perBuffer.Weights, external.Weights);
             Assert.True(perBuffer.Weights.Zip(Values(In * 8, 5, 0.4f), (a, b) => Math.Abs(a - b)).Max() > 1e-2,
                 "training must move the weights");
         }

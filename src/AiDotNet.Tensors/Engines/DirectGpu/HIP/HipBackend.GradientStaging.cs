@@ -5,4 +5,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 public sealed partial class HipBackend : IGradientHostStagingSource
 {
     IGradientHostStaging? IGradientHostStagingSource.TryCreateGradientHostStaging(int floats) => null;
+
+    IGradientHostStaging? IGradientHostStagingSource.TryRegisterGradientHostStaging(System.IntPtr host, int floats,
+        out string? failure)
+    {
+        failure = "this backend has no page-locked host registration";
+        return null;
+    }
 }
