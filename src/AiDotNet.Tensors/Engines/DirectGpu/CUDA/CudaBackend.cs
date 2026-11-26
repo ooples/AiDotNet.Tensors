@@ -348,7 +348,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
     private IntPtr _householderModule;
-    private IntPtr _sequenceMixerModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
     private IntPtr _dotProductModule;
@@ -1644,7 +1643,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _householderModule = CompileKernelModule(device, Kernels.CudaHouseholderKernels.GetSource(), "householder_kernels", Kernels.CudaHouseholderKernels.GetKernelNames());
-        _sequenceMixerModule = CompileKernelModule(device, Kernels.CudaSequenceMixerKernels.GetSource(), "sequence_mixer_kernels", Kernels.CudaSequenceMixerKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
 
@@ -20981,12 +20979,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             UnloadModule(_householderModule);
             _householderModule = IntPtr.Zero;
-        }
-
-        if (_sequenceMixerModule != IntPtr.Zero)
-        {
-            UnloadModule(_sequenceMixerModule);
-            _sequenceMixerModule = IntPtr.Zero;
         }
 
         if (_spatialTransformerModule != IntPtr.Zero)
