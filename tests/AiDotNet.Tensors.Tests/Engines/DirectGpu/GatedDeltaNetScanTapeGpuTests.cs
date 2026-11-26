@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <summary>
 /// Verifies that <see cref="DirectGpuTensorEngine.GatedDeltaNetScanForward{T}"/> stays 100% on-device under an active
 /// <see cref="GradientTape{T}"/> (no CPU fallback or host readback) and that its fused GPU BPTT backward
-/// (<c>gated_delta_scan_recompute</c> + <c>gated_delta_scan_backward</c>) matches <see cref="CpuEngine"/> across all
+/// (CUDA's trajectory kernels, <c>gated_delta_scan_backward_ckpt</c> on the other backends) matches <see cref="CpuEngine"/> across all
 /// five gradients (<c>dQ</c>, <c>dK</c>, <c>dV</c>, <c>dAlpha</c>, <c>dBeta</c>), as well as verifying that the new
 /// <c>float[]</c> fast path in <see cref="CpuEngine"/> matches finite differences.
 /// </summary>
