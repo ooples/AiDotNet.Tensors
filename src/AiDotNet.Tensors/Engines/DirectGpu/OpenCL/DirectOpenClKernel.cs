@@ -367,6 +367,27 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
         }
 
+        private int _localMemoryFits;
+
+        /// <summary>
+        /// Whether one group's local memory (CL_KERNEL_LOCAL_MEM_SIZE) fits the device's (CL_DEVICE_LOCAL_MEM_SIZE). A kernel
+        /// whose __local arrays are sized for a 64 KB part builds on a 32 KB one (gfx90c) and then fails every launch with
+        /// CL_OUT_OF_RESOURCES. True when the driver reports neither. Read once.
+        /// </summary>
+        internal bool FitsDeviceLocalMemory
+        {
+            get
+            {
+                int cached = _localMemoryFits;
+                if (cached != 0) return cached == 1;
+                ulong used = OpenClNativeBindings.GetKernelWorkGroupInfoULong(_kernel, _context.Device,
+                    OpenClNativeBindings.CL_KERNEL_LOCAL_MEM_SIZE);
+                bool fits = used == 0 || _context.LocalMemSize == 0 || used <= _context.LocalMemSize;
+                _localMemoryFits = fits ? 1 : 2;
+                return fits;
+            }
+        }
+
         private static int PowerOfTwoAtLeast(int n)
         {
             int p = 1;

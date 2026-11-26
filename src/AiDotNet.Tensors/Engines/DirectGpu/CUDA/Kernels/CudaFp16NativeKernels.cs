@@ -75,6 +75,15 @@ extern ""C"" __global__ __launch_bounds__(256) void convert_fp16_to_fp32_native(
     output[idx] = h2f(input[idx]);
 }
 
+// bf16 -> fp32 widening: a bf16 value is the top 16 bits of the fp32 with the same value, so this is exact.
+extern ""C"" __global__ __launch_bounds__(256) void convert_bf16_to_fp32_native(
+    const unsigned short* __restrict__ input, float* __restrict__ output, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    output[idx] = __uint_as_float(((unsigned int)input[idx]) << 16);
+}
+
 // FP16-NATIVE GELU: reads FP16 directly, computes in FP32 in-register, writes FP16. No FP32 buffer is
 // materialized — half the bandwidth + half-resident activation, the property the GPU memory/util win needs.
 extern ""C"" __global__ __launch_bounds__(256) void fp16_gelu_native(
@@ -348,6 +357,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_layernorm_grad_params_n
     {
         "convert_fp32_to_fp16_native",
         "convert_fp16_to_fp32_native",
+        "convert_bf16_to_fp32_native",
         "fp16_gelu_native",
         "fp16_relu_native",
         "fp16_add_native",

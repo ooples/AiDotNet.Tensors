@@ -78,10 +78,10 @@ jobs:
 
     - name: Report skipped tests
       # A skip does not fail a build: an unexpected one means a suite did not run. Exempt: the shipped tuning profile
-      # (asserted only on the device it was measured on), the Windows-only loader check, and the rows of the
-      # cross-backend optimizer theories that name another backend.
+      # (asserted only on the device it was measured on), the Windows-only loader check, the rows of the
+      # cross-backend optimizer theories that name another backend, and the hidden-GPU check, which needs two NVIDIA GPUs.
       if: always()
       run: >-
         python3 scripts/ci/summarize-test-skips.py --title "Vulkan lavapipe" --fail-on-skip
-        --allowed-skip '^(No shipped profile is asserted for |SetDefaultDllDirectories is a Windows concern|(Cuda|Hip|Metal|OpenCl|WebGpu) backend unavailable on this system)'
+        --allowed-skip '^(No shipped profile is asserted for |SetDefaultDllDirectories is a Windows concern|(Cuda|Hip|Metal|OpenCl|WebGpu) backend unavailable on this system|Needs nvidia-smi and two or more NVIDIA GPUs)'
         "${{ runner.temp }}/trx/*.trx"

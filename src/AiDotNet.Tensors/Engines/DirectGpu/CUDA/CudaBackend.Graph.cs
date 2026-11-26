@@ -712,16 +712,53 @@ public sealed partial class CudaBackend
                 ReleaseDirectPtxGraphPins(graphExec);
                 return;
             }
+            // A context the circuit breaker found corrupted is not called into at all, not even to wait: only the
+            // tracking goes (see below), and the context's memory goes with the process.
+            if (AiDotNetEngine.GpuCircuitBroken)
+            {
+                ForgetCapturedGraph(graphExec);
+                return;
+            }
             using var _ = PushContext();
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuStreamSynchronize(_stream),
-                "cuStreamSynchronize (graph destroy)");
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuGraphExecDestroy(graphExec),
-                "cuGraphExecDestroy");
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo? waitFailure = null;
+            try
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuStreamSynchronize(_stream),
+                    "cuStreamSynchronize (graph destroy)");
+            }
+            catch (Exception ex)
+            {
+                waitFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+            }
+
+            // Destroyed and unpinned even when the wait failed: the caller has already let go of the handle, so
+            // nothing else would ever destroy this graph or release what it pins. Not on a context the circuit
+            // breaker found corrupted, where any native call can fault: only the tracking goes, and the context's
+            // memory goes with the process, as the breaker itself leaves it.
+            if (AiDotNetEngine.GpuCircuitBroken)
+            {
+                ForgetCapturedGraph(graphExec);
+            }
+            else
+            {
+                try
+                {
+                    var destroyed = CudaNativeBindings.cuGraphExecDestroy(graphExec);
+                    // The failed wait is the error reported; a destroy failing after it is only traced.
+                    if (waitFailure is null) CuBlasNative.CheckCudaResult(destroyed, "cuGraphExecDestroy");
+                    else if (destroyed != CudaResult.Success)
+                        System.Diagnostics.Trace.TraceWarning("cuGraphExecDestroy returned " + destroyed + " after a failed wait.");
+                }
+                finally
+                {
+                    ReleaseDirectPtxGraphPins(graphExec);
+                    RetireGraphMemoryPool(graphExec);
+                }
+            }
+
+            waitFailure?.Throw();
         }
-        ReleaseDirectPtxGraphPins(graphExec);
-        RetireGraphMemoryPool(graphExec);
     }
 
     /// <summary>

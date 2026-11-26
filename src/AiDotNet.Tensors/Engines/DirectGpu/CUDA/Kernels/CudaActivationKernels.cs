@@ -694,7 +694,9 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 
 // Parallel softmax: 1 block per row, 256 threads cooperate on reduction
 // Uses warp shuffles for the last 32 elements, shared memory tree for inter-warp
-extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* __restrict__ input, float* __restrict__ output, int batchSize, int features)
+// No __restrict__: output may be input (the chunked fused cross-entropy's in-place softmax). Every element is read
+// before this thread writes it, and no other thread reads it afterwards.
+extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* input, float* output, int batchSize, int features)
 {
     int batch = blockIdx.x;
     if (batch >= batchSize) return;
@@ -834,7 +836,8 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __re
     B[idx] = xf_absf(A[idx]);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* __restrict__ A, float* __restrict__ B, int size)
+// No __restrict__: B may be A (in place).
+extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* A, float* B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -1079,10 +1082,10 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the -inf identity (the CPU scan never
-    // takes one, so an all-NaN input gives -inf), and fmaxf no longer flushes a subnormal under fast math.
+    // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+    // merge below), and fmaxf no longer flushes a subnormal under fast math.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0xFF800000u;
-    if (xf_isnan(val)) val = 0xFF800000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
@@ -1090,7 +1093,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
     for (int offset = 16; offset > 0; offset >>= 1)
     {
         unsigned int other = __shfl_down_sync(mask, val, offset);
-        val = xf_max(other, val);
+        val = (xf_isnan(other) || xf_gt(other, val)) ? other : val;
     }
 
     // Write warp results to shared memory
@@ -1109,7 +1112,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* __re
         for (int offset = 16; offset > 0; offset >>= 1)
         {
             unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = xf_max(other, val);
+            val = (xf_isnan(other) || xf_gt(other, val)) ? other : val;
         }
 
         if (tid == 0)
@@ -1122,9 +1125,9 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact as reduce_max: NaN skipped, +inf identity.
+    // Exact as reduce_max: a NaN anywhere is the result, +inf identity.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(__ldg(&input[idx])) : 0x7F800000u;
-    if (xf_isnan(val)) val = 0x7F800000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
 
     // Warp-level reduction first (no __syncthreads needed within a warp)
     unsigned int mask = 0xFFFFFFFF;
@@ -1132,7 +1135,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
     for (int offset = 16; offset > 0; offset >>= 1)
     {
         unsigned int other = __shfl_down_sync(mask, val, offset);
-        val = xf_min(other, val);
+        val = (xf_isnan(other) || xf_lt(other, val)) ? other : val;
     }
 
     // Write warp results to shared memory
@@ -1151,7 +1154,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* __re
         for (int offset = 16; offset > 0; offset >>= 1)
         {
             unsigned int other = __shfl_down_sync(0xFFFFFFFF, val, offset);
-            val = xf_min(other, val);
+            val = (xf_isnan(other) || xf_lt(other, val)) ? other : val;
         }
 
         if (tid == 0)
@@ -1301,7 +1304,8 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__
 // per row left most of a block idle for a linear layer's 64-128 columns (~80 GB/s on a GTX 1660 Ti). With cols % 4 == 0
 // (and 16-byte aligned A and C, which the caller checks) each thread moves a float4: vec4 = 1. relu = 1 also applies
 // relu_nan_safe to each sum -- the relu kernel's operation, so the fused pass equals bias_add_out followed by relu.
-extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols, int vec4, int relu)
+// A and C carry no __restrict__: C may be A (in place); each element is read once, before it is written.
+extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* A, const float* __restrict__ bias, float* C, int rows, int cols, int vec4, int relu)
 {
     long long stride = (long long)gridDim.x * blockDim.x;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

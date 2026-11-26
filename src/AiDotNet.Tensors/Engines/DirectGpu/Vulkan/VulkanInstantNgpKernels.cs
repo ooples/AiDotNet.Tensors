@@ -781,6 +781,13 @@ int build_neighbors(int vertex) {
     }
     return count;
 }
+// The sign of a - b as IEEE gives it, zero results included: (-0) - (+0) is the only zero difference that is
+// negative. Read from the operands' bits, since nothing here asks the compiler to keep the sign of a zero.
+bool spiral_sub_negative(float a, float b) {
+    float d = a - b;
+    if (d != 0.0) return d < 0.0;
+    return a == 0.0 && (floatBitsToUint(a) >> 31) != 0u && (floatBitsToUint(b) >> 31) == 0u;
+}
 float spiral_angle(int center, int reference, int vertex) {
     float cx = vertices[center * 3], cy = vertices[center * 3 + 1], cz = vertices[center * 3 + 2];
     float rx = vertices[reference * 3] - cx;
@@ -789,7 +796,22 @@ float spiral_angle(int center, int reference, int vertex) {
     float ax = vertices[vertex * 3] - cx;
     float ay = vertices[vertex * 3 + 1] - cy;
     float az = vertices[vertex * 3 + 2] - cz;
-    return atan(ax * ry - ay * rx, ax * rx + ay * ry + az * rz);
+    precise float first = ax * ry;
+    precise float second = ay * rx;
+    precise float cross = first - second;
+    precise float along = ax * rx + ay * ry + az * rz;
+    // The CPU's atan2 (IEEE): a neighbour opposite the reference has a zero cross product, and its sign decides
+    // between -pi and +pi, so between first and last in the ring. GLSL's atan leaves that case undefined (an AMD
+    // driver returns +pi for atan(-0, -1)) and a shader may lose the sign of a zero, so the sign is derived from
+    // the operands: a product's sign is the exclusive-or of its factors', and of two zero products only
+    // (-0) - (+0) is negative.
+    if (cross == 0.0 && along < 0.0) {
+        bool firstNegative = spiral_sub_negative(vertices[vertex * 3], cx) != spiral_sub_negative(vertices[reference * 3 + 1], cy);
+        bool secondNegative = spiral_sub_negative(vertices[vertex * 3 + 1], cy) != spiral_sub_negative(vertices[reference * 3], cx);
+        bool negativeZero = first == 0.0 && second == 0.0 && firstNegative && !secondNegative;
+        return negativeZero ? -3.14159274 : 3.14159274;
+    }
+    return atan(cross, along);
 }
 void main() {
     if (gl_GlobalInvocationID.x != 0) return;

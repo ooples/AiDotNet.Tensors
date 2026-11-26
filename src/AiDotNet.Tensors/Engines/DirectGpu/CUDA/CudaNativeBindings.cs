@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA Driver API bindings for direct kernel execution.
 using System;
+using System.Threading;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
 
@@ -96,11 +97,22 @@ internal static class CudaNativeBindings
     /// </summary>
     public static bool IsAvailable => Availability.Value;
 
+    private static readonly Lazy<bool> DriverLibrary = new(() => { _ = Availability.Value; return Volatile.Read(ref s_driverLibraryLoaded); }, isThreadSafe: true);
+    private static bool s_driverLibraryLoaded;
+
+    /// <summary>
+    /// True when the CUDA driver library itself loads, whether or not it then initializes or finds a device: false only
+    /// on a host with no NVIDIA driver installed. A driver that loads and fails (cuInit errors, a driver/runtime
+    /// mismatch, CUDA_VISIBLE_DEVICES hiding every device) is present, and is a fault to report, not an absent driver.
+    /// </summary>
+    internal static bool IsDriverLibraryPresent => DriverLibrary.Value;
+
     private static bool CheckAvailability()
     {
         try
         {
             var result = CuBlasNative.cuInit(0);
+            Volatile.Write(ref s_driverLibraryLoaded, true);
             if (result != CudaResult.Success)
             {
                 return false;
@@ -264,9 +276,71 @@ internal static class CudaNativeBindings
     // them all here, after the driver reports success, instead of only the ones a Synchronize() wrapper makes.
     public static CudaResult cuStreamSynchronize(IntPtr stream)
     {
-        var result = cuStreamSynchronizeNative(stream);
+        var result = CudaContextScheduling.EffectivePolicy == GpuHostWaitPolicy.PollThenBlock
+            ? PollThenBlockStreamSynchronize(stream)
+            : cuStreamSynchronizeNative(stream);
         if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
         return result;
+    }
+
+    // CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING: cuEventSynchronize on it blocks the thread whatever the
+    // context's scheduling flag.
+    private const uint BlockingWaitEventFlags = 0x1 | 0x2;
+
+    /// <summary>
+    /// <see cref="GpuHostWaitPolicy.PollThenBlock"/>: polls the stream for the poll window (a short wait ends as a spin
+    /// wait does), then waits on a blocking-sync event recorded behind everything queued so far. Under the context's
+    /// spin flag, cuStreamSynchronize itself spins a core for as long as the device takes: a device starved of memory
+    /// by other processes left a process spinning for hours with nothing of its own running. Any result other than
+    /// finished / not ready, or an event the current context cannot make, falls back to cuStreamSynchronize, so errors
+    /// and capture checks surface exactly as before.
+    /// </summary>
+    /// <remarks>
+    /// Every path ends in a native cuStreamSynchronize, which returns at once on a stream already finished: a query or
+    /// an event wait reports completion, but only a stream synchronization makes the stream's completed cuMemFreeAsync
+    /// frees releasable, so without it a cuMemPoolTrimTo after the wait (empty_cache, an engine reset) freed nothing.
+    /// </remarks>
+    private static CudaResult PollThenBlockStreamSynchronize(IntPtr stream)
+    {
+        var result = cuStreamQuery(stream);
+        if (result != CudaResult.NotReady) return cuStreamSynchronizeNative(stream);
+        long window = (long)(GpuHostWaitOptions.PollWindow.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+        long start = System.Diagnostics.Stopwatch.GetTimestamp();
+        while (System.Diagnostics.Stopwatch.GetTimestamp() - start < window)
+        {
+            result = cuStreamQuery(stream);
+            if (result != CudaResult.NotReady) return cuStreamSynchronizeNative(stream);
+        }
+        var created = cuEventCreate(out IntPtr done, BlockingWaitEventFlags);
+        if (created != CudaResult.Success)
+        {
+            WarnBlockingWaitUnavailable("cuEventCreate", created);
+            return cuStreamSynchronizeNative(stream);
+        }
+        try
+        {
+            var recorded = cuEventRecord(done, stream);
+            if (recorded == CudaResult.Success) cuEventSynchronizeNative(done);
+            else WarnBlockingWaitUnavailable("cuEventRecord", recorded);
+            // Finished (or failed) by now: the native wait returns at once and reports an error as it always did.
+            return cuStreamSynchronizeNative(stream);
+        }
+        finally
+        {
+            cuEventDestroy(done);
+        }
+    }
+
+    private static int s_blockingWaitWarned;
+
+    // The blocking event could not be made or recorded: this wait (and any like it) spins in cuStreamSynchronize, which
+    // the poll-then-block policy exists to avoid. Reported once.
+    private static void WarnBlockingWaitUnavailable(string call, CudaResult result)
+    {
+        if (System.Threading.Interlocked.Exchange(ref s_blockingWaitWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning(
+                $"A poll-then-block stream wait could not block ({call} returned {result}); it waits in cuStreamSynchronize, "
+                + "which spins a core with the context's scheduling flag.");
     }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]

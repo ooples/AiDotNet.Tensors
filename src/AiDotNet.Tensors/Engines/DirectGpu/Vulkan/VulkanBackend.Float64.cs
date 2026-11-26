@@ -37,15 +37,28 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
     private bool SupportsFloat64Compute => SupportsFloat64Storage && KeepsSubnormals();
 
     private readonly object _subnormalProbeLock = new object();
-    private bool? _keepsSubnormals;
+    // The probe's answer: -1 not measured yet, 0 the kernels flush or round another way, 1 they keep the host's bits.
+    private int _keepsSubnormals = -1;
+
+    /// <summary>Tests: forgets the measured answer, so the next question about double support measures again.</summary>
+    internal void ResetFloat64ProbeForTest()
+    {
+        lock (_subnormalProbeLock) System.Threading.Volatile.Write(ref _keepsSubnormals, -1);
+    }
 
     private bool KeepsSubnormals()
     {
-        if (_keepsSubnormals is bool known) return known;
+        int known = System.Threading.Volatile.Read(ref _keepsSubnormals);
+        if (known >= 0) return known == 1;
         lock (_subnormalProbeLock)
         {
-            if (_keepsSubnormals is bool settled) return settled;
+            int settled = System.Threading.Volatile.Read(ref _keepsSubnormals);
+            if (settled >= 0) return settled == 1;
             bool kept;
+            // The probe is the backend's own one-time known-answer check, made from whichever op first asks for double
+            // support (a float matmul's precision plan included): its launches and readbacks are detection evidence,
+            // not that op's, so a residency scope around the op does not see a device-to-host copy it did not make.
+            using var detection = GpuLaunchProbe.DetectionScope();
             try
             {
                 kept = MeasureSubnormals();
@@ -55,7 +68,7 @@ public sealed unsafe partial class VulkanBackend : IGpuFloat64Reductions, IGpuFl
                 // A kernel that cannot be built or run here cannot compute doubles either.
                 kept = false;
             }
-            _keepsSubnormals = kept;
+            System.Threading.Volatile.Write(ref _keepsSubnormals, kept ? 1 : 0);
             return kept;
         }
     }

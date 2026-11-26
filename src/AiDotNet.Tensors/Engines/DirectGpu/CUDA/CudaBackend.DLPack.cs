@@ -39,6 +39,8 @@ public sealed partial class CudaBackend : IDLPackDeviceBackend
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         // The same mechanism keeps a captured graph's memory: a pinned buffer parks every release until retirement.
+        // The consumer keeps the address: a loan of idle step memory gets memory of its own first.
+        EnsureNotIdleLoan(buffer);
         var pins = new CaptureMemoryPool();
         if (buffer is CudaGpuBuffer cuda) cuda.PinTo(pins);
         // Imported memory (ExternalDeviceBuffer) belongs to another library and is never freed here; re-exporting it

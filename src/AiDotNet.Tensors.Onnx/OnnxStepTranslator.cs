@@ -26,7 +26,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         "TensorExp", "TensorLog", "TensorSqrt", "TensorAbs", "TensorNegate", "TensorPower", "TensorErfc",
         "TensorSign", "TensorFloor", "TensorCeiling", "TensorRound", "Floor", "Ceiling", "Round", "Sign",
         "TensorReciprocal", "Reciprocal",
-        "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims", "Expand",
+        "Reshape", "TensorTranspose", "TensorPermute", "TensorSqueeze", "TensorExpandDims", "Expand", "Tile",
         "TensorSlice", "TensorSplit", "Concat", "Concatenate", "Gather",
         "Conv2D", "ConvTranspose2D", "MaxPool2D", "AvgPool2D", "Pad",
         "BatchNormInference", "LayerNorm", "LayerNorm[0]", "ReduceSum", "ReduceMean", "FusedLinear",
@@ -36,9 +36,23 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
     private readonly Dictionary<Tensor<T>, (string Source, int Top, int Left, int Bottom, int Right)> _foldedPads =
         new(OnnxGraphWriter<T>.ReferenceEqualityComparer<Tensor<T>>.Instance);
 
+    // A Tile whose every axis keeps its extent or expands one of extent 1 (same rank): an Expand. Any other tile has
+    // no translation here, as the importer reads no ONNX Tile back.
+    private static bool IsBroadcastTile(CompiledStep<T> step)
+    {
+        if (step.Inputs.Length < 1) return false;
+        var inShape = step.Inputs[0]._shape;
+        var outShape = step.OutputBuffer._shape;
+        if (inShape.Length != outShape.Length) return false;
+        for (int i = 0; i < inShape.Length; i++)
+            if (inShape[i] != outShape[i] && inShape[i] != 1) return false;
+        return true;
+    }
+
     internal bool CanTranslate(CompiledStep<T> step)
     {
         if (!Supported.Contains(step.OpName)) return false;
+        if (step.OpName == "Tile") return IsBroadcastTile(step);
         // A fused linear translates when its activation has an exact ONNX form without parameters.
         return step.OpName != "FusedLinear" || FusedActivation(step) is
             FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.Sigmoid or
@@ -147,6 +161,11 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
                 _w.AddNode("Reshape", new[] { inputs[0], _w.AddInt64(outShape) }, new[] { output });
                 return;
             case "Expand":
+                _w.AddNode("Expand", new[] { inputs[0], _w.AddInt64(outShape) }, new[] { output });
+                return;
+            case "Tile":
+                // Only a tile that repeats size-1 axes reaches here (CanTranslate): TensorBroadcastTo's general case,
+                // which is an Expand to the output shape.
                 _w.AddNode("Expand", new[] { inputs[0], _w.AddInt64(outShape) }, new[] { output });
                 return;
             case "TensorTranspose":

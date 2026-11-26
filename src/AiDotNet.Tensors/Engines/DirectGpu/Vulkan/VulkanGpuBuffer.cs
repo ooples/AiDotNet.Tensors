@@ -336,7 +336,9 @@ public sealed class VulkanGpuBuffer : IGpuBuffer, IPoolableGpuBuffer, IGpuBuffer
             ReleaseNow(buffer);
             return;
         }
-        VulkanDevice.Instance.ReleaseAfterSubmission(serial, () => ReleaseNow(buffer));
+        // A view frees nothing of its own: its parent's memory is counted when the parent is released.
+        long bytes = buffer._viewParent is null ? buffer.SizeInBytes : 0;
+        VulkanDevice.Instance.ReleaseAfterSubmission(serial, () => ReleaseNow(buffer), bytes);
     }
 
     private static void ReleaseNow(VulkanGpuBuffer buffer)

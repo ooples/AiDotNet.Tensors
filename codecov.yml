@@ -29,6 +29,10 @@ coverage:
 # failed. Wait for all seven. Keep this count in step with the uploads: a new coverage shard raises it, a
 # removed one lowers it (missing-kernels and engine-lifecycle were added without raising it, and the project
 # status went red at ~7% again).
+# The CUDA lane's report (flag unittests, name gpu-cuda) is an eighth upload that is deliberately NOT counted: its jobs
+# do not run on drafts, under skip-gpu-ci, or without a runner, and counting it would leave those PRs with no status at
+# all. ci.yml's cuda-coverage job uploads it only after the CPU run and the POCL shards finish, so it can never be one of
+# the seven that trigger the statuses; codecov updates them when it lands.
 # A failed upload no longer passes silently: each counted upload retries once and then fails its job (see the upload
 # steps), so a missing report shows as a red shard instead of a PR with no coverage status at all.
 codecov:

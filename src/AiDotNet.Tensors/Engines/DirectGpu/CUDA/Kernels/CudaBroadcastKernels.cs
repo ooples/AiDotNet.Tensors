@@ -35,9 +35,10 @@ extern ""C"" __global__ __launch_bounds__(256) void broadcast_sub_last(
     output[idx] = a[idx] - b[idx % innerSize];
 }
 
+// a and output carry no __restrict__: output may be a (in place).
 extern ""C"" __global__ __launch_bounds__(256) void broadcast_mul_last(
-    const float* __restrict__ a, const float* __restrict__ b,
-    float* __restrict__ output, int outerSize, int innerSize)
+    const float* a, const float* __restrict__ b,
+    float* output, int outerSize, int innerSize)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = outerSize * innerSize;

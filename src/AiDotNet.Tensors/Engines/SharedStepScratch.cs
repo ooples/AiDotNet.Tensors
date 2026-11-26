@@ -53,6 +53,27 @@ internal sealed class SharedStepScratch
     /// <summary>Whether <paramref name="buffer"/> is co-owned step scratch (never disposed, untracked or lent by an owner).</summary>
     internal static bool IsShared(IGpuBuffer buffer) => s_shared.TryGetValue(buffer, out _);
 
+    // Buffers an owner lent as idle step memory between its steps (CompiledTrainingPlan.LendIdleStepMemory): no other
+    // plan takes one while it is lent, since that plan's step would write memory a borrower is using.
+    private static readonly ConditionalWeakTable<IGpuBuffer, object> s_lent = new();
+
+    internal static void MarkLent(IGpuBuffer buffer) => s_lent.GetValue(buffer, static _ => s_marker);
+
+    internal static void ClearLent(IGpuBuffer buffer) => s_lent.Remove(buffer);
+
+    internal static bool IsLent(IGpuBuffer buffer) => s_lent.TryGetValue(buffer, out _);
+
+    /// <summary>Whether a plan other than <paramref name="owner"/>'s co-owns <paramref name="buffer"/>.</summary>
+    internal bool HasOtherOwner(IGpuBuffer buffer, StepScratchPool owner)
+    {
+        lock (_lock)
+        {
+            if (!_entries.TryGetValue(buffer, out var entry)) return false;
+            foreach (var other in entry.Owners) if (!ReferenceEquals(other, owner)) return true;
+            return false;
+        }
+    }
+
     /// <summary>Buffers offered, and how many times a plan took one instead of allocating (test hooks).</summary>
     internal int Count { get { lock (_lock) return _entries.Count; } }
 
@@ -99,7 +120,7 @@ internal sealed class SharedStepScratch
                 var buffer = entry.Buffer;
                 if (!ReferenceEquals(entry.Backend, backend) || entry.Thread != thread || entry.Owners.Contains(taker)
                     || buffer.Handle == IntPtr.Zero || buffer.Size < length || buffer.Size > 2L * length
-                    || held?.Invoke(buffer) == true)
+                    || IsLent(buffer) || held?.Invoke(buffer) == true)
                     continue;
                 if (pick is null || buffer.Size < pick.Buffer.Size) pick = entry;
             }

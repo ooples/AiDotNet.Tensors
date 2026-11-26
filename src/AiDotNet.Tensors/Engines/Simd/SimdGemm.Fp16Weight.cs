@@ -51,13 +51,12 @@ internal static partial class SimdGemm
         }
 
         int Mc = ChooseAdaptiveMc(m, k, n);
-        int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
-        int ncRounded = ((Nc + Nr - 1) / Nr) * Nr;
+        var (packedASize, packedBSize) = TiledPackSizes(Mc, m, k, n);
         int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
         bool parallel = UseParallelGemm && maxThreads > 1 && (long)m * k * n >= ParallelWorkThreshold;
 
-        float[] packedABuf = ArrayPool<float>.Shared.Rent(mcRounded * Kc);
-        float[]? seqPackedB = parallel ? null : ArrayPool<float>.Shared.Rent(Kc * ncRounded);
+        float[] packedABuf = ArrayPool<float>.Shared.Rent(packedASize);
+        float[]? seqPackedB = parallel ? null : ArrayPool<float>.Shared.Rent(packedBSize);
         try
         {
             for (int jc = 0; jc < n; jc += Nc)

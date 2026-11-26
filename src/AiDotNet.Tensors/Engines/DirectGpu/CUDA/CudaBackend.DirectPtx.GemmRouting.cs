@@ -385,6 +385,8 @@ public sealed partial class CudaBackend
     /// </summary>
     private bool TryRoutedGemm(IGpuBuffer a, IGpuBuffer b, IGpuBuffer c, int m, int n, int k, float alpha, float beta)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!GemmRouteActivationEnabled || !GemmRoutingEnabled) return false;
         var key = new GemmRouteKey(m, n, k, GemmRouteIsStrict);
         // First GEMM of a shape in this mode: activate its persisted verdict, if any. Never inside a stream capture,

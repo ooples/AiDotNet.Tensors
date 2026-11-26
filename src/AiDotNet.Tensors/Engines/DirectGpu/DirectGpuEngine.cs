@@ -197,7 +197,17 @@ public sealed class DirectGpuEngine : IDisposable
         _fusionManager = new KernelFusionManager();
         Trace.WriteLine("[DirectGpuEngine] Initializing GPU backends...");
 
+        var required = GpuBackendOptions.RequiredBackend;
         var backendOrder = GetBackendOrderFromEnv();
+        if (required != GpuBackendType.None)
+        {
+            // The required backend is the only one tried: running on another would be the error it exists to prevent.
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(BackendOrderEnvVar)))
+                Trace.TraceWarning(
+                    $"{BackendOrderEnvVar} is ignored: {nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} "
+                    + $"is {required}, so only the {GpuBackendOptions.NameOf(required)} backend is tried.");
+            backendOrder = new[] { GpuBackendOptions.NameOf(required) };
+        }
         if (backendOrder.Count == 0)
         {
             Trace.WriteLine($"[DirectGpuEngine] Direct GPU backends disabled via {BackendOrderEnvVar}.");
@@ -206,22 +216,43 @@ public sealed class DirectGpuEngine : IDisposable
         }
 
         Trace.WriteLine($"[DirectGpuEngine] Backend order: {string.Join(", ", backendOrder)}");
+        string? failure = null;
         foreach (var backendName in backendOrder)
         {
-            var backend = TryCreateBackend(backendName);
+            var backend = TryCreateBackend(backendName, out failure);
             if (backend != null)
             {
                 _backend = backend;
                 // Decided by the name TryCreateBackend dispatched on, not a concrete-class test (TENS0007).
                 _borrowsBackend = string.Equals(backendName, "vulkan", StringComparison.OrdinalIgnoreCase);
                 _isAvailable = true;
+                if (CudaInitializationFailure is { } cudaFailure && !_cudaAbsent)
+                    GpuBackendOptions.WarnCudaFallback(cudaFailure, backend.BackendName);
                 return;
+            }
+            if (string.Equals(backendName, "cuda", StringComparison.OrdinalIgnoreCase))
+            {
+                CudaInitializationFailure = failure ?? "the CUDA backend could not be created";
+                // No CUDA driver at all (an AMD, Intel or GPU-less host): nothing failed, so nothing is warned about.
+                _cudaAbsent = t_cudaDriverAbsent;
             }
         }
 
+        if (required != GpuBackendType.None)
+            throw new InvalidOperationException(
+                $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is {required}, and the " +
+                $"{GpuBackendOptions.NameOf(required)} backend could not be created: {failure ?? "no reason was reported"}.");
+        if (CudaInitializationFailure is { } noGpuCudaFailure && !_cudaAbsent)
+            GpuBackendOptions.WarnCudaFallback(noGpuCudaFailure, "the CPU (no GPU backend could be created)");
         Trace.WriteLine("[DirectGpuEngine] No GPU backends available. Falling back to CPU.");
         _isAvailable = false;
     }
+
+    /// <summary>
+    /// Why this engine's detection could not create a CUDA backend, or null when it did or never tried. Set whenever
+    /// detection fell back past CUDA (to another backend or to the CPU), which it also reports with a warning.
+    /// </summary>
+    public string? CudaInitializationFailure { get; }
 
     /// <summary>Creates an engine around an already-selected backend.</summary>
     /// <remarks>
@@ -301,27 +332,43 @@ public sealed class DirectGpuEngine : IDisposable
             backends.Add(name);
     }
 
-    private static IDirectGpuBackend? TryCreateBackend(string backendName)
+    private static IDirectGpuBackend? TryCreateBackend(string backendName, out string? failure)
     {
-        return backendName.ToLowerInvariant() switch
+        failure = null;
+        var backend = backendName.ToLowerInvariant() switch
         {
-            "cuda" => TryCreateCudaBackend(),
+            "cuda" => TryCreateCudaBackend(out failure),
             "opencl" => TryCreateOpenClBackend(),
             "hip" => TryCreateHipBackend(),
             "vulkan" => TryCreateVulkanBackend(),
             _ => null
         };
+        if (backend is null) failure ??= $"the {backendName} backend is not available on this system";
+        return backend;
     }
 
-    private static IDirectGpuBackend? TryCreateCudaBackend()
+    /// <summary>
+    /// Replaces the CUDA backend construction of detection, so a test can make CUDA initialization fail (throw) or
+    /// report no device (return a backend whose <see cref="IDirectGpuBackend.IsAvailable"/> is false).
+    /// </summary>
+    internal static Func<IDirectGpuBackend>? CudaBackendFactoryForTests { get; set; }
+
+    // Set by TryCreateCudaBackend on the constructing thread: the CUDA driver itself could not be loaded.
+    [ThreadStatic] private static bool t_cudaDriverAbsent;
+    private bool _cudaAbsent;
+
+    private static IDirectGpuBackend? TryCreateCudaBackend(out string? failure)
     {
+        failure = null;
+        t_cudaDriverAbsent = false;
         try
         {
             Trace.WriteLine("[DirectGpuEngine] Checking CUDA availability...");
-            if (CudaBackend.IsCudaAvailable)
+            var factory = CudaBackendFactoryForTests;
+            if (factory is not null || CudaBackend.IsCudaAvailable)
             {
                 Trace.WriteLine("[DirectGpuEngine] Creating CUDA backend...");
-                var cudaBackend = new CudaBackend();
+                var cudaBackend = factory is not null ? factory() : new CudaBackend();
                 Trace.WriteLine($"[DirectGpuEngine] CUDA backend created, IsAvailable = {cudaBackend.IsAvailable}");
 
                 if (cudaBackend.IsAvailable)
@@ -332,35 +379,56 @@ public sealed class DirectGpuEngine : IDisposable
                 }
                 Trace.WriteLine("[DirectGpuEngine] CUDA backend created but not available, disposing...");
                 cudaBackend.Dispose();
+                failure = "the CUDA driver loaded but reports no usable device" + VisibleDevicesNote();
             }
             else
             {
                 Trace.WriteLine("[DirectGpuEngine] CUDA is not available on this system");
+                failure = "the CUDA driver or NVRTC library could not be loaded";
+                // Absent only when the driver library itself is not installed; a driver that loads and then fails
+                // (cuInit errors, a version mismatch, every device hidden) is the failure the warning exists for.
+                t_cudaDriverAbsent = !CudaNativeBindings.IsDriverLibraryPresent;
             }
         }
         catch (DllNotFoundException ex)
         {
+            failure = "CUDA library not found: " + ex.Message;
+            t_cudaDriverAbsent = !CudaNativeBindings.IsDriverLibraryPresent;
             Trace.WriteLine($"[DirectGpuEngine] CUDA library not found: {ex.Message}");
             System.Diagnostics.Debug.WriteLine($"CUDA library not found: {ex.Message}");
         }
         catch (TypeInitializationException ex)
         {
+            failure = "CUDA type initialization failed: " + (ex.InnerException?.Message ?? ex.Message);
             Trace.WriteLine($"[DirectGpuEngine] CUDA type initialization failed: {ex.InnerException?.Message ?? ex.Message}");
             System.Diagnostics.Debug.WriteLine($"CUDA type initialization failed: {ex.InnerException?.Message ?? ex.Message}");
         }
         catch (InvalidOperationException ex)
         {
+            failure = "CUDA initialization failed: " + ex.Message;
             Trace.WriteLine($"[DirectGpuEngine] CUDA initialization failed: {ex.Message}");
             System.Diagnostics.Debug.WriteLine($"CUDA initialization failed: {ex.Message}");
         }
         catch (EntryPointNotFoundException ex)
         {
+            failure = "CUDA function not found: " + ex.Message;
             Trace.WriteLine($"[DirectGpuEngine] CUDA function not found: {ex.Message}");
             System.Diagnostics.Debug.WriteLine($"CUDA function not found: {ex.Message}");
         }
 
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            failure = $"CUDA initialization threw {ex.GetType().Name}: {ex.Message}";
+            Trace.WriteLine($"[DirectGpuEngine] {failure}");
+        }
+
         return null;
     }
+
+    private static string VisibleDevicesNote()
+        => Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES") is { } visible
+            ? $" (CUDA_VISIBLE_DEVICES={visible})"
+            : "";
 
     private static IDirectGpuBackend? TryCreateVulkanBackend()
     {

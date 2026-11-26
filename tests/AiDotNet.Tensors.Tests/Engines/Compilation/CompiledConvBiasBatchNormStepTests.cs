@@ -256,7 +256,7 @@ public class CompiledConvBiasBatchNormStepTests : IDisposable
             Assert.Equal(2, run.StepNames.Count(n => n == "ConvBiasBatchNorm"));
             Assert.All(run.Losses, loss => Assert.True(TestHelpers.MathCompat.IsFinite(loss), $"loss {loss}"));
             Assert.True(CompiledTrainingPlan<float>.GraphReplayCount > replaysBefore,
-                "the BF16 step never replayed as a captured graph (AIDOTNET_GRAPHSTEP_DIAG=1 says why)");
+                "the BF16 step never replayed as a captured graph (CompiledTrainingDiagnostics.TraceGraphSteps says why)");
             Assert.Equal(Rand([Channels], 5, 0.5f).ToArray(), run.Biases[0]);
             Assert.Equal(Rand([Channels], 6, 0.5f).ToArray(), run.Biases[1]);
         }

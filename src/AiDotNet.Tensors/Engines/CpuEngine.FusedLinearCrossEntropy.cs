@@ -633,6 +633,10 @@ public partial class CpuEngine
         private bool _weightMutated;
         private bool _biasMutated;
 
+        /// <summary>The readout weight and bias this guard watches (a plan keeps them across its steps).</summary>
+        internal Tensor<T> Weight => _weight;
+        internal Tensor<T> Bias => _bias;
+
         internal ReadoutMutationGuard(Tensor<T> weight, Tensor<T> bias)
         {
             _weight = weight;

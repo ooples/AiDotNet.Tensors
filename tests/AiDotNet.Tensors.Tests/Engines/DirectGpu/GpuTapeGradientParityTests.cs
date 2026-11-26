@@ -1,4 +1,6 @@
+using System;
 using System.Linq;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -1038,6 +1040,39 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertChunkedParity("FusedLinearCE(ids, bias, 3 chunks)", ChunkBias,
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(ChunkHidden, ChunkWeight, t, ChunkTargetIds));
 
+    // Under deterministic mode the chunked backward's one-hot subtraction went through ScatterAdd's stable-sort route,
+    // whose scratch keeps a start slot per destination cell: chunk x vocab int32 (128 MiB at 672 x 49152), held for the
+    // backend's life. One position per row is distinct, so it takes no sort to be deterministic.
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_backward_under_determinism_keeps_no_sort_scratch()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (TestRequire.NotNull(gpu, "gpu"))
+        {
+            var cuda = gpu.GetBackend() as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(cuda is null, "CUDA backend only.");
+            bool wasDeterministic = AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode;
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(true);
+            try
+            {
+                static Tensor<float> Op(IEngine e, Tensor<float> t) =>
+                    e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds);
+                var cpuGrad = GradientOf(new CpuEngine(), ChunkHidden, Op);
+                DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+                var first = GradientOf(gpu, ChunkHidden, Op);
+                Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);   // 672 rows a chunk
+                var second = GradientOf(gpu, ChunkHidden, Op);
+                Assert.Equal(first, second);   // bit-identical run to run
+                for (int i = 0; i < cpuGrad.Length; i++)
+                    Assert.True(Math.Abs(first[i] - cpuGrad[i]) <= 1e-6, $"gradient[{i}] {first[i]} vs CPU {cpuGrad[i]}");
+                long chunkCells = 672L * ChunkVocab;
+                Assert.True(TestRequire.NotNull(cuda, "cuda").SortedScatterScratchBytes < chunkCells,
+                    $"sort scratch {cuda.SortedScatterScratchBytes} bytes, a start slot per logit of a chunk is {chunkCells * 4}.");
+            }
+            finally { AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(wasDeterministic); }
+        }
+    }
+
     // The forward runs in the same row chunks: a GEMM per chunk, row log-softmax, a gather of the target log-probability
     // and a ones-vector GEMM summing them. It replaced a one-thread-per-row kernel that took 3.68 s at N=4096, V=49152.
     [SkippableFact]
@@ -1053,9 +1088,98 @@ public class GpuTapeGradientParityTests : IDisposable
             // A device without room for the chunk scratch takes the supported fused-kernel fallback: no chunks to count.
             Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined,
                 "The chunked forward declined on this device (scratch did not fit or a primitive is unavailable).");
-            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);   // 672 rows a chunk
             Assert.True(!float.IsNaN(cpu) && !float.IsInfinity(cpu) && cpu > 1f, $"CPU loss {cpu} is not a usable reference.");
             Assert.True(Math.Abs(device - cpu) <= 1e-5 * Math.Abs(cpu), $"GPU loss {device} vs CPU {cpu}.");
+        }
+    }
+
+    // The forward and the backward each held two [chunk, vocab] blocks (logits and their exponentials or
+    // probabilities): at 672 rows a chunk (V = 49152) each pair was 2 x 126 MiB, the largest transient of a 16-layer
+    // LM's training step and its peak. A backend that transforms rows in place holds one block per direction, at the
+    // same 672-row chunks (halving the block instead doubled the chunks and the step's launches).
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_chunked_scratch_is_one_block_per_direction()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (TestRequire.NotNull(gpu, "gpu"))
+        {
+            var backend = gpu.GetBackend();
+            Skip.If(backend is null, "No device backend.");
+            Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend holds two blocks (no in-place row transforms).");
+            static Tensor<float> Op(IEngine e, Tensor<float> t) =>
+                e.FusedLinearCrossEntropyWithLogits(t, ChunkWeight, ChunkBias, ChunkTargetIds);
+            DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined = false;
+            // Warm: kernels, pools and the inputs' uploads.
+            _ = GradientOf(gpu, ChunkHidden, Op);
+            Skip.If(DirectGpuTensorEngine.LastFusedCeForwardChunkedDeclined, "The chunked forward declined on this device.");
+            long before = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(TestRequire.NotNull(backend, "backend")).AllocatedBytes;
+            AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.ResetPeakStats(TestRequire.NotNull(backend, "backend"));
+            DirectGpuTensorEngine.LastFusedCeForwardChunks = 0;
+            DirectGpuTensorEngine.LastFusedCeBackwardChunks = 0;
+            _ = GradientOf(gpu, ChunkHidden, Op);
+            long peak = AiDotNet.Tensors.Engines.DevicePrimitives.GpuMemoryStats.Snapshot(TestRequire.NotNull(backend, "backend")).PeakAllocatedBytes;
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeForwardChunks);    // 672 rows a chunk
+            Assert.Equal(3, DirectGpuTensorEngine.LastFusedCeBackwardChunks);
+            // What the forward and backward hold at once beyond what was live before them: one block, plus the inputs
+            // (if not kept on the device by the first call), the gradients they return and small row scratch.
+            long inputs = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
+            long gradients = 4L * (ChunkRows * ChunkDim + ChunkDim * ChunkVocab + ChunkVocab);
+            long oneBlock = 4L * 672 * ChunkVocab;
+            long held = peak - before;
+            Assert.True(held <= oneBlock + inputs + gradients + (8L << 20),
+                $"The fused CE held {held} bytes at once; one [672, {ChunkVocab}] block is {oneBlock}.");
+        }
+    }
+
+    // The in-place row transforms the chunked fused CE relies on give exactly the out-of-place values, at its chunk
+    // shapes (a full 672-row chunk and the 156-row remainder of 1500 rows at V = 49152).
+    [SkippableTheory]
+    [InlineData(672)]
+    [InlineData(156)]
+    public void FusedLinearCrossEntropy_index_chunked_in_place_row_transforms_match(int rows)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (TestRequire.NotNull(gpu, "gpu"))
+        {
+            var backend = gpu.GetBackend();
+            Skip.If(backend is null, "No device backend.");
+            Skip.IfNot(backend is IInPlaceRowTransformsBackend, "This backend does not declare in-place row transforms.");
+            var inPlaceBackend = (IInPlaceRowTransformsBackend)TestRequire.NotNull(backend, "backend");
+            int v = ChunkVocab, cells = rows * v;
+            var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(rows);
+            var x = new float[cells];
+            for (int i = 0; i < cells; i++) x[i] = (float)(rng.NextDouble() * 8 - 4);
+            var bias = new float[v];
+            for (int i = 0; i < v; i++) bias[i] = (float)(rng.NextDouble() - 0.5);
+            using var biasB = TestRequire.NotNull(backend, "backend").AllocateBuffer(bias);
+            using var scaleB = backend.AllocateBuffer(new[] { 0.37f });
+
+            // The in-place entry point the fused cross-entropy calls against the same kernel run out of place. (The
+            // out-of-place Softmax and BiasAdd may take a declared program or a tuned slot, which can round the last
+            // bit differently; the in-place forms always run the reference kernels.)
+            void Check(string op, Action<IGpuBuffer, IGpuBuffer> apply, Action<IGpuBuffer> applyInPlace)
+            {
+                using var input = backend.AllocateBuffer(x);
+                using var output = backend.AllocateBuffer(new float[cells]);
+                apply(input, output);
+                var expected = backend.DownloadBuffer(output);
+                using var inPlace = backend.AllocateBuffer(x);
+                applyInPlace(inPlace);
+                var got = backend.DownloadBuffer(inPlace);
+                int first = -1;
+                for (int i = 0; i < cells && first < 0; i++)
+                    if (BitConverter.ToInt32(BitConverter.GetBytes(got[i]), 0) != BitConverter.ToInt32(BitConverter.GetBytes(expected[i]), 0)) first = i;
+                Assert.True(first < 0, first < 0 ? "" : $"{op} in place: [{first}] {got[first]:R} vs {expected[first]:R}");
+            }
+
+            var cuda = backend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+            Skip.If(cuda is null, "The reference-kernel hooks are CUDA's.");
+            Check("BiasAdd", (a, c) => TestRequire.NotNull(cuda, "cuda").BiasAddReferenceForTest(a, biasB, c, rows, v), d => inPlaceBackend.BiasAddInPlace(d, biasB, rows, v));
+            Check("Exp", (a, c) => backend.Exp(a, c, cells), d => inPlaceBackend.ExpInPlace(d, cells));
+            Check("Softmax", (a, c) => TestRequire.NotNull(cuda, "cuda").SoftmaxReferenceForTest(a, c, rows, v), d => inPlaceBackend.SoftmaxInPlace(d, rows, v));
+            Check("BroadcastMultiplyLastAxis", (a, c) => backend.BroadcastMultiplyLastAxis(a, scaleB, c, cells, 1),
+                d => inPlaceBackend.BroadcastMultiplyLastAxisInPlace(d, scaleB, cells, 1));
         }
     }
 

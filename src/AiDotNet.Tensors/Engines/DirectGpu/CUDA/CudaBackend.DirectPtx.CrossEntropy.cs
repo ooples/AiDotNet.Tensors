@@ -22,6 +22,8 @@ public sealed partial class CudaBackend
         int hiddenDimension,
         int vocabulary)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!IsDirectPtxFusedLinearEnabled ||
             !DirectPtxFeatureGate.FusedLinearExperimentOverride)
             return false;

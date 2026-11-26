@@ -890,6 +890,20 @@ void main() {
 
 }";
 
+    // bf16 -> fp32 (exact): element i is the low (even i) or high (odd i) 16 bits of 32-bit word i / 2.
+    public static string Bf16ToFloat => @"#version 450
+layout(local_size_x = 256) in;
+layout(set=0, binding=0) buffer B0 { uint words[]; };
+layout(set=0, binding=1) buffer B1 { float outputValues[]; };
+layout(push_constant) uniform PC {
+    int n;
+};
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x); if (gid >= n) return; uint w = words[gid >> 1];
+    outputValues[gid] = uintBitsToFloat((((gid & 1) != 0) ? (w >> 16) : (w & 0xFFFFu)) << 16);
+}";
+
     public static string Int32ToFloat => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { int raw[]; };

@@ -144,6 +144,8 @@ kernel void hgemm_tiled(
     private IGpuBuffer GemmEpilogue(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K,
         GemmActivation activation, float slope)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         ThrowIfDisposed();
         if (A is not MetalGpuBuffer aBuffer || B is not MetalGpuBuffer bBuffer || bias is not MetalGpuBuffer biasBuffer)
             throw new ArgumentException("Buffers must be MetalGpuBuffer");
