@@ -59,5 +59,15 @@
       "commit": "37597f19895ccd76df9bae55064677bcd4807c88",
       "tree": "8b744511f0c6f2b10b47c8274da9eac6e71bce4b"
     }
+  },
+  "2026-11-26": {
+    "AiDotNet": {
+      "url": "https://github.com/ooples/AiDotNet.git",
+      "fetch": [
+        "9dc1c8287faa0ea46236985b9dd5e268a09d51bf"
+      ],
+      "commit": "9dc1c8287faa0ea46236985b9dd5e268a09d51bf",
+      "tree": "1f43a96a9ad6aa361cd0385b31b43aec43e9d875"
+    }
   }
 }
