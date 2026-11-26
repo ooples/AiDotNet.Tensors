@@ -2232,6 +2232,39 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     public void ArgMaxArgMin_WideRows_MatchCpuScanExactly(int rows, int width)
     {
         SkipIfNoDirectGpu();
+        var data = WideRowArgExtremeCases(rows, width);
+        var values = new Tensor<float>(data, new[] { rows, width });
+        IEngine cpu = new CpuEngine();
+        IEngine gpu = Gpu;
+        var backend = Gpu.GetBackend();
+        long Launches() => backend is AiDotNet.Tensors.Engines.DirectGpu.IArgExtremeRowLaunchCounter counter
+            ? counter.ArgExtremeRowLaunches
+            : 0;
+        long launches = Launches();
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            var gpuMax = gpu.TensorArgMax(values, 1);
+            var gpuMin = gpu.TensorArgMin(values, 1);
+            Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpuMax.GetDataArray());
+            Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpuMin.GetDataArray());
+            long expectedLaunches = width >= AiDotNet.Tensors.Engines.DirectGpu.ArgExtremeRows.MinWidth
+                && backend is AiDotNet.Tensors.Engines.DirectGpu.IArgExtremeRowLaunchCounter ? 2 : 0;
+            Assert.Equal(expectedLaunches, Launches() - launches);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+    }
+
+    /// <summary>
+    /// Rows for the arg-extreme scans: many exact ties, ties at the extreme in several work items' slices, NaNs (leading
+    /// and later), infinities, signed zeros and subnormals. Shared with the Dawn-hosted WebGPU test.
+    /// </summary>
+    internal static float[] WideRowArgExtremeCases(int rows, int width)
+    {
         var rng = new Random(rows * 7919 + width);
         var data = new float[rows * width];
         for (int i = 0; i < data.Length; i++) data[i] = (float)Math.Round(rng.NextDouble() * 8 - 4, 1); // many exact ties
@@ -2258,33 +2291,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
                     break;
             }
         }
-        var values = new Tensor<float>(data, new[] { rows, width });
-        IEngine cpu = new CpuEngine();
-        IEngine gpu = Gpu;
-        var backend = Gpu.GetBackend();
-        long Launches() => backend switch
-        {
-            AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cuda => cuda.ArgExtremeRowLaunches,
-            AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend hip => hip.ArgExtremeRowLaunches,
-            _ => 0
-        };
-        long launches = Launches();
-        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
-        try
-        {
-            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
-            var gpuMax = gpu.TensorArgMax(values, 1);
-            var gpuMin = gpu.TensorArgMin(values, 1);
-            Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), gpuMax.GetDataArray());
-            Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), gpuMin.GetDataArray());
-            long expectedLaunches = width >= 512 && backend is
-                (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend or AiDotNet.Tensors.Engines.DirectGpu.HIP.HipBackend) ? 2 : 0;
-            Assert.Equal(expectedLaunches, Launches() - launches);
-        }
-        finally
-        {
-            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
-        }
+        return data;
     }
 
     [SkippableTheory]

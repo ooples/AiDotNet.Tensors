@@ -9271,14 +9271,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows, the CUDA kernel); narrower rows
     // keep one thread per row.
-    internal const int ArgExtremeRowKernelMinWidth = 512;
     private long _argExtremeRowLaunches;
-    internal long ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+    long IArgExtremeRowLaunchCounter.ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
 
 
     private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
     {
-        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+        if (reduceSize < ArgExtremeRows.MinWidth || outerSize <= 0
             || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
             return false;
         IntPtr inputPtr = A.Handle;

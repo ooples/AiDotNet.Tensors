@@ -100,6 +100,35 @@ internal static class DawnHostedWebGpu
 [Collection("DirectGpuSerial")]
 public sealed class DawnHostedWebGpuBackendTests
 {
+    [SkippableTheory]
+    [InlineData(1, 49152)]   // one vocabulary row: the work-group-per-row kernel
+    [InlineData(5, 4097)]
+    [InlineData(3, 512)]     // the row-kernel threshold
+    [InlineData(4, 511)]     // just below it: one invocation per row
+    public void ArgMaxArgMin_WideRows_MatchCpuScanExactly(int rows, int width)
+    {
+        var backend = DawnHostedWebGpu.BackendOrSkip();
+        using var direct = new DirectGpuEngine(backend, borrowsBackend: true);
+        using var gpu = new DirectGpuTensorEngine(direct);
+        var cpu = new CpuEngine();
+        var values = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(
+            GpuCpuConsistencyTests.WideRowArgExtremeCases(rows, width), new[] { rows, width });
+        long launches = ((IArgExtremeRowLaunchCounter)backend).ArgExtremeRowLaunches;
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            Assert.Equal(cpu.TensorArgMax(values, 1).GetDataArray(), ((IEngine)gpu).TensorArgMax(values, 1).GetDataArray());
+            Assert.Equal(cpu.TensorArgMin(values, 1).GetDataArray(), ((IEngine)gpu).TensorArgMin(values, 1).GetDataArray());
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+        Assert.Equal(width >= ArgExtremeRows.MinWidth ? 2 : 0,
+            ((IArgExtremeRowLaunchCounter)backend).ArgExtremeRowLaunches - launches);
+    }
+
     [SkippableFact]
     public void BorrowedEngineDisposal_PreservesSharedBackend()
     {

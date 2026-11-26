@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend, IArgExtremeRowLaunchCounter
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -11896,8 +11896,28 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(outerSize, Math.Min(64, outerSize));
         }
 
+        private long _argExtremeRowLaunches;
+        long IArgExtremeRowLaunchCounter.ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+
+        // A row at least ArgExtremeRows.MinWidth wide: one 256-item work group per row.
+        private bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+        {
+            if (reduceSize < ArgExtremeRows.MinWidth || outerSize <= 0 || (long)outerSize * 256 > int.MaxValue
+                || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var k) || k.MaxWorkGroupSize < 256)
+                return false;
+            k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+            k.SetArg(1, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(2, outerSize);
+            k.SetArg(3, reduceSize);
+            k.SetArg(4, findMin);
+            k.Execute1D(outerSize * 256, 256);
+            System.Threading.Interlocked.Increment(ref _argExtremeRowLaunches);
+            return true;
+        }
+
         public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
             var k = _kernelCache["argmax_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -11910,6 +11930,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) return;
             var k = _kernelCache["argmin_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -11946,6 +11967,7 @@ KERNEL VARIANTS (A/B testing):
         public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
 
             var aBuf = ((DirectOpenClGpuBuffer)A).Buffer;
             var idxBuf = ((DirectOpenClGpuBuffer)indices).Buffer;

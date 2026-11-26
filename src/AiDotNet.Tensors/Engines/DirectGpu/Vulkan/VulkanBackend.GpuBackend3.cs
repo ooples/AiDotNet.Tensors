@@ -712,6 +712,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMax: 1)) return;
         GlslUnaryOp(VulkanGlslKernels.ArgExtremaAxis, A, indices, outerSize,
             new uint[] { (uint)outerSize, (uint)reduceSize, 1 }, 3 * sizeof(uint));
     }
@@ -724,6 +725,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMax: 0)) return;
         GlslUnaryOp(VulkanGlslKernels.ArgExtremaAxis, A, indices, outerSize,
             new uint[] { (uint)outerSize, (uint)reduceSize, 0 }, 3 * sizeof(uint));
     }

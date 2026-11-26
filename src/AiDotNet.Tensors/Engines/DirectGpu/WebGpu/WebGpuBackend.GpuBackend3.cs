@@ -1037,6 +1037,7 @@ public sealed partial class WebGpuBackend
 
     public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMax: true)) return;
         Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "argmax_axis",
             A, indices, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
@@ -1049,6 +1050,7 @@ public sealed partial class WebGpuBackend
 
     public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
     {
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMax: false)) return;
         Dispatch2BufferAsync("Statistics", WebGpuKernels.StatisticsSource, "argmin_axis",
             A, indices, MakeUniformInts2(outerSize, reduceSize), outerSize).GetAwaiter().GetResult();
     }
