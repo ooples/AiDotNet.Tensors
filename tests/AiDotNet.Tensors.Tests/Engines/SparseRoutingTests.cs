@@ -185,6 +185,44 @@ public sealed class SparseRoutingTests
         AssertClose(reference[2], fusedRun[2], "mix_second_dweights", rel: 1e-4);
     }
 
+    // Third order through the mix, with the first gradient taken for the table alone (the weights then need no gradient
+    // at that level) and out-of-range indices in the routing.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void TopKMix_ThirdOrderGradients_TableOnlyFirstLevel_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+    {
+        var e = new CpuEngine();
+        var idxShape = valShape.ToArray();
+        idxShape[^1] = k;
+        var outShape = valShape.ToArray();
+        outShape[^1] = c;
+        var indices = RandIndices(idxShape, g, 61, includeOutOfBounds: true);
+        var table = RandFloat([g, c], 62);
+        var weights = RandFloat(idxShape, 63);
+        var u = RandFloat(outShape, 64);
+        var vTable = RandFloat([g, c], 65);
+        var vWeights = RandFloat(idxShape, 66);
+
+        float[][] Run(bool fused)
+        {
+            using var tape = new GradientTape<float>();
+            var y = fused ? e.TopKWeightedRowMix(table, indices, weights) : DecomposedTopKMix(e, table, indices, weights);
+            var loss = e.ReduceSum(e.TensorMultiply(e.TensorMultiply(y, y), u), null);
+            var first = tape.ComputeGradients(loss, [table], createGraph: true);
+            var h = e.ReduceSum(e.TensorMultiply(first[table], vTable), null);
+            var second = tape.ComputeGradients(h, [weights], createGraph: true);
+            var h2 = e.ReduceSum(e.TensorMultiply(second[weights], vWeights), null);
+            var third = tape.ComputeGradients(h2, [table, weights]);
+            return [second[weights].ToArray(), third[table].ToArray(), third[weights].ToArray()];
+        }
+
+        var reference = Run(fused: false);
+        var fusedRun = Run(fused: true);
+        AssertClose(reference[0], fusedRun[0], "mix_second_dweights", rel: 1e-4);
+        AssertClose(reference[1], fusedRun[1], "mix_third_dtable", rel: 1e-4);
+        AssertClose(reference[2], fusedRun[2], "mix_third_dweights", rel: 1e-4);
+    }
+
     [Theory]
     [MemberData(nameof(RoutingShapes))]
     public void TopKWeightedRowMix_TapeGradients_MatchOneHotMatMulComposition(int[] valShape, int g, int k, int c)

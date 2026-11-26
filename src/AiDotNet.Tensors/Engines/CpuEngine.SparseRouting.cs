@@ -374,9 +374,15 @@ public partial class CpuEngine
         var weights = inputs[1];
         // With no index there is nothing to select: the output is a constant zero and the kernels' zero gradients are exact.
         if (savedIndices.Length == 0 || savedIndices._shape[savedIndices.Rank - 1] == 0) return false;
+        // Only the sources the backward needs: a gradient nobody asked for is not computed (as the kernel path skips it).
+        bool tableRequired = DifferentiableOps.IsGradientRequired(table);
+        bool weightsRequired = DifferentiableOps.IsGradientRequired(weights);
+        if (!tableRequired && !weightsRequired) return true;
+        var sources = tableRequired && weightsRequired ? new[] { table, weights }
+            : tableRequired ? new[] { table } : new[] { weights };
         var (indices, mask) = TopKInRangeIndicesAndMask<T>(savedIndices, table._shape[0]);
         var outShape = (int[])gradOutput._shape.Clone();
-        return BackwardFunctions<T>.TryCompositeBackward(gradOutput, new[] { table, weights }, engine, grads,
+        return BackwardFunctions<T>.TryCompositeBackward(gradOutput, sources, engine, grads,
             eng => TopKWeightedRowMixComposed(eng, table, indices, weights, mask, outShape));
     }
 
