@@ -122,6 +122,49 @@ public sealed class LogSumExpAndInPlaceAddResidencyTests : IClassFixture<DirectG
         AssertClose(expected.Dz, actual.Dz, "dz");
     }
 
+    // TakeAlongDim alone (ce: false), and the per-token cross-entropy LSE(z) - z[ids] (ce: true), whose two gradients
+    // into z, the scatter-add and the LogSumExp backward, are accumulated on the device.
+    private static (Tensor<float> Loss, Tensor<float> Dz) TapedGather(IEngine engine, Tensor<float> z, Tensor<int> ids,
+        Tensor<float> r, bool ce)
+    {
+        using var tape = new GradientTape<float>();
+        int rows = z._shape[0];
+        var picked = engine.Reshape(engine.TensorTakeAlongDim(z, ids, 1), new[] { rows });
+        var perToken = ce ? engine.TensorSubtract(engine.TensorLogSumExp(z, 1, keepDims: false), picked) : picked;
+        var loss = engine.ReduceSum(engine.TensorMultiply(perToken, r), new[] { 0 }, keepDims: false);
+        var grads = tape.ComputeGradients(loss, new[] { z });
+        return (loss, grads[z]);
+    }
+
+    [SkippableTheory]
+    [InlineData(8, 33, false)]
+    [InlineData(8, 33, true)]
+    [InlineData(64, 4099, true)]
+    public void TapedTakeAlongDim_GradientStaysOnTheDevice_AndMatchesTheCpu(int rows, int vocab, bool ce)
+    {
+        var gpu = Gpu();
+        var z = Rand(new[] { rows, vocab }, 7);
+        var r = Rand(new[] { rows }, 8, 1.0);
+        var ids = new Tensor<int>(new[] { rows, 1 });
+        var rng = new Random(9);
+        for (int i = 0; i < rows; i++) ids[i, 0] = i % 4 == 3 ? ids[i - 1, 0] : rng.Next(vocab);   // repeated targets too
+        var expected = TapedGather(new CpuEngine(), z, ids, r, ce);
+
+        var dz = gpu.UploadToGpu(z, GpuTensorRole.General);
+        var dr = gpu.UploadToGpu(r, GpuTensorRole.General);
+        _ = TapedGather(gpu, dz, ids, dr, ce).Dz.ToArray();   // warm-up
+
+        (Tensor<float> Loss, Tensor<float> Dz) actual;
+        GpuResidencyScope scope;
+        using (scope = GpuResidencyScope.Begin(captureOperations: true))
+            actual = TapedGather(gpu, dz, ids, dr, ce);
+        // The host index tensor may be uploaded; nothing may come back.
+        Assert.True(scope.Downloads == 0, $"the taped gather downloaded: {Transfers(scope)}");
+        Assert.True(actual.Dz.IsGpuResident || actual.Dz.HasPendingGpuData, "dz was computed on the host");
+        AssertClose(expected.Loss, actual.Loss, "loss");
+        AssertClose(expected.Dz, actual.Dz, "dz");
+    }
+
     public static IEnumerable<object[]> InPlaceOperands() => new[]
     {
         new object[] { "uploaded", "uploaded" },

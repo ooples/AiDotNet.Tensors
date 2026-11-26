@@ -5423,9 +5423,58 @@ public partial class DirectGpuTensorEngine
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
             BindTapeIfRecording<T>();
-            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
+            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, TakeAlongDimDeviceBackward<T>, savedState: new object[] { indices, dim });
         }
         return result;
+    }
+
+    // The gradient of a gather is a scatter-add into zeros: dx[outer, idx, inner] += dy[outer, i, inner], the ScatterReduce
+    // kernel in sum mode. The host loop of BackwardFunctions.TakeAlongDimBackward downloaded dy and left dx on the host,
+    // so the gradient of a gathered [rows x vocabulary] input crossed the bus twice and was accumulated on the host.
+    // A second-order backward keeps the CPU function, which records its own differentiable graph.
+    private static void TakeAlongDimDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (!Autodiff.BackwardFunctions<T>.CreatesGraph && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
+            && gpu.TryTakeAlongDimBackwardOnDevice(gradOutput, inputs[0], (Tensor<int>)savedState[0], (int)savedState[1]) is { } onDevice)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
+            return;
+        }
+        if (engine.Is<DirectGpuTensorEngine>() && !Autodiff.BackwardFunctions<T>.CreatesGraph)
+            GpuLaunchProbe.OnFallback("TensorTakeAlongDim backward: host loop", null);
+        Autodiff.BackwardFunctions<T>.TakeAlongDimBackward(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    private Tensor<T>? TryTakeAlongDimBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<int> indices, int dim)
+    {
+        using var __gpuOp = EnterGpuOp();
+        int rank = input.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || input.Length == 0 || indices.Length == 0 || d < 0 || d >= rank
+            || indices.Rank != rank || gradOutput.Length != indices.Length || !TryGetBackend(out var backend))
+            return null;
+        for (int k = 0; k < rank; k++)
+            if (k != d && indices._shape[k] != input._shape[k]) return null;
+        try
+        {
+            int dstDim = input._shape[d], srcDim = indices._shape[d], n = input.Length;
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= input._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= input._shape[k];
+            var cg = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            var ci = indices.IsContiguous ? indices : indices.Contiguous();
+            using var bufG = GetOrAllocateBuffer(backend, cg);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
+            // Not fullyWritten: the output starts zeroed and the kernel adds only at the gathered positions.
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])input._shape.Clone(),
+                output => backend.ScatterReduce(output, bufG.Buffer, bufIdx.Buffer, outerSize, srcDim, dstDim, innerSize, 0));
+        }
+        catch (NotSupportedException ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("TensorTakeAlongDim backward", ex);
+            return null;
+        }
     }
 
     private Tensor<T> TensorTakeAlongDimOnGpu<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
