@@ -464,6 +464,9 @@ public class CudaFallbackReportingTests
         }
     }
 
+#if NET6_0_OR_GREATER
+    // The module initializer (GpuAutoDetectModuleInit) exists only on .NET 6 and later, and it is the only code that
+    // defers the GPU detection. On net462/net471 nothing defers it, so the behaviour tested here does not exist there.
     /// <summary>
     /// With AIDOTNET_DISABLE_GPU set, the module initializer used to skip the detection altogether, so a backend
     /// required afterwards was never checked and Current handed out the CPU engine. The detection is now owed either way.
@@ -489,4 +492,5 @@ public class CudaFallbackReportingTests
             AiDotNetEngine.Current = saved;
         }
     }
+#endif
 }
