@@ -36,7 +36,9 @@ public sealed class SparseRoutingTests
         var t = new Tensor<int>(shape);
         for (int i = 0; i < t.Length; i++)
         {
-            if (includeOutOfBounds && i % 11 == 0)
+            if (includeOutOfBounds && i == t.Length - 1 && i % 11 != 0)
+                t[i] = numBins + 3; // an index past the end in every shape, not only the long ones
+            else if (includeOutOfBounds && i % 11 == 0)
                 t[i] = (i % 2 == 0) ? -1 : numBins + 3;
             else
                 t[i] = rng.Next(0, numBins);
@@ -185,11 +187,11 @@ public sealed class SparseRoutingTests
         AssertClose(reference[2], fusedRun[2], "mix_second_dweights", rel: 1e-4);
     }
 
-    // Third order through the mix, with the first gradient taken for the table alone (the weights then need no gradient
-    // at that level) and out-of-range indices in the routing.
+    // Third order through the mix, with out-of-range indices in the routing: the first gradient is for the table, the
+    // second for the weights, and the third for both.
     [Theory]
     [MemberData(nameof(RoutingShapes))]
-    public void TopKMix_ThirdOrderGradients_TableOnlyFirstLevel_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+    public void TopKMix_ThirdOrderGradients_WithOutOfRangeIndices_MatchOneHotComposition(int[] valShape, int g, int k, int c)
     {
         var e = new CpuEngine();
         var idxShape = valShape.ToArray();
