@@ -14,7 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
         /// </summary>
         public static string GetSource()
         {
-            return ExactFloatKernels.OpenCl + @"
+            return ExactFloatKernels.OpenCl + PackedFloatLibrary.OpenCl + @"
 // ===========================================================================
 // Fast exp4 — Cephes-style polynomial approximation for float4.
 // ~0.01% relative error, 3-5x faster than hardware exp() on most GPUs.
@@ -819,7 +819,8 @@ __kernel void conv2d_bias_add(
     const int totalSize = batch * channels * spatialSize;
     if (idx >= totalSize) return;
     const int channel = (idx / spatialSize) % channels;
-    output[idx] += bias[channel];
+    // Keeps subnormals on a device that flushes them (pk_add_keep), as the CPU does.
+    output[idx] = pk_add_keep(output[idx], bias[channel]);
 }
 
 // ===========================================================================

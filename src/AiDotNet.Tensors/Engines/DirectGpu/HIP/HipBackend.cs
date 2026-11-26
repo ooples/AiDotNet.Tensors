@@ -4405,12 +4405,16 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return ReduceToScalar(krnl, A, size);
     }
 
+    // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU, also for a single element, which a
+    // reduction with nothing to merge can hand back as it is, payload included.
+    private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
+
     public float Max(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("reduce_max", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: reduce_max");
 
-        return ReduceToScalar(krnl, A, size);
+        return CanonicalNaN(ReduceToScalar(krnl, A, size));
     }
 
     public float Min(IGpuBuffer A, int size)
@@ -4418,7 +4422,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (!_kernelCache.TryGetValue("reduce_min", out var krnl))
             throw new GpuCapabilityUnavailableException("HIP kernel not found: reduce_min");
 
-        return ReduceToScalar(krnl, A, size);
+        return CanonicalNaN(ReduceToScalar(krnl, A, size));
     }
 
     private unsafe float ReduceToScalar(IntPtr kernel, IGpuBuffer input, int size)

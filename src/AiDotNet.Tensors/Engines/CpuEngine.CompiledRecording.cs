@@ -61,11 +61,22 @@ public partial class CpuEngine
         }
         BindCaptures(scope, forward, operands, privatizeArrays: true);
         if (backwardForward is not null) BindCaptures(scope, backwardForward, operands, privatizeArrays: true);
+        // The shape cache keys on the caller's closure, which a probe (that records no producers) presents unwrapped.
+        var shapeKeyForward = forward;
+        // Integer index tensors the closure reads that integer ops of this trace still have to produce: the plan
+        // schedules only this op's operands, so each run of the closure recomputes them first.
+        if (!scope.IsProbe && CaptureClosureIndexProducers(forward, opName) is { } refreshIndices)
+        {
+            var inner = forward;
+            forward = engine => { refreshIndices(engine); return inner(engine); };
+            if (backwardForward is { } innerBackward)
+                backwardForward = engine => { refreshIndices(engine); return innerBackward(engine); };
+        }
 
         Tensor<T> traced;
         var position = scope.NodeCount;
         var shapeKey = CompiledOpShapeCache.Supports(opName)
-            ? ObjectiveSignature.BuildShapeKey(opName, this, operands, forward) : null;
+            ? ObjectiveSignature.BuildShapeKey(opName, this, operands, shapeKeyForward) : null;
         if (scope.IsProbe)
         {
             if (shapeKey is null) throw new ObjectiveProbeAbortedException(opName + " (shape cache unsupported)");
@@ -303,6 +314,37 @@ public partial class CpuEngine
             {
                 // A closure over variables of an enclosing scope holds that scope's closure object.
                 BindCaptures(scope, value, operands, privatizeArrays, depth + 1);
+            }
+        }
+    }
+
+    // What recomputes every integer index tensor an op's closure captured whose producers this trace recorded; null
+    // when it captured none.
+    private static Action<IEngine>? CaptureClosureIndexProducers(Delegate closure, string opName)
+    {
+        if (closure.Target is not { } target
+            || !target.GetType().IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+            return null;
+        Action<IEngine>? refresh = null;
+        CollectClosureIndexProducers(target, opName, depth: 0, ref refresh);
+        return refresh;
+    }
+
+    private static void CollectClosureIndexProducers(object closure, string opName, int depth, ref Action<IEngine>? refresh)
+    {
+        const System.Reflection.BindingFlags fields =
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic;
+        foreach (var field in closure.GetType().GetFields(fields).Where(candidate => !candidate.FieldType.IsValueType))
+        {
+            var value = field.GetValue(closure);
+            if (value is Tensor<int> indices)
+            {
+                if (CaptureIndexProducers(indices, opName) is { } one) refresh += one;
+            }
+            else if (value is not null && depth < 4
+                && field.FieldType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false))
+            {
+                CollectClosureIndexProducers(value, opName, depth + 1, ref refresh);
             }
         }
     }

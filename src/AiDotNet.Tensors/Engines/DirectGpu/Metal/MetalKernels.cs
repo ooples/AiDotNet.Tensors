@@ -1792,12 +1792,12 @@ kernel void max_reduce(
     uint group_id [[threadgroup_position_in_grid]],
     uint group_size [[threads_per_threadgroup]])
 {
-    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped (the CPU scan never takes one, so an all-NaN input
-    // gives -inf) and max() no longer flushes a subnormal. Ties keep the left operand.
+    // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (once taken it is
+    // kept, and it wins every merge below), and max() no longer flushes a subnormal. Ties keep the left operand.
     uint max_val = 0xFF800000u;
     for (uint i = gid; i < size; i += group_size * 256) {
         uint v = as_type<uint>(input[i]);
-        if (xf_gt(v, max_val)) max_val = v;
+        if (xf_isnan(v)) max_val = 0xFFC00000u; else if (xf_gt(v, max_val)) max_val = v;
     }
     shared[lid] = as_type<float>(max_val);
 
@@ -1805,7 +1805,8 @@ kernel void max_reduce(
 
     for (uint stride_active = group_size, stride = (group_size + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (lid < stride && lid + stride < stride_active) {
-            shared[lid] = xf_maxf(shared[lid + stride], shared[lid]);
+            uint right = as_type<uint>(shared[lid + stride]);
+            if (xf_isnan(right) || xf_gt(right, as_type<uint>(shared[lid]))) shared[lid] = as_type<float>(right);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1826,11 +1827,11 @@ kernel void min_reduce(
     uint group_id [[threadgroup_position_in_grid]],
     uint group_size [[threads_per_threadgroup]])
 {
-    // Exact as max_reduce: NaN skipped, +inf identity.
+    // Exact as max_reduce: a NaN anywhere is the result, +inf identity.
     uint min_val = 0x7F800000u;
     for (uint i = gid; i < size; i += group_size * 256) {
         uint v = as_type<uint>(input[i]);
-        if (xf_lt(v, min_val)) min_val = v;
+        if (xf_isnan(v)) min_val = 0xFFC00000u; else if (xf_lt(v, min_val)) min_val = v;
     }
     shared[lid] = as_type<float>(min_val);
 
@@ -1838,7 +1839,8 @@ kernel void min_reduce(
 
     for (uint stride_active = group_size, stride = (group_size + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
         if (lid < stride && lid + stride < stride_active) {
-            shared[lid] = xf_minf(shared[lid + stride], shared[lid]);
+            uint right = as_type<uint>(shared[lid + stride]);
+            if (xf_isnan(right) || xf_lt(right, as_type<uint>(shared[lid]))) shared[lid] = as_type<float>(right);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1977,11 +1979,12 @@ kernel void max_axis(
 {
     if (gid < outer_size) {
         // The CPU ReduceMax scan, exact on the bits (ExactFloatKernels): from -inf, take a value only when strictly
-        // greater, so a NaN is skipped, an all-NaN row gives -inf and the first of equal maxima (-0 before +0) is kept.
+        // greater, so the first of equal maxima (-0 before +0) is kept. A NaN anywhere in the row is the row's result.
         uint max_val = 0xFF800000u;
         uint offset = gid * reduce_size;
         for (uint i = 0; i < reduce_size; i++) {
             uint v = as_type<uint>(input[offset + i]);
+            if (xf_isnan(v)) { max_val = v; break; }
             if (xf_gt(v, max_val)) max_val = v;
         }
         output[gid] = as_type<float>(max_val);

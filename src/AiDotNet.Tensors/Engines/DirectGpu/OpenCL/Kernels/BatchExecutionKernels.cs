@@ -24,8 +24,8 @@ public static class BatchExecutionKernels
         .Replace(TranslateSolvers(K.ChannelBiasLeakySource), GetChannelBiasLeakySource());
 
     // Keep the shared CUDA constant intact so all backends deduplicate the common module in CLR metadata.
-    // The OpenCL fusion preserves the bias and activation modules' different denormal policies.
-    internal static string GetChannelBiasLeakySource() => KernelSourceResources.Read("ChannelBiasLeaky.opencl.c");
+    // Like the separate bias add and leaky ReLU it fuses, it keeps subnormals on a device that flushes them.
+    internal static string GetChannelBiasLeakySource() => PackedFloatLibrary.OpenCl + KernelSourceResources.Read("ChannelBiasLeaky.opencl.c");
 
     private static string TranslateSolvers(string cuda)
     {

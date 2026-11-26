@@ -36018,7 +36018,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         int lenIn = materializedInput.Length;
                         for (int i = 0; i < lenIn; i++)
                         {
-                            if (numOps.GreaterThan(inputData[i], outSpan[outFlat]))
+                            if (numOps.GreaterThan(inputData[i], outSpan[outFlat]) || IsFirstNaN(numOps, inputData[i], outSpan[outFlat]))
                             {
                                 outSpan[outFlat] = inputData[i];
                                 idxArr[outFlat] = i;
@@ -36053,7 +36053,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int inner = 0; inner < innerSize; inner++)
                 {
                     T best = srcArr[input.ReductionStorageIndex(o, 0, inner, axis)]; int bestIdx = 0;
-                    for (int a = 1; a < axisSize; a++) { T v = srcArr[input.ReductionStorageIndex(o, a, inner, axis)]; if (ops.GreaterThan(v, best)) { best = v; bestIdx = a; } }
+                    for (int a = 1; a < axisSize; a++) { T v = srcArr[input.ReductionStorageIndex(o, a, inner, axis)]; if (ops.GreaterThan(v, best) || IsFirstNaN(ops, v, best)) { best = v; bestIdx = a; } }
                     rArr[o * innerSize + inner] = best;
                     maxIndices[o * innerSize + inner] = bestIdx;
                 }
@@ -36071,8 +36071,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fData = (float[])(object)fDataLease.Array;
                 float maxVal = float.NegativeInfinity;
                 int maxIdx = 0;
+                // A NaN anywhere is the result (NumPy, PyTorch, the device kernels): it is taken once, then kept.
                 for (int i = 0; i < input.Length; i++)
-                    if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
+                    if (fData[i] > maxVal || (float.IsNaN(fData[i]) && !float.IsNaN(maxVal))) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
                 return TensorAllocator.Rent<T>(FullReductionShape(1, keepDims),
@@ -36115,7 +36116,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int maxLen = input.Length;
         for (int i = 0; i < maxLen; i++)
         {
-            if (numOps.GreaterThan(inputData[i], outputData[maxOutFlat]))
+            if (numOps.GreaterThan(inputData[i], outputData[maxOutFlat]) || IsFirstNaN(numOps, inputData[i], outputData[maxOutFlat]))
             {
                 outputData[maxOutFlat] = inputData[i];
                 maxIndices[maxOutFlat] = i;
@@ -36326,6 +36327,16 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// Whether <paramref name="candidate"/> is the first NaN a maximum scan meets. A scan takes a value that is strictly
+    /// greater or that is the first NaN, and a held NaN is never given up (no value is greater than it), so a NaN
+    /// anywhere in the reduced range is the result, as for NumPy, PyTorch and the device kernels, and the recorded
+    /// index is the first NaN's.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsFirstNaN<T>(INumericOperations<T> ops, T candidate, T held)
+        => ops.IsNaN(candidate) && !ops.IsNaN(held);
+
+    /// <summary>
     /// The value a ReduceMax cell starts from: negative infinity for float and double, otherwise the type's MinValue.
     /// The float seed used to be float.MinValue (-3.4e38), so a row of -infinity (or of NaN, which never replaces the
     /// seed) reduced to -3.4e38 instead of -infinity.
@@ -36367,7 +36378,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int a = 0; a < axisSize; a++)
                     {
                         int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                        for (int j = j0; j < j1; j++) { double v = src[rb + j]; double held = dst[ob + j]; if (v > held || (double.IsNaN(v) && !double.IsNaN(held))) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
                     }
                 }
             }, deterministicSafe: true);
@@ -36386,7 +36397,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     for (int a = 0; a < axisSize; a++)
                     {
                         int rb = ib + a * inner;
-                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; if (v > dst[ob + j]) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
+                        for (int j = j0; j < j1; j++) { float v = src[rb + j]; float held = dst[ob + j]; if (v > held || (float.IsNaN(v) && !float.IsNaN(held))) { dst[ob + j] = v; maxIndices[ob + j] = rb + j; } }
                     }
                 }
             }, deterministicSafe: true);
@@ -40789,7 +40800,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var refreshIndices = CaptureIndexProducers(indices, "TensorScatterAdd"); var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -40874,7 +40885,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!indices.IsContiguous) indices = indices.Contiguous();
 
         int normalizedAxis = axis < 0 ? source._shape.Length + axis : axis;
         if (normalizedAxis < 0 || normalizedAxis >= source._shape.Length)
@@ -40885,16 +40895,21 @@ public partial class CpuEngine : ITensorLevelEngine
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
+                // Before anything reads the indices: a contiguous copy taken here would hold the zeros of indices
+                // the trace has not computed yet, and would not be the tensor their producers write.
+                var refreshIndices = CaptureIndexProducers(indices, "TensorGather");
                 var captured = source;
-                var capIndices = indices;
+                var capIndices = refreshIndices is null && !indices.IsContiguous ? indices.Contiguous() : indices;
                 var capAxis = normalizedAxis;
                 // Compute output shape: replace source._shape[axis] with indices shape
                 var outShape = ComputeGatherOutputShape(source._shape, indices._shape, capAxis);
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorGather", source, outShape,
-                    (eng, output) => { var r = eng.TensorGather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) => { refreshIndices?.Invoke(eng); var r = eng.TensorGather(captured, capIndices, capAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.GatherBackward, new object[] { capIndices, capAxis });
             }
         }
+
+        if (!indices.IsContiguous) indices = indices.Contiguous();
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -43667,9 +43682,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// A captured indexed op reads its indices when the plan runs, but the plan schedules only its float operands:
-    /// indices still to be produced by another captured op would be read before they are computed. Such a capture
-    /// cannot replay, so it is rejected rather than run on uninitialized indices.
+    /// A captured scatter or index-select reads its indices when the plan runs, but the plan schedules only its float
+    /// operands: indices still to be produced by another captured op would be read before they are computed. Such a
+    /// capture is rejected rather than run on uninitialized indices (a saved plan stores the indices by value).
     /// </summary>
     private static void RequireConcreteIndices(Tensor<int> indices, string opName)
     {
@@ -43677,6 +43692,52 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new NotSupportedException(
                 $"{opName} cannot be captured with indices produced inside the same graph; compute the indices "
                 + "before entering graph mode.");
+    }
+
+    /// <summary>
+    /// A captured indexed op (gather, take, index-copy, index-add, scatter-add) reads its indices when the plan runs, but the plan schedules only its float
+    /// operands: indices that integer ops of the same trace still have to produce (an arange plus an offset, a broadcast sum of
+    /// row and column offsets) would be read before they are computed, and the first step would index with zeros.
+    /// Returns what recomputes those indices, for the op's replay to run before it reads them, or null when the
+    /// indices are concrete already. Each replay recomputes them, as each eager call would, so an integer tensor the
+    /// caller edits between steps is followed too.
+    /// </summary>
+    /// <remarks>
+    /// Only integer producers are recomputed. Indices that are another op's auxiliary output (TopK's, a max pool's;
+    /// in a probe trace their source is that op's node) are that op's to refresh, and an integer op reading such an
+    /// output is recomputed from the output's current value.
+    /// </remarks>
+    /// <exception cref="NotSupportedException">The indices come from an in-place integer write, which cannot be
+    /// re-run without applying it twice.</exception>
+    internal static Action<IEngine>? CaptureIndexProducers(Tensor<int> indices, string opName)
+    {
+        if (indices.LazySource is not LazyNode<int> root || root.IsRealized) return null;
+
+        var producers = new List<ILazyNode>();
+        var pending = new Stack<ILazyNode>();
+        pending.Push(root);
+        while (pending.Count > 0)
+        {
+            var node = pending.Pop();
+            if (producers.Contains(node) || node is not LazyNode<int>) continue;
+            if (node.WritesInPlace)
+                throw new NotSupportedException(
+                    $"{opName} cannot be captured with indices produced inside the same graph by '{node.OpName}'; "
+                    + "compute the indices before entering graph mode.");
+            producers.Add(node);
+            foreach (var input in node.GetInputNodes()) pending.Push(input);
+        }
+
+        var nodes = producers.ToArray();
+        return engine =>
+        {
+            // Not a host read by the objective: the op that owns these indices is running.
+            using (GraphMode.SuspendRecording())
+            {
+                foreach (var node in nodes) node.IsRealized = false;
+                root.Realize(engine);
+            }
+        };
     }
 
     /// <inheritdoc/>

@@ -4,7 +4,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
@@ -294,7 +293,7 @@ NF_FN float nf_tanh(float x) { return ((NF_BITS(x) >> 23) & 0xFFu) < 114u ? x : 
 /* Below -80, e^-x overflows on its way to the quotient (a zero, where the result is e^x: 8e-40 at -90). */
 NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f + NF_EXP(-x)); }
 ");
-        if (openCl) source.Append(BitExactLibrary());
+        if (openCl) source.Append(PackedFloatLibrary.CSpelling("NF_FN ", "u32t"));
         foreach (var type in Types)
         {
             string t = Suffix(type);
@@ -360,20 +359,6 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
                 .Append("    float s = 0.0f;\n    for (int j = 0; j < k; j++) s += ").Append(widen).Append("(a[row * k + j]) * ").Append(widen)
                 .Append("(b[j * n + col]);\n    c[i] = ").Append(narrow).Append("(s);\n}\n");
         }
-    }
-
-    // The packed kernels' binary32 library up to its gelu (which needs clamp and tanh), spelled as C: a functional cast
-    // becomes a C cast and uint the program's u32t.
-    private static string BitExactLibrary()
-    {
-        string text = KernelSourceResources.Read("PackedKernels.float.c");
-        text = text.Substring(0, text.IndexOf("float pk_gelu(", StringComparison.Ordinal));
-        // The library's own float routines (square root, exponential, logarithm, tangent, sigmoid) read and write
-        // the bits through FBITS and UFLOAT, which each shader language spells its own way: as_uint and as_float here.
-        text = Regex.Replace(text, @"\b(uint|int|float)\(", "($1)(");
-        text = text.Replace("FBITS(", "as_uint(").Replace("UFLOAT(", "as_float(");
-        text = Regex.Replace(text, @"\buint\b", "u32t");
-        return Regex.Replace(text, @"^(u32t|int|float|bool) (pk_\w+)\(", "NF_FN $1 $2(", RegexOptions.Multiline);
     }
 
     // The OpenCL kernels, every one the name list declares, computed on the bits as the packed kernels compute them

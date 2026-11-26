@@ -3,21 +3,31 @@ using System;
 namespace AiDotNet.Tensors.LinearAlgebra.Decompositions;
 
 /// <summary>
-/// General (non-symmetric) eigendecomposition. Managed implementation uses
-/// Hessenberg reduction followed by the unshifted QR algorithm on the
-/// upper-Hessenberg form. Eigenvalues come out as (real, imag) pairs along a
-/// trailing size-2 axis; right eigenvectors do the same.
+/// General (non-symmetric) eigendecomposition, the managed equivalent of LAPACK <c>dgeev</c>.
+/// Eigenvalues come out as (real, imag) pairs along a trailing size-2 axis; right eigenvectors do
+/// the same, one per column.
 ///
-/// <para>This is the hardest of the decompositions to implement well in pure
-/// managed code. The implementation here targets correctness on well-separated
-/// real-spectrum inputs; production-hardening (Wilkinson shifts, double-implicit
-/// shifts, balancing) is a follow-up. Complex spectra return real diagonals
-/// plus conjugate-pair off-diagonals per standard upper-Hessenberg output.</para>
+/// <para>float, double, Half and BFloat16 inputs run in double precision (narrow types are rounded on output);
+/// decimal runs the same algorithm in decimal (<see cref="GenericLinalg{T}.EigWorkspace"/>) without
+/// balancing. The double kernel performs diagonal balancing (EISPACK
+/// <c>balanc</c>, scaling only), Householder reduction to upper-Hessenberg form (<c>orthes</c>/<c>ortran</c>),
+/// then the Francis double-shift QR algorithm with deflation and exceptional shifts, followed by
+/// back-substitution on the real Schur form for the eigenvectors (<c>hqr2</c>). Everything works in
+/// place on two n×n buffers that are allocated once per call and reused across the batch, so a call
+/// allocates O(n²) regardless of iteration count. A QR iteration that fails to converge throws
+/// <see cref="ArithmeticException"/> (LAPACK <c>info &gt; 0</c>) instead of returning an unconverged
+/// diagonal.</para>
+///
+/// <para>Each eigenvector has unit Euclidean norm and, for a complex eigenvector, a real component of
+/// largest modulus, as <c>dgeev</c> returns. The positive-imaginary member of a conjugate pair comes
+/// first.</para>
 /// </summary>
 internal static class EigDecomposition
 {
-    private const double Eps = 1e-12;
-    private const int MaxIterations = 200;
+    /// <summary>QR sweeps allowed per eigenvalue before the iteration is declared unconverged (LAPACK uses 30).</summary>
+    private const int MaxIterationsPerEigenvalue = 30;
+
+    private static readonly double Eps = Math.Pow(2.0, -52);
 
     internal static (Tensor<T> EigenvaluesReIm, Tensor<T> EigenvectorsReIm) Compute<T>(Tensor<T> input)
         where T : unmanaged, IEquatable<T>, IComparable<T>
@@ -56,296 +66,648 @@ internal static class EigDecomposition
         int valStride = n * 2;
         int vecStride = n * n * 2;
 
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+            GenericLinalg<T>.EnsureSupported("Eig");
+        if (n == 0 || batch == 0) return (eigvals, eigvecs);
+
+        if (typeof(T) == typeof(decimal))
+        {
+            // decimal carries 28 digits, more than double: the same algorithm runs in T.
+            var genericWork = new GenericLinalg<T>.EigWorkspace(n);
+            for (int b = 0; b < batch; b++)
+                genericWork.Solve(inData, b * matStride, valData, b * valStride, vecData, b * vecStride);
+            return (eigvals, eigvecs);
+        }
+
+        // float, double, and the narrow Half / BFloat16 (accumulated in double, rounded on output).
+        var work = new Workspace(n);
         for (int b = 0; b < batch; b++)
-            ComputeSingle(inData, b * matStride, valData, b * valStride, vecData, b * vecStride, n);
+        {
+            for (int i = 0; i < matStride; i++) work.H[i] = ToDouble(inData[b * matStride + i]);
+            work.Solve();
+            int offW = b * valStride, offV = b * vecStride;
+            for (int k = 0; k < n; k++)
+            {
+                valData[offW + k * 2] = FromDouble<T>(work.D[k]);
+                valData[offW + k * 2 + 1] = FromDouble<T>(work.E[k]);
+            }
+            work.WriteEigenvectors(vecData, offV);
+        }
 
         return (eigvals, eigvecs);
     }
 
-    private static void ComputeSingle<T>(
-        T[] src, int offSrc, T[] w, int offW, T[] v, int offV, int n)
-        where T : unmanaged, IEquatable<T>, IComparable<T>
+    /// <summary>
+    /// The O(n²) state of one dgeev-style solve: H (input, then Hessenberg, then real Schur form and
+    /// the triangular eigenvectors), V (Householder/QR transforms, then the eigenvectors), and O(n) vectors.
+    /// </summary>
+    private sealed class Workspace
     {
-        // decimal / Half / BFloat16: Hessenberg + Francis double-shift QR carried out in T.
-        if (typeof(T) != typeof(float) && typeof(T) != typeof(double))
+        private readonly int _n;
+        internal readonly double[] H;
+        internal readonly double[] V;
+        internal readonly double[] D;
+        internal readonly double[] E;
+        private readonly double[] _ort;
+        private readonly double[] _scale;
+
+        internal Workspace(int n)
         {
-            GenericLinalg<T>.Eig(src, offSrc, w, offW, v, offV, n);
-            return;
+            _n = n;
+            H = new double[n * n];
+            V = new double[n * n];
+            D = new double[n];
+            E = new double[n];
+            _ort = new double[n];
+            _scale = new double[n];
         }
 
-        // Working matrix H (will become upper Hessenberg, then quasi-triangular
-        // via QR iterations) and Q (accumulated similarity transforms).
-        var h = new double[n * n];
-        var q = new double[n * n];
-        for (int i = 0; i < n; i++)
+        internal void Solve()
         {
-            for (int j = 0; j < n; j++) h[i * n + j] = ToDouble(src[offSrc + i * n + j]);
-            q[i * n + i] = 1.0;
+            // dgeev rejects non-finite input; report NaN eigenpairs rather than iterate on NaN shifts.
+            if (HasNonFinite()) { FillNaN(); return; }
+            Balance();
+            Orthes();
+            Hqr2();
+            Unbalance();
         }
 
-        // Phase 1: Hessenberg reduction via Householder.
-        HessenbergReduce(h, q, n);
-
-        // Phase 2: QR iteration (unshifted — simple, robust enough for well-conditioned
-        // cases; full Francis double-shift is a follow-up optimization).
-        QrIterate(h, q, n);
-
-        // Phase 3: read eigenvalues from the diagonal / 2×2 blocks of the
-        // quasi-triangular H. For 2×2 blocks (complex conjugate pair):
-        //   eigenvalues = (h_ii + h_jj)/2 ± sqrt(discriminant)
-        int idx = 0;
-        while (idx < n)
+        private bool HasNonFinite()
         {
-            if (idx < n - 1 && Math.Abs(h[(idx + 1) * n + idx]) > Eps * (Math.Abs(h[idx * n + idx]) + Math.Abs(h[(idx + 1) * n + (idx + 1)])))
+            for (int i = 0; i < H.Length; i++)
+                if (double.IsNaN(H[i]) || double.IsInfinity(H[i])) return true;
+            return false;
+        }
+
+        private void FillNaN()
+        {
+            for (int i = 0; i < _n; i++) { D[i] = double.NaN; E[i] = double.NaN; }
+            for (int i = 0; i < V.Length; i++) V[i] = double.NaN;
+        }
+
+        /// <summary>
+        /// Diagonal similarity H ← S⁻¹·H·S with power-of-two S chosen so each row and column have
+        /// comparable norms (EISPACK <c>balanc</c> without permutation; exact in floating point).
+        /// </summary>
+        private void Balance()
+        {
+            const double radix = 2.0, sqrdx = radix * radix;
+            int n = _n;
+            for (int i = 0; i < n; i++) _scale[i] = 1.0;
+            bool done = false;
+            while (!done)
             {
-                // 2×2 block — complex conjugate pair.
-                double a = h[idx * n + idx];
-                double b = h[idx * n + idx + 1];
-                double c = h[(idx + 1) * n + idx];
-                double d = h[(idx + 1) * n + idx + 1];
-                double tr = a + d;
-                double det = a * d - b * c;
-                double disc = tr * tr / 4.0 - det;
+                done = true;
+                for (int i = 0; i < n; i++)
+                {
+                    double c = 0.0, r = 0.0;
+                    for (int j = 0; j < n; j++)
+                    {
+                        if (j == i) continue;
+                        c += Math.Abs(H[j * n + i]);
+                        r += Math.Abs(H[i * n + j]);
+                    }
+                    if (c == 0.0 || r == 0.0) continue;
+                    double g = r / radix, f = 1.0, s = c + r;
+                    while (c < g) { f *= radix; c *= sqrdx; }
+                    g = r * radix;
+                    while (c > g) { f /= radix; c /= sqrdx; }
+                    if ((c + r) / f < 0.95 * s)
+                    {
+                        done = false;
+                        g = 1.0 / f;
+                        _scale[i] *= f;
+                        for (int j = 0; j < n; j++) H[i * n + j] *= g;
+                        for (int j = 0; j < n; j++) H[j * n + i] *= f;
+                    }
+                }
+            }
+        }
 
-                double re = tr / 2.0;
-                double im = Math.Sqrt(Math.Max(-disc, 0.0));
-                w[offW + idx * 2] = FromDouble<T>(re);
-                w[offW + idx * 2 + 1] = FromDouble<T>(im);
-                w[offW + (idx + 1) * 2] = FromDouble<T>(re);
-                w[offW + (idx + 1) * 2 + 1] = FromDouble<T>(-im);
-                idx += 2;
+        /// <summary>Eigenvectors of S⁻¹·A·S map back to eigenvectors of A through x = S·x'.</summary>
+        private void Unbalance()
+        {
+            int n = _n;
+            for (int i = 0; i < n; i++)
+            {
+                double f = _scale[i];
+                if (f == 1.0) continue;
+                for (int j = 0; j < n; j++) V[i * n + j] *= f;
+            }
+        }
+
+        /// <summary>
+        /// Householder reduction of H to upper-Hessenberg form, accumulating the orthogonal similarity
+        /// in V (EISPACK <c>orthes</c> + <c>ortran</c>).
+        /// </summary>
+        private void Orthes()
+        {
+            int n = _n, low = 0, high = n - 1;
+            var h = H; var v = V; var ort = _ort;
+            for (int m = low + 1; m <= high - 1; m++)
+            {
+                double scale = 0.0;
+                for (int i = m; i <= high; i++) scale += Math.Abs(h[i * n + (m - 1)]);
+                if (scale == 0.0) continue;
+
+                double hh = 0.0;
+                for (int i = high; i >= m; i--)
+                {
+                    ort[i] = h[i * n + (m - 1)] / scale;
+                    hh += ort[i] * ort[i];
+                }
+                double g = Math.Sqrt(hh);
+                if (ort[m] > 0) g = -g;
+                hh -= ort[m] * g;
+                ort[m] -= g;
+
+                // H = (I - u·uᵀ/h)·H·(I - u·uᵀ/h)
+                for (int j = m; j < n; j++)
+                {
+                    double f = 0.0;
+                    for (int i = high; i >= m; i--) f += ort[i] * h[i * n + j];
+                    f /= hh;
+                    for (int i = m; i <= high; i++) h[i * n + j] -= f * ort[i];
+                }
+                for (int i = 0; i <= high; i++)
+                {
+                    double f = 0.0;
+                    for (int j = high; j >= m; j--) f += ort[j] * h[i * n + j];
+                    f /= hh;
+                    for (int j = m; j <= high; j++) h[i * n + j] -= f * ort[j];
+                }
+                ort[m] = scale * ort[m];
+                h[m * n + (m - 1)] = scale * g;
+            }
+
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    v[i * n + j] = i == j ? 1.0 : 0.0;
+
+            for (int m = high - 1; m >= low + 1; m--)
+            {
+                if (h[m * n + (m - 1)] == 0.0) continue;
+                for (int i = m + 1; i <= high; i++) ort[i] = h[i * n + (m - 1)];
+                for (int j = m; j <= high; j++)
+                {
+                    double g = 0.0;
+                    for (int i = m; i <= high; i++) g += ort[i] * v[i * n + j];
+                    // Double division avoids possible underflow.
+                    g = g / ort[m] / h[m * n + (m - 1)];
+                    for (int i = m; i <= high; i++) v[i * n + j] += g * ort[i];
+                }
+            }
+        }
+
+        private static void Cdiv(double xr, double xi, double yr, double yi, out double cr, out double ci)
+        {
+            double r, d;
+            if (Math.Abs(yr) > Math.Abs(yi))
+            {
+                r = yi / yr;
+                d = yr + r * yi;
+                cr = (xr + r * xi) / d;
+                ci = (xi - r * xr) / d;
             }
             else
             {
-                // Real eigenvalue.
-                w[offW + idx * 2] = FromDouble<T>(h[idx * n + idx]);
-                w[offW + idx * 2 + 1] = FromDouble<T>(0.0);
-                idx += 1;
+                r = yr / yi;
+                d = yi + r * yr;
+                cr = (r * xr + xi) / d;
+                ci = (r * xi - xr) / d;
             }
         }
 
-        // Right eigenvectors via inverse iteration on the ORIGINAL matrix A.
-        // The Schur vectors q are NOT eigenvectors for a non-symmetric matrix
-        // (only the Schur basis), so copying them was incorrect. Inverse
-        // iteration solves (A − λI)x = b for the (now accurate) eigenvalue λ;
-        // because the shift sits ε away from λ, one or two solves amplify the
-        // matching eigenvector to dominate. Complex λ is handled with the
-        // equivalent 2n×2n real system, so a single routine covers real and
-        // complex-conjugate eigenpairs.
-        var a0 = new double[n * n];
-        double scale = 0.0;
-        for (int i = 0; i < n; i++)
-            for (int j = 0; j < n; j++)
-            {
-                double aij = ToDouble(src[offSrc + i * n + j]);
-                a0[i * n + j] = aij;
-                double m = Math.Abs(aij);
-                if (m > scale) scale = m;
-            }
-        if (scale == 0.0) scale = 1.0;
-
-        for (int k = 0; k < n; k++)
+        /// <summary>
+        /// Francis double-shift QR on the Hessenberg H down to real Schur form, accumulating the
+        /// transforms in V, then back-substitution for the eigenvectors (EISPACK <c>hqr2</c>).
+        /// </summary>
+        private void Hqr2()
         {
-            double re = ToDouble(w[offW + k * 2]);
-            double im = ToDouble(w[offW + k * 2 + 1]);
-            EigenvectorByInverseIteration(a0, n, re, im, scale, out var xr, out var xi);
-            for (int r = 0; r < n; r++)
-            {
-                v[offV + (r * n + k) * 2] = FromDouble<T>(xr[r]);
-                v[offV + (r * n + k) * 2 + 1] = FromDouble<T>(xi[r]);
-            }
-        }
-    }
+            int nn = _n;
+            int n = nn - 1;
+            int low = 0, high = nn - 1;
+            var h = H; var v = V; var d = D; var e = E;
+            double exshift = 0.0;
+            double p = 0, q = 0, r = 0, s = 0, z = 0, t, w, x, y;
 
-    /// <summary>
-    /// Right eigenvector for eigenvalue (<paramref name="re"/> + i·<paramref name="im"/>)
-    /// of the real matrix <paramref name="a"/> via inverse iteration. The shift is
-    /// perturbed ε·scale off the eigenvalue to keep (A − shift·I) non-singular while
-    /// still converging to the matching eigenvector. The complex solve is cast to a
-    /// 2n×2n real system: (A−sI)xr + im·xi = br, −im·xr + (A−sI)xi = bi.
-    /// </summary>
-    private static void EigenvectorByInverseIteration(
-        double[] a, int n, double re, double im, double scale, out double[] xr, out double[] xi)
-    {
-        double shift = re + (re >= 0 ? 1.0 : -1.0) * 1e-7 * scale;
-        int m = 2 * n;
-        var mat = new double[m * m];
-        for (int i = 0; i < n; i++)
-            for (int j = 0; j < n; j++)
-            {
-                double val = a[i * n + j] - (i == j ? shift : 0.0);
-                mat[i * m + j] = val;               // top-left  (A − sI)
-                mat[(i + n) * m + (j + n)] = val;   // bottom-right (A − sI)
-            }
-        for (int i = 0; i < n; i++)
-        {
-            mat[i * m + (i + n)] = im;              // top-right  (+im·I)
-            mat[(i + n) * m + i] = -im;             // bottom-left (−im·I)
-        }
+            double norm = 0.0;
+            for (int i = 0; i < nn; i++)
+                for (int j = Math.Max(i - 1, 0); j < nn; j++)
+                    norm += Math.Abs(h[i * nn + j]);
 
-        // Start vector: ones in the real block. Two inverse-iteration steps.
-        var x = new double[m];
-        for (int i = 0; i < n; i++) x[i] = 1.0;
-        for (int iter = 0; iter < 2; iter++)
-        {
-            var y = SolveDense(mat, x, m);
-            double nrm = 0.0;
-            for (int i = 0; i < m; i++) nrm += y[i] * y[i];
-            nrm = Math.Sqrt(nrm);
-            if (nrm > 0.0) for (int i = 0; i < m; i++) y[i] /= nrm;
-            x = y;
-        }
-
-        xr = new double[n];
-        xi = new double[n];
-        double cnorm = 0.0;
-        for (int i = 0; i < n; i++) { xr[i] = x[i]; xi[i] = x[i + n]; cnorm += xr[i] * xr[i] + xi[i] * xi[i]; }
-        cnorm = Math.Sqrt(cnorm);
-        if (cnorm > 0.0) for (int i = 0; i < n; i++) { xr[i] /= cnorm; xi[i] /= cnorm; }
-    }
-
-    /// <summary>Solve M·y = b (M is m×m, row-major) via Gaussian elimination with
-    /// partial pivoting. Operates on copies so the caller's matrix is preserved.</summary>
-    private static double[] SolveDense(double[] mIn, double[] b, int m)
-    {
-        var a = (double[])mIn.Clone();
-        var y = (double[])b.Clone();
-        for (int col = 0; col < m; col++)
-        {
-            // Partial pivot.
-            int piv = col;
-            double best = Math.Abs(a[col * m + col]);
-            for (int r = col + 1; r < m; r++)
+            int maxIter = MaxIterationsPerEigenvalue * Math.Max(nn, 10);
+            int iter = 0, totalIter = 0;
+            while (n >= low)
             {
-                double val = Math.Abs(a[r * m + col]);
-                if (val > best) { best = val; piv = r; }
-            }
-            if (piv != col)
-            {
-                for (int j = 0; j < m; j++) { (a[col * m + j], a[piv * m + j]) = (a[piv * m + j], a[col * m + j]); }
-                (y[col], y[piv]) = (y[piv], y[col]);
-            }
-            double diag = a[col * m + col];
-            if (diag == 0.0) diag = 1e-300; // guard; shift keeps M non-singular in practice
-            for (int r = col + 1; r < m; r++)
-            {
-                double f = a[r * m + col] / diag;
-                if (f == 0.0) continue;
-                for (int j = col; j < m; j++) a[r * m + j] -= f * a[col * m + j];
-                y[r] -= f * y[col];
-            }
-        }
-        // Back-substitution.
-        var x = new double[m];
-        for (int i = m - 1; i >= 0; i--)
-        {
-            double s = y[i];
-            for (int j = i + 1; j < m; j++) s -= a[i * m + j] * x[j];
-            double diag = a[i * m + i];
-            x[i] = diag == 0.0 ? 0.0 : s / diag;
-        }
-        return x;
-    }
-
-    private static void HessenbergReduce(double[] h, double[] q, int n)
-    {
-        for (int k = 0; k < n - 2; k++)
-        {
-            int colLen = n - k - 1;
-            // Reflector for column k below sub-diagonal.
-            double norm2 = 0;
-            for (int i = k + 1; i < n; i++) norm2 += h[i * n + k] * h[i * n + k];
-            if (norm2 == 0) continue;
-            double norm = Math.Sqrt(norm2);
-            double alpha = -Math.Sign(h[(k + 1) * n + k]) * norm;
-            if (h[(k + 1) * n + k] == 0.0 && alpha == 0.0) alpha = norm;
-
-            var vvec = new double[colLen];
-            vvec[0] = h[(k + 1) * n + k] - alpha;
-            for (int i = 1; i < colLen; i++) vvec[i] = h[(k + 1 + i) * n + k];
-            double vNorm2 = 0;
-            for (int i = 0; i < colLen; i++) vNorm2 += vvec[i] * vvec[i];
-            if (vNorm2 == 0) continue;
-            double beta = 2.0 / vNorm2;
-
-            // Apply reflector to H from the left: H ← (I − β v vᵀ) H  (rows k+1..n−1).
-            for (int c = k; c < n; c++)
-            {
-                double dot = 0;
-                for (int i = 0; i < colLen; i++) dot += vvec[i] * h[(k + 1 + i) * n + c];
-                double s = beta * dot;
-                for (int i = 0; i < colLen; i++) h[(k + 1 + i) * n + c] -= s * vvec[i];
-            }
-            // Apply from the right: H ← H (I − β v vᵀ) (columns k+1..n−1).
-            for (int r = 0; r < n; r++)
-            {
-                double dot = 0;
-                for (int i = 0; i < colLen; i++) dot += vvec[i] * h[r * n + (k + 1 + i)];
-                double s = beta * dot;
-                for (int i = 0; i < colLen; i++) h[r * n + (k + 1 + i)] -= s * vvec[i];
-            }
-            // Accumulate into Q (columns k+1..n−1).
-            for (int r = 0; r < n; r++)
-            {
-                double dot = 0;
-                for (int i = 0; i < colLen; i++) dot += vvec[i] * q[r * n + (k + 1 + i)];
-                double s = beta * dot;
-                for (int i = 0; i < colLen; i++) q[r * n + (k + 1 + i)] -= s * vvec[i];
-            }
-        }
-    }
-
-    private static void QrIterate(double[] h, double[] q, int n)
-    {
-        // Unshifted QR iteration on the upper-Hessenberg H. This converges to an
-        // upper quasi-triangular form where eigenvalues are read from the diagonal
-        // (real) or 2×2 blocks (complex conjugate pairs). The unshifted variant has
-        // slow convergence for clustered eigenvalues; follow-up PR can add Wilkinson
-        // / Francis double-implicit shifts for sub-cubic iteration count.
-        for (int iter = 0; iter < MaxIterations; iter++)
-        {
-            // Check convergence (sub-diagonals small).
-            double maxSub = 0;
-            for (int i = 1; i < n; i++)
-                maxSub = Math.Max(maxSub, Math.Abs(h[i * n + (i - 1)]));
-            if (maxSub < Eps) return;
-
-            // Givens-based QR step on the Hessenberg form.
-            var cs = new double[n - 1];
-            var ss = new double[n - 1];
-            for (int k = 0; k < n - 1; k++)
-            {
-                double x = h[k * n + k];
-                double y = h[(k + 1) * n + k];
-                double r = Math.Sqrt(x * x + y * y);
-                if (r == 0) { cs[k] = 1; ss[k] = 0; continue; }
-                cs[k] = x / r;
-                ss[k] = y / r;
-                // Apply rotation G(k, k+1) to rows k and k+1.
-                for (int c = k; c < n; c++)
+                // Look for a single small sub-diagonal element.
+                int l = n;
+                while (l > low)
                 {
-                    double a1 = h[k * n + c];
-                    double a2 = h[(k + 1) * n + c];
-                    h[k * n + c] = cs[k] * a1 + ss[k] * a2;
-                    h[(k + 1) * n + c] = -ss[k] * a1 + cs[k] * a2;
+                    s = Math.Abs(h[(l - 1) * nn + (l - 1)]) + Math.Abs(h[l * nn + l]);
+                    if (s == 0.0) s = norm;
+                    if (Math.Abs(h[l * nn + (l - 1)]) < Eps * s) break;
+                    l--;
+                }
+
+                if (l == n)
+                {
+                    // One root found.
+                    h[n * nn + n] += exshift;
+                    d[n] = h[n * nn + n];
+                    e[n] = 0.0;
+                    n--;
+                    iter = 0;
+                }
+                else if (l == n - 1)
+                {
+                    // Two roots found.
+                    w = h[n * nn + (n - 1)] * h[(n - 1) * nn + n];
+                    p = (h[(n - 1) * nn + (n - 1)] - h[n * nn + n]) / 2.0;
+                    q = p * p + w;
+                    z = Math.Sqrt(Math.Abs(q));
+                    h[n * nn + n] += exshift;
+                    h[(n - 1) * nn + (n - 1)] += exshift;
+                    x = h[n * nn + n];
+
+                    if (q >= 0)
+                    {
+                        // Real pair: rotate the 2×2 block to upper triangular.
+                        z = p >= 0 ? p + z : p - z;
+                        d[n - 1] = x + z;
+                        d[n] = d[n - 1];
+                        if (z != 0.0) d[n] = x - w / z;
+                        e[n - 1] = 0.0;
+                        e[n] = 0.0;
+                        x = h[n * nn + (n - 1)];
+                        s = Math.Abs(x) + Math.Abs(z);
+                        p = x / s;
+                        q = z / s;
+                        r = Math.Sqrt(p * p + q * q);
+                        p /= r;
+                        q /= r;
+                        for (int j = n - 1; j < nn; j++)
+                        {
+                            z = h[(n - 1) * nn + j];
+                            h[(n - 1) * nn + j] = q * z + p * h[n * nn + j];
+                            h[n * nn + j] = q * h[n * nn + j] - p * z;
+                        }
+                        for (int i = 0; i <= n; i++)
+                        {
+                            z = h[i * nn + (n - 1)];
+                            h[i * nn + (n - 1)] = q * z + p * h[i * nn + n];
+                            h[i * nn + n] = q * h[i * nn + n] - p * z;
+                        }
+                        for (int i = low; i <= high; i++)
+                        {
+                            z = v[i * nn + (n - 1)];
+                            v[i * nn + (n - 1)] = q * z + p * v[i * nn + n];
+                            v[i * nn + n] = q * v[i * nn + n] - p * z;
+                        }
+                    }
+                    else
+                    {
+                        // Complex conjugate pair, positive imaginary part first.
+                        d[n - 1] = x + p;
+                        d[n] = x + p;
+                        e[n - 1] = z;
+                        e[n] = -z;
+                    }
+                    n -= 2;
+                    iter = 0;
+                }
+                else
+                {
+                    // No convergence yet: form the double shift.
+                    x = h[n * nn + n];
+                    y = 0.0;
+                    w = 0.0;
+                    if (l < n)
+                    {
+                        y = h[(n - 1) * nn + (n - 1)];
+                        w = h[n * nn + (n - 1)] * h[(n - 1) * nn + n];
+                    }
+
+                    // Wilkinson's original ad hoc shift.
+                    if (iter == 10)
+                    {
+                        exshift += x;
+                        for (int i = low; i <= n; i++) h[i * nn + i] -= x;
+                        s = Math.Abs(h[n * nn + (n - 1)]) + Math.Abs(h[(n - 1) * nn + (n - 2)]);
+                        x = y = 0.75 * s;
+                        w = -0.4375 * s * s;
+                    }
+
+                    // MATLAB's ad hoc shift.
+                    if (iter == 30)
+                    {
+                        s = (y - x) / 2.0;
+                        s = s * s + w;
+                        if (s > 0)
+                        {
+                            s = Math.Sqrt(s);
+                            if (y < x) s = -s;
+                            s = x - w / ((y - x) / 2.0 + s);
+                            for (int i = low; i <= n; i++) h[i * nn + i] -= s;
+                            exshift += s;
+                            x = y = w = 0.964;
+                        }
+                    }
+
+                    iter++;
+                    if (++totalIter > maxIter)
+                        throw new ArithmeticException("Eig: the QR algorithm failed to converge (LAPACK info > 0).");
+
+                    // Look for two consecutive small sub-diagonal elements.
+                    int m = n - 2;
+                    while (m >= l)
+                    {
+                        z = h[m * nn + m];
+                        r = x - z;
+                        s = y - z;
+                        p = (r * s - w) / h[(m + 1) * nn + m] + h[m * nn + (m + 1)];
+                        q = h[(m + 1) * nn + (m + 1)] - z - r - s;
+                        r = h[(m + 2) * nn + (m + 1)];
+                        s = Math.Abs(p) + Math.Abs(q) + Math.Abs(r);
+                        p /= s;
+                        q /= s;
+                        r /= s;
+                        if (m == l) break;
+                        if (Math.Abs(h[m * nn + (m - 1)]) * (Math.Abs(q) + Math.Abs(r)) <
+                            Eps * (Math.Abs(p) * (Math.Abs(h[(m - 1) * nn + (m - 1)]) + Math.Abs(z) +
+                                                  Math.Abs(h[(m + 1) * nn + (m + 1)]))))
+                            break;
+                        m--;
+                    }
+
+                    for (int i = m + 2; i <= n; i++)
+                    {
+                        h[i * nn + (i - 2)] = 0.0;
+                        if (i > m + 2) h[i * nn + (i - 3)] = 0.0;
+                    }
+
+                    // Double QR step involving rows l:n and columns m:n.
+                    for (int k = m; k <= n - 1; k++)
+                    {
+                        bool notlast = k != n - 1;
+                        if (k != m)
+                        {
+                            p = h[k * nn + (k - 1)];
+                            q = h[(k + 1) * nn + (k - 1)];
+                            r = notlast ? h[(k + 2) * nn + (k - 1)] : 0.0;
+                            x = Math.Abs(p) + Math.Abs(q) + Math.Abs(r);
+                            if (x == 0.0) continue;
+                            p /= x;
+                            q /= x;
+                            r /= x;
+                        }
+
+                        s = Math.Sqrt(p * p + q * q + r * r);
+                        if (p < 0) s = -s;
+                        if (s == 0) continue;
+
+                        if (k != m) h[k * nn + (k - 1)] = -s * x;
+                        else if (l != m) h[k * nn + (k - 1)] = -h[k * nn + (k - 1)];
+                        p += s;
+                        x = p / s;
+                        y = q / s;
+                        z = r / s;
+                        q /= p;
+                        r /= p;
+
+                        // Row modification.
+                        for (int j = k; j < nn; j++)
+                        {
+                            p = h[k * nn + j] + q * h[(k + 1) * nn + j];
+                            if (notlast)
+                            {
+                                p += r * h[(k + 2) * nn + j];
+                                h[(k + 2) * nn + j] -= p * z;
+                            }
+                            h[k * nn + j] -= p * x;
+                            h[(k + 1) * nn + j] -= p * y;
+                        }
+
+                        // Column modification.
+                        int iMax = Math.Min(n, k + 3);
+                        for (int i = 0; i <= iMax; i++)
+                        {
+                            p = x * h[i * nn + k] + y * h[i * nn + (k + 1)];
+                            if (notlast)
+                            {
+                                p += z * h[i * nn + (k + 2)];
+                                h[i * nn + (k + 2)] -= p * r;
+                            }
+                            h[i * nn + k] -= p;
+                            h[i * nn + (k + 1)] -= p * q;
+                        }
+
+                        // Accumulate transformations.
+                        for (int i = low; i <= high; i++)
+                        {
+                            p = x * v[i * nn + k] + y * v[i * nn + (k + 1)];
+                            if (notlast)
+                            {
+                                p += z * v[i * nn + (k + 2)];
+                                v[i * nn + (k + 2)] -= p * r;
+                            }
+                            v[i * nn + k] -= p;
+                            v[i * nn + (k + 1)] -= p * q;
+                        }
+                    }
                 }
             }
-            // Apply Rᵀ·Q from the right to produce R·Q = H_new, and accumulate into Q.
-            for (int k = 0; k < n - 1; k++)
+
+            // Zero matrix: every eigenvalue is 0 and V (the identity) already holds a basis.
+            if (norm == 0.0) return;
+
+            // Back-substitute to find the eigenvectors of the quasi-triangular Schur form.
+            for (n = nn - 1; n >= 0; n--)
             {
-                for (int r = 0; r < n; r++)
+                p = d[n];
+                q = e[n];
+
+                if (q == 0)
                 {
-                    double a1 = h[r * n + k];
-                    double a2 = h[r * n + (k + 1)];
-                    h[r * n + k] = cs[k] * a1 + ss[k] * a2;
-                    h[r * n + (k + 1)] = -ss[k] * a1 + cs[k] * a2;
+                    // Real vector.
+                    int l = n;
+                    h[n * nn + n] = 1.0;
+                    for (int i = n - 1; i >= 0; i--)
+                    {
+                        w = h[i * nn + i] - p;
+                        r = 0.0;
+                        for (int j = l; j <= n; j++) r += h[i * nn + j] * h[j * nn + n];
+                        if (e[i] < 0.0)
+                        {
+                            z = w;
+                            s = r;
+                        }
+                        else
+                        {
+                            l = i;
+                            if (e[i] == 0.0)
+                            {
+                                h[i * nn + n] = w != 0.0 ? -r / w : -r / (Eps * norm);
+                            }
+                            else
+                            {
+                                x = h[i * nn + (i + 1)];
+                                y = h[(i + 1) * nn + i];
+                                q = (d[i] - p) * (d[i] - p) + e[i] * e[i];
+                                t = (x * s - z * r) / q;
+                                h[i * nn + n] = t;
+                                h[(i + 1) * nn + n] = Math.Abs(x) > Math.Abs(z) ? (-r - w * t) / x : (-s - y * t) / z;
+                            }
+
+                            // Overflow control.
+                            t = Math.Abs(h[i * nn + n]);
+                            if (Eps * t * t > 1)
+                                for (int j = i; j <= n; j++) h[j * nn + n] /= t;
+                        }
+                    }
                 }
-                for (int r = 0; r < n; r++)
+                else if (q < 0)
                 {
-                    double a1 = q[r * n + k];
-                    double a2 = q[r * n + (k + 1)];
-                    q[r * n + k] = cs[k] * a1 + ss[k] * a2;
-                    q[r * n + (k + 1)] = -ss[k] * a1 + cs[k] * a2;
+                    // Complex vector, kept as columns n-1 (real part) and n (imaginary part).
+                    int l = n - 1;
+                    if (Math.Abs(h[n * nn + (n - 1)]) > Math.Abs(h[(n - 1) * nn + n]))
+                    {
+                        h[(n - 1) * nn + (n - 1)] = q / h[n * nn + (n - 1)];
+                        h[(n - 1) * nn + n] = -(h[n * nn + n] - p) / h[n * nn + (n - 1)];
+                    }
+                    else
+                    {
+                        Cdiv(0.0, -h[(n - 1) * nn + n], h[(n - 1) * nn + (n - 1)] - p, q, out double cr, out double ci);
+                        h[(n - 1) * nn + (n - 1)] = cr;
+                        h[(n - 1) * nn + n] = ci;
+                    }
+                    h[n * nn + (n - 1)] = 0.0;
+                    h[n * nn + n] = 1.0;
+                    for (int i = n - 2; i >= 0; i--)
+                    {
+                        double ra = 0.0, sa = 0.0;
+                        for (int j = l; j <= n; j++)
+                        {
+                            ra += h[i * nn + j] * h[j * nn + (n - 1)];
+                            sa += h[i * nn + j] * h[j * nn + n];
+                        }
+                        w = h[i * nn + i] - p;
+
+                        if (e[i] < 0.0)
+                        {
+                            z = w;
+                            r = ra;
+                            s = sa;
+                        }
+                        else
+                        {
+                            l = i;
+                            if (e[i] == 0)
+                            {
+                                Cdiv(-ra, -sa, w, q, out double cr, out double ci);
+                                h[i * nn + (n - 1)] = cr;
+                                h[i * nn + n] = ci;
+                            }
+                            else
+                            {
+                                // Solve the complex 2×2 system.
+                                x = h[i * nn + (i + 1)];
+                                y = h[(i + 1) * nn + i];
+                                double vr = (d[i] - p) * (d[i] - p) + e[i] * e[i] - q * q;
+                                double vi = (d[i] - p) * 2.0 * q;
+                                if (vr == 0.0 && vi == 0.0)
+                                    vr = Eps * norm * (Math.Abs(w) + Math.Abs(q) + Math.Abs(x) + Math.Abs(y) + Math.Abs(z));
+                                Cdiv(x * r - z * ra + q * sa, x * s - z * sa - q * ra, vr, vi, out double cr, out double ci);
+                                h[i * nn + (n - 1)] = cr;
+                                h[i * nn + n] = ci;
+                                if (Math.Abs(x) > Math.Abs(z) + Math.Abs(q))
+                                {
+                                    h[(i + 1) * nn + (n - 1)] = (-ra - w * h[i * nn + (n - 1)] + q * h[i * nn + n]) / x;
+                                    h[(i + 1) * nn + n] = (-sa - w * h[i * nn + n] - q * h[i * nn + (n - 1)]) / x;
+                                }
+                                else
+                                {
+                                    Cdiv(-r - y * h[i * nn + (n - 1)], -s - y * h[i * nn + n], z, q, out cr, out ci);
+                                    h[(i + 1) * nn + (n - 1)] = cr;
+                                    h[(i + 1) * nn + n] = ci;
+                                }
+                            }
+
+                            // Overflow control.
+                            t = Math.Max(Math.Abs(h[i * nn + (n - 1)]), Math.Abs(h[i * nn + n]));
+                            if (Eps * t * t > 1)
+                            {
+                                for (int j = i; j <= n; j++)
+                                {
+                                    h[j * nn + (n - 1)] /= t;
+                                    h[j * nn + n] /= t;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Back-transform: V ← V·T maps Schur-form eigenvectors to those of the balanced matrix.
+            for (int j = nn - 1; j >= low; j--)
+            {
+                for (int i = low; i <= high; i++)
+                {
+                    z = 0.0;
+                    int kMax = Math.Min(j, high);
+                    for (int k = low; k <= kMax; k++) z += v[i * nn + k] * h[k * nn + j];
+                    v[i * nn + j] = z;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Writes the eigenvectors in V as (re, im) columns, each scaled to unit Euclidean norm with
+        /// a real, positive component of largest modulus when complex (the <c>dgeev</c> normalization).
+        /// </summary>
+        internal void WriteEigenvectors<T>(T[] dst, int off)
+        {
+            int n = _n;
+            var v = V;
+            int k = 0;
+            while (k < n)
+            {
+                if (E[k] > 0.0 && k + 1 < n)
+                {
+                    // Columns k and k+1 hold Re and Im of the eigenvector for D[k] + i·E[k].
+                    double nrm2 = 0.0, best = -1.0, ur = 1.0, ui = 0.0;
+                    for (int i = 0; i < n; i++)
+                    {
+                        double a = v[i * n + k], b = v[i * n + k + 1];
+                        double m2 = a * a + b * b;
+                        nrm2 += m2;
+                        if (m2 > best) { best = m2; ur = a; ui = b; }
+                    }
+                    // Multiply by conj(x_max) / (|x_max|·‖x‖).
+                    double denom = Math.Sqrt(best) * Math.Sqrt(nrm2);
+                    double cr = denom > 0.0 ? ur / denom : 1.0, ci = denom > 0.0 ? -ui / denom : 0.0;
+                    for (int i = 0; i < n; i++)
+                    {
+                        double a = v[i * n + k], b = v[i * n + k + 1];
+                        double re = a * cr - b * ci, im = a * ci + b * cr;
+                        dst[off + (i * n + k) * 2] = FromDouble<T>(re);
+                        dst[off + (i * n + k) * 2 + 1] = FromDouble<T>(im);
+                        dst[off + (i * n + k + 1) * 2] = FromDouble<T>(re);
+                        dst[off + (i * n + k + 1) * 2 + 1] = FromDouble<T>(-im);
+                    }
+                    k += 2;
+                }
+                else
+                {
+                    double nrm2 = 0.0;
+                    for (int i = 0; i < n; i++) nrm2 += v[i * n + k] * v[i * n + k];
+                    double inv = nrm2 > 0.0 ? 1.0 / Math.Sqrt(nrm2) : 1.0;
+                    for (int i = 0; i < n; i++)
+                    {
+                        dst[off + (i * n + k) * 2] = FromDouble<T>(v[i * n + k] * inv);
+                        dst[off + (i * n + k) * 2 + 1] = FromDouble<T>(0.0);
+                    }
+                    k += 1;
                 }
             }
         }
@@ -355,13 +717,13 @@ internal static class EigDecomposition
     {
         if (typeof(T) == typeof(float)) return (float)(object)v!;
         if (typeof(T) == typeof(double)) return (double)(object)v!;
-        throw new NotSupportedException($"Eig requires float or double, got {typeof(T).Name}.");
+        return Real<T>.Ops.ToDouble(v);
     }
 
     private static T FromDouble<T>(double v)
     {
         if (typeof(T) == typeof(float)) return (T)(object)(float)v;
         if (typeof(T) == typeof(double)) return (T)(object)v;
-        throw new NotSupportedException($"Eig requires float or double, got {typeof(T).Name}.");
+        return Real<T>.Ops.FromDouble(v);
     }
 }

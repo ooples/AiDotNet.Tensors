@@ -73,17 +73,26 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
     }
 
     /// <inheritdoc/>
-    public long SumInteger(IGpuBuffer a, int size)
+    public long SumInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Sum, a, size);
+
+    /// <inheritdoc/>
+    public long MinInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Min, a, size);
+
+    /// <inheritdoc/>
+    public long MaxInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Max, a, size);
+
+    private long ReduceInteger(GpuIntegerReduction reduction, IGpuBuffer a, int size)
     {
         if (!IsInt32(a))
         {
             // The result is read back between passes, which resets the command buffer an open batch is recording into.
             ThrowIfHostSpanOpInsideOpenBatch();
-            return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
+            return GpuPackedCompute.Reduce(reduction, this, LaunchPacked, a, size, (partials, count) => ReduceInteger(reduction, partials, count));
         }
 
         GpuInt32ShaderSource.RequireSum(a, size);
-        string glsl = VulkanInt32Kernels.SumBlocks;
+        string glsl = VulkanInt32Kernels.ReduceBlocks(reduction);
+        GpuIntegerLayout.RequireElements(reduction, size);
         if (size == 0) return 0;
         // The result is read back between passes, which resets the command buffer an open batch is recording into.
         ThrowIfHostSpanOpInsideOpenBatch();
@@ -98,7 +107,7 @@ public sealed unsafe partial class VulkanBackend : IGpuIntegerElementwise, IGpuI
         while (true)
         {
             int outputs = GpuIntegerLayout.Blocks(count, block);
-            ParityDispatch("sum_i32", glsl, outputs, new[] { (uint)outputs, (uint)count }, current, target);
+            ParityDispatch(GpuInt32ShaderSource.Name(reduction) + "_i32", glsl, outputs, new[] { (uint)outputs, (uint)count }, current, target);
             if (outputs == 1)
                 return BitConverter.ToInt32(DownloadByteBuffer(target, sizeof(int)), 0);
             current = target;
@@ -172,15 +181,20 @@ void main()
     }
 
     /// <summary>Pass of a sum: <c>o[i]</c> is the wrapping sum of block <c>i</c> of the <c>count</c> input elements.</summary>
-    public static string SumBlocks => Sources.GetOrAdd("sum", _ => Head + OneIn + @"
+    public static string ReduceBlocks(GpuIntegerReduction reduction) => Sources.GetOrAdd(GpuInt32ShaderSource.Name(reduction), _ => Head + OneIn + @"
 layout(push_constant) uniform P { uint n; uint count; };
 void main()
 {
 " + Guard + @"    uint first = i * " + GpuInt32ShaderSource.SumBlock + @"u;
     uint last = min(first + " + GpuInt32ShaderSource.SumBlock + @"u, count);
-    uint s = 0u;
+" + (reduction == GpuIntegerReduction.Sum
+    ? @"    uint s = 0u;
     for (uint j = first; j < last; j++) { s += uint(a[j]); }
     o[i] = int(s);
-}
+"
+    : @"    int s = a[first];
+    for (uint j = first + 1u; j < last; j++) { s = " + (reduction == GpuIntegerReduction.Min ? "min" : "max") + @"(s, a[j]); }
+    o[i] = s;
+") + @"}
 ");
 }

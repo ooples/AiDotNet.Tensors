@@ -68,6 +68,14 @@ internal static class GpuPackedCompute
     /// <paramref name="sumInt32"/> is the backend's Int32 sum: the narrow types fold into Int32 partials it finishes.
     /// </summary>
     public static long Sum(IDirectGpuBackend backend, GpuPackedLaunch launch, IGpuBuffer a, int size, Func<IGpuBuffer, int, long> sumInt32)
+        => Reduce(GpuIntegerReduction.Sum, backend, launch, a, size, sumInt32);
+
+    /// <summary>
+    /// A reduction of the first <paramref name="size"/> elements. <paramref name="sumInt32"/> is the backend's Int32
+    /// form of the same reduction: the narrow types fold into Int32 partials it finishes.
+    /// </summary>
+    public static long Reduce(GpuIntegerReduction reduction, IDirectGpuBackend backend, GpuPackedLaunch launch, IGpuBuffer a, int size,
+        Func<IGpuBuffer, int, long> sumInt32)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
         var type = a.ElementType;
@@ -75,9 +83,10 @@ internal static class GpuPackedCompute
             throw new ArgumentException($"A sum reduces integer buffers, got {type}.", nameof(a));
         if (size < 0 || size > a.Size)
             throw new ArgumentOutOfRangeException(nameof(size), $"Size ({size}) is outside the buffer's {a.Size} elements.");
+        GpuIntegerLayout.RequireElements(reduction, size);
         if (size == 0) return 0;
         const int Block = GpuPackedKernelSource.SumBlock;
-        var kernel = GpuPackedKernelSource.Sum(type);
+        var kernel = GpuPackedKernelSource.Reduce(reduction, type);
         int partials = GpuIntegerLayout.Blocks(size, Block);
         if (type != GpuElementType.Int64)
         {

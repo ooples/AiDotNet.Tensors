@@ -671,51 +671,37 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     {
         ThrowIfNotInitialized();
 
-        var aBuffer = (WebGpuBuffer)A;
-
-        const int workgroupSize = 256;
-        int numWorkgroups = (size + workgroupSize - 1) / workgroupSize;
-
         var pipelineId = await GetOrCreatePipelineAsync("Reduction", WebGpuKernels.ReductionSource, kernelName);
-
-        // First pass reduction
-        using var partialResults = new WebGpuBuffer(numWorkgroups);
-
         var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), 0, 0, 0 };
         using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
+        return await ReducePassAsync(pipelineId, (WebGpuBuffer)A, size, uniformBuffer, paramsData);
+    }
 
-        using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, partialResults);
+    // One pass reduces `remaining` values of `source` to one partial per workgroup, and the next pass reduces those
+    // partials, until one value is left. Every pass once read the FIRST pass's partials, so a reduction needing three
+    // passes (more than 65,536 elements) reduced only that buffer's first few entries and returned a wrong sum,
+    // maximum or minimum. Each pass owns its partials for as long as the passes after it run (four passes cover 2^32).
+    private static async Task<float> ReducePassAsync(
+        int pipelineId, WebGpuBuffer source, int remaining, WebGpuBuffer uniformBuffer, float[] paramsData)
+    {
+        const int workgroupSize = 256;
+        int numWorkgroups = (remaining + workgroupSize - 1) / workgroupSize;
 
-        await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
-        await WebGpuNativeBindings.SubmitAndWaitAsync();
-
-        // Continue reducing until we have a single value
-        while (numWorkgroups > 1)
+        using var partials = new WebGpuBuffer(numWorkgroups);
+        paramsData[0] = BitConverter.Int32BitsToSingle(remaining);
+        uniformBuffer.CopyFrom(paramsData);
+        using (var bindGroup = new WebGpuBindGroup(pipelineId, source, partials))
         {
-            int prevSize = numWorkgroups;
-            numWorkgroups = (numWorkgroups + workgroupSize - 1) / workgroupSize;
-
-            using var newPartialResults = new WebGpuBuffer(numWorkgroups);
-
-            paramsData[0] = BitConverter.Int32BitsToSingle(prevSize);
-            uniformBuffer.CopyFrom(paramsData);
-
-            using var bindGroup2 = new WebGpuBindGroup(pipelineId, partialResults, newPartialResults);
-
-            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup2.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
+            await WebGpuNativeBindings.DispatchComputeWithUniformsAsync(pipelineId, bindGroup.BindGroupId, uniformBuffer.BufferId, numWorkgroups, 1, 1);
             await WebGpuNativeBindings.SubmitAndWaitAsync();
-
-            if (numWorkgroups == 1)
-            {
-                // A host read like DownloadBuffer: counted, so the readback probe sees reductions too.
-                GpuLaunchProbe.OnReadback((long)newPartialResults.Size * sizeof(float), GpuBackendType.WebGpu);
-                var result = await newPartialResults.DownloadAsync();
-                return result[0];
-            }
         }
 
-        GpuLaunchProbe.OnReadback((long)partialResults.Size * sizeof(float), GpuBackendType.WebGpu);
-        var finalResult = await partialResults.DownloadAsync();
+        if (numWorkgroups > 1)
+            return await ReducePassAsync(pipelineId, partials, numWorkgroups, uniformBuffer, paramsData);
+
+        // A host read like DownloadBuffer: counted, so the readback probe sees reductions too.
+        GpuLaunchProbe.OnReadback((long)partials.Size * sizeof(float), GpuBackendType.WebGpu);
+        var finalResult = await partials.DownloadAsync();
         return finalResult[0];
     }
 

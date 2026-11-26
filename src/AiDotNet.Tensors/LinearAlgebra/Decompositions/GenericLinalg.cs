@@ -93,7 +93,9 @@ internal readonly struct Real<T> : IEquatable<Real<T>>
 ///   <item>Eigh: cyclic Jacobi; eigenvalues ascending, eigenvectors as columns.</item>
 ///   <item>Eig: Householder Hessenberg reduction + Francis double-shift QR (<c>?hseqr</c>), eigenvalues in
 ///   Schur order with the positive-imaginary member of each conjugate pair first, eigenvectors by
-///   inverse iteration normalized to unit 2-norm with the largest component real (<c>?geev</c>).</item>
+///   back-substitution on the real Schur form (<c>hqr2</c>/<c>?trevc</c>) in O(n²) workspace, normalized to unit
+///   2-norm with the largest component real (<c>?geev</c>). Used for decimal; Half and BFloat16 run the double
+///   kernel in <see cref="EigDecomposition"/> and round the result.</item>
 ///   <item>SVD: one-sided (Hestenes) Jacobi; singular values descending, orthonormal completion of U/Vᵀ
 ///   for full matrices (<c>?gesvd</c>).</item>
 /// </list></para>
@@ -136,17 +138,11 @@ internal static class GenericLinalg<T>
     // sweep can keep rotating there. Beyond it the decomposition has not converged and the loop throws.
     private const int JacobiStallFactor = 4;
 
-    // Inverse-iteration solves per seed vector, and the residual (in units of n times machine epsilon) at which a seed's
-    // eigenvector is accepted and the search stops.
-    private const int InverseIterationSteps = 3;
-    private const int EigenvectorAcceptFactor = 64;
 
     // Francis QR iterations allowed per eigenvalue (EISPACK hqr's 30 per eigenvalue, at least 10 eigenvalues' worth).
     private const int QrIterationsPerEigenvalue = 30;
     private const int MinQrEigenvalueBudget = 10;
 
-    // Two eigenvalues are the same repeated one when they agree within this many machine epsilons (relative to 1 + |λ|).
-    private const int RepeatedEigenvalueFactor = 8;
 
     private static Real<T> MachineEpsilon()
     {
@@ -504,484 +500,600 @@ internal static class GenericLinalg<T>
     // ── General eigendecomposition ─────────────────────────────────────────
 
     /// <summary>
-    /// Eigenpairs of one general real n×n block. <paramref name="w"/> receives (re, im) pairs,
-    /// <paramref name="v"/> the right eigenvectors as (re, im) columns — the layout of
-    /// <see cref="EigDecomposition"/>.
+    /// O(n²) working state of a general eigendecomposition in <typeparamref name="T"/>: H (the scaled input,
+    /// then its Hessenberg and real Schur forms, then the triangular eigenvectors), V (the accumulated
+    /// orthogonal transforms, then the eigenvectors) and O(n) vectors. One instance serves every matrix of
+    /// a batch; nothing is allocated per QR iteration or per eigenvector.
     /// </summary>
-    internal static void Eig(T[] src, int offSrc, T[] w, int offW, T[] v, int offV, int n)
+    internal sealed class EigWorkspace
     {
-        EnsureSupported("Eig");
-        if (n == 0) return;
-        var a0 = Load(src, offSrc, n * n);
-        Real<T> scale = Real<T>.Zero;
-        for (int i = 0; i < n * n; i++) scale = Real<T>.Max(scale, Real<T>.Abs(a0[i]));
-        if (scale.IsZero) scale = Real<T>.One;
-        // QR's products and inverse iteration operate on an O(1) matrix, not on squared input magnitudes.
-        for (int i = 0; i < a0.Length; i++) a0[i] /= scale;
-        var h = (Real<T>[])a0.Clone();
-        HessenbergReduce(h, n);
-        var (wr, wi) = FrancisQr(h, n);
+        private readonly int _n;
+        private readonly Real<T>[] _h, _v, _d, _e, _ort;
 
-        for (int k = 0; k < n; k++)
+        internal EigWorkspace(int n)
         {
-            w[offW + k * 2] = (wr[k] * scale).V;
-            w[offW + k * 2 + 1] = (wi[k] * scale).V;
-            var (xr, xi) = InverseIteration(a0, n, wr[k], wi[k], Real<T>.One, wr, wi, k, v, offV);
-            for (int r = 0; r < n; r++)
+            _n = n;
+            _h = new Real<T>[n * n];
+            _v = new Real<T>[n * n];
+            _d = new Real<T>[n];
+            _e = new Real<T>[n];
+            _ort = new Real<T>[n];
+        }
+
+        /// <summary>
+        /// Eigenpairs of one general real n×n block. <paramref name="w"/> receives (re, im) pairs,
+        /// <paramref name="v"/> the right eigenvectors as (re, im) columns — the layout of
+        /// <see cref="EigDecomposition"/>.
+        /// </summary>
+        internal void Solve(T[] src, int offSrc, T[] w, int offW, T[] v, int offV)
+        {
+            int n = _n;
+            if (n == 0) return;
+            Real<T> scale = Real<T>.Zero;
+            for (int i = 0; i < n * n; i++) scale = Real<T>.Max(scale, Real<T>.Abs(src[offSrc + i]));
+            if (scale.IsZero) scale = Real<T>.One;
+            // The QR products and the back-substitution operate on an O(1) matrix, not on squared input magnitudes.
+            for (int i = 0; i < n * n; i++) _h[i] = (Real<T>)src[offSrc + i] / scale;
+
+            Orthes();
+            Hqr2();
+
+            for (int k = 0; k < n; k++)
             {
-                v[offV + (r * n + k) * 2] = xr[r].V;
-                v[offV + (r * n + k) * 2 + 1] = xi[r].V;
+                w[offW + k * 2] = (_d[k] * scale).V;
+                w[offW + k * 2 + 1] = (_e[k] * scale).V;
+            }
+            WriteEigenvectors(v, offV);
+        }
+
+        /// <summary>Householder reduction to upper-Hessenberg form, accumulating the similarity in V (EISPACK orthes/ortran).</summary>
+        private void Orthes()
+        {
+            int n = _n, high = n - 1;
+            var h = _h; var v = _v; var ort = _ort;
+            Real<T> zero = Real<T>.Zero;
+            for (int m = 1; m <= high - 1; m++)
+            {
+                Real<T> scale = zero;
+                for (int i = m; i <= high; i++) scale += Real<T>.Abs(h[i * n + (m - 1)]);
+                if (scale.IsZero) continue;
+
+                Real<T> hh = zero;
+                for (int i = high; i >= m; i--)
+                {
+                    ort[i] = h[i * n + (m - 1)] / scale;
+                    hh += ort[i] * ort[i];
+                }
+                Real<T> g = Real<T>.Sqrt(hh);
+                if (ort[m] > zero) g = -g;
+                hh -= ort[m] * g;
+                ort[m] -= g;
+
+                for (int j = m; j < n; j++)
+                {
+                    Real<T> f = zero;
+                    for (int i = high; i >= m; i--) f += ort[i] * h[i * n + j];
+                    f /= hh;
+                    for (int i = m; i <= high; i++) h[i * n + j] -= f * ort[i];
+                }
+                for (int i = 0; i <= high; i++)
+                {
+                    Real<T> f = zero;
+                    for (int j = high; j >= m; j--) f += ort[j] * h[i * n + j];
+                    f /= hh;
+                    for (int j = m; j <= high; j++) h[i * n + j] -= f * ort[j];
+                }
+                ort[m] = scale * ort[m];
+                h[m * n + (m - 1)] = scale * g;
+            }
+
+            for (int i = 0; i < n; i++)
+                for (int j = 0; j < n; j++)
+                    v[i * n + j] = i == j ? Real<T>.One : zero;
+
+            for (int m = high - 1; m >= 1; m--)
+            {
+                if (h[m * n + (m - 1)].IsZero) continue;
+                for (int i = m + 1; i <= high; i++) ort[i] = h[i * n + (m - 1)];
+                for (int j = m; j <= high; j++)
+                {
+                    Real<T> g = zero;
+                    for (int i = m; i <= high; i++) g += ort[i] * v[i * n + j];
+                    g = g / ort[m] / h[m * n + (m - 1)];
+                    for (int i = m; i <= high; i++) v[i * n + j] += g * ort[i];
+                }
             }
         }
-    }
 
-    private static void HessenbergReduce(Real<T>[] h, int n)
-    {
-        Real<T> two = Real<T>.Int(2);
-        for (int k = 0; k < n - 2; k++)
+        private static void Cdiv(Real<T> xr, Real<T> xi, Real<T> yr, Real<T> yi, out Real<T> cr, out Real<T> ci)
         {
-            int colLen = n - k - 1;
-            var vv = new Real<T>[colLen];
-            for (int i = 0; i < colLen; i++) vv[i] = h[(k + 1 + i) * n + k];
-            Real<T> norm = Norm2(vv);
-            if (norm.IsZero) continue;
-            for (int i = 0; i < colLen; i++) vv[i] /= norm;
-            Real<T> alpha = vv[0] > Real<T>.Zero ? -Real<T>.One : Real<T>.One;
-            vv[0] -= alpha;
-            Real<T> vNorm2 = Real<T>.Zero;
-            for (int i = 0; i < colLen; i++) vNorm2 += vv[i] * vv[i];
-            if (vNorm2.IsZero) continue;
-            Real<T> beta = two / vNorm2;
-
-            for (int c = k; c < n; c++)
+            Real<T> r, d;
+            if (Real<T>.Abs(yr) > Real<T>.Abs(yi))
             {
-                Real<T> dot = Real<T>.Zero;
-                for (int i = 0; i < colLen; i++) dot += vv[i] * h[(k + 1 + i) * n + c];
-                Real<T> s = beta * dot;
-                for (int i = 0; i < colLen; i++) h[(k + 1 + i) * n + c] -= s * vv[i];
+                r = yi / yr;
+                d = yr + r * yi;
+                cr = (xr + r * xi) / d;
+                ci = (xi - r * xr) / d;
             }
-            for (int r = 0; r < n; r++)
+            else
             {
-                Real<T> dot = Real<T>.Zero;
-                for (int i = 0; i < colLen; i++) dot += vv[i] * h[r * n + (k + 1 + i)];
-                Real<T> s = beta * dot;
-                for (int i = 0; i < colLen; i++) h[r * n + (k + 1 + i)] -= s * vv[i];
+                r = yr / yi;
+                d = yi + r * yr;
+                cr = (r * xr + xi) / d;
+                ci = (r * xi - xr) / d;
             }
-            for (int i = k + 2; i < n; i++) h[i * n + k] = Real<T>.Zero;
         }
-    }
 
-    /// <summary>
-    /// Eigenvalues of an upper-Hessenberg matrix by the Francis double-shift QR algorithm with
-    /// small-subdiagonal deflation and exceptional shifts (EISPACK <c>hqr</c>). Eigenvalue k sits at
-    /// diagonal position k of the converged Schur form; the positive-imaginary member of a complex
-    /// conjugate pair comes first, as in LAPACK <c>?geev</c>.
-    /// </summary>
-    private static (Real<T>[] Wr, Real<T>[] Wi) FrancisQr(Real<T>[] hIn, int nIn)
-    {
-        // 1-based working copy so the classic formulation can be followed index for index.
-        int n = nIn;
-        var a = new Real<T>[(n + 1) * (n + 1)];
-        for (int i = 0; i < a.Length; i++) a[i] = Real<T>.Zero;
-        int ld = n + 1;
-        for (int i = 1; i <= n; i++)
-            for (int j = 1; j <= n; j++)
-                a[i * ld + j] = hIn[(i - 1) * n + (j - 1)];
-        var wr = new Real<T>[n + 1];
-        var wi = new Real<T>[n + 1];
-        for (int i = 0; i <= n; i++) { wr[i] = Real<T>.Zero; wi[i] = Real<T>.Zero; }
-
-        Real<T> zero = Real<T>.Zero;
-        Real<T> half = Real<T>.One / Real<T>.Int(2);
-        Real<T> threeQuarters = Real<T>.Int(3) / Real<T>.Int(4);
-        Real<T> exShift = -(Real<T>.Int(7) / Real<T>.Int(16));
-
-        Real<T> anorm = zero;
-        for (int i = 1; i <= n; i++)
-            for (int j = Math.Max(i - 1, 1); j <= n; j++)
-                anorm += Real<T>.Abs(a[i * ld + j]);
-
-        int nn = n;
-        Real<T> t = zero;
-        int maxIts = QrIterationsPerEigenvalue * Math.Max(n, MinQrEigenvalueBudget);
-        // s, x, y, z and w are assigned before each read, so they start unset (an initial zero was never read).
-        Real<T> p = zero, q = zero, r = zero, s, x, y, z, w;
-        while (nn >= 1)
+        /// <summary>
+        /// Rescales the partial eigenvector (rows <paramref name="from"/>..<paramref name="to"/> of columns
+        /// <paramref name="c0"/>..<paramref name="c1"/>) when |num| / |den| would exceed 1/√ε, and returns the
+        /// factor so the caller scales the right-hand sides it holds. Keeps a near-repeated eigenvalue's tiny
+        /// divisor from overflowing types without infinity (decimal throws OverflowException).
+        /// </summary>
+        private Real<T> GuardQuotient(Real<T> num, Real<T> den, int from, int to, int c0, int c1)
         {
-            int its = 0;
-            int l;
-            do
+            Real<T> big = Real<T>.One / Real<T>.Sqrt(Eps);
+            Real<T> limit = big * den;
+            if (!(num > limit) || num.IsZero) return Real<T>.One;
+            Real<T> f = limit / num;
+            int n = _n;
+            for (int j = from; j <= to; j++)
+                for (int c = c0; c <= c1; c++)
+                    _h[j * n + c] *= f;
+            return f;
+        }
+
+        /// <summary>
+        /// Francis double-shift QR down to real Schur form with the transforms accumulated in V, then
+        /// back-substitution for the eigenvectors (EISPACK hqr2).
+        /// </summary>
+        private void Hqr2()
+        {
+            int nn = _n;
+            int n = nn - 1;
+            int high = nn - 1;
+            var h = _h; var v = _v; var d = _d; var e = _e;
+            Real<T> zero = Real<T>.Zero, one = Real<T>.One, two = Real<T>.Int(2);
+            Real<T> threeQuarters = Real<T>.Int(3) / Real<T>.Int(4);
+            Real<T> exShiftFactor = -(Real<T>.Int(7) / Real<T>.Int(16));
+            Real<T> matlabShift = Real<T>.Int(964) / Real<T>.Int(1000);
+            Real<T> exshift = zero;
+            Real<T> p = zero, q = zero, r = zero, s = zero, z = zero, t, w, x, y;
+
+            Real<T> norm = zero;
+            for (int i = 0; i < nn; i++)
+                for (int j = Math.Max(i - 1, 0); j < nn; j++)
+                    norm += Real<T>.Abs(h[i * nn + j]);
+
+            Real<T> deflationFloor = Real<T>.Int(nn) * Eps * norm;
+            int maxIter = QrIterationsPerEigenvalue * Math.Max(nn, MinQrEigenvalueBudget);
+            int iter = 0, totalIter = 0;
+            while (n >= 0)
             {
-                for (l = nn; l >= 2; l--)
+                int l = n;
+                while (l > 0)
                 {
-                    s = Real<T>.Abs(a[(l - 1) * ld + (l - 1)]) + Real<T>.Abs(a[l * ld + l]);
-                    if (s.IsZero) s = anorm;
-                    if (Real<T>.Abs(a[l * ld + (l - 1)]) + s == s)
-                    {
-                        a[l * ld + (l - 1)] = zero;
-                        break;
-                    }
+                    s = Real<T>.Abs(h[(l - 1) * nn + (l - 1)]) + Real<T>.Abs(h[l * nn + l]);
+                    if (s.IsZero) s = norm;
+                    // decimal is fixed-point below 1: nothing smaller than 1e-28 exists, and a sub-diagonal
+                    // stagnates at a few units of that. Once s < 1, ε·s drops under that granularity (or to zero),
+                    // so the relative test alone can never deflate; the absolute floor n·ε·‖H‖ (LAPACK's smlnum
+                    // role) keeps the deflation normwise backward stable and reachable.
+                    Real<T> sub = Real<T>.Abs(h[l * nn + (l - 1)]);
+                    if (sub + s == s || sub < Eps * s || sub <= deflationFloor) break;
+                    l--;
                 }
-                x = a[nn * ld + nn];
-                if (l == nn)
+
+                if (l == n)
                 {
-                    wr[nn] = x + t;
-                    wi[nn] = zero;
-                    nn--;
+                    h[n * nn + n] += exshift;
+                    d[n] = h[n * nn + n];
+                    e[n] = zero;
+                    n--;
+                    iter = 0;
                 }
-                else
+                else if (l == n - 1)
                 {
-                    y = a[(nn - 1) * ld + (nn - 1)];
-                    w = a[nn * ld + (nn - 1)] * a[(nn - 1) * ld + nn];
-                    if (l == nn - 1)
+                    w = h[n * nn + (n - 1)] * h[(n - 1) * nn + n];
+                    p = (h[(n - 1) * nn + (n - 1)] - h[n * nn + n]) / two;
+                    q = p * p + w;
+                    z = Real<T>.Sqrt(Real<T>.Abs(q));
+                    h[n * nn + n] += exshift;
+                    h[(n - 1) * nn + (n - 1)] += exshift;
+                    x = h[n * nn + n];
+
+                    if (q >= zero)
                     {
-                        p = half * (y - x);
-                        q = p * p + w;
-                        z = Real<T>.Sqrt(Real<T>.Abs(q));
-                        x += t;
-                        if (q >= zero)
+                        z = p >= zero ? p + z : p - z;
+                        d[n - 1] = x + z;
+                        d[n] = d[n - 1];
+                        if (!z.IsZero) d[n] = x - w / z;
+                        e[n - 1] = zero;
+                        e[n] = zero;
+                        x = h[n * nn + (n - 1)];
+                        s = Real<T>.Abs(x) + Real<T>.Abs(z);
+                        p = x / s;
+                        q = z / s;
+                        r = Real<T>.Sqrt(p * p + q * q);
+                        p /= r;
+                        q /= r;
+                        for (int j = n - 1; j < nn; j++)
                         {
-                            z = p + Real<T>.CopySign(z, p);
-                            wr[nn - 1] = wr[nn] = x + z;
-                            if (!z.IsZero) wr[nn] = x - w / z;
-                            wi[nn - 1] = wi[nn] = zero;
+                            z = h[(n - 1) * nn + j];
+                            h[(n - 1) * nn + j] = q * z + p * h[n * nn + j];
+                            h[n * nn + j] = q * h[n * nn + j] - p * z;
                         }
-                        else
+                        for (int i = 0; i <= n; i++)
                         {
-                            wr[nn - 1] = wr[nn] = x + p;
-                            wi[nn - 1] = z;
-                            wi[nn] = -z;
+                            z = h[i * nn + (n - 1)];
+                            h[i * nn + (n - 1)] = q * z + p * h[i * nn + n];
+                            h[i * nn + n] = q * h[i * nn + n] - p * z;
                         }
-                        nn -= 2;
+                        for (int i = 0; i <= high; i++)
+                        {
+                            z = v[i * nn + (n - 1)];
+                            v[i * nn + (n - 1)] = q * z + p * v[i * nn + n];
+                            v[i * nn + n] = q * v[i * nn + n] - p * z;
+                        }
                     }
                     else
                     {
-                        if (its >= maxIts)
-                            throw new ArithmeticException(
-                                $"Eig: the QR algorithm failed to converge for {typeof(T).Name} input (LAPACK info > 0).");
-                        if (its == 10 || its == 20)
+                        d[n - 1] = x + p;
+                        d[n] = x + p;
+                        e[n - 1] = z;
+                        e[n] = -z;
+                    }
+                    n -= 2;
+                    iter = 0;
+                }
+                else
+                {
+                    x = h[n * nn + n];
+                    y = zero;
+                    w = zero;
+                    if (l < n)
+                    {
+                        y = h[(n - 1) * nn + (n - 1)];
+                        w = h[n * nn + (n - 1)] * h[(n - 1) * nn + n];
+                    }
+
+                    if (iter == 10)
+                    {
+                        exshift += x;
+                        for (int i = 0; i <= n; i++) h[i * nn + i] -= x;
+                        s = Real<T>.Abs(h[n * nn + (n - 1)]) + Real<T>.Abs(h[(n - 1) * nn + (n - 2)]);
+                        x = y = threeQuarters * s;
+                        w = exShiftFactor * s * s;
+                    }
+
+                    if (iter == 30)
+                    {
+                        s = (y - x) / two;
+                        s = s * s + w;
+                        if (s > zero)
                         {
-                            t += x;
-                            for (int i = 1; i <= nn; i++) a[i * ld + i] -= x;
-                            s = Real<T>.Abs(a[nn * ld + (nn - 1)]) + Real<T>.Abs(a[(nn - 1) * ld + (nn - 2)]);
-                            y = x = threeQuarters * s;
-                            w = exShift * s * s;
+                            s = Real<T>.Sqrt(s);
+                            if (y < x) s = -s;
+                            s = x - w / ((y - x) / two + s);
+                            for (int i = 0; i <= n; i++) h[i * nn + i] -= s;
+                            exshift += s;
+                            x = y = w = matlabShift;
                         }
-                        ++its;
-                        int m;
-                        for (m = nn - 2; m >= l; m--)
+                    }
+
+                    iter++;
+                    if (++totalIter > maxIter)
+                        throw new ArithmeticException(
+                            $"Eig: the QR algorithm failed to converge for {typeof(T).Name} input (LAPACK info > 0).");
+
+                    int m = n - 2;
+                    while (m >= l)
+                    {
+                        z = h[m * nn + m];
+                        r = x - z;
+                        s = y - z;
+                        p = (r * s - w) / h[(m + 1) * nn + m] + h[m * nn + (m + 1)];
+                        q = h[(m + 1) * nn + (m + 1)] - z - r - s;
+                        r = h[(m + 2) * nn + (m + 1)];
+                        s = Real<T>.Abs(p) + Real<T>.Abs(q) + Real<T>.Abs(r);
+                        p /= s;
+                        q /= s;
+                        r /= s;
+                        if (m == l) break;
+                        if (Real<T>.Abs(h[m * nn + (m - 1)]) * (Real<T>.Abs(q) + Real<T>.Abs(r)) <
+                            Eps * (Real<T>.Abs(p) * (Real<T>.Abs(h[(m - 1) * nn + (m - 1)]) + Real<T>.Abs(z) +
+                                                     Real<T>.Abs(h[(m + 1) * nn + (m + 1)]))))
+                            break;
+                        m--;
+                    }
+
+                    for (int i = m + 2; i <= n; i++)
+                    {
+                        h[i * nn + (i - 2)] = zero;
+                        if (i > m + 2) h[i * nn + (i - 3)] = zero;
+                    }
+
+                    for (int k = m; k <= n - 1; k++)
+                    {
+                        bool notlast = k != n - 1;
+                        if (k != m)
                         {
-                            z = a[m * ld + m];
-                            r = x - z;
-                            s = y - z;
-                            p = (r * s - w) / a[(m + 1) * ld + m] + a[m * ld + (m + 1)];
-                            q = a[(m + 1) * ld + (m + 1)] - z - r - s;
-                            r = a[(m + 2) * ld + (m + 1)];
-                            s = Real<T>.Abs(p) + Real<T>.Abs(q) + Real<T>.Abs(r);
-                            p /= s;
-                            q /= s;
-                            r /= s;
-                            if (m == l) break;
-                            Real<T> u = Real<T>.Abs(a[m * ld + (m - 1)]) * (Real<T>.Abs(q) + Real<T>.Abs(r));
-                            Real<T> vv = Real<T>.Abs(p) * (Real<T>.Abs(a[(m - 1) * ld + (m - 1)]) + Real<T>.Abs(z) +
-                                Real<T>.Abs(a[(m + 1) * ld + (m + 1)]));
-                            if (u + vv == vv) break;
+                            p = h[k * nn + (k - 1)];
+                            q = h[(k + 1) * nn + (k - 1)];
+                            r = notlast ? h[(k + 2) * nn + (k - 1)] : zero;
+                            x = Real<T>.Abs(p) + Real<T>.Abs(q) + Real<T>.Abs(r);
+                            if (x.IsZero) continue;
+                            p /= x;
+                            q /= x;
+                            r /= x;
                         }
-                        for (int i = m + 2; i <= nn; i++)
+
+                        s = Real<T>.Sqrt(p * p + q * q + r * r);
+                        if (p < zero) s = -s;
+                        if (s.IsZero) continue;
+
+                        if (k != m) h[k * nn + (k - 1)] = -s * x;
+                        else if (l != m) h[k * nn + (k - 1)] = -h[k * nn + (k - 1)];
+                        p += s;
+                        x = p / s;
+                        y = q / s;
+                        z = r / s;
+                        q /= p;
+                        r /= p;
+
+                        for (int j = k; j < nn; j++)
                         {
-                            a[i * ld + (i - 2)] = zero;
-                            if (i != m + 2) a[i * ld + (i - 3)] = zero;
-                        }
-                        for (int k = m; k <= nn - 1; k++)
-                        {
-                            if (k != m)
+                            p = h[k * nn + j] + q * h[(k + 1) * nn + j];
+                            if (notlast)
                             {
-                                p = a[k * ld + (k - 1)];
-                                q = a[(k + 1) * ld + (k - 1)];
-                                r = zero;
-                                if (k != nn - 1) r = a[(k + 2) * ld + (k - 1)];
-                                x = Real<T>.Abs(p) + Real<T>.Abs(q) + Real<T>.Abs(r);
-                                if (!x.IsZero)
-                                {
-                                    p /= x;
-                                    q /= x;
-                                    r /= x;
-                                }
+                                p += r * h[(k + 2) * nn + j];
+                                h[(k + 2) * nn + j] -= p * z;
                             }
-                            s = Real<T>.CopySign(Real<T>.Sqrt(p * p + q * q + r * r), p);
-                            if (!s.IsZero)
+                            h[k * nn + j] -= p * x;
+                            h[(k + 1) * nn + j] -= p * y;
+                        }
+
+                        int iMax = Math.Min(n, k + 3);
+                        for (int i = 0; i <= iMax; i++)
+                        {
+                            p = x * h[i * nn + k] + y * h[i * nn + (k + 1)];
+                            if (notlast)
                             {
-                                if (k == m)
+                                p += z * h[i * nn + (k + 2)];
+                                h[i * nn + (k + 2)] -= p * r;
+                            }
+                            h[i * nn + k] -= p;
+                            h[i * nn + (k + 1)] -= p * q;
+                        }
+
+                        for (int i = 0; i <= high; i++)
+                        {
+                            p = x * v[i * nn + k] + y * v[i * nn + (k + 1)];
+                            if (notlast)
+                            {
+                                p += z * v[i * nn + (k + 2)];
+                                v[i * nn + (k + 2)] -= p * r;
+                            }
+                            v[i * nn + k] -= p;
+                            v[i * nn + (k + 1)] -= p * q;
+                        }
+                    }
+                }
+            }
+
+            // Zero matrix: every eigenvalue is 0 and V (the identity) already holds a basis.
+            if (norm.IsZero) return;
+
+            Real<T> tiny = Eps * norm;
+            for (n = nn - 1; n >= 0; n--)
+            {
+                p = d[n];
+                q = e[n];
+
+                if (q.IsZero)
+                {
+                    int l = n;
+                    h[n * nn + n] = one;
+                    for (int i = n - 1; i >= 0; i--)
+                    {
+                        w = h[i * nn + i] - p;
+                        r = zero;
+                        for (int j = l; j <= n; j++) r += h[i * nn + j] * h[j * nn + n];
+                        if (e[i] < zero)
+                        {
+                            z = w;
+                            s = r;
+                        }
+                        else
+                        {
+                            l = i;
+                            if (e[i].IsZero)
+                            {
+                                Real<T> den = w.IsZero ? tiny : w;
+                                Real<T> f = GuardQuotient(Real<T>.Abs(r), Real<T>.Abs(den), i + 1, n, n, n);
+                                r *= f;
+                                h[i * nn + n] = -r / den;
+                            }
+                            else
+                            {
+                                x = h[i * nn + (i + 1)];
+                                y = h[(i + 1) * nn + i];
+                                q = (d[i] - p) * (d[i] - p) + e[i] * e[i];
+                                t = (x * s - z * r) / q;
+                                h[i * nn + n] = t;
+                                h[(i + 1) * nn + n] = Real<T>.Abs(x) > Real<T>.Abs(z) ? (-r - w * t) / x : (-s - y * t) / z;
+                            }
+
+                            // Overflow control; (ε·t)·t keeps the product itself in range.
+                            t = Real<T>.Abs(h[i * nn + n]);
+                            if (Eps * t * t > one)
+                                for (int j = i; j <= n; j++) h[j * nn + n] /= t;
+                        }
+                    }
+                }
+                else if (q < zero)
+                {
+                    int l = n - 1;
+                    if (Real<T>.Abs(h[n * nn + (n - 1)]) > Real<T>.Abs(h[(n - 1) * nn + n]))
+                    {
+                        h[(n - 1) * nn + (n - 1)] = q / h[n * nn + (n - 1)];
+                        h[(n - 1) * nn + n] = -(h[n * nn + n] - p) / h[n * nn + (n - 1)];
+                    }
+                    else
+                    {
+                        Cdiv(zero, -h[(n - 1) * nn + n], h[(n - 1) * nn + (n - 1)] - p, q, out var cr, out var ci);
+                        h[(n - 1) * nn + (n - 1)] = cr;
+                        h[(n - 1) * nn + n] = ci;
+                    }
+                    h[n * nn + (n - 1)] = zero;
+                    h[n * nn + n] = one;
+                    for (int i = n - 2; i >= 0; i--)
+                    {
+                        Real<T> ra = zero, sa = zero;
+                        for (int j = l; j <= n; j++)
+                        {
+                            ra += h[i * nn + j] * h[j * nn + (n - 1)];
+                            sa += h[i * nn + j] * h[j * nn + n];
+                        }
+                        w = h[i * nn + i] - p;
+
+                        if (e[i] < zero)
+                        {
+                            z = w;
+                            r = ra;
+                            s = sa;
+                        }
+                        else
+                        {
+                            l = i;
+                            if (e[i].IsZero)
+                            {
+                                Real<T> f = GuardQuotient(Real<T>.Max(Real<T>.Abs(ra), Real<T>.Abs(sa)),
+                                    Real<T>.Max(Real<T>.Abs(w), Real<T>.Abs(q)), i + 1, n, n - 1, n);
+                                ra *= f;
+                                sa *= f;
+                                Cdiv(-ra, -sa, w, q, out var cr, out var ci);
+                                h[i * nn + (n - 1)] = cr;
+                                h[i * nn + n] = ci;
+                            }
+                            else
+                            {
+                                x = h[i * nn + (i + 1)];
+                                y = h[(i + 1) * nn + i];
+                                Real<T> vr = (d[i] - p) * (d[i] - p) + e[i] * e[i] - q * q;
+                                Real<T> vi = (d[i] - p) * two * q;
+                                if (vr.IsZero && vi.IsZero)
+                                    vr = tiny * (Real<T>.Abs(w) + Real<T>.Abs(q) + Real<T>.Abs(x) + Real<T>.Abs(y) + Real<T>.Abs(z));
+                                Real<T> nr = x * r - z * ra + q * sa, ni = x * s - z * sa - q * ra;
+                                // The partial vector below row i+1 is shared by this row pair, so the saved r and s scale too.
+                                Real<T> f = GuardQuotient(Real<T>.Max(Real<T>.Abs(nr), Real<T>.Abs(ni)),
+                                    Real<T>.Max(Real<T>.Abs(vr), Real<T>.Abs(vi)), i + 2, n, n - 1, n);
+                                if (f != one)
                                 {
-                                    if (l != m) a[k * ld + (k - 1)] = -a[k * ld + (k - 1)];
+                                    ra *= f; sa *= f; r *= f; s *= f;
+                                    nr = x * r - z * ra + q * sa;
+                                    ni = x * s - z * sa - q * ra;
+                                }
+                                Cdiv(nr, ni, vr, vi, out var cr, out var ci);
+                                h[i * nn + (n - 1)] = cr;
+                                h[i * nn + n] = ci;
+                                if (Real<T>.Abs(x) > Real<T>.Abs(z) + Real<T>.Abs(q))
+                                {
+                                    h[(i + 1) * nn + (n - 1)] = (-ra - w * h[i * nn + (n - 1)] + q * h[i * nn + n]) / x;
+                                    h[(i + 1) * nn + n] = (-sa - w * h[i * nn + n] - q * h[i * nn + (n - 1)]) / x;
                                 }
                                 else
                                 {
-                                    a[k * ld + (k - 1)] = -s * x;
+                                    Cdiv(-r - y * h[i * nn + (n - 1)], -s - y * h[i * nn + n], z, q, out cr, out ci);
+                                    h[(i + 1) * nn + (n - 1)] = cr;
+                                    h[(i + 1) * nn + n] = ci;
                                 }
-                                p += s;
-                                x = p / s;
-                                y = q / s;
-                                z = r / s;
-                                q /= p;
-                                r /= p;
-                                for (int j = k; j <= nn; j++)
+                            }
+
+                            t = Real<T>.Max(Real<T>.Abs(h[i * nn + (n - 1)]), Real<T>.Abs(h[i * nn + n]));
+                            if (Eps * t * t > one)
+                            {
+                                for (int j = i; j <= n; j++)
                                 {
-                                    p = a[k * ld + j] + q * a[(k + 1) * ld + j];
-                                    if (k != nn - 1)
-                                    {
-                                        p += r * a[(k + 2) * ld + j];
-                                        a[(k + 2) * ld + j] -= p * z;
-                                    }
-                                    a[(k + 1) * ld + j] -= p * y;
-                                    a[k * ld + j] -= p * x;
-                                }
-                                int mmin = nn < k + 3 ? nn : k + 3;
-                                for (int i = l; i <= mmin; i++)
-                                {
-                                    p = x * a[i * ld + k] + y * a[i * ld + (k + 1)];
-                                    if (k != nn - 1)
-                                    {
-                                        p += z * a[i * ld + (k + 2)];
-                                        a[i * ld + (k + 2)] -= p * r;
-                                    }
-                                    a[i * ld + (k + 1)] -= p * q;
-                                    a[i * ld + k] -= p;
+                                    h[j * nn + (n - 1)] /= t;
+                                    h[j * nn + n] /= t;
                                 }
                             }
                         }
                     }
                 }
-            } while (l < nn - 1);
+            }
+
+            // V ← V·T: Schur-form eigenvectors back to eigenvectors of the input.
+            for (int j = nn - 1; j >= 0; j--)
+            {
+                for (int i = 0; i <= high; i++)
+                {
+                    z = zero;
+                    int kMax = Math.Min(j, high);
+                    for (int k = 0; k <= kMax; k++) z += v[i * nn + k] * h[k * nn + j];
+                    v[i * nn + j] = z;
+                }
+            }
         }
 
-        var outR = new Real<T>[n];
-        var outI = new Real<T>[n];
-        for (int i = 0; i < n; i++) { outR[i] = wr[i + 1]; outI[i] = wi[i + 1]; }
-        return (outR, outI);
-    }
-    // Remove only vectors for the same eigenvalue; vectors for distinct eigenvalues of a non-normal
-    // matrix need not be orthogonal. Two modified Gram-Schmidt passes preserve repeated eigenspaces.
-    private static void ProjectRepeatedEigenvectors(Real<T>[] x, int n, bool complex, Real<T> re, Real<T> im,
-        Real<T>[] wr, Real<T>[] wi, int count, T[] vectors, int offset)
-    {
-        Real<T> tol = Real<T>.Int(RepeatedEigenvalueFactor) * Eps * (Real<T>.One + Real<T>.Abs(re) + Real<T>.Abs(im));
-        for (int pass = 0; pass < 2; pass++)
-            for (int k = 0; k < count; k++)
+        /// <summary>
+        /// Writes V as (re, im) columns with unit 2-norm and, for a complex vector, a real positive component
+        /// of largest modulus (?geev). Norms are scaled by the largest modulus so squares cannot overflow.
+        /// </summary>
+        private void WriteEigenvectors(T[] dst, int off)
+        {
+            int n = _n;
+            var v = _v;
+            Real<T> zero = Real<T>.Zero;
+            int k = 0;
+            while (k < n)
             {
-                if (Real<T>.Abs(wr[k] - re) > tol || Real<T>.Abs(wi[k] - im) > tol) continue;
-                Real<T> dotR = Real<T>.Zero, dotI = Real<T>.Zero, normSq = Real<T>.Zero;
+                bool complex = _e[k] > zero && k + 1 < n;
+                int best = 0;
+                Real<T> bestMag = zero;
                 for (int i = 0; i < n; i++)
                 {
-                    Real<T> vr = vectors[offset + (i * n + k) * 2];
-                    Real<T> vi = vectors[offset + (i * n + k) * 2 + 1];
-                    Real<T> xi = complex ? x[i + n] : Real<T>.Zero;
-                    dotR += vr * x[i] + vi * xi;
-                    dotI += vr * xi - vi * x[i];
-                    normSq += vr * vr + vi * vi;
+                    Real<T> mag = complex ? Real<T>.Hypot(v[i * n + k], v[i * n + k + 1]) : Real<T>.Abs(v[i * n + k]);
+                    if (mag > bestMag) { bestMag = mag; best = i; }
                 }
-                if (normSq.IsZero) continue;
-                dotR /= normSq; dotI /= normSq;
+                Real<T> ss = zero;
+                if (!bestMag.IsZero)
+                    for (int i = 0; i < n; i++)
+                    {
+                        Real<T> a = v[i * n + k] / bestMag;
+                        ss += a * a;
+                        if (complex)
+                        {
+                            Real<T> b = v[i * n + k + 1] / bestMag;
+                            ss += b * b;
+                        }
+                    }
+                // x / ‖x‖ = (x / |x_max|) / sqrt(ss); for complex x also multiply by conj(x_max) / |x_max|.
+                Real<T> norm = bestMag.IsZero ? Real<T>.One : Real<T>.Sqrt(ss);
+                Real<T> cr = Real<T>.One, ci = zero;
+                if (complex && !bestMag.IsZero)
+                {
+                    cr = v[best * n + k] / bestMag;
+                    ci = -(v[best * n + k + 1] / bestMag);
+                }
+                Real<T> scale = bestMag.IsZero ? Real<T>.One : bestMag;
                 for (int i = 0; i < n; i++)
                 {
-                    Real<T> vr = vectors[offset + (i * n + k) * 2];
-                    Real<T> vi = vectors[offset + (i * n + k) * 2 + 1];
-                    x[i] -= vr * dotR - vi * dotI;
-                    if (complex) x[i + n] -= vr * dotI + vi * dotR;
+                    Real<T> a = v[i * n + k] / scale;
+                    Real<T> b = complex ? v[i * n + k + 1] / scale : zero;
+                    Real<T> re = (a * cr - b * ci) / norm, im = (a * ci + b * cr) / norm;
+                    if (complex && i == best) im = zero;
+                    dst[off + (i * n + k) * 2] = re.V;
+                    dst[off + (i * n + k) * 2 + 1] = im.V;
+                    if (complex)
+                    {
+                        dst[off + (i * n + k + 1) * 2] = re.V;
+                        dst[off + (i * n + k + 1) * 2 + 1] = (-im).V;
+                    }
                 }
+                k += complex ? 2 : 1;
             }
-    }
-
-    private static Real<T> EigenResidual(Real<T>[] a, Real<T>[] x, int n, bool complex, Real<T> re, Real<T> im)
-    {
-        Real<T> residual = Real<T>.Zero;
-        for (int i = 0; i < n; i++)
-        {
-            Real<T> xi = complex ? x[i + n] : Real<T>.Zero;
-            Real<T> rr = -re * x[i] + im * xi;
-            Real<T> ri = -im * x[i] - re * xi;
-            for (int j = 0; j < n; j++)
-            {
-                rr += a[i * n + j] * x[j];
-                if (complex) ri += a[i * n + j] * x[j + n];
-            }
-            residual = Real<T>.Max(residual, Real<T>.Abs(rr) + Real<T>.Abs(ri));
-        }
-        return residual;
-    }
-
-
-
-    /// <summary>
-    /// Right eigenvector of <paramref name="a"/> for λ = re + i·im by inverse iteration with a shift
-    /// √ε·scale off λ. The complex system (A − sI)(xr + i·xi) = b is solved as the equivalent 2n×2n real
-    /// system. The result has unit 2-norm and, for complex λ, its largest component is made real.
-    /// </summary>
-    private static (Real<T>[] Xr, Real<T>[] Xi) InverseIteration(
-        Real<T>[] a, int n, Real<T> re, Real<T> im, Real<T> scale,
-        Real<T>[] wr, Real<T>[] wi, int eigenIndex, T[] previousVectors, int vectorOffset)
-    {
-        bool complex = !im.IsZero;
-        int m = complex ? 2 * n : n;
-        Real<T> delta = Real<T>.Sqrt(Eps) * scale;
-        Real<T> shift = re >= Real<T>.Zero ? re + delta : re - delta;
-        var mat = new Real<T>[m * m];
-        for (int i = 0; i < mat.Length; i++) mat[i] = Real<T>.Zero;
-        for (int i = 0; i < n; i++)
-            for (int j = 0; j < n; j++)
-            {
-                Real<T> val = i == j ? a[i * n + j] - shift : a[i * n + j];
-                mat[i * m + j] = val;
-                if (complex) mat[(i + n) * m + (j + n)] = val;
-            }
-        if (complex)
-            for (int i = 0; i < n; i++)
-            {
-                mat[i * m + (i + n)] = im;
-                mat[(i + n) * m + i] = -im;
-            }
-
-        var piv = new int[m];
-        LuInPlace(mat, piv, m, Eps * scale);
-
-        // Try a basis of seeds: an all-ones seed can be exactly orthogonal to the desired eigenspace.
-        // For a repeated eigenvalue, remove already found directions after every solve. Linear combinations
-        // inside that eigenspace remain eigenvectors, so independent eigenvectors are not collapsed together.
-        var x = new Real<T>[m];
-        Real<T> bestResidual = Real<T>.Zero;
-        bool haveBest = false;
-        // Rounding in the residual grows with n, so the acceptance does too; the first seed that reaches it ends the
-        // search (each further seed costs three O(m^2) solves and an O(n^2) residual). It never exceeds sqrt(Eps): in
-        // BFloat16 (Eps = 1/128) the n-scaled bound reaches 1 for n = 2, which accepted a seed still parallel to another
-        // eigenvalue's axis (residual 0.5 on diag(0.5, 1)); sqrt(Eps) leaves double's bound unchanged.
-        Real<T> scaledAccept = Real<T>.Int(EigenvectorAcceptFactor) * Real<T>.Int(Math.Max(n, 1)) * Eps;
-        Real<T> rootEps = Real<T>.Sqrt(Eps);
-        Real<T> accept = scaledAccept < rootEps ? scaledAccept : rootEps;
-        for (int seed = 0; seed < n; seed++)
-        {
-            if (haveBest && bestResidual <= accept) break;
-            var candidate = new Real<T>[m];
-            for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
-            bool usable = true;
-            for (int iter = 0; iter < InverseIterationSteps; iter++)
-            {
-                SolveInPlace(mat, piv, candidate, m);
-                ProjectRepeatedEigenvectors(candidate, n, complex, re, im, wr, wi, eigenIndex, previousVectors, vectorOffset);
-                Real<T> nrm = Norm2(candidate);
-                if (nrm <= Eps) { usable = false; break; }
-                for (int i = 0; i < m; i++) candidate[i] /= nrm;
-            }
-            if (!usable) continue;
-            Real<T> residual = EigenResidual(a, candidate, n, complex, re, im);
-            if (!haveBest || residual < bestResidual)
-            {
-                haveBest = true;
-                bestResidual = residual;
-                Array.Copy(candidate, x, m);
-            }
-        }
-        // A defective matrix need not have another independent vector for a repeated eigenvalue.
-        // Retain an ordinary inverse iterate in that case, as geev does, rather than returning a zero vector.
-        if (!haveBest || bestResidual > accept)
-        {
-            for (int seed = 0; seed < n; seed++)
-            {
-                if (haveBest && bestResidual <= accept) break;
-                var candidate = new Real<T>[m];
-                for (int i = 0; i < m; i++) candidate[i] = i == seed ? Real<T>.One : Real<T>.Zero;
-                for (int iter = 0; iter < InverseIterationSteps; iter++)
-                {
-                    SolveInPlace(mat, piv, candidate, m);
-                    Real<T> nrm = Norm2(candidate);
-                    if (nrm.IsZero) break;
-                    for (int i = 0; i < m; i++) candidate[i] /= nrm;
-                }
-                Real<T> residual = EigenResidual(a, candidate, n, complex, re, im);
-                if (!haveBest || residual < bestResidual)
-                {
-                    haveBest = true;
-                    bestResidual = residual;
-                    Array.Copy(candidate, x, m);
-                }
-            }
-        }
-
-        var xr = new Real<T>[n];
-        var xi = new Real<T>[n];
-        for (int i = 0; i < n; i++) { xr[i] = x[i]; xi[i] = complex ? x[i + n] : Real<T>.Zero; }
-
-        if (complex)
-        {
-            // Rotate by conj(z_max)/|z_max| so the largest component is real and positive.
-            int best = 0;
-            Real<T> bestMag = Real<T>.Zero;
-            for (int i = 0; i < n; i++)
-            {
-                Real<T> mag = Real<T>.Hypot(xr[i], xi[i]);
-                if (mag > bestMag) { bestMag = mag; best = i; }
-            }
-            if (!bestMag.IsZero)
-            {
-                Real<T> cr = xr[best] / bestMag, ci = -(xi[best] / bestMag);
-                for (int i = 0; i < n; i++)
-                {
-                    Real<T> nr = xr[i] * cr - xi[i] * ci;
-                    Real<T> ni = xr[i] * ci + xi[i] * cr;
-                    xr[i] = nr;
-                    xi[i] = ni;
-                }
-                xi[best] = Real<T>.Zero;
-            }
-        }
-
-        var all = new Real<T>[2 * n];
-        for (int i = 0; i < n; i++) { all[i] = xr[i]; all[i + n] = xi[i]; }
-        Real<T> cnorm = Norm2(all);
-        if (!cnorm.IsZero)
-            for (int i = 0; i < n; i++) { xr[i] /= cnorm; xi[i] /= cnorm; }
-        return (xr, xi);
-    }
-
-    /// <summary>Partial-pivot LU of a dense m×m scratch matrix; exact-zero pivots are replaced by
-    /// <paramref name="tiny"/> (the standard inverse-iteration perturbation).</summary>
-    private static void LuInPlace(Real<T>[] a, int[] piv, int m, Real<T> tiny)
-    {
-        if (tiny.IsZero) tiny = Eps;
-        for (int col = 0; col < m; col++)
-        {
-            int p = col;
-            Real<T> best = Real<T>.Abs(a[col * m + col]);
-            for (int r = col + 1; r < m; r++)
-            {
-                Real<T> val = Real<T>.Abs(a[r * m + col]);
-                if (val > best) { best = val; p = r; }
-            }
-            piv[col] = p;
-            if (p != col)
-                for (int j = 0; j < m; j++) (a[col * m + j], a[p * m + j]) = (a[p * m + j], a[col * m + j]);
-            if (a[col * m + col].IsZero) a[col * m + col] = tiny;
-            Real<T> d = a[col * m + col];
-            for (int r = col + 1; r < m; r++)
-            {
-                Real<T> f = a[r * m + col] / d;
-                a[r * m + col] = f;
-                if (f.IsZero) continue;
-                for (int j = col + 1; j < m; j++) a[r * m + j] -= f * a[col * m + j];
-            }
-        }
-    }
-
-    private static void SolveInPlace(Real<T>[] lu, int[] piv, Real<T>[] x, int m)
-    {
-        for (int i = 0; i < m; i++)
-            if (piv[i] != i) (x[i], x[piv[i]]) = (x[piv[i]], x[i]);
-        for (int i = 1; i < m; i++)
-            for (int j = 0; j < i; j++) x[i] -= lu[i * m + j] * x[j];
-        for (int i = m - 1; i >= 0; i--)
-        {
-            Real<T> s = x[i];
-            for (int j = i + 1; j < m; j++) s -= lu[i * m + j] * x[j];
-            x[i] = s / lu[i * m + i];
         }
     }
 

@@ -953,7 +953,21 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                             zero = 0;
                             CuBlasNative.cuMemPoolSetAttribute(memPool, 8, ref zero);
                         });
-                    ulong threshold = ulong.MaxValue; // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+                    bool isWddm = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                        && (CuBlasNative.cuDeviceGetAttribute(out int tccMode, 35 /* CU_DEVICE_ATTRIBUTE_TCC_DRIVER */, device) != CudaResult.Success // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
+                            || tccMode == 0);
+                    // Null when the reading is unavailable; a successful reading of zero headroom is kept as zero.
+                    ulong? initFreeBytes = null;
+                    if (CudaNativeBindings.cuMemGetInfo(out ulong queriedFree, out _) == CudaResult.Success) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
+                        initFreeBytes = queriedFree;
+                    if (isWddm)
+                    {
+                        _bufferPool.MaxPooledElements = ComputeDefaultWddmHostPoolMaxElements(
+                            _bufferPool.MaxPooledElements, initFreeBytes);
+                    }
+                    ulong threshold = ComputeDefaultMemPoolReleaseThreshold(
+                        totalMem, initFreeBytes, isWddm,
+                        Environment.GetEnvironmentVariable("AIDOTNET_CUDA_MEMPOOL_RELEASE_THRESHOLD_MB")); // CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
                     var poolAttrStatus = CuBlasNative.cuMemPoolSetAttribute(memPool, 4, ref threshold);
                     if (poolAttrStatus != CudaResult.Success)
                     {
@@ -2303,24 +2317,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         }
 
-        // Pressured: run pending finalizers so dereferenced transient GPU buffers are released,
-        // then reclaim any completed deferred frees. Two collects bracket the finalizer wait so
-        // objects promoted to the finalizer queue on the first pass are reclaimed on the second.
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
+        // Pressured: collect unreachable managed wrappers AND drain the finalizer queue first, measuring
+        // actual unreachable-tensor / deferred-free reclamation BEFORE releasing reusable scratch pools.
+        // That way reusable pool eviction relieves physical VRAM pressure without resetting the GC backoff
+        // on steady-state workloads that legitimately recycle scratch memory each step.
+        long allocatedBeforeGc = _memoryAccount.AllocatedBytes;
+        ReclaimUnreachableForRetry();
         DrainDeferredFrees(blockOldest: false);
+        long allocatedAfterGc = _memoryAccount.AllocatedBytes;
+        long garbageReclaimed = Math.Max(0L, allocatedBeforeGc - allocatedAfterGc);
 
-        // Effectiveness check: a workload legitimately resident below the threshold reclaims ~nothing;
-        // back off exponentially so the per-step GC tax amortizes away. A sweep that frees >=1% of the
-        // device means transient garbage IS accumulating — keep full cadence.
-        ulong freeAfter = free;
+        ulong freeAfterGc = free;
         using (PushContext())
         {
-            if (CudaNativeBindings.cuMemGetInfo(out var f2, out _) == CudaResult.Success)
-                freeAfter = f2;
+            if (CudaNativeBindings.cuMemGetInfo(out var f2, out _) == CudaResult.Success) // lgtm[cs/call-to-unmanaged-code] CUDA device queries have no managed API.
+                freeAfterGc = f2;
         }
-        bool effective = freeAfter > free && (freeAfter - free) >= total / 100;
+        bool effective = ((ulong)garbageReclaimed >= total / 100)
+            || (freeAfterGc > free && (freeAfterGc - free) >= total / 100);
+
+        if ((double)freeAfterGc / total <= freeFractionThreshold
+            && !IsCapturingOnThisThread && !_backendStreamCaptureActive)
+        {
+            ((IDeviceMemoryPressure)this).ReleaseCachedBuffers();
+        }
         _reclaimBackoffSteps = effective ? 1 : Math.Min(_reclaimBackoffSteps * 2, 256);
         _reclaimCooldownRemaining = effective ? 0 : _reclaimBackoffSteps;
     }
@@ -2328,10 +2348,37 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private int _reclaimCooldownRemaining;
     private int _reclaimBackoffSteps = 1;
 
-    /// <summary>
-    /// Unconditionally releases device memory held only by unreachable managed objects: runs the pending
-    /// finalizers (which free or enqueue their buffers) and drains the completed deferred frees back to the pool.
-    /// </summary>
+    private const ulong MinWddmMemPoolReleaseThresholdBytes = 256UL << 20;
+    private const long MinWddmHostPoolMaxBytes = 64L << 20;
+
+    internal static ulong ComputeDefaultMemPoolReleaseThreshold(
+        ulong totalBytes, ulong? freeBytes, bool isWddm, string? envOverrideMb)
+    {
+        if (envOverrideMb is not null
+            && !string.IsNullOrWhiteSpace(envOverrideMb)
+            && long.TryParse(envOverrideMb.Trim(), System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long overrideMb))
+        {
+            if (overrideMb < 0) return ulong.MaxValue;
+            return (ulong)overrideMb * (1UL << 20);
+        }
+        if (!isWddm || totalBytes == 0)
+            return ulong.MaxValue;
+        // An unavailable reading falls back to the whole device; zero headroom stays zero (the floor below applies).
+        ulong effectiveFree = freeBytes is { } f && f <= totalBytes ? f : totalBytes;
+        ulong bounded = Math.Min(totalBytes / 2, effectiveFree / 2);
+        return Math.Max(MinWddmMemPoolReleaseThresholdBytes, Math.Min(bounded, totalBytes));
+    }
+
+    internal static long ComputeDefaultWddmHostPoolMaxElements(long currentMaxElements, ulong? freeBytes)
+    {
+        // An unavailable reading leaves the cap as it is; zero headroom caps the pool at its floor.
+        if (currentMaxElements <= 0 || freeBytes is not { } free)
+            return currentMaxElements;
+        long wddmCapBytes = Math.Max(MinWddmHostPoolMaxBytes, (long)Math.Min(free / 4, (ulong)long.MaxValue));
+        long wddmCapElements = wddmCapBytes / sizeof(float);
+        return Math.Min(currentMaxElements, wddmCapElements);
+    }
     /// <summary>Free and total device memory (cuMemGetInfo), or false when unavailable.</summary>
     internal bool TryGetDeviceMemory(out ulong free, out ulong total)
     {
@@ -6003,6 +6050,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private float SumGpuReduction(IGpuBuffer A, int size)
         => ReduceGpuScalar("reduce_sum", A, size, 0.0f);
 
+    // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU, also for a single element, which a
+    // reduction with nothing to merge can hand back as it is, payload included.
+    private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
+
     private float ReduceGpuScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
     {
         if (!IsAvailable)
@@ -6045,12 +6096,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public float Max(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_max", A, size, float.MinValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_max", A, size, float.MinValue));
     }
 
     public float Min(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_min", A, size, float.MaxValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_min", A, size, float.MaxValue));
     }
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -10516,7 +10567,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // as CpuEngine.Dropout does), then apply it with scale = 1. When not training / rate <= 0 the
         // mask kernel keeps everything at scale 1, so output == input (identity), matching the CPU path.
         float keepProb = training ? (1.0f - dropoutRate) : 1.0f;
-        DropoutMask(mask, size, keepProb, seed);
+        // The mask kernel's two-round hash does not separate nearby seeds (see GpuSeed).
+        DropoutMask(mask, size, keepProb, GpuSeed.Mix(seed));
 
         using var _ = PushContext();
         uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -15150,8 +15202,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (outerSize <= 0) return;
-        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
-            return;
+        // The opt-in direct-PTX row maximum is not taken here: its fold is max.f32, which drops a NaN operand, and a
+        // row that holds a NaN must reduce to NaN. Its modules are precompiled (the embedded SM86 cubins are keyed by
+        // the PTX text), so the fold can only change together with regenerated cubins. The kernels below run on the
+        // device as well.
         // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
         bool rows = reduceSize >= 256 && _kernelCache.ContainsKey("max_axis_rows");
         if (!_kernelCache.TryGetValue(rows ? "max_axis_rows" : "max_axis", out var kernel))

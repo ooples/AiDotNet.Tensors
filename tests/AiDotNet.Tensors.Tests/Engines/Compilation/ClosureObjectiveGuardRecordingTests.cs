@@ -105,6 +105,33 @@ public class ClosureObjectiveGuardRecordingTests
     }
 
     [Fact]
+    public void Leaves_are_the_traced_external_inputs_in_signature_order()
+    {
+        var engine = new CpuEngine();
+        var w = Filled(4, 3, 1);
+        var x = Filled(2, 4, 2);
+        var bias = Filled(2, 3, 3);
+        var parameters = new[] { w };
+        object[]? signedLeaves = null;
+        using var recording = ClosureObjectiveGuard<float>.BeginRecording();
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var loss = engine.ReduceSum(engine.TensorAdd(engine.TensorMatMul(x, w), bias));
+            ObjectiveSignature.Build(scope.Nodes, parameters, out signedLeaves);
+            plan = scope.CompileTraining(parameters, loss);
+        }
+        var guard = ClosureObjectiveGuard<float>.TakeRecorded(out var reason)
+                    ?? throw new InvalidOperationException($"no guard was recorded: {reason}");
+
+        Assert.Equal(guard.LeafCount, guard.Leaves.Length);
+        Assert.Equal(signedLeaves, guard.Leaves);
+        Assert.Same(x, guard.Leaves[0]);
+        Assert.Same(bias, guard.Leaves[1]);
+        plan.Dispose();
+    }
+
+    [Fact]
     public void Rebind_reports_a_mismatch_when_the_step_changes_shape()
     {
         var engine = new CpuEngine();

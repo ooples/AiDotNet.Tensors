@@ -115,11 +115,20 @@ public sealed partial class MetalBackend : IGpuIntegerElementwise, IGpuIntegerRe
     }
 
     /// <inheritdoc/>
-    public long SumInteger(IGpuBuffer a, int size)
+    public long SumInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Sum, a, size);
+
+    /// <inheritdoc/>
+    public long MinInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Min, a, size);
+
+    /// <inheritdoc/>
+    public long MaxInteger(IGpuBuffer a, int size) => ReduceInteger(GpuIntegerReduction.Max, a, size);
+
+    private long ReduceInteger(GpuIntegerReduction reduction, IGpuBuffer a, int size)
     {
-        if (!IsInt32(a)) return GpuPackedCompute.Sum(this, LaunchPacked, a, size, SumInteger);
+        if (!IsInt32(a)) return GpuPackedCompute.Reduce(reduction, this, LaunchPacked, a, size, (partials, count) => ReduceInteger(reduction, partials, count));
         GpuInt32ShaderSource.RequireSum(a, size);
-        var pipeline = Int32Pipeline("i32k_sum");
+        var pipeline = Int32Pipeline("i32k_" + GpuInt32ShaderSource.Name(reduction));
+        GpuIntegerLayout.RequireElements(reduction, size);
         if (size == 0) return 0;
         int block = GpuInt32ShaderSource.SumBlock;
         int partials = GpuIntegerLayout.Blocks(size, block);
@@ -222,6 +231,27 @@ kernel void i32k_sum(
     o[gid] = int(s);
 }
 ");
+        foreach (var reduction in new[] { GpuIntegerReduction.Min, GpuIntegerReduction.Max })
+        {
+            source.Append(@"
+// Pass of a minimum or maximum: o[gid] is that of block gid of the `count` input elements (a block is never empty).
+kernel void i32k_" + GpuInt32ShaderSource.Name(reduction) + @"(
+    device const int* a [[buffer(0)]],
+    device int* o [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant uint& count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) { return; }
+    uint first = gid * " + GpuInt32ShaderSource.SumBlock + @"u;
+    uint last = min(first + " + GpuInt32ShaderSource.SumBlock + @"u, count);
+    int s = a[first];
+    for (uint j = first + 1u; j < last; j++) { s = " + (reduction == GpuIntegerReduction.Min ? "min" : "max") + @"(s, a[j]); }
+    o[gid] = s;
+}
+");
+        }
+
         return source.ToString();
     }
 }

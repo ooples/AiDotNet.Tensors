@@ -54,6 +54,12 @@ internal static class GpuIntegerKernelSource
         GpuIntegerBinaryOperation.And => "iand",
         GpuIntegerBinaryOperation.Or => "ior",
         GpuIntegerBinaryOperation.Xor => "ixor",
+        GpuIntegerBinaryOperation.Divide => "idiv",
+        GpuIntegerBinaryOperation.Remainder => "irem",
+        GpuIntegerBinaryOperation.Equal => "ieq",
+        GpuIntegerBinaryOperation.NotEqual => "ine",
+        GpuIntegerBinaryOperation.Greater => "igt",
+        GpuIntegerBinaryOperation.Less => "ilt",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -61,6 +67,8 @@ internal static class GpuIntegerKernelSource
     {
         GpuIntegerUnaryOperation.Negate => "ineg",
         GpuIntegerUnaryOperation.Not => "inot",
+        GpuIntegerUnaryOperation.Abs => "iabs",
+        GpuIntegerUnaryOperation.Sign => "isign",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -79,6 +87,18 @@ internal static class GpuIntegerKernelSource
     /// </summary>
     public static string Sum(GpuElementType type) => "isum_" + Suffix(type);
 
+    /// <summary>
+    /// The kernel reducing blocks of <see cref="SumBlock"/> elements into 64-bit partials, with the arguments of
+    /// <see cref="Sum"/>; the partials of a minimum or maximum are reduced by the Int64 kernel of the same reduction.
+    /// </summary>
+    public static string Reduce(GpuIntegerReduction reduction, GpuElementType type) => reduction switch
+    {
+        GpuIntegerReduction.Sum => Sum(type),
+        GpuIntegerReduction.Min => "irmin_" + Suffix(type),
+        GpuIntegerReduction.Max => "irmax_" + Suffix(type),
+        _ => throw new ArgumentOutOfRangeException(nameof(reduction), reduction, "Unknown integer reduction."),
+    };
+
     /// <summary>Every kernel name of the program, in source order.</summary>
     public static IReadOnlyList<string> KernelNames => Names.Value;
 
@@ -89,10 +109,15 @@ internal static class GpuIntegerKernelSource
     {
         GpuIntegerBinaryOperation.Add, GpuIntegerBinaryOperation.Subtract, GpuIntegerBinaryOperation.Multiply,
         GpuIntegerBinaryOperation.Min, GpuIntegerBinaryOperation.Max, GpuIntegerBinaryOperation.And,
-        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor,
+        GpuIntegerBinaryOperation.Or, GpuIntegerBinaryOperation.Xor, GpuIntegerBinaryOperation.Divide,
+        GpuIntegerBinaryOperation.Remainder, GpuIntegerBinaryOperation.Equal, GpuIntegerBinaryOperation.NotEqual,
+        GpuIntegerBinaryOperation.Greater, GpuIntegerBinaryOperation.Less,
     };
 
-    private static readonly GpuIntegerUnaryOperation[] UnaryOperations = { GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not };
+    private static readonly GpuIntegerUnaryOperation[] UnaryOperations = 
+    {
+        GpuIntegerUnaryOperation.Negate, GpuIntegerUnaryOperation.Not, GpuIntegerUnaryOperation.Abs, GpuIntegerUnaryOperation.Sign,
+    };
 
     private static List<string> BuildNames()
     {
@@ -106,7 +131,12 @@ internal static class GpuIntegerKernelSource
             }
 
             names.AddRange(UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)).Select(operation => Unary(operation, type)));
-            if (type != GpuElementType.Bool) names.Add(Sum(type));
+            if (type != GpuElementType.Bool)
+            {
+                names.Add(Sum(type));
+                names.Add(Reduce(GpuIntegerReduction.Min, type));
+                names.Add(Reduce(GpuIntegerReduction.Max, type));
+            }
         }
 
         GpuNarrowFloatKernelSource.AddNames(names);
@@ -123,6 +153,14 @@ internal static class GpuIntegerKernelSource
         GpuIntegerBinaryOperation.And => logical ? "(x != 0) && (y != 0)" : "x & y",
         GpuIntegerBinaryOperation.Or => logical ? "(x != 0) || (y != 0)" : "x | y",
         GpuIntegerBinaryOperation.Xor => logical ? "(x != 0) != (y != 0)" : "x ^ y",
+        // C leaves a zero divisor and the most negative value over -1 undefined: both are decided before the
+        // division, whose divisor is never zero. Over -1 the quotient is the wrapping negation.
+        GpuIntegerBinaryOperation.Divide => "y == 0 ? 0 : (y == -1 ? (W)0 - (W)x : x / (y == 0 ? 1 : y))",
+        GpuIntegerBinaryOperation.Remainder => "(y == 0 || y == -1) ? 0 : x % (y == 0 ? 1 : y)",
+        GpuIntegerBinaryOperation.Equal => "x == y",
+        GpuIntegerBinaryOperation.NotEqual => "x != y",
+        GpuIntegerBinaryOperation.Greater => "x > y",
+        GpuIntegerBinaryOperation.Less => "x < y",
         _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "Unknown integer operation."),
     };
 
@@ -176,7 +214,13 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
 
             foreach (var operation in UnaryOperations.Where(operation => GpuIntegerLayout.Defined(operation, type)))
             {
-                string expression = operation == GpuIntegerUnaryOperation.Negate ? "(" + w + ")0 - (" + w + ")x" : logical ? "x == 0" : "~x";
+                string expression = operation switch
+                {
+                    GpuIntegerUnaryOperation.Negate => "(" + w + ")0 - (" + w + ")x",
+                    GpuIntegerUnaryOperation.Abs => "x < 0 ? (" + w + ")0 - (" + w + ")x : (" + w + ")x",
+                    GpuIntegerUnaryOperation.Sign => "(x > 0) - (x < 0)",
+                    _ => logical ? "x == 0" : "~x",
+                };
                 source.Append("IK_KERNEL ").Append(Unary(operation, type))
                     .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR ").Append(t)
                     .Append("* o, const int size)\n{\n    const int i = IK_GID;\n    if (i < size) { const ").Append(t)
@@ -190,6 +234,16 @@ typedef unsigned int u32t; typedef unsigned long long u64t;
                 .Append("    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * ").Append(SumBlock)
                 .Append(";\n    const int last = (count - first > ").Append(SumBlock).Append(") ? first + ").Append(SumBlock)
                 .Append(" : count;\n    u64t s = 0;\n    for (int j = first; j < last; j++) s += (u64t)(i64t)a[j];\n    o[i] = (i64t)s;\n}\n");
+            // The extreme of a block, widened by the element's own signedness: a block is never empty.
+            foreach (var reduction in new[] { GpuIntegerReduction.Min, GpuIntegerReduction.Max })
+            {
+                source.Append("IK_KERNEL ").Append(Reduce(reduction, type))
+                    .Append("(IK_PTR const ").Append(t).Append("* a, IK_PTR i64t* o, const int count, const int blocks)\n{\n")
+                    .Append("    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * ").Append(SumBlock)
+                    .Append(";\n    const int last = (count - first > ").Append(SumBlock).Append(") ? first + ").Append(SumBlock)
+                    .Append(" : count;\n    i64t s = (i64t)a[first];\n    for (int j = first + 1; j < last; j++) { const i64t v = (i64t)a[j]; if (v ")
+                    .Append(reduction == GpuIntegerReduction.Min ? "<" : ">").Append(" s) s = v; }\n    o[i] = s;\n}\n");
+            }
         }
 
         // The 16-bit float kernels ride in the same program: one compile, one module.
