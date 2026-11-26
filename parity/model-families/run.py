@@ -56,6 +56,13 @@ def delegate(args, root):
         command.append("--smoke")
     if args.allow_battery:
         command.append("--allow-battery")
+    if args.scale:
+        # Large-data mode: whole epochs over real and synthetic datasets, built by the pinned prepare_data.py.
+        command += ["--scale", str(args.scale.resolve())]
+        if args.scale_torch_from:
+            command += ["--scale-torch-from", str(args.scale_torch_from.resolve())]
+    if args.gpu_clock_lock:
+        command += ["--gpu-clock-lock", str(args.gpu_clock_lock)]
     env = os.environ.copy()
     env.setdefault("TORCHINDUCTOR_CACHE_DIR", str(root / "inductor-cache"))
     env.setdefault("TRITON_CACHE_DIR", str(root / "triton-cache"))
@@ -73,6 +80,14 @@ def main():
                         "to PyTorch's first update (current snapshots always check it)")
     parser.add_argument("--work", type=Path, default=DEFAULT_WORK, help="Dedicated source, build, cache and results directory")
     parser.add_argument("--allow-battery", action="store_true", help="Run even when the machine is on battery power")
+    parser.add_argument("--scale", type=Path, metavar="DATA_ROOT",
+                        help="Large-data comparison: whole epochs over the real and 1,000,000-sample synthetic datasets in "
+                             "DATA_ROOT, built first by the snapshot's scale/prepare_data.py when missing")
+    parser.add_argument("--scale-torch-from", type=Path, metavar="SUMMARY_CSV",
+                        help="With --scale, run only the fastest PyTorch configuration per training row of this summary.csv")
+    parser.add_argument("--gpu-clock-lock", type=int, metavar="MHZ",
+                        help="Declare that the GPU's SM clock is locked at MHZ (nvidia-smi -lgc MHZ,MHZ as administrator); "
+                             "the pinned runner refuses to start unless the GPU sustains it")
     args = parser.parse_args()
     if args.launches is not None and args.launches < 1 or len(set(args.devices)) != len(args.devices) or len(set(args.models)) != len(args.models):
         parser.error("Choose positive launches and unique models/devices.")
@@ -89,6 +104,19 @@ def main():
     require_external_power(args.allow_battery)
 
     root = prepare(args.work, args.snapshot)
+    runner = root / "AiDotNet/benchmarks/AiDotNet.PyTorchParity/run_matrix.py"
+    if args.gpu_clock_lock and (args.snapshot in HISTORICAL or "--gpu-clock-lock" not in runner.read_text(encoding="utf-8")):
+        parser.error(f"Snapshot {args.snapshot}'s runner has no --gpu-clock-lock; choose a later --snapshot")
+    if args.scale:
+        builder = root / "AiDotNet/benchmarks/AiDotNet.PyTorchParity/scale/prepare_data.py"
+        if args.snapshot in HISTORICAL or not builder.is_file():
+            parser.error(f"Snapshot {args.snapshot} has no large-data mode; choose a later --snapshot")
+        # Idempotent: datasets whose meta.json exists are kept, so a second run reuses the verified files.
+        missing = [n for n in ("emnist-digits", "emnist-seq32", "cinic10", "synth-mnist", "synth-seq32", "synth-rgb32")
+                   if not (args.scale / n / "meta.json").is_file()]
+        if missing and subprocess.run([sys.executable, str(builder), "--root", str(args.scale), "--datasets",
+                                       ",".join(missing)]).returncode:
+            sys.exit("Building the large-data datasets failed")
     if args.snapshot not in HISTORICAL:
         delegate(args, root)
     launches = args.launches if args.launches is not None else (1 if args.smoke else 2)

@@ -28,8 +28,10 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// - Third dimension: color channels (red, green, blue)
 /// </para>
 /// </remarks>
-public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
+public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedDeviceTensor
 {
+    void Engines.IScopedDeviceTensor.ReleaseFromScope(Engines.DirectGpuTensorEngine engine)
+        => engine.ReleaseDeadDeviceStorage(this, afterQueuedWork: true);
     /// <summary>
     /// Accumulated gradient from backward passes. Null until first backward, then
     /// lazily allocated and reused across training steps to avoid per-step allocation.

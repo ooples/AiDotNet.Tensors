@@ -530,190 +530,147 @@ kernel void causal_dwconv1d_backward_kernel(
     dw[jc] = acc;
 }
 
-kernel void gated_delta_scan_recompute(
-    device const float* K [[buffer(0)]], device const float* V [[buffer(1)]],
-    device const float* A [[buffer(2)]], device const float* B [[buffer(3)]],
-    device float* Straj [[buffer(4)]],
-    constant int& batch [[buffer(5)]], constant int& seqLen [[buffer(6)]], constant int& modelDim [[buffer(7)]],
-    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]],
-    constant int& keyScaleBits [[buffer(10)]], constant int& decayFirst [[buffer(11)]], uint gid [[thread_position_in_grid]])
-{
-    int total = batch * numHeads * headDim;
-    if ((int)gid >= total) return;
-    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
-    int hOff = h * headDim; int hh = headDim * headDim;
-    float kappa = as_type<float>(keyScaleBits);
-    float Srow[REC_MAX_HEADDIM];
-    for (int ki = 0; ki < headDim; ki++) Srow[ki] = 0.0f;
-    for (int t = 0; t < seqLen; t++) {
-        int baseOff = (b * seqLen + t) * modelDim + hOff;
-        int gIdx = (b * seqLen + t) * numHeads + h;
-        float a = A[gIdx], bet = B[gIdx];
-        float sK = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) sK += Srow[ki] * (K[baseOff + ki] * kappa);
-        float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
-        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
-        for (int ki = 0; ki < headDim; ki++) { float s = a * Srow[ki] + bd * (K[baseOff + ki] * kappa); Srow[ki] = s; Straj[trajBase + ki] = s; }
-    }
-}
-
-kernel void gated_delta_scan_backward(
+/ Checkpointed backward (GatedDeltaNetCheckpoint): one work-group per (batch, head) whose threads stride over the
+// state rows. Pass 1 saves the state entering every `chunk` steps (Ckpt); pass 2 walks the chunks in reverse,
+// recomputes the chunk's states (Scratch), sums dQ over the rows, runs BPTT per row (carrying the row's adjoint in dS
+// between chunks, and overwriting each Scratch row with its dK contribution once nothing reads it), then sums dK, dA
+// and dB over the rows. Every sum runs over di in ascending order behind a barrier: deterministic, no atomics, every
+// output element written.
+kernel void gated_delta_scan_backward_ckpt(
     device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
     device const float* V [[buffer(3)]], device const float* A [[buffer(4)]], device const float* B [[buffer(5)]],
-    device const float* Straj [[buffer(6)]],
-    device atomic_uint* dQ [[buffer(7)]], device atomic_uint* dK [[buffer(8)]], device float* dV [[buffer(9)]],
-    device atomic_uint* dA [[buffer(10)]], device atomic_uint* dB [[buffer(11)]],
+    device float* Work [[buffer(6)]],
+    device float* dQ [[buffer(7)]], device float* dK [[buffer(8)]], device float* dV [[buffer(9)]],
+    device float* dA [[buffer(10)]], device float* dB [[buffer(11)]],
     constant int& batch [[buffer(12)]], constant int& seqLen [[buffer(13)]], constant int& modelDim [[buffer(14)]],
-    constant int& numHeads [[buffer(15)]], constant int& headDim [[buffer(16)]],
-    constant int& keyScaleBits [[buffer(17)]], constant int& decayFirst [[buffer(18)]], uint gid [[thread_position_in_grid]])
+    constant int& numHeads [[buffer(15)]], constant int& headDim [[buffer(16)]], constant int& chunk [[buffer(17)]],
+    constant int& headStride [[buffer(18)]], constant int& keyScaleBits [[buffer(19)]], constant int& decayFirst [[buffer(20)]],
+    uint groupId [[threadgroup_position_in_grid]], uint localId [[thread_position_in_threadgroup]],
+    uint groupSize [[threads_per_threadgroup]])
 {
-    int total = batch * numHeads * headDim;
-    if ((int)gid >= total) return;
-    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
-    int hOff = h * headDim; int hh = headDim * headDim;
+    int bh = (int)groupId;
+    if (bh >= batch * numHeads) return;
+    int tid = (int)localId, nt = (int)groupSize;
+    int h = bh % numHeads, b = bh / numHeads, hOff = h * headDim, hd = headDim;
+    long hh = (long)hd * hd;
+    int nChunks = (seqLen + chunk - 1) / chunk;
+    device float* ck = Work + (long)bh * headStride;
+    device float* sc = ck + nChunks * hh;
+    device float* dsb = sc + chunk * hh;
+    device float* part = dsb + hh;
     float kappa = as_type<float>(keyScaleBits);
-    float dSrow[REC_MAX_HEADDIM];
-    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
-    for (int t = seqLen - 1; t >= 0; t--) {
-        int baseOff = (b * seqLen + t) * modelDim + hOff;
-        int gIdx = (b * seqLen + t) * numHeads + h;
-        float a = A[gIdx], bet = B[gIdx];
-        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
-        int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
-        float sK = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
-        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
-        float pa = decayFirst ? a : 1.0f;
-        float delta = V[baseOff + di] - pa * sK;
-        float dOutVal = dOut[baseOff + di];
-        for (int ki = 0; ki < headDim; ki++) {
-            float sval = Straj[trajBase + ki];
-            gla_atomic_add_f(dQ, baseOff + ki, dOutVal * sval);
-            dSrow[ki] += dOutVal * Q[baseOff + ki];
-        }
-        float dA_acc = 0.0f, dB_acc = 0.0f, dDelta = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            float kScaled = K[baseOff + ki] * kappa;
-            dA_acc += dSt * sprev;
-            dB_acc += dSt * delta * kScaled;
-            dDelta += dSt * bet * kScaled;
-        }
-        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
-        if (decayFirst) dA_acc -= dDelta * sK;
-        dV[baseOff + di] = dDelta;
-        gla_atomic_add_f(dA, gIdx, dA_acc);
-        gla_atomic_add_f(dB, gIdx, dB_acc);
-        float dSk = -dDelta;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            float kScaled = K[baseOff + ki] * kappa;
-            float dKS = dSt * (bet * delta) + dSk * pa * sprev;
-            gla_atomic_add_f(dK, baseOff + ki, dKS * kappa);
-            dSrow[ki] = dSt * a + dSk * pa * kScaled;
+    float R[REC_MAX_HEADDIM];
+    int tLast = (nChunks - 1) * chunk;
+
+    for (int di = tid; di < hd; di += nt) {
+        long rowOff = (long)di * hd;
+        for (int ki = 0; ki < hd; ki++) { R[ki] = 0.0f; dsb[rowOff + ki] = 0.0f; }
+        for (int t = 0; ; t++) {
+            if (t % chunk == 0) {
+                device float* dst = ck + (t / chunk) * hh + rowOff;
+                for (int ki = 0; ki < hd; ki++) dst[ki] = R[ki];
+            }
+            if (t == tLast) break;
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gIdx = (b * seqLen + t) * numHeads + h;
+            float a = A[gIdx], bet = B[gIdx];
+            float sK = 0.0f;
+            for (int ki = 0; ki < hd; ki++) sK += R[ki] * (K[baseOff + ki] * kappa);
+            float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
+            for (int ki = 0; ki < hd; ki++) R[ki] = a * R[ki] + bd * (K[baseOff + ki] * kappa);
         }
     }
-}
 
-// gated_delta_scan_backward without atomics, for deterministic mode: dQ comes from gated_delta_scan_dq, each row's dK
-// contribution overwrites that row of Straj (read only by this thread, and last read at step t + 1), and dA/dB go to
-// per-row partials P = [dA | dB]. gated_delta_scan_reduce then sums the rows in a fixed order.
-kernel void gated_delta_scan_backward_det(
-    device const float* dOut [[buffer(0)]], device const float* Q [[buffer(1)]], device const float* K [[buffer(2)]],
-    device const float* V [[buffer(3)]], device const float* A [[buffer(4)]], device const float* B [[buffer(5)]],
-    device float* Straj [[buffer(6)]], device float* P [[buffer(7)]], device float* dV [[buffer(8)]],
-    constant int& batch [[buffer(9)]], constant int& seqLen [[buffer(10)]], constant int& modelDim [[buffer(11)]],
-    constant int& numHeads [[buffer(12)]], constant int& headDim [[buffer(13)]],
-    constant int& keyScaleBits [[buffer(14)]], constant int& decayFirst [[buffer(15)]], uint gid [[thread_position_in_grid]])
-{
-    int total = batch * numHeads * headDim;
-    if ((int)gid >= total) return;
-    int di = (int)gid % headDim; int h = ((int)gid / headDim) % numHeads; int b = (int)gid / (headDim * numHeads);
-    int hOff = h * headDim; int hh = headDim * headDim;
-    float kappa = as_type<float>(keyScaleBits);
-    float dSrow[REC_MAX_HEADDIM];
-    for (int ki = 0; ki < headDim; ki++) dSrow[ki] = 0.0f;
-    for (int t = seqLen - 1; t >= 0; t--) {
-        int baseOff = (b * seqLen + t) * modelDim + hOff;
-        int gIdx = (b * seqLen + t) * numHeads + h;
-        float a = A[gIdx], bet = B[gIdx];
-        int trajBase = ((b * numHeads + h) * seqLen + t) * hh + di * headDim;
-        int sprevBase = (t > 0) ? (((b * numHeads + h) * seqLen + (t - 1)) * hh + di * headDim) : 0;
-        float sK = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) { float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f; sK += sprev * (K[baseOff + ki] * kappa); }
-        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
-        float pa = decayFirst ? a : 1.0f;
-        float delta = V[baseOff + di] - pa * sK;
-        float dOutVal = dOut[baseOff + di];
-        for (int ki = 0; ki < headDim; ki++) {
-            dSrow[ki] += dOutVal * Q[baseOff + ki];
+    for (int c = nChunks - 1; c >= 0; c--) {
+        int t0 = c * chunk;
+        int len = min(seqLen - t0, chunk);
+        device float* ckc = ck + c * hh;
+        for (int di = tid; di < hd; di += nt) {
+            long rowOff = (long)di * hd;
+            for (int ki = 0; ki < hd; ki++) R[ki] = ckc[rowOff + ki];
+            for (int lt = 0; lt < len; lt++) {
+                int t = t0 + lt;
+                int baseOff = (b * seqLen + t) * modelDim + hOff;
+                int gIdx = (b * seqLen + t) * numHeads + h;
+                float a = A[gIdx], bet = B[gIdx];
+                float sK = 0.0f;
+                for (int ki = 0; ki < hd; ki++) sK += R[ki] * (K[baseOff + ki] * kappa);
+                float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
+                device float* dst = sc + lt * hh + rowOff;
+                for (int ki = 0; ki < hd; ki++) {
+                    float s = a * R[ki] + bd * (K[baseOff + ki] * kappa);
+                    R[ki] = s;
+                    dst[ki] = s;
+                }
+            }
         }
-        float dA_acc = 0.0f, dB_acc = 0.0f, dDelta = 0.0f;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            float kScaled = K[baseOff + ki] * kappa;
-            dA_acc += dSt * sprev;
-            dB_acc += dSt * delta * kScaled;
-            dDelta += dSt * bet * kScaled;
-        }
-        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
-        if (decayFirst) dA_acc -= dDelta * sK;
-        dV[baseOff + di] = dDelta;
-        P[gIdx * headDim + di] = dA_acc;
-        P[batch * seqLen * modelDim + gIdx * headDim + di] = dB_acc;
-        float dSk = -dDelta;
-        for (int ki = 0; ki < headDim; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t > 0) ? Straj[sprevBase + ki] : 0.0f;
-            float kScaled = K[baseOff + ki] * kappa;
-            float dKS = dSt * (bet * delta) + dSk * pa * sprev;
-            Straj[trajBase + ki] = dKS * kappa;
-            dSrow[ki] = dSt * a + dSk * pa * kScaled;
-        }
-    }
-}
+        threadgroup_barrier(mem_flags::mem_device);
 
-// Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].
-kernel void gated_delta_scan_dq(
-    device const float* dOut [[buffer(0)]], device const float* Straj [[buffer(1)]], device float* dQ [[buffer(2)]],
-    constant int& batch [[buffer(3)]], constant int& seqLen [[buffer(4)]], constant int& modelDim [[buffer(5)]],
-    constant int& numHeads [[buffer(6)]], constant int& headDim [[buffer(7)]], uint gid [[thread_position_in_grid]])
-{
-    int g = (int)gid;
-    if (g >= batch * seqLen * modelDim) return;
-    int ki = g % headDim; int h = (g / headDim) % numHeads; int bt = g / modelDim; int t = bt % seqLen; int b = bt / seqLen;
-    int trajT = ((b * numHeads + h) * seqLen + t) * headDim * headDim;
-    int base = bt * modelDim + h * headDim;
-    float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += dOut[base + di] * Straj[trajT + di * headDim + ki];
-    dQ[g] = acc;
-}
+        for (int e = tid; e < len * hd; e += nt) {
+            int lt = e / hd, ki = e % hd;
+            int base = (b * seqLen + t0 + lt) * modelDim + hOff;
+            device const float* st = sc + lt * hh;
+            float acc = 0.0f;
+            for (int di = 0; di < hd; di++) acc += dOut[base + di] * st[(long)di * hd + ki];
+            dQ[base + ki] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
 
-// Deterministic reduction of gated_delta_scan_backward_det's partials: dK from the rows of PK (the overwritten
-// trajectory) and dA/dB from P = [dA | dB], each summed over di in ascending order.
-kernel void gated_delta_scan_reduce(
-    device const float* PK [[buffer(0)]], device const float* P [[buffer(1)]], device float* dK [[buffer(2)]],
-    device float* dA [[buffer(3)]], device float* dB [[buffer(4)]],
-    constant int& batch [[buffer(5)]], constant int& seqLen [[buffer(6)]], constant int& modelDim [[buffer(7)]],
-    constant int& numHeads [[buffer(8)]], constant int& headDim [[buffer(9)]], uint gid [[thread_position_in_grid]])
-{
-    int g = (int)gid;
-    int n = batch * seqLen * modelDim;
-    if (g >= n) return;
-    int ki = g % headDim; int h = (g / headDim) % numHeads; int bt = g / modelDim; int t = bt % seqLen; int b = bt / seqLen;
-    int trajT = ((b * numHeads + h) * seqLen + t) * headDim * headDim;
-    float acc = 0.0f;
-    for (int di = 0; di < headDim; di++) acc += PK[trajT + di * headDim + ki];
-    dK[g] = acc;
-    if (ki == 0) {
-        int gIdx = bt * numHeads + h;
-        float sa = 0.0f, sb = 0.0f;
-        for (int di = 0; di < headDim; di++) { sa += P[gIdx * headDim + di]; sb += P[n + gIdx * headDim + di]; }
-        dA[gIdx] = sa;
-        dB[gIdx] = sb;
+        for (int di = tid; di < hd; di += nt) {
+            long rowOff = (long)di * hd;
+            for (int ki = 0; ki < hd; ki++) R[ki] = dsb[rowOff + ki];
+            for (int lt = len - 1; lt >= 0; lt--) {
+                int t = t0 + lt;
+                int baseOff = (b * seqLen + t) * modelDim + hOff;
+                int gIdx = (b * seqLen + t) * numHeads + h;
+                float a = A[gIdx], bet = B[gIdx];
+                float pa = decayFirst ? a : 1.0f;
+                device const float* sp = (lt > 0 ? sc + (lt - 1) * hh : ckc) + rowOff;
+                device float* kOut = sc + lt * hh + rowOff;
+                float sK = 0.0f;
+                for (int ki = 0; ki < hd; ki++) sK += sp[ki] * (K[baseOff + ki] * kappa);
+                float delta = V[baseOff + di] - pa * sK;
+                float dOutVal = dOut[baseOff + di];
+                for (int ki = 0; ki < hd; ki++) R[ki] += dOutVal * Q[baseOff + ki];
+                float dA_acc = 0.0f, dB_acc = 0.0f, dDelta = 0.0f;
+                for (int ki = 0; ki < hd; ki++) {
+                    float kScaled = K[baseOff + ki] * kappa;
+                    dA_acc += R[ki] * sp[ki];
+                    dB_acc += R[ki] * delta * kScaled;
+                    dDelta += R[ki] * bet * kScaled;
+                }
+                if (decayFirst) dA_acc -= dDelta * sK;
+                dV[baseOff + di] = dDelta;
+                part[(2 * lt) * hd + di] = dA_acc;
+                part[(2 * lt + 1) * hd + di] = dB_acc;
+                float dSk = -dDelta;
+                for (int ki = 0; ki < hd; ki++) {
+                    float dSt = R[ki];
+                    float kScaled = K[baseOff + ki] * kappa;
+                    kOut[ki] = (dSt * (bet * delta) + dSk * pa * sp[ki]) * kappa;
+                    R[ki] = dSt * a + dSk * pa * kScaled;
+                }
+            }
+            for (int ki = 0; ki < hd; ki++) dsb[rowOff + ki] = R[ki];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        for (int e = tid; e < len * hd; e += nt) {
+            int lt = e / hd, ki = e % hd;
+            int base = (b * seqLen + t0 + lt) * modelDim + hOff;
+            device const float* pk = sc + lt * hh;
+            float acc = 0.0f;
+            for (int di = 0; di < hd; di++) acc += pk[(long)di * hd + ki];
+            dK[base + ki] = acc;
+        }
+        for (int lt = tid; lt < len; lt += nt) {
+            int gIdx = (b * seqLen + t0 + lt) * numHeads + h;
+            float sa = 0.0f, sb = 0.0f;
+            for (int di = 0; di < hd; di++) { sa += part[(2 * lt) * hd + di]; sb += part[(2 * lt + 1) * hd + di]; }
+            dA[gIdx] = sa;
+            dB[gIdx] = sb;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
