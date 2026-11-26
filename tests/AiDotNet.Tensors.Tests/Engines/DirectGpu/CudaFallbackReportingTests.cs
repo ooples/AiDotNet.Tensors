@@ -257,7 +257,7 @@ public class CudaFallbackReportingTests
     /// weight buffers, the caches, the backend itself) were skipped and a retry returned at once, so the context
     /// leaked. Every copy is now tried, every later stage runs, and the failures are reported together.
     /// </summary>
-    [Fact]
+    [SkippableFact]
     public void A_failing_host_mask_release_neither_stops_the_other_copies_nor_the_rest_of_the_disposal()
     {
         DirectGpuTensorEngine gpu;
@@ -292,28 +292,36 @@ public class CudaFallbackReportingTests
         Assert.Equal(cuda, AiDotNetEngine.IsCudaBackendName(name));
 
     /// <summary>
-    /// After a trip, a superseded engine on another backend is released (a CUDA fault does not affect it) while a CUDA
-    /// engine stays listed and open on the corrupted context.
+    /// After a trip every detection returns at the breaker; it still releases a superseded engine on another backend (a
+    /// CUDA fault does not affect it), while a CUDA engine stays listed and open on the corrupted context.
     /// </summary>
     [SkippableFact]
     public void After_a_trip_superseded_engines_of_other_backends_are_released_and_CUDA_ones_kept()
     {
         Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU") is { Length: > 0 }, "GPU detection is disabled.");
-        var openCl = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL);
-        Skip.If(openCl is null || !openCl.BackendName.StartsWith("OpenCL", StringComparison.Ordinal), "No OpenCL device.");
-        var cuda = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.CUDA);
-        DirectGpuTensorEngine other = new(new DirectGpuEngine(openCl!));
-        DirectGpuTensorEngine? onCuda = cuda is not null && AiDotNetEngine.IsCudaBackendName(cuda.BackendName)
-            ? new DirectGpuTensorEngine(new DirectGpuEngine(cuda)) : null;
+        var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
+        var previousRequired = GpuBackendOptions.RequiredBackend;
+        IDirectGpuBackend? openCl = null, cuda = null;
+        DirectGpuTensorEngine? other = null, onCuda = null;
         try
         {
+            openCl = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL);
+            Skip.If(openCl is null || !openCl.BackendName.StartsWith("OpenCL", StringComparison.Ordinal), "No OpenCL device.");
+            cuda = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.CUDA);
+            other = new DirectGpuTensorEngine(new DirectGpuEngine(openCl!));
+            if (cuda is not null && AiDotNetEngine.IsCudaBackendName(cuda.BackendName))
+                onCuda = new DirectGpuTensorEngine(new DirectGpuEngine(cuda));
+            GpuBackendOptions.RequiredBackend = GpuBackendType.None;
+
             AiDotNetEngine.OpenGpuCircuitBreakerForTests();
-            AiDotNetEngine.ReleaseSupersededGpuForTests(other);
+            // Parked with the breaker open: a parked CUDA engine is kept, the OpenCL one waits for a release pass.
+            if (onCuda is not null) AiDotNetEngine.ReleaseSupersededGpuForTests(onCuda);
+            AiDotNetEngine.ParkSupersededForTests(other);
+            Assert.False(AiDotNetEngine.AutoDetectAndConfigureGpu(verbose: false));
             Assert.True(other.IsDisposed, "a superseded OpenCL engine was kept open after a CUDA trip");
             Assert.False(AiDotNetEngine.IsSupersededForTests(other));
             if (onCuda is not null)
             {
-                AiDotNetEngine.ReleaseSupersededGpuForTests(onCuda);
                 Assert.False(onCuda.IsDisposed, "a CUDA engine was torn down on the corrupted context");
                 Assert.True(AiDotNetEngine.IsSupersededForTests(onCuda));
             }
@@ -321,8 +329,13 @@ public class CudaFallbackReportingTests
         finally
         {
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            GpuBackendOptions.RequiredBackend = previousRequired;
+            AiDotNetEngine.RestoreCurrentForTests(savedSlot);
             if (onCuda is not null) { AiDotNetEngine.ForgetSupersededForTests(onCuda); onCuda.Dispose(); }
-            if (!other.IsDisposed) { AiDotNetEngine.ForgetSupersededForTests(other); other.Dispose(); }
+            if (other is not null) { AiDotNetEngine.ForgetSupersededForTests(other); if (!other.IsDisposed) other.Dispose(); }
+            // The engines borrow these backends: they are the test's to free.
+            openCl?.Dispose();
+            cuda?.Dispose();
         }
     }
 

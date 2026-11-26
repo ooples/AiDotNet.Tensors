@@ -32158,51 +32158,56 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         IsDisposed = true;
         Helpers.PooledArrayRecycling.Unregister(this);
         UnregisterAsBackendOwner();
-        // Clear activation cache to free GPU memory from cached activations
-        ClearActivationCache();
-
-        // Results callers still hold keep their values: each live one downloads (if its host copy is stale) and lets
-        // go of its device buffer while the backend can still do both. Only when this engine frees the backend; a
-        // shared backend keeps serving them.
-        ReleaseIndexReplayBindings();
-        if (_ownsDirectGpu) _ownedResults.EvacuateAll();
-        _compiledWorkspaceBroker?.Release();
-        _compiledWorkspaceBroker = null;
-
-        ReleaseGraphAttentionGraphs();
-
-        // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in these
-        // buffers: their host arrays download before the buffers are freed.
-        foreach (var key in _persistentBufferCache.Keys)
-        {
-            if (!Helpers.HostSync.IsPending(key)) continue;
-            try { Helpers.HostSync.TryMaterialize(key); }
-            catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
-            {
-                System.Diagnostics.Trace.TraceWarning(
-                    $"[DirectGpu] A device-updated parameter could not be downloaded before the engine was released: {ex.Message}");
-            }
-        }
-
-        // Dispose all cached GPU buffers
-        foreach (var entry in _persistentBufferCache.Values)
-        {
-            entry.Dispose();
-        }
-        _persistentBufferCache.Clear();
-        _tensorVersions.Clear();
-        _persistentWeightHostVersion.Clear();
-        // Each later stage runs even when one throws, and the backend is disposed last either way: an exception from one
-        // stage used to skip the rest and the backend's own disposal, and a retry returned at once, so the context
-        // leaked. The failures are rethrown together at the end.
+        // Each stage runs even when one throws, and the backend is disposed last either way: an exception from one stage
+        // used to skip the rest and the backend's own disposal, and a retry returned at once, so the context leaked.
+        // The failures are rethrown together at the end. After the circuit breaker tripped on a CUDA backend no stage
+        // runs (each would issue native calls on the corrupted context); the backend's dispose then skips its teardown.
         List<Exception>? failures = null;
+        bool corrupted = CorruptedByBreaker();
         void Stage(Action stage)
         {
+            if (corrupted || (corrupted = CorruptedByBreaker())) return;
             try { stage(); }
             catch (Exception ex) when (ex is not OutOfMemoryException) { (failures ??= new List<Exception>()).Add(ex); }
         }
         try
         {
+            // Clear activation cache to free GPU memory from cached activations
+            Stage(ClearActivationCache);
+
+            // Results callers still hold keep their values: each live one downloads (if its host copy is stale) and
+            // lets go of its device buffer while the backend can still do both. Only when this engine frees the
+            // backend; a shared backend keeps serving them.
+            Stage(ReleaseIndexReplayBindings);
+            if (_ownsDirectGpu) Stage(() => _ownedResults.EvacuateAll());
+            Stage(() => { _compiledWorkspaceBroker?.Release(); _compiledWorkspaceBroker = null; });
+
+            Stage(ReleaseGraphAttentionGraphs);
+
+            Stage(() =>
+            {
+                // Parameters an optimizer updated on the device (CommitParameterUpdatedOnDevice) are current only in
+                // these buffers: their host arrays download before the buffers are freed.
+                foreach (var key in _persistentBufferCache.Keys)
+                {
+                    if (!Helpers.HostSync.IsPending(key)) continue;
+                    try { Helpers.HostSync.TryMaterialize(key); }
+                    catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException)
+                    {
+                        System.Diagnostics.Trace.TraceWarning(
+                            $"[DirectGpu] A device-updated parameter could not be downloaded before the engine was released: {ex.Message}");
+                    }
+                }
+
+                // Dispose all cached GPU buffers
+                foreach (var entry in _persistentBufferCache.Values)
+                {
+                    entry.Dispose();
+                }
+                _persistentBufferCache.Clear();
+                _tensorVersions.Clear();
+                _persistentWeightHostVersion.Clear();
+            });
             Stage(ReleaseBf16DeviceWeights);
             Stage(ReleaseHostMaskDeviceCopies);
             Stage(() =>
@@ -32259,11 +32264,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (_ownsDirectGpu) Stage(() => _directGpu?.Dispose());
+            // Not through Stage: it runs after a trip as well, and the backend's dispose skips its native teardown then.
+            if (_ownsDirectGpu)
+            {
+                try { _directGpu?.Dispose(); }
+                catch (Exception ex) when (ex is not OutOfMemoryException) { (failures ??= new List<Exception>()).Add(ex); }
+            }
         }
         if (failures is { Count: 1 }) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
         if (failures is { Count: > 1 }) throw new AggregateException("Disposing the GPU engine failed in several stages.", failures);
         return true;
+    }
+
+    // Whether this engine's backend is CUDA and the circuit breaker has found its context corrupted.
+    private bool CorruptedByBreaker()
+    {
+        if (!AiDotNetEngine.GpuCircuitBroken) return false;
+        try { return AiDotNetEngine.IsCudaBackendName(_directGpu?.BackendName); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return true; }
     }
 
     /// <summary>

@@ -1127,7 +1127,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // A backend used after its teardown completed would launch unloaded kernels into freed pool memory -- an
         // illegal address (CUDA 700) that poisons the device's shared primary context for EVERY engine in the
         // process. Fail the caller instead. (During Dispose itself the context is still held, so teardown works.)
-        if (_disposed && _cudaContext == IntPtr.Zero)
+        // A backend disposed after a breaker trip keeps its context (its teardown was skipped) but is just as unusable.
+        if (_disposed && (_cudaContext == IntPtr.Zero || AiDotNetEngine.GpuCircuitBroken))
             throw new ObjectDisposedException(nameof(CudaBackend),
                 "This CUDA backend (and the DirectGpuTensorEngine that owns it) was disposed; it can no longer run " +
                 "operations. A tensor or engine reference outlived its engine.");
@@ -20370,7 +20371,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (AiDotNetEngine.GpuCircuitBroken)
         {
             System.Diagnostics.Trace.TraceWarning("[CUDA] Backend disposed after the GPU circuit breaker tripped: its context is left to the process exit.");
-            if (disposing) GC.SuppressFinalize(this);
             return;
         }
 

@@ -972,6 +972,12 @@ public static class AiDotNetEngine
     /// <summary>Parks <paramref name="engine"/> in the superseded list and runs a release pass over it (tests).</summary>
     internal static void ReleaseSupersededGpuForTests(DirectGpuTensorEngine engine) => ReleaseSupersededGpu(engine);
 
+    /// <summary>Adds <paramref name="engine"/> to the superseded list without a release pass (tests).</summary>
+    internal static void ParkSupersededForTests(DirectGpuTensorEngine engine)
+    {
+        lock (_adoptionLock) if (!_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
+    }
+
     /// <summary>Whether <paramref name="engine"/> is still in the superseded list (tests).</summary>
     internal static bool IsSupersededForTests(DirectGpuTensorEngine engine)
     {
