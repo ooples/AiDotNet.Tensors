@@ -131,7 +131,7 @@ public sealed class TensorScope : IDisposable
     // the plan keeps it observable (LazyTensorScope.RetainedNodes).
     private static void MarkRetainedIfTraced<T>(Tensor<T> tensor)
     {
-        if (tensor.LazySource is Compilation.ILazyNode node && Compilation.GraphMode.Current is { } trace) trace.MarkRetained(node);
+        if (tensor.LazySource is Compilation.ILazyNode node && Compilation.GraphMode.Current is { } trace) trace.MarkRetained<T>(node);
     }
 
     /// <summary>
