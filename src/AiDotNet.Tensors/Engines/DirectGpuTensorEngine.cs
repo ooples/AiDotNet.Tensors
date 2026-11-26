@@ -2069,8 +2069,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             result = gathered;
             return true;
         }
-        if (baseBuffer is null || view._storageOffset < 0 || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
-        if (view._storageOffset == 0 && view.Length == baseBuffer.Size) return false;
+        if (view._storageOffset == 0) return false;
+        if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
         var output = AllocateFullyWrittenOutputBuffer(backend, view.Length);
         try
         {
@@ -2184,7 +2184,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
-        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0 || !tensor.CoversWholeVector;
+        bool isView = !tensor.IsContiguous || tensor._storageOffset != 0;
         int tCountG = 0;
         var tHalfG = isView ? null : TryFp16ResidentInput(tensor, out tCountG);
         if (tHalfG is not null)
@@ -2280,7 +2280,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Get the backing array reference WITHOUT triggering materialization.
         // This is critical: GetDataArray() would download from GPU, which is wasteful
         // when we're about to find the GPU buffer in the activation cache.
-        var backingArray = tensor.CoversWholeVector ? tensor.GetBackingArrayForCacheLookupUnsafe() : null;
+        var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is not null)
         {
             // Persistent tensors use the same host-version gate as the dedicated weight path.
@@ -2689,7 +2689,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // gave a wrong result (an innermost-axis IEngine.ReduceSum of a permuted resident tensor was off by
         // 3.7, #1090). GetOrAllocateBuffer resolves views: it permutes or slices on the device, else
         // materializes the view's logical layout.
-        if (!tensor.IsContiguous || tensor._storageOffset != 0 || !tensor.CoversWholeVector)
+        if (!tensor.IsContiguous || tensor._storageOffset != 0)
             return GetOrAllocateBuffer(backend, tensor);
         // As GetOrAllocateBuffer: a released intermediate fails loudly instead of handing out a buffer the pool may have
         // re-rented, and a device read of a quarantined one is reported to the probe. The resident and activation-cache
