@@ -125,9 +125,17 @@ public partial class DirectGpuTensorEngine
     private bool TryBf16StreamingWeight<T>(IDirectGpuBackend backend, Tensor<T> t, out OwnedBuffer buffer)
     {
         buffer = default;
-        if (typeof(T) != typeof(float) || t.Lifetime != WeightLifetime.Streaming || t.StreamingPoolHandle < 0
-            || t.StreamingStoreEncoding != StreamingEncoding.Bf16 || !t.IsContiguous || t._storageOffset != 0)
+        if (typeof(T) != typeof(float) || t.Lifetime != WeightLifetime.Streaming || t.StreamingPoolHandle < 0)
             return false;
+        if (t.StreamingStoreEncoding != StreamingEncoding.Bf16)
+        {
+            // The store left bf16 (promoted to a writable encoding for training): a copy made before is dead, and
+            // nothing would read it again, so its device memory goes now rather than when the weight is collected.
+            lock (_bf16WeightsLock)
+                if (_bf16Weights.TryGetValue(t, out var stale)) ReleaseBf16Copy(stale, queued: true);
+            return false;
+        }
+        if (!t.IsContiguous || t._storageOffset != 0) return false;
         if (backend is not IBf16WidenBackend widen || !widen.CanWidenBf16) return false;
         // The first use uploads (a synchronous copy), which a stream capture cannot record.
         if (backend is IGpuGraphCapture capture && capture.IsStreamCapturing()) return false;

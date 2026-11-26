@@ -1983,7 +1983,10 @@ public static partial class WeightRegistry
         lock (_lock) { pool = _streamingPool; }
         if (pool is null) return null;
         var bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
-        return bytes.Length == 2L * weight.Length ? bytes : null;
+        if (bytes.Length != 2L * weight.Length)
+            throw new InvalidOperationException(
+                $"The bf16 store entry of a {weight.Length}-element weight holds {bytes.Length} bytes, not {2L * weight.Length}.");
+        return bytes;
     }
 
     /// <summary>

@@ -192,4 +192,42 @@ public class StreamingBf16InferenceTests
         var b = Stream(Filled(new[] { N }, 3, v => v));
         gpu.FusedLinear(x, w, b, FusedActivationType.None);
     }
+
+    /// <summary>
+    /// A bf16 streaming weight trained after its device copy was made: switching to training promotes the store to a
+    /// writable encoding, and each of several steps writes new values into the weight (as an optimizer step does) and
+    /// runs the op on the GPU and the CPU. The GPU must read the written values, bit for bit with the CPU, and the bf16
+    /// device copies made before the promotion must be released, not held until the weights are collected.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_bf16_weight_written_after_its_device_copy_is_read_with_the_written_values()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        var cpu = new CpuEngine();
+        var x = Filled(new[] { M, K }, 1, v => v);
+        var dir = Configure();
+        try
+        {
+            var w = Stream(Filled(new[] { K, N }, 2, v => v));
+            var b = Stream(Filled(new[] { N }, 3, v => v));
+            gpu.FusedLinear(x, w, b, FusedActivationType.None);   // makes the device copy from the stored bytes
+            WeightRegistry.SetStreamingExecutionTraining(true);
+            for (int step = 1; step <= 3; step++)
+            {
+                WeightRegistry.Materialize(w);
+                for (int i = 0; i < w.Length; i++) w.SetFlat(i, Value(i, 2 + 5 * step));   // exact in bf16
+                var expected = cpu.FusedLinear(x, w, b, FusedActivationType.None);
+                var actual = gpu.FusedLinear(x, w, b, FusedActivationType.None);
+                for (int i = 0; i < M * N; i++)
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected.GetFlat(i)) == TestHelpers.MathCompat.SingleToInt32Bits(actual.GetFlat(i)),
+                        $"step {step} [{i}]: GPU {actual.GetFlat(i)} vs CPU {expected.GetFlat(i)}");
+            }
+            // The copies made from the bf16 store are dead once it is promoted, and their device memory is released.
+            Assert.Equal(0L, gpu.Bf16WeightDeviceBytes);
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
 }

@@ -81,6 +81,50 @@ public class CudaFallbackReportingTests
         });
     }
 
+    /// <summary>
+    /// A required backend that fails the owed startup detection must keep failing: before, the detection's finally
+    /// marked it done, so the read after the throw silently returned the CPU engine the requirement ruled out. A GPU
+    /// engine adopted earlier on another backend (CUDA, on the CUDA lane) must not be reinstated in its place either.
+    /// </summary>
+    [SkippableFact]
+    public void DeferredDetection_RequiredBackendFailing_ThrowsOnEveryRead_NotJustTheFirst()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU") is { Length: > 0 }, "GPU detection is disabled.");
+        var saved = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = new CpuEngine();
+            // HIP: absent on the CPU and CUDA lanes, so the required backend fails without a fault hook.
+            var previousRequired = GpuBackendOptions.RequiredBackend;
+            GpuBackendOptions.RequiredBackend = GpuBackendType.Hip;
+            try
+            {
+                AiDotNetEngine.DeferGpuAutoDetection(verbose: false);
+                Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+                Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+                Assert.True(AiDotNetEngine.IsGpuAutoDetectionDeferred);
+            }
+            finally { GpuBackendOptions.RequiredBackend = previousRequired; }
+        }
+        finally { AiDotNetEngine.Current = saved; }
+        Assert.False(AiDotNetEngine.IsGpuAutoDetectionDeferred);
+    }
+
+    /// <summary>
+    /// The factory enforces the requirement on every route, not only the NVIDIA one: a contradicting preference is
+    /// refused, and a required backend that cannot be created throws instead of returning another backend or null.
+    /// </summary>
+    [Fact]
+    public void Factory_RequiredCuda_ThrowsOnEveryRoute_InsteadOfAnotherBackendOrNull()
+    {
+        WithCudaFailing(GpuBackendType.Cuda, () =>
+        {
+            Assert.Throws<ArgumentException>(() => DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL));
+            var ex = Assert.Throws<InvalidOperationException>(() => DirectGpuBackendFactory.CreateNew());
+            Assert.Contains(nameof(GpuBackendOptions.RequiredBackend), ex.Message);
+        });
+    }
+
     [Fact]
     public void Factory_NvidiaBackend_WarnsOnTheOpenClFallback_AndThrowsWhenCudaIsRequired()
     {

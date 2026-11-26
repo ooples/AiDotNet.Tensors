@@ -155,11 +155,16 @@ public static class AiDotNetEngine
             {
                 // AutoDetectAndConfigureGpu already falls back to CPU on its own failures; this guards the rest.
             }
-            finally
+            catch (Exception)
             {
+                // A required backend failed. The detection stays owed, so every later read of Current throws the
+                // failure again instead of handing out the CPU engine the caller ruled out. Assigning an engine
+                // explicitly clears it.
                 t_completingDeferred = false;
-                Volatile.Write(ref _deferredDetection, 0);
+                throw;
             }
+            t_completingDeferred = false;
+            Volatile.Write(ref _deferredDetection, 0);
         }
     }
 
@@ -394,7 +399,7 @@ public static class AiDotNetEngine
         // success path below overwrites Current without disposing it. A whole tournament of small models
         // therefore spent most of its time rebuilding (and leaking) GPU contexts. The circuit-breaker and
         // disable checks above already cover the cases where the current engine must NOT be reused.
-        if (Current.TryGet<DirectGpuTensorEngine>(out var adopted) && adopted.SupportsGpu)
+        if (Current.TryGet<DirectGpuTensorEngine>(out var adopted) && adopted.SupportsGpu && SatisfiesRequiredBackend(adopted))
         {
             return true;
         }
@@ -403,7 +408,7 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             var parked = _adoptedGpu;
-            if (parked is not null && !parked.IsDisposed && parked.SupportsGpu)
+            if (parked is not null && !parked.IsDisposed && parked.SupportsGpu && SatisfiesRequiredBackend(parked))
             {
                 PublishCurrent(parked);
                 Volatile.Write(ref _callerAssigned, false);
@@ -422,7 +427,7 @@ public static class AiDotNetEngine
                 {
                     // Another thread adopted while this one probed: keep its engine. This one was never published,
                     // so no other thread can hold it and disposing it here is safe.
-                    if (_adoptedGpu is { IsDisposed: false } winner && winner.SupportsGpu)
+                    if (_adoptedGpu is { IsDisposed: false } winner && winner.SupportsGpu && SatisfiesRequiredBackend(winner))
                     {
                         gpuEngine.Dispose();
                         PublishCurrent(winner);
@@ -744,6 +749,16 @@ public static class AiDotNetEngine
 
     /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
     internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
+
+    // An engine detection would reuse (the current one, a parked one, or another thread's) runs on the required backend,
+    // if one is required: reusing a CUDA engine while HIP is required is the silent substitution the option forbids.
+    private static bool SatisfiesRequiredBackend(DirectGpuTensorEngine engine)
+    {
+        var required = global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend;
+        return required == GpuBackendType.None
+            || (((IEngine)engine).DirectGpu?.BackendName is { } name
+                && name.StartsWith(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.NameOf(required), System.StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>True once a sticky CUDA fault has forced a permanent CPU fallback for this process.</summary>
     public static bool GpuCircuitBroken => _gpuCircuitBroken;

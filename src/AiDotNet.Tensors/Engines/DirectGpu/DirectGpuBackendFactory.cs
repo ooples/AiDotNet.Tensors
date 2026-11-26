@@ -52,6 +52,11 @@ public static class DirectGpuBackendFactory
             // Return cached backend if already created
             if (_cachedBackend is not null && _cachedBackend.IsAvailable)
             {
+                var required = GpuBackendOptions.RequiredBackend;
+                if (required != GpuBackendType.None && !IsBackend(_cachedBackend, required))
+                    throw new InvalidOperationException(
+                        $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is {required}, but this " +
+                        $"process's shared GPU backend is {_cachedBackend.BackendName}, created before the requirement was set.");
                 return _cachedBackend;
             }
 
@@ -147,11 +152,17 @@ public static class DirectGpuBackendFactory
         return gpus.ToArray();
     }
 
+    private static bool IsBackend(IDirectGpuBackend backend, GpuBackendType type)
+        => backend.BackendName.StartsWith(GpuBackendOptions.NameOf(type), StringComparison.OrdinalIgnoreCase);
+
     private static IDirectGpuBackend? CreateInternal(
         GpuBackendPreference preference,
         int deviceIndex,
         ILogger? logger)
     {
+        var required = GpuBackendOptions.RequiredBackend;
+        if (required != GpuBackendType.None) return CreateRequired(required, preference, deviceIndex, logger);
+
         // Detect vendor first
         _detectedVendor = DetectVendor();
 
@@ -175,6 +186,34 @@ public static class DirectGpuBackendFactory
             GpuVendor.Intel => CreateIntelBackend(deviceIndex, logger),
             _ => CreateFallbackBackend(deviceIndex, logger)
         };
+    }
+
+    // RequiredBackend set: only that backend is tried, whatever the vendor or preference, and its failure throws rather
+    // than leaving the caller on another backend or on no GPU.
+    private static IDirectGpuBackend CreateRequired(
+        GpuBackendType required, GpuBackendPreference preference, int deviceIndex, ILogger? logger)
+    {
+        string prefix = $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is {required}";
+        GpuBackendPreference matching = required switch
+        {
+            GpuBackendType.Cuda => GpuBackendPreference.CUDA,
+            GpuBackendType.Hip => GpuBackendPreference.HIP,
+            GpuBackendType.OpenCl => GpuBackendPreference.OpenCL,
+            _ => throw new NotSupportedException(
+                $"{prefix}, which this factory cannot create; create a {nameof(DirectGpuEngine)} instead."),
+        };
+        if (preference != GpuBackendPreference.Auto && preference != matching)
+            throw new ArgumentException($"{prefix}, which contradicts the requested {preference} backend.", nameof(preference));
+        string? failure = null;
+        var backend = required switch
+        {
+            GpuBackendType.Cuda => TryCreateCuda(deviceIndex, logger, out failure),
+            GpuBackendType.Hip => TryCreateHip(deviceIndex, logger),
+            _ => TryCreateOpenCl(deviceIndex, logger),
+        };
+        return backend ?? throw new InvalidOperationException(
+            $"{prefix}, and the {GpuBackendOptions.NameOf(required)} backend for device {deviceIndex} could not be " +
+            $"created: {failure ?? "no reason was reported"}.");
     }
 
     private static IDirectGpuBackend? CreateWithPreference(
