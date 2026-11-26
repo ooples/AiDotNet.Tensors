@@ -156,8 +156,14 @@ public class StreamingBf16InferenceTests
     /// weights exceed the budget re-uploads on every pass, and its host memory grew about two bytes per byte uploaded
     /// faster than the collector reclaimed it (a 7 GiB budget during one evaluation forward: 14 GB of host growth).
     /// </summary>
-    [SkippableFact]
-    public void Gpu_bf16_evict_and_reupload_cycles_make_no_host_copy_of_the_weight()
+    /// <remarks>Both with the weights resident in the pool and paged out of it: a paged-out weight was read back into a
+    /// fresh resident array on every upload (two for a compressed store), evicting another whose array became garbage.
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(64L * 1024 * 1024, false)]
+    [InlineData(64L * 1024, false)]
+    [InlineData(64L * 1024, true)]
+    public void Gpu_bf16_evict_and_reupload_cycles_make_no_host_copy_of_the_weight(long poolResidentBytes, bool compressed)
     {
         DirectGpuTensorEngine gpu;
         try { gpu = new DirectGpuTensorEngine(); }
@@ -169,8 +175,9 @@ public class StreamingBf16InferenceTests
         WeightRegistry.Configure(new GpuOffloadOptions
         {
             StreamingBackingStorePath = dir,
-            // Both weights stay resident in the pool, so a re-upload reads resident bytes and nothing pages in.
-            StreamingPoolMaxResidentBytes = 64L * 1024 * 1024,
+            // 64 MiB keeps both weights resident in the pool; 64 KiB pages them out, so every re-upload reads the disk.
+            StreamingPoolMaxResidentBytes = poolResidentBytes,
+            EnableCompression = compressed,
             StreamingStoreDtype = StreamingStoreDtype.Bf16,
         });
         WeightRegistry.SetStreamingExecutionTraining(false);
@@ -192,6 +199,8 @@ public class StreamingBf16InferenceTests
 
             Assert.True(gpu.Bf16WeightEvictions - evictions0 >= 2 * (cycles - 1), "the budget did not force re-uploads");
             Assert.True(uploaded >= (long)cycles * 2 * k * n, $"uploaded {uploaded} bytes");
+            if (poolResidentBytes < 2L * k * n)
+                Assert.True(WeightRegistry.StreamingPool.GetReport().DiskReadBytes > 0, "the weights never paged out");
             // A few small host results and bookkeeping per call; one weight-sized array per upload would be 1 MiB each.
             Assert.True(allocated < uploaded / 8,
                 $"{allocated} host bytes allocated for {uploaded} bf16 bytes uploaded over {cycles} re-uploads");
