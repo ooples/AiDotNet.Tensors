@@ -1507,7 +1507,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // download synchronizes the stream (the backward has finished) and its upload completes before the launch.
             // A deferred update (gradient accumulation) launches only the epilogue: the loss and the progress word are
             // published, and no applied step is counted.
-            if (ExchangeGradients(deviceAuthoritative: true))
+            _lastLaunchDeferred = ExchangeGradients(deviceAuthoritative: true);
+            if (_lastLaunchDeferred)
             {
                 LaunchStepGraph(cb, _epilogueGraphExec);
                 if (_capturedOptimizer is { } deferring) deferring.DeferredReplays++;
@@ -1562,7 +1563,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             optimizer.AgesApplied = applied;
         }
         _optimizerStep = (int)applied;
-        if (launched > 0)
+        // A deferred replay ran no update, so it has no verdict: the flag keeps the last update's, as on the eager path.
+        if (launched > 0 && !_lastLaunchDeferred)
         {
             double last = io.SumOfSquares(launched - 1);
             _lastStepSkippedNonFiniteGradients = double.IsNaN(last) || double.IsInfinity(last);
@@ -1852,6 +1854,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Part(() => DestroyUpdateGraph(gte));
         }
         _updateGraphExec = IntPtr.Zero;
+        _epilogueGraphExec = IntPtr.Zero;
         _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
@@ -4856,6 +4859,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     catch (Exception captureFailure)
                     {
                         RecordGraphCaptureFailure(captureFailure.GetType().Name + ": " + captureFailure.Message);
+                        // An update or epilogue graph captured before the throw is never launched: release it now.
+                        DestroyUpdateGraph(gte);
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback

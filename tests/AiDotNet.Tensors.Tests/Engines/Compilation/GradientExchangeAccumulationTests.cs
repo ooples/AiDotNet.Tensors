@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 [Collection("DirectGpuSerial")]
 public class GradientExchangeAccumulationTests
 {
-    private const int Rows = 4, In = 16, Hidden = 8, Out = 4, Micro = 4, Windows = 5;
+    private const int Rows = 4, In = 16, Hidden = 8, Out = 4, Windows = 5;
 
     private static float[] Values(int count, int seed, float scale)
     {
@@ -30,7 +30,7 @@ public class GradientExchangeAccumulationTests
     }
 
     // Micro-batch m of window w: its inputs, and its (made-up, unequal) valid-token count.
-    private static float[] MicroInputs(int window, int micro) => Values(Rows * In, 100 + window * Micro + micro, 2f);
+    private static float[] MicroInputs(int window, int micro) => Values(Rows * In, 100 + window * 8 + micro, 2f);
 
     private static long Tokens(int window, int micro) => 20 + (7 * window + 13 * micro) % 31;
 
@@ -108,11 +108,12 @@ public class GradientExchangeAccumulationTests
         public int OptimizerStep, Skipped;
         public long Exchanges, Deferred, UpdateLaunches;
         public bool Split;
+        public bool EpilogueCaptured;
     }
 
     // mode "accumulate": defer every micro-batch but the last of each window, then combine. mode "replace": one step per
     // window (on the window's last micro-batch) whose exchange writes the given gradients instead (the reference).
-    private static Run Train(IEngine engine, bool accumulate, IReadOnlyList<float[]>? replacement = null)
+    private static Run Train(IEngine engine, int Micro, bool accumulate, IReadOnlyList<float[]>? replacement = null)
     {
         var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(MicroInputs(0, 0)));
         var t = new Tensor<float>(new[] { Rows, Out }, new Vector<float>(Target));
@@ -175,6 +176,7 @@ public class GradientExchangeAccumulationTests
             run.Deferred = compiled.DeferredUpdateCount;
             run.UpdateLaunches = compiled.UpdateGraphReplayCount;
             run.Split = compiled.HasSplitStepGraph;
+            run.EpilogueCaptured = compiled.EpilogueGraphHandleForTests != IntPtr.Zero;
         }
         return run;
     }
@@ -212,15 +214,19 @@ public class GradientExchangeAccumulationTests
         return g1.Concat(g2).Select(v => (float)v).ToArray();
     }
 
+    // micro 4: the capture (the 4th step) is a window's last, so every window's update runs as the update graph. micro 3:
+    // the capture is a deferred step (the first of window 1), and window 0 ran before it, eagerly.
     [SkippableTheory]
-    [InlineData("cpu")]
-    [InlineData("device")]
-    public void DeferredMicroBatches_CombineBitwiseLikeTheEagerAccumulation_AndUpdateOncePerWindow(string where)
+    [InlineData("cpu", 4)]
+    [InlineData("device", 4)]
+    [InlineData("cpu", 3)]
+    [InlineData("device", 3)]
+    public void DeferredMicroBatches_CombineBitwiseLikeTheEagerAccumulation_AndUpdateOncePerWindow(string where, int Micro)
     {
         var engine = TestRequire.NotNull(ResolveEngine(where, out bool cuda), "the engine");
         using (engine as IDisposable)
         {
-            var acc = Train(engine, accumulate: true);
+            var acc = Train(engine, Micro, accumulate: true);
             Console.WriteLine($"cuda={cuda} split={acc.Split} exchanges={acc.Exchanges} deferred={acc.Deferred} "
                 + $"updateLaunches={acc.UpdateLaunches} optimizerStep={acc.OptimizerStep}");
 
@@ -229,9 +235,10 @@ public class GradientExchangeAccumulationTests
             // One applied step per window; a deferred step advances neither the count nor the schedule.
             Assert.Equal(Windows, acc.OptimizerStep);
             Assert.Equal(0, acc.Skipped);   // nor does it count as a discarded (non-finite) step
-            // CUDA captures on the 4th step (a window's last): every window's update then runs as the update graph.
+            // CUDA captures on the 4th step: every window whose last step comes at or after it updates as the update graph.
             Assert.Equal(cuda, acc.Split);
-            Assert.Equal(cuda ? Windows : 0, acc.UpdateLaunches);
+            Assert.Equal(cuda, acc.EpilogueCaptured);
+            Assert.Equal(cuda ? Enumerable.Range(0, Windows).Count(w => (w + 1) * Micro >= 4) : 0, acc.UpdateLaunches);
             // Every step published its own loss, deferred or not.
             Assert.Equal(acc.Losses, acc.ExchangedLosses);
 
@@ -258,8 +265,8 @@ public class GradientExchangeAccumulationTests
             // The update ran on the combined gradient: a plan that takes one step per window with the same gradients
             // written at its exchange follows the same weights (to the rounding of its eager warm-up updates), and one
             // given only the last micro-batch's gradient does not.
-            var reference = Train(engine, accumulate: false, acc.Combined);
-            var lastOnly = Train(engine, accumulate: false, acc.Raw.Select(r => r[Micro - 1]).ToList());
+            var reference = Train(engine, Micro, accumulate: false, acc.Combined);
+            var lastOnly = Train(engine, Micro, accumulate: false, acc.Raw.Select(r => r[Micro - 1]).ToList());
             double refDiff = acc.FinalWeights.Zip(reference.FinalWeights, (a, b) => Math.Abs(a - b)).Max();
             double lastDiff = acc.FinalWeights.Zip(lastOnly.FinalWeights, (a, b) => Math.Abs(a - b)).Max();
             Console.WriteLine($"referenceDiff={refDiff:G4} lastOnlyDiff={lastDiff:G4}");
@@ -305,6 +312,47 @@ public class GradientExchangeAccumulationTests
                 Assert.Contains("loss scaling", Assert.IsType<InvalidOperationException>(deferFailure).Message);
                 Assert.Equal(0, compiled.DeferredUpdateCount);
                 Assert.Equal(1, compiled.OptimizerStep);
+            }
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void ACallbackThatThrowsAfterDeferring_DropsTheWindow(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        {
+            var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(MicroInputs(0, 0)));
+            var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Values(In * Out, 5, 0.4f)));
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.TensorMultiplyScalar(engine.ReduceSum(engine.TensorMultiply(engine.TensorMatMul(x, w),
+                    engine.TensorMatMul(x, w)), null), 1f / Rows);
+                plan = scope.CompileTraining(new[] { w });
+            }
+            using (plan)
+            {
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+                int step = 0;
+                var held = new List<int>();
+                compiled.SetGradientExchange(exchange =>
+                {
+                    held.Add(exchange.AccumulatedSteps);
+                    exchange.DeferUpdate(1.0);
+                    // A collective after the local deferral fails on the third step.
+                    if (++step == 3) throw new TimeoutException("peer gone");
+                });
+                plan.Step();
+                plan.Step();
+                Assert.Throws<TimeoutException>(() => plan.Step());
+                Assert.Equal(0, compiled.AccumulatedGradientSteps);   // the window went with the failed step
+                plan.Step();
+                Assert.Equal(new[] { 0, 1, 2, 0 }, held);
+                Assert.Equal(1, compiled.AccumulatedGradientSteps);
             }
         }
     }

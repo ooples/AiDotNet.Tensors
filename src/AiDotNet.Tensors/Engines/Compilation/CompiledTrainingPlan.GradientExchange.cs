@@ -70,6 +70,9 @@ internal sealed class GradientExchange<T>
     /// <summary>Whether <see cref="DeferUpdate"/> ran on this step: the plan skips its update and keeps the gradients.</summary>
     internal bool UpdateDeferred { get; private set; }
 
+    /// <summary>Whether <see cref="CombineAccumulated"/> ran on this step.</summary>
+    internal bool CombinedAccumulation => _combined;
+
     /// <summary>The steps whose gradients the accumulator holds (deferred and not yet combined).</summary>
     public int AccumulatedSteps => _accumulation?.Steps ?? 0;
 
@@ -82,8 +85,10 @@ internal sealed class GradientExchange<T>
     /// update (its step count and learning-rate schedule do not advance; the loss is still published). The first
     /// deferred step sets the accumulator to <c>g * weight</c>, each later one adds <c>g * weight</c> to it; the multiply
     /// and the add are separate roundings (no fused multiply-add), so the sum is bitwise the eager
-    /// <c>acc = g1 * w1; acc += gm * wm</c>. The step's own gradient buffers are left scaled. A later step ends the
-    /// accumulation with <see cref="CombineAccumulated"/> before its exchange.
+    /// <c>acc = g1 * w1; acc += gm * wm</c> computed with the same backend Scale and Add operations (on CUDA these
+    /// flush subnormals, as the device's eager element-wise ops do). The step's own gradient buffers are left scaled. A
+    /// later step ends the accumulation with <see cref="CombineAccumulated"/> before its exchange. An exchange callback
+    /// that throws after this call drops the window (the accumulator already holds this step).
     /// </summary>
     /// <param name="weight">The step's weight (for a token-weighted mean, its valid-token count), rounded to the
     /// gradient type.</param>
@@ -639,12 +644,18 @@ internal sealed partial class CompiledTrainingPlan<T>
     // Whether the last exchange deferred its step's update (the plan then skipped the clip and the optimizer).
     private bool _lastStepUpdateDeferred;
 
+    // Whether the last launched split replay ran the epilogue-only graph (no update, so no finiteness verdict).
+    private bool _lastLaunchDeferred;
+
     // The epilogue-only graph a split step launches instead of the update graph when the exchange deferred the update:
     // it publishes the loss and the progress word without counting an applied step.
     private IntPtr _epilogueGraphExec;
 
     /// <summary>Steps whose exchange deferred the update (their gradients were accumulated instead).</summary>
     internal long DeferredUpdateCount { get; private set; }
+
+    /// <summary>The captured epilogue-only graph (zero when there is none), for tests.</summary>
+    internal IntPtr EpilogueGraphHandleForTests => _epilogueGraphExec;
 
     /// <summary>The deferred steps whose gradients the plan's accumulator holds now.</summary>
     internal int AccumulatedGradientSteps => _gradientAccumulation?.Steps ?? 0;
@@ -722,7 +733,17 @@ internal sealed partial class CompiledTrainingPlan<T>
         var step = new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
             _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray),
             _gradientAccumulation, deferRefusal);
-        exchange(step);
+        try
+        {
+            exchange(step);
+        }
+        catch when (step.UpdateDeferred || step.CombinedAccumulation)
+        {
+            // The accumulator already took this step's gradients (or was folded into them): a retried step would count
+            // twice, and a combined window lives only in this step's gradients. The window is dropped.
+            _gradientAccumulation.Release();
+            throw;
+        }
         GradientExchangeCount++;
         if (step.UpdateDeferred)
         {
