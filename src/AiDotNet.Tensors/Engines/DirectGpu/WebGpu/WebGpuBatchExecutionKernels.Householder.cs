@@ -5,7 +5,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 internal static partial class WebGpuBatchExecutionKernels
 {
     public static readonly string HouseholderNorm = Shader(
-        new[] { "r:u", "rw:uHat", "rw:meta" }, "K: i32, D: i32, sqrtFloorBits: i32",
+        new[] { "r:u", "rw:uHat", "rw:hhStats" }, "K: i32, D: i32, sqrtFloorBits: i32",
         Main + @"
     let K = p.K; let D = p.D;
     if (i >= K) { return; }
@@ -20,8 +20,8 @@ internal static partial class WebGpuBatchExecutionKernels
     let denom = max(scaledSq, scaledFloor);
     let r = 1.0 / sqrt(denom);
     for (var c: i32 = 0; c < D; c++) { uHat[i * D + c] = (u[i * D + c] / rowScale) * r; }
-    meta[2 * i] = r / rowScale;
-    meta[2 * i + 1] = select(select(0.0, 0.5, scaledSq == scaledFloor), 1.0, scaledSq > scaledFloor);
+    hhStats[2 * i] = r / rowScale;
+    hhStats[2 * i + 1] = select(select(0.0, 0.5, scaledSq == scaledFloor), 1.0, scaledSq > scaledFloor);
 }");
 
     public static readonly string HouseholderForward = Shader(
@@ -98,16 +98,16 @@ internal static partial class WebGpuBatchExecutionKernels
 }");
 
     public static readonly string HouseholderBackwardReflectorsNorm = Shader(
-        new[] { "r:duHat", "r:uHat", "r:meta", "rw:dU" }, "K: i32, D: i32",
+        new[] { "r:duHat", "r:uHat", "r:hhStats", "rw:dU" }, "K: i32, D: i32",
         Main + @"
     let K = p.K; let D = p.D;
     if (i >= K) { return; }
-    let invNorm = meta[2 * i];
-    let active = meta[2 * i + 1];
+    let invNorm = hhStats[2 * i];
+    let isActive = hhStats[2 * i + 1];
     let off = i * D;
     var dot: f32 = 0.0;
     for (var c: i32 = 0; c < D; c++) { dot += duHat[off + c] * uHat[off + c]; }
-    for (var c: i32 = 0; c < D; c++) { dU[off + c] = invNorm * (duHat[off + c] - active * dot * uHat[off + c]); }
+    for (var c: i32 = 0; c < D; c++) { dU[off + c] = invNorm * (duHat[off + c] - isActive * dot * uHat[off + c]); }
 }");
 }
 #endif

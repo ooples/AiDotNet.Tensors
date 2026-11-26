@@ -1,4 +1,4 @@
-extern "C" __global__ __launch_bounds__(256) void hh_p_norm(const float* u, float* uHat, float* meta, int K, int D, int sqrtFloorBits) {
+extern "C" __global__ __launch_bounds__(256) void hh_p_norm(const float* u, float* uHat, float* hhStats, int K, int D, int sqrtFloorBits) {
     int k = bx_gid(); if (k >= K) return;
     float sqrtFloor = __int_as_float(sqrtFloorBits);
     float maxAbs = 0.0f;
@@ -19,8 +19,8 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_norm(const float* u, floa
     for (int i = 0; i < D; i++) {
         uHat[k * D + i] = (u[k * D + i] / rowScale) * r;
     }
-    meta[2 * k] = r / rowScale;
-    meta[2 * k + 1] = scaledSq > scaledFloor ? 1.0f : (scaledSq == scaledFloor ? 0.5f : 0.0f);
+    hhStats[2 * k] = r / rowScale;
+    hhStats[2 * k + 1] = scaledSq > scaledFloor ? 1.0f : (scaledSq == scaledFloor ? 0.5f : 0.0f);
 }
 
 extern "C" __global__ __launch_bounds__(256) void hh_p_fwd(const float* x, const float* uHat, float* y, int M, int K, int D, int trans) {
@@ -94,14 +94,14 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_du_raw(const float* d
     }
 }
 
-extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_du_norm(const float* duHat, const float* uHat, const float* meta, float* dU, int K, int D) {
+extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_du_norm(const float* duHat, const float* uHat, const float* hhStats, float* dU, int K, int D) {
     int j = bx_gid(); if (j >= K) return;
-    float invNorm = meta[2 * j];
-    float active = meta[2 * j + 1];
+    float invNorm = hhStats[2 * j];
+    float isActive = hhStats[2 * j + 1];
     int off = j * D;
     float dot = 0.0f;
     for (int i = 0; i < D; i++) dot += duHat[off + i] * uHat[off + i];
     for (int i = 0; i < D; i++) {
-        dU[off + i] = invNorm * (duHat[off + i] - active * dot * uHat[off + i]);
+        dU[off + i] = invNorm * (duHat[off + i] - isActive * dot * uHat[off + i]);
     }
 }
