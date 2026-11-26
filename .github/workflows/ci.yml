@@ -130,6 +130,52 @@ jobs:
       actions: read
     secrets: inherit
 
+  # The CUDA suites' coverage, uploaded only after the CPU unit-test run and the POCL shards: codecov.yml posts its
+  # statuses after seven uploads (after_n_builds), and the CUDA report must not be one of the first seven, or the
+  # statuses could be posted without the CPU report. It lands as an eighth upload and codecov updates them.
+  cuda-coverage:
+    name: CUDA coverage upload
+    needs: [cuda, build, gpu-parity-pocl]
+    if: ${{ always() && (needs.cuda.result == 'success' || needs.cuda.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: AiDotNet.Tensors
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gpu-cuda-coverage-*
+          path: ${{ runner.temp }}/cuda-coverage
+      - name: Upload CUDA coverage to Codecov
+        id: codecov-upload
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml
+          disable_search: true
+          root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+          flags: unittests
+          name: gpu-cuda
+          fail_ci_if_error: true
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Retry CUDA coverage upload
+        if: ${{ steps.codecov-upload.outcome == 'failure' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml
+          disable_search: true
+          root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+          flags: unittests
+          name: gpu-cuda
+          fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
   evolution-lifecycle:
     name: Evolution lifecycle source integration
     needs: changes

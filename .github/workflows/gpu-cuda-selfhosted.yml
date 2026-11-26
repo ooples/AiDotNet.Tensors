@@ -1192,36 +1192,17 @@ jobs:
         foreach ($name in $missing) { Write-Output "::error::Ratchet $name did not run (no pass or failure in the results)." }
         if ($tests -ne 0 -or $skips -ne 0 -or $missing.Count -gt 0) { exit 1 }
 
-    # The suites' coverage, under build.yml's flag (unittests): codecov merges it with the CPU run's. codecov.yml still
-    # posts its statuses after the seven CPU and POCL uploads (after_n_builds: 7) and updates them when this one lands,
-    # so a pull request whose CUDA jobs do not run (a draft, skip-gpu-ci, no runner) still gets a coverage status.
-    - name: Upload CUDA coverage to Codecov
-      id: codecov-upload
+    # The suites' coverage, handed to ci.yml's cuda-coverage job, which uploads it to codecov under build.yml's flag
+    # (unittests) only after the CPU unit-test run and the POCL shards have finished. Uploaded from here, it could land
+    # before the CPU report and be counted among codecov.yml's seven (after_n_builds), posting statuses without it.
+    - name: Keep CUDA coverage for the upload job
       if: ${{ always() && !inputs.ratchets_only && (matrix.arch == 'pr' || matrix.arch == 'sm86') }}
-      continue-on-error: true
-      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        files: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
-        disable_search: true
-        root_dir: ${{ github.workspace }}/AiDotNet.Tensors
-        flags: unittests
-        name: gpu-cuda
-        fail_ci_if_error: true
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-    - name: Retry CUDA coverage upload
-      if: ${{ always() && !inputs.ratchets_only && (matrix.arch == 'pr' || matrix.arch == 'sm86') && steps.codecov-upload.outcome == 'failure' }}
-      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-      with:
-        files: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
-        disable_search: true
-        root_dir: ${{ github.workspace }}/AiDotNet.Tensors
-        flags: unittests
-        name: gpu-cuda
-        fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        name: gpu-cuda-coverage-${{ matrix.arch }}
+        path: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
+        if-no-files-found: error
+        retention-days: 3
 
     - name: Upload results
       if: always()
