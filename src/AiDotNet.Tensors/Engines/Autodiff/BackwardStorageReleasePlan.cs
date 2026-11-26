@@ -77,7 +77,7 @@ internal sealed class ProducerKey : IEquatable<ProducerKey>
     private readonly int _hash;
 
     internal ProducerKey(System.Reflection.MethodInfo? producer, int[] shape)
-        : this(producer?.Module, producer?.MetadataToken ?? 0, (int[])shape.Clone(), ordinal: 0)
+        : this(producer?.Module, producer?.MetadataToken ?? 0, shape, ordinal: 0)
     {
     }
 
@@ -179,14 +179,16 @@ internal static class ReleaseScope
 /// </summary>
 internal sealed class BackwardStorageReleasePlan<T>
 {
+    private static readonly GraphSignature s_emptySignature = new(0, Array.Empty<ProducerKey>());
+
     private readonly struct ReleaseCandidate
     {
         internal readonly object StorageIdentity;
         internal readonly Tensor<T> Tensor;
-        internal readonly LastUseReleaseNote Note;
-        internal readonly ProducerKey Key;   // the producer's structural identity (AutoRetainProbe)
+        internal readonly LastUseReleaseNote? Note;
+        internal readonly ProducerKey? Key;   // the producer's structural identity (AutoRetainProbe)
 
-        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor, LastUseReleaseNote note, ProducerKey key)
+        internal ReleaseCandidate(object storageIdentity, Tensor<T> tensor, LastUseReleaseNote? note, ProducerKey? key)
         {
             StorageIdentity = storageIdentity;
             Tensor = tensor;
@@ -245,7 +247,10 @@ internal sealed class BackwardStorageReleasePlan<T>
             }
         }
 
-        internal BackwardStorageReleasePlan<T> Build(int stepCount, Func<int, System.Reflection.MethodInfo?> method)
+        internal BackwardStorageReleasePlan<T> Build(
+            int stepCount,
+            Func<int, System.Reflection.MethodInfo?>? method,
+            bool includeMetadata = true)
         {
             foreach (var read in _reads)
                 if (!_outputs.Contains(read) && _usage.TryGetValue(read.StorageIdentity, out var leafOwned))
@@ -265,6 +270,18 @@ internal sealed class BackwardStorageReleasePlan<T>
             }
 
             Array.Clear(counts, 0, counts.Length);
+            if (!includeMetadata || method is null)
+            {
+                foreach (var usage in _usage.Values)
+                {
+                    if (usage.ReleaseCandidate is null) continue;
+                    int step = usage.LastUse;
+                    if (releases[step] is { } slot)
+                        slot[counts[step]++] = new ReleaseCandidate(usage.Identity, usage.ReleaseCandidate, note: null, key: null);
+                }
+                return new BackwardStorageReleasePlan<T>(releases, s_emptySignature);
+            }
+
             // A producer's structural key: its backward function, output shape and ordinal among same-keyed outputs,
             // stable across the per-step rebuilds of the same graph. The graph signature combines them all.
             var ordinals = new Dictionary<ProducerKey, int>();
@@ -362,7 +379,11 @@ internal sealed class BackwardStorageReleasePlan<T>
             var visitor = new SavedUseVisitor(builder, step);
             SavedStateTensorTraversal.Visit(entry.SavedState, ref visitor);
         }
-        return builder.Build(executionOrder.Length, i => entries[executionOrder[i]].Backward?.Method);
+        bool includeMetadata = ReleaseScope.FreeDeviceActivations;
+        return builder.Build(
+            executionOrder.Length,
+            includeMetadata ? i => entries[executionOrder[i]].Backward?.Method : null,
+            includeMetadata);
     }
 
     /// <summary>
@@ -407,10 +428,10 @@ internal sealed class BackwardStorageReleasePlan<T>
             var candidate = candidates[i];
             if (protectedStorages.Contains(candidate.StorageIdentity)) continue;
             if (!ReferenceEquals(candidate.Tensor.StorageIdentity, candidate.StorageIdentity)) continue;
-            if (AutoRetainProbe.IsRetained(candidate.Key)) continue;   // read after backward on a probe run: kept
+            if (candidate.Key is { } candidateKey && AutoRetainProbe.IsRetained(candidateKey)) continue;   // read after backward on a probe run: kept
             // Dead after this step: never download it (materializing moved ~0.6 GB device-to-host per training step
             // on a 26.8M-parameter LM).
-            if (_probing)
+            if (_probing && candidate.Key is { } probeKey)
             {
                 var tensor = candidate.Tensor;
                 var note = candidate.Note;
@@ -423,7 +444,7 @@ internal sealed class BackwardStorageReleasePlan<T>
                 var storage = new WeakReference<object>(tensor.StorageIdentity);
                 int version = tensor.Version, deviceVersion = tensor.GpuCacheVersion;
                 AutoRetainProbe.Quarantine(_signature, tensor.DataVector, tensor.GetBackingArrayForCacheLookupUnsafe(),
-                    candidate.Key, () =>
+                    probeKey, () =>
                     {
                         if (!weak.TryGetTarget(out var held)) return;
                         if (!storage.TryGetTarget(out var quarantinedStorage)

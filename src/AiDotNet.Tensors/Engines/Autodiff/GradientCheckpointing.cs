@@ -30,7 +30,7 @@ public static class GradientCheckpointing<T>
         IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,
         Tensor<T> input,
         int segmentSize = 2)
-        => CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters: null, segmentSize, tryConsumeParameterGradient: null);
+        => CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters: null, segmentSize, tryConsumeParameterGradient: null, onSegmentGradientsConsumed: null);
 
     /// <summary>
     /// Runs a checkpointed sequence while differentiating only the explicitly selected parameters.
@@ -49,7 +49,7 @@ public static class GradientCheckpointing<T>
     {
         if (parameterSourceFactory is null)
             throw new ArgumentNullException(nameof(parameterSourceFactory));
-        return CheckpointCore(functions, input, parameterSourceFactory, segmentParameters: null, segmentSize, tryConsumeParameterGradient: null);
+        return CheckpointCore(functions, input, parameterSourceFactory, segmentParameters: null, segmentSize, tryConsumeParameterGradient: null, onSegmentGradientsConsumed: null);
     }
 
     /// <summary>
@@ -76,12 +76,27 @@ public static class GradientCheckpointing<T>
         IReadOnlyList<IReadOnlyList<Tensor<T>>>? segmentParameters,
         int segmentSize = 2,
         Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient = null)
+        => CheckpointSegmentsWithFlush(functions, input, segmentParameters, segmentSize, tryConsumeParameterGradient, onSegmentGradientsConsumed: null);
+
+    /// <summary>
+    /// Runs a checkpointed sequence with explicit per-segment parameter lists, an optional in-backward
+    /// parameter-gradient consumer, and an optional per-segment completion callback invoked while consumed
+    /// gradient buffers are still live in the segment recompute scope (enabling multi-tensor batched norm/clip/step
+    /// flushes immediately before the segment's activation and gradient buffers are reclaimed).
+    /// </summary>
+    public static Tensor<T> CheckpointSegmentsWithFlush(
+        IReadOnlyList<Func<Tensor<T>, Tensor<T>>> functions,
+        Tensor<T> input,
+        IReadOnlyList<IReadOnlyList<Tensor<T>>>? segmentParameters,
+        int segmentSize,
+        Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient,
+        Action? onSegmentGradientsConsumed)
     {
         if (tryConsumeParameterGradient is not null && segmentParameters is null)
             throw new ArgumentException(
                 "A parameter-gradient consumer needs explicit segment parameter lists: without them every touched leaf, "
                 + "intermediates included, would be offered to it as a parameter.", nameof(segmentParameters));
-        return CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters, segmentSize, tryConsumeParameterGradient);
+        return CheckpointCore(functions, input, parameterSourceFactory: null, segmentParameters, segmentSize, tryConsumeParameterGradient, onSegmentGradientsConsumed);
     }
 
     private static Tensor<T> CheckpointCore(
@@ -90,7 +105,8 @@ public static class GradientCheckpointing<T>
         Func<IReadOnlyList<Tensor<T>>>? parameterSourceFactory,
         IReadOnlyList<IReadOnlyList<Tensor<T>>>? segmentParameters,
         int segmentSize,
-        Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient)
+        Func<Tensor<T>, Tensor<T>, bool>? tryConsumeParameterGradient,
+        Action? onSegmentGradientsConsumed)
     {
         if (segmentSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(segmentSize), "Must be positive.");
@@ -275,6 +291,7 @@ public static class GradientCheckpointing<T>
                         // Preserve only the selected VJPs (or consume single-segment parameter gradients in-place).
                         detachedGradients = new List<(Tensor<T>, Tensor<T>)>(segGrads.Count);
                         bool hasInputGrad = false;
+                        bool anyConsumed = false;
                         foreach (var kvp in segGrads)
                         {
                             // The seed and its detached copy are leaves the unfiltered (sources: null) backward also reaches;
@@ -295,6 +312,7 @@ public static class GradientCheckpointing<T>
                                 }
                                 if (consumed)
                                 {
+                                    anyConsumed = true;
                                     // The nested backward mirrored the gradient into Grad; it belongs to
                                     // recomputeGpuScope and is released below, and no outer accumulation will
                                     // replace it. Clear the mirror only while it still points at that gradient.
@@ -305,6 +323,14 @@ public static class GradientCheckpointing<T>
                             var key = isSegmentInput ? reInput : kvp.Key;
                             var copied = recomputeGpuScope.Keep(CloneCheckpointBoundary(kvp.Value, eng));
                             detachedGradients.Add((key, copied));
+                        }
+
+                        if (anyConsumed && onSegmentGradientsConsumed is not null)
+                        {
+                            using (TensorScope.Suspend())
+                            {
+                                onSegmentGradientsConsumed();
+                            }
                         }
 
                         if (!hasInputGrad && ReferenceEquals(reOutput, reInputDetached))

@@ -4661,6 +4661,74 @@ public partial interface IEngine
         int numHeads);
 
     /// <summary>
+    /// Applies a matrix-free chain of <c>K</c> Householder reflections <c>y = x H_0 H_1 ... H_{K-1}</c>
+    /// (or reverse order when <paramref name="transpose"/> is <c>true</c>) to <paramref name="input"/> (<c>[..., D]</c>)
+    /// using <paramref name="reflectors"/> (<c>[K, D]</c>) normalized with overflow-safe row scaling and squared-norm
+    /// floor <paramref name="normFloor"/> (when <c>&lt;= 0</c>, selects the element-type default floor).
+    /// </summary>
+    Tensor<T> HouseholderChain<T>(
+        Tensor<T> input,
+        Tensor<T> reflectors,
+        bool transpose = false,
+        double normFloor = 0.0);
+
+    Tensor<T> SplitHalfGivensRotation<T>(Tensor<T> input, Tensor<T> angles);
+
+    Tensor<T> DepthwiseCausalConv1d2Tap<T>(Tensor<T> input, Tensor<T> weight0, Tensor<T> weight1);
+
+    Tensor<T> RopeL2NormalizeHeads<T>(
+        Tensor<T> input,
+        Tensor<T> cos,
+        Tensor<T> sin,
+        int numHeads,
+        double epsilon = 1e-6,
+        double postScale = 1.0,
+        int startPosition = 0);
+
+    Tensor<T> RopeQuadraticOuterFeatures<T>(
+        Tensor<T> input,
+        Tensor<T> cos,
+        Tensor<T> sin,
+        int numHeads,
+        int outputHeadDim = 0,
+        int startPosition = 0);
+
+    Tensor<T> ProjectiveGatedResidual<T>(
+        Tensor<T> baseHidden,
+        Tensor<T> proposal,
+        Tensor<T> parallelGateLogit,
+        double epsilon = 1e-6);
+
+    Tensor<T> SpectralCirculantMatrix<T>(
+        Tensor<T> diagScale,
+        Tensor<T> spectrumRe,
+        Tensor<T> spectrumIm);
+
+    Tensor<T> SigmoidTopKExpertMix<T>(
+        Tensor<T> logits,
+        Tensor<T> expertTable,
+        Tensor<T> routingBias,
+        int topK,
+        double epsilon = 1e-12,
+        double biasUpdateRate = 0.0);
+
+    Tensor<T> DualModulatedSwiGlu<T>(
+        Tensor<T> gateUpProj,
+        Tensor<T> gateUpGainDelta,
+        Tensor<T> upBase);
+
+    Tensor<T> BornRatioNormalize<T>(
+        Tensor<T> scanOutput,
+        Tensor<T>? sinkLogAlpha,
+        int headDim,
+        double epsilon = 1e-4);
+
+    Tensor<T> BoundedSigmoidGate<T>(
+        Tensor<T> logits,
+        Tensor<T> bias,
+        double floor);
+
+    /// <summary>
     /// Fused ABC (Attention with Bounded-memory Control) slot recurrence over a whole sequence as one
     /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.AbcScan.cs</c> (#1464).
     /// </summary>

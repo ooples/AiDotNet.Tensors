@@ -464,6 +464,7 @@ public class CudaFallbackReportingTests
         }
     }
 
+#if NET6_0_OR_GREATER
     /// <summary>
     /// With AIDOTNET_DISABLE_GPU set, the module initializer used to skip the detection altogether, so a backend
     /// required afterwards was never checked and Current handed out the CPU engine. The detection is now owed either way.
@@ -489,4 +490,5 @@ public class CudaFallbackReportingTests
             AiDotNetEngine.Current = saved;
         }
     }
+#endif
 }

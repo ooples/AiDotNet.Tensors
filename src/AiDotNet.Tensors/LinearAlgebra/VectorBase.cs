@@ -18,8 +18,10 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Think of it as a row or column of values that you can add, subtract, multiply, etc. Vectors are fundamental
 /// building blocks in machine learning for representing data points and model parameters.</para>
 /// </remarks>
-public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.IDeviceResultStorage
+public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.IDeviceResultStorage, Engines.IScopeTrackableStorage
 {
+    int Engines.IScopeTrackableStorage.CreatedThreadId { get; set; }
+    long Engines.IScopeTrackableStorage.CreatedScopeTick { get; set; }
     /// <summary>
     /// The internal memory that stores the vector's elements.
     /// May start as Memory&lt;T&gt;.Empty for GPU-resident vectors (lazy allocation).
