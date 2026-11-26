@@ -590,7 +590,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal static readonly string[] TeardownStages =
     {
         "land gradients", "reclaim idle memory", "invalidate graphs", "checkpoint buffers", "loss scale",
-        "pinned handles", "exchange staging", "shared moments", "optimizer buffers", "pooled moments", "step state",
+        "pinned handles", "exchange staging", "flat exchange buffer", "shared moments", "optimizer buffers",
+        "pooled moments", "step state",
     };
 
     // Which plans' finalizers ran, by id, while a test tracks them.

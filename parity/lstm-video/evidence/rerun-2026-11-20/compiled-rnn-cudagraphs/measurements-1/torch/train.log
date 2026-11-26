@@ -1,0 +1,5 @@
+driver.c
+   Creating library C:\Users\yolan\BENCH-~1\tmp\TMPPV9~1\cuda_utils.cp313-win_amd64.lib and object C:\Users\yolan\BENCH-~1\tmp\TMPPV9~1\cuda_utils.cp313-win_amd64.exp
+W1120 18:13:14.768000 10648 Lib\site-packages\torch\_inductor\utils.py:1806] [0/0] Not enough SMs to use max_autotune_gemm mode
+C:\Users\yolan\bench-review\venv\Lib\site-packages\triton\knobs.py:524: UserWarning: TRITON_DEFAULT_FP_FUSION is unset: defaulting to FP fusion ENABLED for backward compatibility in Triton 3.9. The default will change to DISABLED in Triton 3.10; set TRITON_DEFAULT_FP_FUSION=1 to keep fusion enabled or =0 to adopt the new default early and silence this warning.
+  warn_once(FP_FUSION_DEFAULT_WARNING)

@@ -29,7 +29,25 @@ python parity/lstm-video/run.py
 
 The first invocation fetches the pinned source, builds AiDotNet, generates the original data and checks its SHA-256. It runs PyTorch and AiDotNet one at a time. The output shows your times, your held-out scores, and the location of both raw logs. The build and initial PyTorch compilation can take several minutes. Use `--work PATH` to choose where to put the downloads and results.
 
-The recording used one take, with PyTorch running first, and PyTorch's default `torch.compile` mode. The launcher has three options for checking that result. `--repeats N` runs the pair N times, alternates which framework runs first, and reports each take plus the median and range of the time ratio. `--torch-compile-mode reduce-overhead` compiles the PyTorch trainer with CUDA graphs. The original trainer still runs unchanged, because the launcher binds the mode to `torch.compile` before the trainer starts. The launcher refuses to start or to begin a trainer on battery power unless you pass `--allow-battery`, and it pins AiDotNet to its CUDA backend. These options have not yet been used for a published measurement. The clip's figures above are still one take in the default mode.
+The recording used one take, with PyTorch running first. Its trainer calls `torch.compile(model)` in PyTorch's default mode. Because `torch._dynamo.config.allow_rnn` is off by default, Dynamo skips any model that contains an `nn.LSTM`. So the recorded PyTorch side trained with eager cuDNN, and nothing was compiled.
+
+The launcher has four options for checking the recording:
+
+- `--repeats N` runs the pair N times, alternates which framework runs first, and reports each take plus the median and range of the time ratio.
+- `--torch-compile-rnn` sets `allow_rnn`, so `torch.compile` traces the LSTM.
+- `--torch-compile-mode reduce-overhead` adds CUDA graphs to whatever Dynamo compiles.
+- `--allow-battery` lets the launcher run on battery. Without it, the launcher refuses to start, or to begin a trainer, on battery power.
+
+The original trainer runs unchanged in every case, because the launcher sets both compile options before the trainer starts. The launcher records how many graphs Dynamo compiled in every take and pins AiDotNet to its CUDA backend.
+
+Five-take reruns on November 20, on the same GTX 1660 Ti on AC power:
+
+| PyTorch setup | Graphs compiled | AiDotNet median | PyTorch median | PyTorch time ÷ AiDotNet time, median (range) |
+| --- | ---: | ---: | ---: | ---: |
+| As recorded: `torch.compile` default mode, LSTM not traced (eager cuDNN) | 0 | 2.645 s | 12.902 s | 4.79 (4.34–5.14) |
+| `--torch-compile-rnn --torch-compile-mode reduce-overhead`: LSTM compiled, CUDA graphs | 2 | 2.573 s | 12.087 s | 4.71 (4.52–4.95) |
+
+Both frameworks reached the same held-out scores as the recording (302 and 301 of 320). Compiling the LSTM and adding CUDA graphs made PyTorch about 6% faster, which is within the spread between takes. The recorded take's 5.77 was at the high end. Five takes put the ratio at about 4.7–4.8. [Eager takes](evidence/rerun-2026-11-20/eager) · [Compiled takes](evidence/rerun-2026-11-20/compiled-rnn-cudagraphs)
 
 To record your own comparison, install the optional capture tools and add `--record`:
 
@@ -46,7 +64,7 @@ This records two live AiDotNet.Dashboard panels with Playwright. Each panel read
 - A single-layer LSTM has 32 inputs per time step, 32 time steps, 64 hidden units and a linear head with 10 outputs. Both implementations have 25,482 trainable parameters. PyTorch's standard `nn.LSTM` has two bias vectors. The model freezes the second at zero to match the C# model.
 - Each batch has 64 sequences. Training cycles through 256 batches. Five separate batches supply the 320 held-out signals. The exact starting weights ship here and the data generator uses seed 20261119. [Generator](original/fixture.py) · [Starting weights](lstm.weights.safetensors)
 - Both sides take eight actual warm-up updates before the clock starts and then run 4,096 more. Every 64 updates both evaluate all 320 held-out signals and synchronize the GPU before recording elapsed time. This includes validation in both times.
-- Python uses CUDA PyTorch 2.14.1+cu126, `torch.compile(model)` with its default settings, cross-entropy, backpropagation, gradient clipping at 1.0 and fused AdamW. AiDotNet uses its fused CUDA LSTM training path. Its training program checks that the fused path handled all 4,104 updates. The original recording does not contain a profiler trace of which PyTorch operations were compiled. These times describe this particular pair of implementations on one laptop.
+- Python uses CUDA PyTorch 2.14.1+cu126, `torch.compile(model)` with its default settings (which leaves the LSTM to eager cuDNN, as described above), cross-entropy, backpropagation, gradient clipping at 1.0 and fused AdamW. AiDotNet uses its fused CUDA LSTM training path. Its training program checks that the fused path handled all 4,104 updates. These times describe this particular pair of implementations on one laptop.
 
 ## Exact source and evidence
 
