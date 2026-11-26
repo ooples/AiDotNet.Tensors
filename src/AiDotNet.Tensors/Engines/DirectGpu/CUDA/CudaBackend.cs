@@ -16249,37 +16249,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     /// <inheritdoc/>
-    public unsafe void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        // Validate buffer parameters
-        if (param is null) throw new ArgumentNullException(nameof(param));
-        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
-        if (velocity is null) throw new ArgumentNullException(nameof(velocity));
-        if (size <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
-        if (trustCoeff <= 0)
-            throw new ArgumentOutOfRangeException(nameof(trustCoeff), "Trust coefficient must be positive.");
-
-        if (!_kernelCache.TryGetValue("lars_update", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: lars_update");
-
-        using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr paramPtr = param.Handle;
-        IntPtr gradPtr = gradient.Handle;
-        IntPtr velPtr = velocity.Handle;
-        void** args = stackalloc void*[8];
-        args[0] = &paramPtr;
-        args[1] = &gradPtr;
-        args[2] = &velPtr;
-        args[3] = &learningRate;
-        args[4] = &momentum;
-        args[5] = &weightDecay;
-        args[6] = &trustCoeff;
-        args[7] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
-    }
+    public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     /// <inheritdoc/>
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

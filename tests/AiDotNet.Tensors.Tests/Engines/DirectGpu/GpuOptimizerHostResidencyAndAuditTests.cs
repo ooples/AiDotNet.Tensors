@@ -133,19 +133,19 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
         }
     }
 
+    // LARS (You et al. 2017, Algorithm 1) as the CPU optimizer computes it: one local rate per tensor from the two norms,
+    // and a velocity that holds the rate-scaled step.
     private static void SimulateLars(
         float[] param, float[] grad, float[] velocity,
-        float lr, float momentum, float weightDecay)
+        float lr, float momentum, float weightDecay, float trust, float epsilon)
     {
+        double pn = Math.Sqrt(param.Sum(x => (double)x * x)), gn = Math.Sqrt(grad.Sum(x => (double)x * x));
+        float local = pn < epsilon || gn < epsilon ? lr : lr * (float)(trust * pn / (gn + weightDecay * pn + epsilon));
         for (int i = 0; i < param.Length; i++)
         {
-            float g = grad[i];
-            float p = param[i];
-            if (weightDecay > 0f)
-                g += weightDecay * p;
-            float v = momentum * velocity[i] + g;
+            float v = momentum * velocity[i] + local * (grad[i] + weightDecay * param[i]);
             velocity[i] = v;
-            param[i] = p - lr * v;
+            param[i] -= v;
         }
     }
 
@@ -306,12 +306,12 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             {
                 var p = HostTensor(pInit);
                 var vel = new Tensor<float>(new[] { n });
-                Assert.True(GpuOptimizer.TryLarsStep(p, HostTensor(g1Raw), vel, 0.01f, 0.9f, 0.01f, 0.001f));
+                Assert.True(GpuOptimizer.TryLarsStep(p, HostTensor(g1Raw), vel, 0.01f, 0.9f, 0.01f, 0.001f, 1e-8f));
                 Assert.True(gpu.IsDeviceAuthoritative(p));
-                Assert.True(GpuOptimizer.TryLarsStep(p, HostTensor(g2Raw), vel, 0.01f, 0.9f, 0.01f, 0.001f));
+                Assert.True(GpuOptimizer.TryLarsStep(p, HostTensor(g2Raw), vel, 0.01f, 0.9f, 0.01f, 0.001f, 1e-8f));
                 var refP = (float[])pInit.Clone(); var refVel = new float[n];
-                SimulateLars(refP, g1Raw, refVel, 0.01f, 0.9f, 0.01f);
-                SimulateLars(refP, g2Raw, refVel, 0.01f, 0.9f, 0.01f);
+                SimulateLars(refP, g1Raw, refVel, 0.01f, 0.9f, 0.01f, 0.001f, 1e-8f);
+                SimulateLars(refP, g2Raw, refVel, 0.01f, 0.9f, 0.01f, 0.001f, 1e-8f);
                 AssertClose(refP, p.ToArray(), 1e-5f, "TryLarsStep.param");
                 AssertClose(refVel, vel.ToArray(), 1e-5f, "TryLarsStep.vel");
             }
@@ -1355,7 +1355,7 @@ public sealed class GpuOptimizerHostResidencyAndAuditTests : IDisposable
             Assert.True(GpuOptimizer.TryRmspropStep(FreshHost(), gHost, FreshHost(), 0.01f, 0.99f, 1e-8f, 0.01f));
             Assert.True(GpuOptimizer.TryAdagradStep(FreshHost(), gHost, FreshHost(), 0.01f, 1e-8f, 0.01f));
             Assert.True(GpuOptimizer.TryNagStep(FreshHost(), gHost, FreshHost(), 0.01f, 0.9f, 0.01f));
-            Assert.True(GpuOptimizer.TryLarsStep(FreshHost(), gHost, FreshHost(), 0.01f, 0.9f, 0.01f, 0.001f));
+            Assert.True(GpuOptimizer.TryLarsStep(FreshHost(), gHost, FreshHost(), 0.01f, 0.9f, 0.01f, 0.001f, 1e-8f));
             Assert.True(GpuOptimizer.TryLambStep(FreshHost(), gHost, FreshHost(), FreshHost(), 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1));
             Assert.True(GpuOptimizer.TryAdadeltaStep(FreshHost(), gHost, FreshHost(), FreshHost(), 0.95f, 1e-6f, 0.01f));
             Assert.True(GpuOptimizer.TryAmsgradStep(FreshHost(), gHost, FreshHost(), FreshHost(), FreshHost(), 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1));

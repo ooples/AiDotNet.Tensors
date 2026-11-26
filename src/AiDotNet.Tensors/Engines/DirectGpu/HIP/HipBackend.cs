@@ -12464,32 +12464,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     /// <inheritdoc/>
-    public unsafe void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        if (!_kernelCache.TryGetValue("lars_update", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: lars_update");
-
-            {
-            IntPtr _p0 = ((HipGpuBuffer)param).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)gradient).Handle;
-            IntPtr _p2 = ((HipGpuBuffer)velocity).Handle;
-            void** args = stackalloc void*[8];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &learningRate;
-            args[4] = &momentum;
-            args[5] = &weightDecay;
-            args[6] = &trustCoeff;
-            args[7] = &size;
-
-
-            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
+    public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     /// <inheritdoc/>
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

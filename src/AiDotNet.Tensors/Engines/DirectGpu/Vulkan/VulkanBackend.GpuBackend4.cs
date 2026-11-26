@@ -134,12 +134,10 @@ public sealed unsafe partial class VulkanBackend : IGatedDeltaNetBackwardBackend
     }
 
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        EnsureInitialized();
-        DispatchOptimizer(VulkanOptimizerKernels.Lars, 1, new[] { param, gradient, velocity },
-            (uint)size, FloatBits(learningRate), FloatBits(momentum), FloatBits(weightDecay), FloatBits(trustCoeff));
-    }
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,

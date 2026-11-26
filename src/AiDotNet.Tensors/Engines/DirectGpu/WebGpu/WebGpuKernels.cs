@@ -4682,19 +4682,6 @@ struct OptimizerParams {
 @group(0) @binding(4) var<uniform> opt_params: OptimizerParams;
 
 @compute @workgroup_size(256)
-fn lars_update(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
-    if (idx < opt_params.size) {
-        // extra = pre-computed local_lr = trust_coeff * param_norm / (grad_norm + weight_decay * param_norm)
-        let local_lr = opt_params.extra;
-        let grad = gradients[idx] + opt_params.weight_decay * params_arr[idx];
-        // state1 = velocity, beta1 = momentum
-        state1[idx] = opt_params.beta1 * state1[idx] + local_lr * grad;
-        params_arr[idx] = params_arr[idx] - opt_params.lr * state1[idx];
-    }
-}
-
-@compute @workgroup_size(256)
 fn lamb_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < opt_params.size) {

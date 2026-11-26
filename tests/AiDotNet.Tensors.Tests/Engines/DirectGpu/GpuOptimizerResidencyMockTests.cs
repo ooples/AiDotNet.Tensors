@@ -46,7 +46,7 @@ public sealed class GpuOptimizerResidencyMockTests
             t => GpuOptimizer.TryNagStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f),
             t => t.P, t => t.Velocity);
         RunDenseCase(ctx, "LarsUpdate",
-            t => GpuOptimizer.TryLarsStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f, 0.001f),
+            t => GpuOptimizer.TryLarsStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f, 0.001f, 1e-8f),
             t => t.P, t => t.Velocity);
         RunDenseCase(ctx, "LambUpdate",
             t => GpuOptimizer.TryLambStep(t.P, t.G, t.M, t.V, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
