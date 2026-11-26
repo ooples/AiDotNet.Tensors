@@ -549,47 +549,75 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _pinnedHandles.AddRange(pinnedHandles);
     }
 
-    // A plan dropped without Dispose still releases its captured graph and the memory the graph pins.
+    // A plan dropped without Dispose still releases its captured graphs (the step's two and the split step's update
+    // graph) and the memory they pin.
     ~CompiledTrainingPlan()
     {
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExec);
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExecOdd);
+        _stepGraphOwner?.RetireIndexGraphBindings(_updateGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
+        Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_updateGraphExec);
     }
 
+    /// <summary>Set once every stage of <see cref="Dispose"/> has run, whether or not one of them threw (tests).</summary>
+    internal bool TeardownCompletedForTests { get; private set; }
+
+    /// <summary>
+    /// Releases the plan. Every stage runs even when an earlier one throws, so one failure cannot leak the captured
+    /// graphs or the device and pinned memory after it; the first failure is rethrown at the end (all of them, as an
+    /// <see cref="AggregateException"/>, when more than one stage failed).
+    /// </summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         GC.SuppressFinalize(this);
-        LandGradientsOnHost();
-        DisposeCheckpointBuffers();
-        _lossScaleDevice?.Dispose();
-        _lossScaleDevice = null;
+        List<Exception>? failures = null;
+        void Stage(Action release)
+        {
+            try { release(); }
+            catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
+        }
+        Stage(LandGradientsOnHost);
+        // Land captured counters/parameter ages while the old moment storage is still owned.
+        Stage(ReclaimIdleStepMemory);
+        // The captured graphs read the checkpoint and loss-scale buffers and the pinned host arrays: retire them first,
+        // so no graph is left referencing freed memory.
+        Stage(InvalidateCapturedStepGraph);
+        Stage(DisposeCheckpointBuffers);
+        Stage(() => { _lossScaleDevice?.Dispose(); _lossScaleDevice = null; });
         if (StepTiming.Enabled)
             try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
                 System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }
             catch { }
-        foreach (var handle in _pinnedHandles)
+        Stage(() =>
         {
-            if (handle.IsAllocated)
-                handle.Free();
-        }
-        _pinnedHandles.Clear();
+            foreach (var handle in _pinnedHandles)
+            {
+                if (handle.IsAllocated)
+                    handle.Free();
+            }
+            _pinnedHandles.Clear();
+        });
         // CodeRabbit #425: release GPU optimizer state. Buffers are added in
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
-        // Land captured counters/parameter ages while the old moment storage is still owned.
-        ReclaimIdleStepMemory();
-        InvalidateCapturedStepGraph();
-        ReleasePinnedExchangeStaging();
-        LeaveSharedMoments();
-        DisposeGpuOptimizerBuffers();
-        ReturnPooledMoments(_optimizerRuntimeState);
-        _optimizerRuntimeState = null;
+        Stage(ReleasePinnedExchangeStaging);
+        Stage(LeaveSharedMoments);
+        Stage(DisposeGpuOptimizerBuffers);
+        Stage(() => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });
+        Stage(DisposeRemainingStepState);
+        TeardownCompletedForTests = true;
+        if (failures is null) return;
+        if (failures.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        throw new AggregateException("Several stages of releasing a compiled training plan failed.", failures);
+    }
 
+    private void DisposeRemainingStepState()
+    {
         if (_residentGradBuffers is not null)
         {
             foreach (var buf in _residentGradBuffers) buf?.Dispose();

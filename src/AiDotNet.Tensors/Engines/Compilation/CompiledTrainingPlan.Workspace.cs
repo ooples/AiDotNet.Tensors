@@ -341,11 +341,15 @@ internal sealed partial class CompiledTrainingPlan<T>
         return idle;
     }
 
+    /// <summary>Test hook: runs first in <see cref="ReclaimIdleStepMemory"/>, so a test can make it fail.</summary>
+    internal Action? TestFaultInIdleReclaim;
+
     /// <summary>Takes back the memory <see cref="LendIdleStepMemory"/> lent: before a step, an invalidation or disposal.</summary>
     /// <remarks>A loan that cannot be moved (no memory for it, or it was baked into a graph) still reads memory the next
     /// replay overwrites: the plan then stops replaying its graph and lending, and trains eagerly from here on.</remarks>
     private void ReclaimIdleStepMemory()
     {
+        TestFaultInIdleReclaim?.Invoke();
         if (System.Threading.Interlocked.Exchange(ref _idleLender, null) is not { } lender) return;
         try
         {
