@@ -86,7 +86,9 @@ public sealed class TensorScope : IDisposable
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         ThrowIfDisposed();
-        object storage = tensor.DataVector;
+        // The storage's identity, not DataVector: that getter realizes a traced value (and, in an inference trace,
+        // records a host escape), while keeping or detaching a tensor reads none of its values.
+        object storage = tensor.GraphVectorIdentity;
         _kept.Add(storage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) _kept.Add(array);
         if (_results.TryGetValue(storage, out var release))
@@ -106,7 +108,7 @@ public sealed class TensorScope : IDisposable
     public static Tensor<T> Detach<T>(Tensor<T> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        object storage = tensor.DataVector;
+        object storage = tensor.GraphVectorIdentity;   // reads no value: a traced tensor stays in the graph (see Keep)
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         // A result kept in a nested scope was adopted by the enclosing one, and each scope's activation release spares
         for (var scope = s_current; scope is not null; scope = scope._outer)

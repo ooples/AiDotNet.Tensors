@@ -39,6 +39,80 @@ public class MoeInferencePlanTests
         using (gpu) Run(gpu!);
     }
 
+    /// <summary>
+    /// A forward that hands the MoE's loads to their own lifetime (TensorScope.Detach, a per-forward expert-load
+    /// statistic kept past the call) compiles: Detach reads no value, so it is no host read of the traced loads. Every
+    /// replay refreshes the detached loads with that execution's routing. Detach realized the loads, which an inference
+    /// trace records as a host escape, so the compile threw GraphCaptureNotSupportedException.
+    /// </summary>
+    [Fact]
+    public void A_cpu_inference_plan_compiles_a_forward_that_detaches_the_moe_loads() => RunDetached(new CpuEngine());
+
+    [SkippableFact]
+    public void A_gpu_inference_plan_compiles_a_forward_that_detaches_the_moe_loads()
+    {
+        DirectGpuTensorEngine? gpu = null;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+        Skip.If(gpu is null || !gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        using (gpu) RunDetached(gpu!);
+    }
+
+    /// <summary>A real host read of the loads inside the forward still makes the trace uncompilable.</summary>
+    [Fact]
+    public void A_host_read_of_the_moe_loads_inside_the_forward_still_refuses_the_compile()
+    {
+        var engine = new CpuEngine();
+        var (w1, w3, w2) = Weights();
+        using (new EngineScope(engine))
+        using (var cache = new CompiledModelCache<float>())
+            Assert.Throws<GraphCaptureNotSupportedException>(() => cache.GetOrCompileInference(new Tensor<float>([N, D]), xi =>
+            {
+                var y = MixtureOfExperts.SwiGluExperts(engine, xi, engine.TensorMatMul(xi, Router()), null, w1, w3, w2, K, 1, out var loads);
+                _ = loads.ToArray();
+                return y;
+            }));
+    }
+
+    private static (Tensor<float>, Tensor<float>, Tensor<float>) Weights()
+        => (T([G, D, F], i => 0.1f * MathF.Sin(i)), T([G, D, F], i => 0.1f * MathF.Cos(i * 0.7f)), T([G, F, D], i => 0.1f * MathF.Sin(i * 1.3f + 1)));
+
+    private static Tensor<float> Router() => T([D, G], i => MathF.Sin(i * 0.37f + 2));
+
+    private static void RunDetached(IEngine engine)
+    {
+        var (w1, w3, w2) = Weights();
+        var router = Router();
+        var x = new Tensor<float>([N, D]);
+        Tensor<float>? kept = null;
+        using (new EngineScope(engine))
+        using (var cache = new CompiledModelCache<float>())
+        {
+            var plan = cache.GetOrCompileInference(x, xi =>
+            {
+                var y = MixtureOfExperts.SwiGluExperts(engine, xi, engine.TensorMatMul(xi, router), null, w1, w3, w2, K, 1, out var loads);
+                kept = TensorScope.Detach(loads);
+                return y;
+            });
+            Assert.NotNull(kept);
+            var cpu = new CpuEngine();
+            var seen = new System.Collections.Generic.HashSet<string>();
+            for (int t = 0; t < 3; t++)
+            {
+                // Each execution's input routes to different experts.
+                var xt = T([N, D], i => 2f * MathF.Sin(i * (0.9f + 0.4f * t) + 3 * t));
+                plan.SetInputs(new[] { xt });
+                var got = plan.Execute().ToArray();
+                var expect = MixtureOfExperts.SwiGluExperts(cpu, xt, cpu.TensorMatMul(xt, router), null, w1, w3, w2, K, 1, out var eagerLoads).ToArray();
+                for (int i = 0; i < got.Length; i++)
+                    Assert.True(Math.Abs(got[i] - expect[i]) <= 1e-4f * (1 + Math.Abs(expect[i])), $"t{t} y[{i}]: {got[i]} vs {expect[i]}");
+                Assert.Equal(eagerLoads.ToArray(), kept!.ToArray());
+                seen.Add(string.Join(",", eagerLoads.ToArray()));
+            }
+            Assert.True(seen.Count > 1, "every execution routed alike, so a stale copy of the loads would pass");
+        }
+    }
+
     private static void Run(IEngine engine)
     {
         var w1 = T([G, D, F], i => 0.1f * MathF.Sin(i));
