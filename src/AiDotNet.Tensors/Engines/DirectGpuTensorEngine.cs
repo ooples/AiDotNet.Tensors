@@ -6329,6 +6329,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         using var __gpuOp = EnterGpuOp();
+        // These run float kernels: a double (or any type the policy keeps at its own precision) would come back
+        // rounded to float32, 1e-300 as 0 and 1.5e300 as infinity. Decline as TryRunScalar does.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return null;
         if (!TryGetBackend(out var backend))
             return null;
         if (left.Length != right.Length)
@@ -6363,6 +6367,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
         using var __gpuOp = EnterGpuOp();
+        // These run float kernels: a double (or any type the policy keeps at its own precision) would come back
+        // rounded to float32, 1e-300 as 0 and 1.5e300 as infinity. Decline as TryRunScalar does.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return null;
         if (!TryGetBackend(out var backend))
             return null;
 
@@ -8140,7 +8148,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(count),
                 $"Strided gather would access index {lastIndex} but source length is {source.Length}.");
 
-        if (!TryGetBackend(out var backend))
+        // The device copy goes through float buffers: a double would come back rounded to float32.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>() || !TryGetBackend(out var backend))
             return base.StridedGather(source, offset, stride, count);
 
         try
@@ -8162,7 +8171,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     void IEngine.StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        // The device copy goes through float buffers: it would round the whole destination to float32, the elements
+        // it does not write included.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>() || !TryGetBackend(out var backend))
         {
             base.StridedScatter(destination, source, offset, stride);
             return;
