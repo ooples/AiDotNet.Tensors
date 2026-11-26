@@ -165,6 +165,49 @@ public sealed class LogSumExpAndInPlaceAddResidencyTests : IClassFixture<DirectG
         AssertClose(expected.Dz, actual.Dz, "dz");
     }
 
+    // The gated linear units under a tape: the kernel's result carries the CPU op's node, and the backward runs on the
+    // device. A recording tape used to send the forward to the CPU op, which downloaded the input.
+    [SkippableTheory]
+    [InlineData("GLU")]
+    [InlineData("GeGLU")]
+    [InlineData("ReGLU")]
+    [InlineData("SwiGLU")]
+    public void TapedGatedLinearUnit_StaysOnTheDevice_AndMatchesTheCpu(string op)
+    {
+        var gpu = Gpu();
+        int[] shape = { 6, 64 };
+        var x = Rand(shape, 11, 2.0);
+        var r = Rand(new[] { 6, 32 }, 12, 1.0);
+        (Tensor<float> Y, Tensor<float> Dx) Run(IEngine e, Tensor<float> xi, Tensor<float> ri)
+        {
+            using var tape = new GradientTape<float>();
+            // A computed input: on the device its host copy is stale, so a host fallback has to download it (a freshly
+            // uploaded input still has a current host copy and hid the fallback).
+            var h = e.TensorAdd(xi, xi);
+            var y = op switch
+            {
+                "GLU" => e.GLU(h, -1),
+                "GeGLU" => e.GeGLU(h, -1),
+                "ReGLU" => e.ReGLU(h, -1),
+                _ => e.SwiGLU(h, -1),
+            };
+            var loss = e.ReduceSum(e.TensorMultiply(y, ri), new[] { 0, 1 }, keepDims: false);
+            return (y, tape.ComputeGradients(loss, new[] { xi })[xi]);
+        }
+        var expected = Run(new CpuEngine(), x, r);
+        var dx = gpu.UploadToGpu(x, GpuTensorRole.General);
+        var dr = gpu.UploadToGpu(r, GpuTensorRole.General);
+        _ = Run(gpu, dx, dr).Dx.ToArray();   // warm-up
+        (Tensor<float> Y, Tensor<float> Dx) actual;
+        GpuResidencyScope scope;
+        using (scope = GpuResidencyScope.Begin(captureOperations: true))
+            actual = Run(gpu, dx, dr);
+        Assert.True(scope.Downloads == 0, $"the taped {op} downloaded: {Transfers(scope)}");
+        Assert.True(actual.Dx.IsGpuResident || actual.Dx.HasPendingGpuData, "dx was computed on the host");
+        AssertClose(expected.Y, actual.Y, "y");
+        AssertClose(expected.Dx, actual.Dx, "dx");
+    }
+
     public static IEnumerable<object[]> InPlaceOperands() => new[]
     {
         new object[] { "uploaded", "uploaded" },
