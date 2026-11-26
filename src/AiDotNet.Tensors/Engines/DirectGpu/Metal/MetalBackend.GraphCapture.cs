@@ -34,3 +34,40 @@ public sealed partial class MetalBackend : IGpuGraphCapture
     IGraphStepIo? IGpuGraphCapture.CreateStepIo(System.Collections.Generic.IReadOnlyList<IGpuBuffer> inputs,
         System.Collections.Generic.IReadOnlyList<int> lengths) => null;
 }
+
+// No device graphs on this backend, so no plan holds step memory across its steps: nothing idle is lent, and an owner's
+// reclaim has nothing to take back. Allocations between steps come from the backend's own allocator.
+public sealed partial class MetalBackend : IIdleDeviceMemoryLender, IIdleLoanCaptureGuard
+{
+    // This backend lends nothing (LendIdle is a no-op), so there is no loan to move before a capture.
+    System.IDisposable IIdleLoanCaptureGuard.SuspendLoansForCapture() => NoLoans.Instance;
+
+    private sealed class NoLoans : System.IDisposable
+    {
+        public static readonly NoLoans Instance = new();
+        public void Dispose() { }
+    }
+
+    void IIdleDeviceMemoryLender.LendIdle(object owner, System.Collections.Generic.IReadOnlyCollection<IGpuBuffer> buffers)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+        if (buffers is null) throw new System.ArgumentNullException(nameof(buffers));
+    }
+
+    void IIdleDeviceMemoryLender.LendIdleOnDemand(object owner,
+        System.Func<System.Collections.Generic.IReadOnlyCollection<IGpuBuffer>?> collect)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+        if (collect is null) throw new System.ArgumentNullException(nameof(collect));
+    }
+
+    void IIdleDeviceMemoryLender.ReclaimIdle(object owner)
+    {
+        if (owner is null) throw new System.ArgumentNullException(nameof(owner));
+    }
+
+    // Nothing is lent here, so nothing is ever moved.
+    void IIdleDeviceMemoryLender.MoveLiveLoans()
+    {
+    }
+}

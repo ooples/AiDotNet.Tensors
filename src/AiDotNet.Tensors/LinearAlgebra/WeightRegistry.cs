@@ -571,6 +571,16 @@ public static partial class WeightRegistry
     private static bool? _streamingTrainingMode;
 
     /// <summary>
+    /// The hint last set by <see cref="SetStreamingExecutionTraining"/>: <c>true</c> training, <c>false</c> inference,
+    /// <c>null</c> unknown (also after <see cref="Reset"/>). A caller that changes the hint for a scoped operation (a
+    /// model load that may fail partway) reads it first so it can put it back.
+    /// </summary>
+    public static bool? StreamingExecutionTraining
+    {
+        get { lock (_lock) return _streamingTrainingMode; }
+    }
+
+    /// <summary>
     /// Hints whether streaming weights are currently used in TRAINING (<c>true</c>)
     /// or INFERENCE (<c>false</c>) so <see cref="StreamingStoreDtype.Auto"/> picks
     /// bf16 only where it's safe. <c>null</c> = unknown (treated as training → full
@@ -1957,6 +1967,58 @@ public static partial class WeightRegistry
         {
             return _streamingPool?.IsResident(weight.StreamingPoolHandle) ?? false;
         }
+    }
+
+    /// <summary>
+    /// The bf16 bytes (2 per element, little-endian, logical layout) of a weight whose streaming store is bf16, read from
+    /// the pool without materializing its fp32 view; null for any other weight. A device that keeps the weight in bf16
+    /// uploads these once.
+    /// </summary>
+    internal static byte[]? TryReadBf16Store<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0
+            || weight.StreamingStoreEncoding != StreamingEncoding.Bf16) return null;
+        StreamingTensorPool? pool;
+        lock (_lock) { pool = _streamingPool; }
+        if (pool is null) return null;
+        var bytes = pool.RehydrateInto(weight.StreamingPoolHandle);
+        if (bytes.Length != 2L * weight.Length)
+            throw new InvalidOperationException(
+                $"The bf16 store entry of a {weight.Length}-element weight holds {bytes.Length} bytes, not {2L * weight.Length}.");
+        return bytes;
+    }
+
+    /// <summary>
+    /// <see cref="TryReadBf16Store{T}"/> without the copy: the bf16 bytes go to <paramref name="reader"/> straight from
+    /// the pool's resident buffer, valid only during the call. False (and <paramref name="reader"/> not called) for a
+    /// weight whose streaming store is not bf16.
+    /// </summary>
+    internal static bool HasBf16Store<T>(Tensor<T> weight)
+    {
+        if (weight is null || weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0
+            || weight.StreamingStoreEncoding != StreamingEncoding.Bf16) return false;
+        lock (_lock) return _streamingPool is not null;
+    }
+
+    internal static bool TryReadBf16Store<T>(Tensor<T> weight, StreamingTensorPool.ResidentBytesReader reader)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (reader is null) throw new ArgumentNullException(nameof(reader));
+        if (weight.Lifetime != WeightLifetime.Streaming || weight.StreamingPoolHandle < 0
+            || weight.StreamingStoreEncoding != StreamingEncoding.Bf16) return false;
+        StreamingTensorPool? pool;
+        lock (_lock) { pool = _streamingPool; }
+        if (pool is null) return false;
+        long expected = 2L * weight.Length;
+        pool.ReadResident(weight.StreamingPoolHandle, bytes =>
+        {
+            if (bytes.Length != expected)
+                throw new InvalidOperationException(
+                    $"The bf16 store entry of a {weight.Length}-element weight holds {bytes.Length} bytes, not {expected}.");
+            reader(bytes);
+        });
+        return true;
     }
 
     /// <summary>

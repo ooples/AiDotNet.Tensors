@@ -559,6 +559,8 @@ public sealed unsafe partial class VulkanBackend
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         EnsureInitialized();
         ValidateGemmBuffers(A, B, C, M, N, K, false);
         if (!TryGlslGemmFp32(A, B, C, M, N, K, alpha, beta))
@@ -632,6 +634,8 @@ public sealed unsafe partial class VulkanBackend
     /// <inheritdoc/>
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         EnsureInitialized();
         // Shape validation up-front — without this, mismatched shapes
         // would IndexOutOfRange inside the inner loop instead of failing
@@ -652,6 +656,8 @@ public sealed unsafe partial class VulkanBackend
 
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1.0f, float beta = 0.0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)batchCount * M * K, ref B, (long)batchCount * K * N);
         EnsureInitialized();
         if (batchCount <= 0) throw new ArgumentOutOfRangeException(nameof(batchCount));
         ValidateGemmBuffers(A, B, C, M, N, K, false, batchCount);
@@ -683,6 +689,8 @@ public sealed unsafe partial class VulkanBackend
     private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K,
         string shader, float? alpha = null)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         EnsureInitialized();
         if (M <= 0 || N <= 0 || K <= 0) throw new ArgumentOutOfRangeException(nameof(M));
         var result = AllocateBuffer(M * N);

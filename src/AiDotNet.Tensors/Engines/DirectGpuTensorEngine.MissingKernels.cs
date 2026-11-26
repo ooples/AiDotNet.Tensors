@@ -5423,9 +5423,58 @@ public partial class DirectGpuTensorEngine
         {
             // Binds the tape to this engine, so the backward of a device result runs on the device.
             BindTapeIfRecording<T>();
-            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, Autodiff.BackwardFunctions<T>.TakeAlongDimBackward, savedState: new object[] { indices, dim });
+            Autodiff.DifferentiableOps.RecordUnary("TensorTakeAlongDim", result, tensor, TakeAlongDimDeviceBackward<T>, savedState: new object[] { indices, dim });
         }
         return result;
+    }
+
+    // The gradient of a gather is a scatter-add into zeros: dx[outer, idx, inner] += dy[outer, i, inner], the ScatterReduce
+    // kernel in sum mode. The host loop of BackwardFunctions.TakeAlongDimBackward downloaded dy and left dx on the host,
+    // so the gradient of a gathered [rows x vocabulary] input crossed the bus twice and was accumulated on the host.
+    // A second-order backward keeps the CPU function, which records its own differentiable graph.
+    private static void TakeAlongDimDeviceBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (!Autodiff.BackwardFunctions<T>.CreatesGraph && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
+            && gpu.TryTakeAlongDimBackwardOnDevice(gradOutput, inputs[0], (Tensor<int>)savedState[0], (int)savedState[1]) is { } onDevice)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
+            return;
+        }
+        if (engine.Is<DirectGpuTensorEngine>() && !Autodiff.BackwardFunctions<T>.CreatesGraph)
+            GpuLaunchProbe.OnFallback("TensorTakeAlongDim backward: host loop", null);
+        Autodiff.BackwardFunctions<T>.TakeAlongDimBackward(gradOutput, inputs, output, savedState, engine, grads);
+    }
+
+    private Tensor<T>? TryTakeAlongDimBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<int> indices, int dim)
+    {
+        using var __gpuOp = EnterGpuOp();
+        int rank = input.Rank;
+        int d = dim < 0 ? dim + rank : dim;
+        if (typeof(T) != typeof(float) || input.Length == 0 || indices.Length == 0 || d < 0 || d >= rank
+            || indices.Rank != rank || gradOutput.Length != indices.Length || !TryGetBackend(out var backend))
+            return null;
+        for (int k = 0; k < rank; k++)
+            if (k != d && indices._shape[k] != input._shape[k]) return null;
+        try
+        {
+            int dstDim = input._shape[d], srcDim = indices._shape[d], n = input.Length;
+            int outerSize = 1; for (int k = 0; k < d; k++) outerSize *= input._shape[k];
+            int innerSize = 1; for (int k = d + 1; k < rank; k++) innerSize *= input._shape[k];
+            var cg = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            var ci = indices.IsContiguous ? indices : indices.Contiguous();
+            using var bufG = GetOrAllocateBuffer(backend, cg);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci, originalIndices: indices, upperBound: dstDim);
+            // Not fullyWritten: the output starts zeroed and the kernel adds only at the gathered positions.
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])input._shape.Clone(),
+                output => backend.ScatterReduce(output, bufG.Buffer, bufIdx.Buffer, outerSize, srcDim, dstDim, innerSize, 0));
+        }
+        catch (NotSupportedException ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("TensorTakeAlongDim backward", ex);
+            return null;
+        }
     }
 
     private Tensor<T> TensorTakeAlongDimOnGpu<T>(Tensor<T> tensor, Tensor<int> indices, int dim)
@@ -6783,7 +6832,10 @@ public partial class DirectGpuTensorEngine
                     difference = DispatchDeferredGpuOp<T>(backend, total, logitShape, output =>
                     {
                         backend.Copy(probabilityBuffer.Buffer, output, total);
-                        backend.ScatterAdd(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
+                        if (backend is DirectGpu.IUniquePositionAddBackend unique)   // one position per row: distinct
+                            unique.AddAtUniquePositions(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
+                        else
+                            backend.ScatterAdd(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
                     });
                 }
                 else
@@ -6807,9 +6859,13 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    // Scratch per row chunk of the chunked fused-CE backward: two [chunk, vocab] float buffers of at most this many
-    // elements each (128 MiB), so a V=49152 head takes 672-row chunks instead of several [N, V] tensors.
-    private const int FusedCeBackwardChunkElements = 32 * 1024 * 1024;
+    // Scratch per row chunk of the chunked fused CE, so a V=49152 head takes row chunks instead of [N, V] tensors:
+    // elements of one [chunk, vocab] block (128 MiB of fp32; 672 rows at V = 49152). A backend that transforms rows in
+    // place (IInPlaceRowTransformsBackend) holds one block per direction; any other holds two (the logits and their
+    // exponentials or probabilities). Two blocks were 254 MiB, the largest transient of a 16-layer LM's training step
+    // and its peak, in the forward and again in the backward. Halving the block instead (16M elements) also halved the
+    // pair, but doubled the row chunks: 66 more nodes in each captured step and 2.8 ms a step (of 106) of launch time.
+    private const int FusedCeBlockElements = 32 * 1024 * 1024;
 
     /// <summary>Row chunks the last chunked fused-CE backward ran (tests: proves the multi-chunk path executed).</summary>
     internal static int LastFusedCeBackwardChunks;
@@ -6835,15 +6891,19 @@ public partial class DirectGpuTensorEngine
         IGpuBuffer b, int[]? targetIds, IGpuBuffer meanLoss, int n, int d, int vocab, IGpuBuffer? deviceIds = null)
     {
         if (n <= 0 || d <= 0 || vocab <= 0 || (deviceIds is null && targetIds?.Length != n)) return false;
-        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBlockElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; }
 
         // Each row's target position inside its chunk's [chunk, vocab] block, as int bits (the gather reads the bits).
         if (!TryFusedCeTargetPositions(backend, targetIds, deviceIds, n, chunk, vocab, out var positions)) return false;
         using var _positions = positions;
+        // In place, the block holds h_c·W, then the logits, then their exponentials; otherwise a second block takes the
+        // GEMM's output and the exponentials. The values are the same either way.
+        var inPlace = backend as DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace is not null ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var ones = AllocateStreamOrderedScratch(backend, chunk);
         using var picked = AllocateStreamOrderedScratch(backend, chunk);
@@ -6861,22 +6921,29 @@ public partial class DirectGpuTensorEngine
             backend.Copy(h, r0 * d, hChunk, 0, c * d);
             backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
             backend.Gemm(hChunk, w, work, c, vocab, d);                    // h_c·W
-            backend.BiasAdd(work, b, logits, c, vocab);                    // logits = h_c·W + b
+            if (inPlace is not null) inPlace.BiasAddInPlace(logits, b, c, vocab);   // logits = h_c·W + b
+            else backend.BiasAdd(work, b, logits, c, vocab);
             backend.MaxAxis(logits, rowStat, c, vocab);                    // m_r
-            backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(rowStat, onesV, logits, c, vocab, 1, -1f, 1f);    // logits - m_r (rank-1 update)
             backend.Gather(logits, chunkPositions, picked, c, 1);          // shifted target logit
-            backend.Exp(logits, work, cv);
+            if (inPlace is not null) inPlace.ExpInPlace(logits, cv);
+            else backend.Exp(logits, work, cv);
             backend.SumAxis(work, rowStat, c, vocab);
             backend.Log(rowStat, rowStat, c);                              // shifted lse_r
-            backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
-            backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(ones, rowStat, meanLoss, 1, 1, c, 1f, beta);      // sum += 1ᵀ·lse
+            using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                backend.Gemm(ones, picked, meanLoss, 1, 1, c, -1f, 1f);        // sum -= 1ᵀ·target
             if (chunkFlags is not null)
             {
                 backend.Copy(positions.Buffer, n + r0, chunkFlags, 0, c);
-                backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, chunkFlags, meanLoss, 1, 1, c, 1f, 1f); // NaN when a row's id was out of range
                 // Finite 0/1 flags, so the count holds even where a backend assumes no NaN. Sticky until read.
                 backend.Copy(positions.Buffer, 2 * n + r0, chunkFlags, 0, c);
-                backend.Gemm(ones, chunkFlags, labelError!, 1, 1, c, 1f, 1f);
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones, chunkFlags, labelError!, 1, 1, c, 1f, 1f);
             }
         }
         backend.Scale(meanLoss, meanLoss, 1f / n, 1);
@@ -6906,7 +6973,7 @@ public partial class DirectGpuTensorEngine
         int n = hidden._shape[0], d = hidden._shape[1], vocab = weight._shape[1];
         if (n <= 0 || d <= 0 || vocab <= 0 || weight._shape[0] != d || (deviceIds is null && targetIds?.Length != n))
             return false;
-        int chunk = Math.Max(1, Math.Min(n, FusedCeBackwardChunkElements / vocab));
+        int chunk = Math.Max(1, Math.Min(n, FusedCeBlockElements / vocab));
         if (chunk >= 32) chunk &= ~31;
         checked { _ = chunk * vocab; _ = n * d; _ = d * vocab; }
 
@@ -6929,8 +6996,12 @@ public partial class DirectGpuTensorEngine
         using var dWeight = needWeight ? AllocateOutputBuffer(backend, d * vocab) : default;
         using var dBias = needBias ? AllocateOutputBuffer(backend, vocab) : default;
         // Stream-ordered scratch: still read by queued kernels when this returns.
+        // In place, one block holds the logits, then the probabilities, then dLogits; otherwise the second block takes
+        // the biased logits and dLogits. The values are the same either way.
+        var inPlace = backend as DirectGpu.IInPlaceRowTransformsBackend;
         using var logits = AllocateStreamOrderedScratch(backend, chunk * vocab);
-        using var work = AllocateStreamOrderedScratch(backend, chunk * vocab);
+        using var workBlock = inPlace is not null ? null : AllocateStreamOrderedScratch(backend, chunk * vocab);
+        var work = workBlock ?? logits;
         using var hChunk = AllocateStreamOrderedScratch(backend, chunk * d);
         using var dhChunk = needHidden ? AllocateStreamOrderedScratch(backend, chunk * d) : default;
         using var ones = needBias ? AllocateStreamOrderedScratch(backend, chunk) : default;
@@ -6948,11 +7019,24 @@ public partial class DirectGpuTensorEngine
             backend.Copy(hB.Buffer, r0 * d, hChunk, 0, c * d);
             backend.Copy(positions.Buffer, r0, chunkPositions, 0, c);
             backend.Gemm(hChunk, wB.Buffer, logits, c, vocab, d);                // logits = h_c·W
-            backend.BiasAdd(logits, bB.Buffer, work, c, vocab);                  // + b
-            backend.Softmax(work, logits, c, vocab);                             // probabilities
-            backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);        // - one-hot
+            if (inPlace is not null)
+            {
+                inPlace.BiasAddInPlace(logits, bB.Buffer, c, vocab);             // + b
+                inPlace.SoftmaxInPlace(logits, c, vocab);                        // probabilities
+            }
+            else
+            {
+                backend.BiasAdd(logits, bB.Buffer, work, c, vocab);
+                backend.Softmax(work, logits, c, vocab);
+            }
+            // - one-hot. Each row has one target position inside its own row, so the positions are distinct.
+            if (backend is DirectGpu.IUniquePositionAddBackend unique)
+                unique.AddAtUniquePositions(minusOnes, chunkPositions, logits, c, cv);
+            else
+                backend.ScatterAdd(minusOnes, chunkPositions, logits, c, cv);
             backend.Scale(logits, logits, 1f / n, cv);                           // / N
-            backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);   // * gradOutput[0] = dLogits_c
+            if (inPlace is not null) inPlace.BroadcastMultiplyLastAxisInPlace(logits, gB.Buffer, cv, 1);   // * gradOutput[0] = dLogits_c
+            else backend.BroadcastMultiplyLastAxis(logits, gB.Buffer, work, cv, 1);
             if (chunkFlags is not null)
             {
                 // A row whose id was out of range gets NaN gradients, as its loss term is NaN.
@@ -6967,7 +7051,8 @@ public partial class DirectGpuTensorEngine
             if (needWeight)
                 transposedA!.MatMulTransposedA(hChunk, work, dWeight.Buffer, d, vocab, c, 1f, beta); // dW += h_cᵀ·dL_c
             if (needBias)
-                backend.Gemm(ones!, work, dBias.Buffer, 1, vocab, c, 1f, beta);   // dB += 1ᵀ·dL_c
+                using (GemmAutocastExemption.Enter())   // a sum or broadcast: FP32 under autocast
+                    backend.Gemm(ones!, work, dBias.Buffer, 1, vocab, c, 1f, beta);   // dB += 1ᵀ·dL_c
         }
         RecordFusedCeBackwardChunks((n + chunk - 1) / chunk);
         if (needHidden)
@@ -7080,6 +7165,12 @@ public partial class DirectGpuTensorEngine
                 throw;
             }
         }
+    }
+
+    /// <summary>The label-error word if a device-id fused cross-entropy has created it, else null (never allocates).</summary>
+    internal IGpuBuffer? ExistingFusedCeLabelErrorWord
+    {
+        get { lock (_fusedCeLabelErrorLock) return _fusedCeLabelError; }
     }
 
     /// <summary>

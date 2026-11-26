@@ -898,6 +898,11 @@ internal sealed class PersistentParallelExecutor
             return;
         }
 
+        // A worker runs the chunk under the dispatching thread's fresh-allocation override (a compiled step's first
+        // trace), so an op's allocations do not depend on which thread ran its chunk. Only while one is in force.
+        int freshOverride = TensorPool.ThreadFreshOverride;
+        if (freshOverride != 0) action = TensorPool.UnderThreadFreshOverride(freshOverride, action);
+
         // Detect reentrancy (nested Execute from callback) — fall back to sequential
         if (_isExecuting)
         {
@@ -1074,6 +1079,17 @@ internal sealed class PersistentParallelExecutor
             }
             if (first is not null) throw first;
             return;
+        }
+
+        // Each participant's local init, chunks and finally run under the dispatching thread's fresh-allocation
+        // override (see the Action overload): the per-participant buffers are an op's allocations too.
+        int freshOverride = TensorPool.ThreadFreshOverride;
+        if (freshOverride != 0)
+        {
+            var init = localInit; var run = body; var fin = localFinally;
+            localInit = () => { int p = TensorPool.SwapThreadFreshOverride(freshOverride); try { return init(); } finally { TensorPool.SwapThreadFreshOverride(p); } };
+            body = (c, tl) => { int p = TensorPool.SwapThreadFreshOverride(freshOverride); try { run(c, tl); } finally { TensorPool.SwapThreadFreshOverride(p); } };
+            localFinally = tl => { int p = TensorPool.SwapThreadFreshOverride(freshOverride); try { fin(tl); } finally { TensorPool.SwapThreadFreshOverride(p); } };
         }
 
         // Single global A/B / kill-switch (AIDOTNET_COOP_POOL=0) — one place for the thread-local

@@ -215,6 +215,8 @@ public sealed partial class WebGpuBackend
 
     public void Gemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1f, float beta = 0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         GemmAsync(A, B, C, M, N, K, alpha, beta).GetAwaiter().GetResult();
     }
 
@@ -228,6 +230,8 @@ public sealed partial class WebGpuBackend
     /// <inheritdoc/>
     public void MatMulTransposed(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1f, float beta = 0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         // Routes through the WGSL gemm_transposed_simple kernel which
         // reads B with the [N, K] index pattern — no materialized
         // transpose copy.
@@ -236,6 +240,8 @@ public sealed partial class WebGpuBackend
 
     public void BatchedGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, int batchCount, float alpha = 1f, float beta = 0f)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)batchCount * M * K, ref B, (long)batchCount * K * N);
         // BatchedGemmSource: binding(0)=A, binding(1)=B, binding(2)=C, uniform: batch_size, M, N, K, alpha, beta, pad, pad
         var uniforms = new float[]
         {
@@ -259,6 +265,8 @@ public sealed partial class WebGpuBackend
     // activation: 0=none, 1=relu, 2=gelu, 3=sigmoid, 4=tanh
     private IGpuBuffer GemmBiasActivation(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, int activationType = 0)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         var output = AllocateBuffer(M * N);
         var uniforms = new float[]
         {

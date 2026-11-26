@@ -216,6 +216,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     internal IntPtr ContextHandle => _cudaContext;
     private int _cuDevice;   // the CUdevice whose primary context this backend holds
     private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts, AddContextHolder)
+    /// <summary>This backend's context registration generation (see LiveContexts).</summary>
+    internal long ContextGeneration => _contextGeneration;
 
     /// <summary>True while this backend's CUDA context has not been destroyed (engine disposal destroys it; the
     /// backend object and its buffers can outlive it). Anything that would touch the device - a download included -
@@ -253,6 +255,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // skinny_gemm_tn's per-tile arrival counters (zero between launches): its partials use Workspace, in the
         // same stream order, so the counters live beside it.
         public IGpuBuffer? SkinnyCounters;
+        // Autocast split-K partials and the ones vector that reduces them (CudaBackend.AutocastGemm), and partials
+        // outgrown while a captured graph may still replay into them.
+        public IGpuBuffer? SplitKPartials;
+        public IGpuBuffer? SplitKOnes;
+        public List<IGpuBuffer>? RetiredSplitKPartials;
     }
 
     // Per-handle cuBLAS workspace (PyTorch sets one the same way). 8 MiB covers the fp32 GEMM algorithms used here.
@@ -508,7 +515,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         // Returned whether or not the free below runs: a block it skips goes with its context.
         CudaAccountedMemory.Untrack(ptr);
-        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return;
+        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting || AiDotNetEngine.GpuCircuitBroken) return;
         lock (ContextLifecycleLock)
         {
             if (_cudaContext == IntPtr.Zero || !IsLiveContext(_cudaContext, _contextGeneration)) return;
@@ -638,7 +645,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     private unsafe bool TryStageUploadBytes(IntPtr destination, void* src, ulong byteSize)
     {
-        if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
+        if (byteSize == 0 || _backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
             return false;
         int bytes = checked((int)byteSize);
         DrainStagedUploads(blockAll: false);
@@ -808,14 +815,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public CudaBackend(int deviceIndex)
     {
         // Backends collected without Dispose release their native resources before this one takes more.
-        if (!PendingAbandonedBackends.IsEmpty && !IsCapturingOnThisThread) DrainPendingAbandonedBackends();
+        // Not after the circuit breaker tripped: their contexts may be the corrupted one (see DisposeAbandoned).
+        if (!PendingAbandonedBackends.IsEmpty && !IsCapturingOnThisThread && !AiDotNetEngine.GpuCircuitBroken) DrainPendingAbandonedBackends();
         DeviceOrdinal = deviceIndex;
         _memoryAccount = DeviceMemoryAccount.For("cuda", deviceIndex);
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
         // Resolve explicit configuration before native probing or the availability fallback. A
         // misspelled policy is a caller error, not evidence that CUDA is unavailable, and must not
         // be hidden by converting the backend into an unavailable instance.
-        uint contextScheduling = CudaContextScheduling.ResolveFromEnvironment();
+        uint contextScheduling = CudaContextScheduling.ResolveContextFlags();
 
         if (!CudaNativeBindings.IsAvailable || !NvrtcNativeBindings.IsAvailable)
         {
@@ -890,6 +898,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
             // A buffer may only free against a live context, and only against the lifetime it was allocated in.
             lock (ContextLifecycleLock) _contextGeneration = AddContextHolder(_cudaContext);
+            _pinnedPool.BindContext(_cudaContext, _contextGeneration);
             RegisterDevicePeer();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _mainStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
@@ -1100,10 +1109,30 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             if (_pushed)
             {
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
-                _threadCurrentContext = IntPtr.Zero;
+                var popped = CuBlasNative.cuCtxPopCurrent(out _);
+                if (popped == CudaResult.Success) _threadCurrentContext = IntPtr.Zero;
+                // A sticky fault the pop itself reports first (700, 709, 719) is the same state: trip the breaker and keep
+                // the marker, rather than clearing it and throwing.
+                else if (((int)popped is 700 or 709 or 719 && TripOnPop(popped)) || AiDotNetEngine.GpuCircuitBroken)
+                {
+                    // After a sticky device fault the pop can fail too; throwing then would replace the error that
+                    // tripped the breaker with this one, from inside the cleanup of the call that hit it. The marker
+                    // stays: the context may still be on this thread's stack, so the next push is not repeated.
+                    System.Diagnostics.Trace.TraceWarning("cuCtxPopCurrent returned " + popped + " after the GPU circuit breaker tripped.");
+                }
+                else
+                {
+                    _threadCurrentContext = IntPtr.Zero;
+                    CuBlasNative.CheckCudaResult(popped, "cuCtxPopCurrent");
+                }
             }
             CudaCurrentStream.Restore(_previousStream);
+        }
+
+        private static bool TripOnPop(CudaResult popped)
+        {
+            AiDotNetEngine.TripGpuCircuitBreaker("cuCtxPopCurrent", (int)popped);
+            return true;
         }
     }
 
@@ -1112,7 +1141,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // A backend used after its teardown completed would launch unloaded kernels into freed pool memory -- an
         // illegal address (CUDA 700) that poisons the device's shared primary context for EVERY engine in the
         // process. Fail the caller instead. (During Dispose itself the context is still held, so teardown works.)
-        if (_disposed && _cudaContext == IntPtr.Zero)
+        // A backend disposed after a breaker trip keeps its context (its teardown was skipped) but is just as unusable.
+        if (_disposed && (_cudaContext == IntPtr.Zero || AiDotNetEngine.GpuCircuitBroken))
             throw new ObjectDisposedException(nameof(CudaBackend),
                 "This CUDA backend (and the DirectGpuTensorEngine that owns it) was disposed; it can no longer run " +
                 "operations. A tensor or engine reference outlived its engine.");
@@ -2194,10 +2224,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // Recording: the logical end of this buffer's lifetime, for the same reason.
             _stepArena?.OnReturned(released);
         }
+        // A loan of idle step memory is reused only by later work on this stream (or the lender's next replay), so its
+        // range goes back now, in stream order, like a stream-ordered free.
         // Stream-ordered buffers (#558 layer 6): cuMemFreeAsync is already ordered after prior stream
         // work, so free immediately — deferring via an event would delay pool reclamation and erase the
         // mid-step reuse that bounds peak. Disposing routes to cuMemFreeAsync (see CudaGpuBuffer.Release).
-        if ((buffer is CudaGpuBuffer cb && cb.IsAsyncFreed) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
+        if ((buffer is CudaGpuBuffer cb && (cb.IsAsyncFreed || cb.IsIdleLoan)) || (buffer is CudaGpuByteBuffer bb && bb.IsAsyncFreed))
         {
             buffer.Dispose();
             return;
@@ -2526,6 +2558,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         // CUDA driver API calls are required for device memory operations.
         using var _ = PushContext();
+        if (CaptureMemoryPool.Current?.TryRentFree(size) is { } recycled)
+        {
+            // Memory this capture released earlier (graph-private reuse), zeroed like any fresh allocation.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(recycled.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(capture reuse)");
+            return recycled;
+        }
         var arena = StepArenaForThisAllocation();
         if (arena?.TryRent(size) is { } slot)
         {
@@ -2535,23 +2575,52 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 "cuMemsetD8Async(arena)");
             return slot;
         }
-        var allocated = AllocateBufferFromPool(size);
+        // A pooled buffer first: it is memory this process already holds. Idle step memory a compiled plan lent
+        // between its steps only serves what the pool cannot (an allocation that would otherwise grow the device
+        // footprint). Served first, it took every allocation between two training steps (the next batch's uploads,
+        // the loss readback), and each such loan was moved (fresh memory and a device copy) when the next step
+        // reclaimed the memory, in the gap before that step's graph launch.
+        IGpuBuffer? allocated = TryRentPooledZeroed(size);
+        if (allocated is null && TryRentIdleLoan(size) is { } borrowed)
+        {
+            // Idle step memory a compiled plan lent between its steps, zeroed like any fresh allocation.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(borrowed.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(idle loan)");
+            return borrowed;
+        }
+        allocated ??= AllocateBufferFromPool(size);
         if (arena is not null && allocated is CudaGpuBuffer tracked) arena.Track(tracked);
         return allocated;
     }
 
-    private IGpuBuffer AllocateBufferFromPool(int size)
+    /// <summary>A pooled buffer of <paramref name="size"/> floats, zeroed on the compute stream, or null.</summary>
+    private IGpuBuffer? TryRentPooledZeroed(int size)
     {
         if (_asyncAlloc)
         {
-            if (TryRentAsyncBuffer(size) is { } reused)
-            {
-                // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
-                CuBlasNative.CheckCudaResult(
-                    CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
-                    "cuMemsetD8Async(reused)");
-                return reused;
-            }
+            if (TryRentAsyncBuffer(size) is not { } reused) return null;
+            // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
+                "cuMemsetD8Async(reused)");
+            return reused;
+        }
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
+                "cuMemsetD32Async");
+            return pooled;
+        }
+        return null;
+    }
+
+    private IGpuBuffer AllocateBufferFromPool(int size)
+    {
+        if (TryRentPooledZeroed(size) is { } reused) return reused;
+        if (_asyncAlloc)
+        {
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
             // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
             // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
@@ -2564,13 +2633,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
             return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
-        }
-        if (CaptureMemoryPool.Current is null && _bufferPool.TryRentForBackend(size, this, out var pooled) && pooled != null) // a capture never takes shared-pool memory
-        {
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemsetD32Async(pooled.Handle, 0, (ulong)size, _stream), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
-                "cuMemsetD32Async");
-            return pooled;
         }
 
         ulong byteSize = (ulong)size * sizeof(float);
@@ -2609,12 +2671,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return AllocateBuffer(size);
         using var _ = PushContext();
         var arena = StepArenaForThisAllocation();
-        var buffer = arena?.TryRent(size);
+        // A pooled buffer before idle step memory, as in AllocateBuffer.
+        CudaGpuBuffer? buffer = CaptureMemoryPool.Current?.TryRentFree(size) ?? arena?.TryRent(size);
+        if (buffer is null && TryRentAsyncBuffer(size) is { } pooled)
+        {
+            buffer = pooled;
+            arena?.Track(buffer);
+        }
+        buffer ??= TryRentIdleLoan(size);
         if (buffer is null)
         {
-            buffer = TryRentAsyncBuffer(size)
-                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            buffer = new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
             arena?.Track(buffer);
         }
         if (PoisonUninitializedBuffers)
@@ -2994,6 +3062,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
+        if (GemmAutocastActive)
+        {
+            using var autocastContext = PushContext();
+            CublasGemm(A, B, C, M, N, K, alpha, beta);
+            return;
+        }
+
         if (alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
@@ -3057,19 +3132,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
 
-        if (alpha == 1.0f && beta == 0.0f &&
+        if (!GemmAutocastActive && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.OutputMajor))
             return;
-        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.GemmTransposedB, A, B, C, 1, M, N, K, alpha, beta)) return;
         MatMulTransposedIncumbent(A, B, C, M, N, K, alpha, beta);
     }
 
     // MatMulTransposed after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
     private void MatMulTransposedIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
-        if (TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySkinnyGemm(A, B, C, M, N, K, transB: true, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySmallGemm(A, B, C, M, N, K, transA: false, transB: true, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -3113,15 +3188,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (!IsAvailable)
             throw new GpuCapabilityUnavailableException("CUDA backend is not available.");
         ValidateGemmArgs(A, B, C, M, N, K);
-        if (TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.GemmTransposedA, A, B, C, 1, M, N, K, alpha, beta)) return;
         MatMulTransposedAIncumbent(A, B, C, M, N, K, alpha, beta);
     }
 
     // MatMulTransposedA after the declared GEMM slot: the narrow kernels, then cuBLAS. The slot's reference for this layout.
     private void MatMulTransposedAIncumbent(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta)
     {
-        if (TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
-        if (TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySkinnyGemmTransposedA(A, B, C, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TrySmallGemm(A, B, C, M, N, K, transA: true, transB: false, alpha, beta)) return;
 
         using var _ = PushContext();
         ApplyDeterministicGemmMathMode();
@@ -3186,12 +3261,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateBatchedGemmArgs(A, B, C, M, N, K, batchCount);
 
-        if (alpha == 1.0f && beta == 0.0f &&
+        if (!GemmAutocastActive && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor,
                 batchCount))
             return;
-        if (TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
+        if (!GemmAutocastActive && TryDeclaredGemm(DeclaredFamily.Gemm, A, B, C, batchCount, M, N, K, alpha, beta)) return;
         BatchedGemmIncumbent(A, B, C, M, N, K, batchCount, alpha, beta);
     }
 
@@ -3802,10 +3877,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// on the current stream: cuBLASLt and the thread's cuBLAS handle run in that stream's order, so they can share
     /// the one workspace. Deterministic like the classic handle: one cached algorithm per problem, no atomic split-K,
     /// and strict fp32 under GpuDeterminism (the classic handle's pedantic mode). False -- nothing launched -- when
-    /// cuBLASLt or the workspace is unavailable or cuBLASLt declines the problem; the caller then runs cuBLAS.
+    /// cuBLASLt or the workspace is unavailable or cuBLASLt declines the problem; the caller then runs cuBLAS. Under a
+    /// cast-operands autocast scope a GEMM cuBLAS declines after its operands were rounded throws instead, as an FP32
+    /// GEMM on the original operands would silently drop the cast.
     /// </summary>
     private bool TryLtMatmulColumnMajor(bool transA, bool transB, int m, int n, int k,
         IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta)
+    {
+        // Under matmul autocast the problem runs on its measured route (cuBLASLt, the classic GemmEx, or a fixed-order
+        // split-K: CudaBackend.AutocastGemm).
+        if (GemmAutocastState is int autocast and not 0 && UsesCublas && CurrentCublasHasWorkspace)
+            return TryAutocastGemmColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, autocast);
+        return TryLtMatmulCore(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta);
+    }
+
+    /// <summary>The cuBLASLt GEMM of <see cref="TryLtMatmulColumnMajor"/> itself.</summary>
+    private bool TryLtMatmulCore(bool transA, bool transB, int m, int n, int k,
+        IntPtr a, int lda, IntPtr b, int ldb, IntPtr d, int ldd, float alpha, float beta, int autocastCompute = -1)
     {
         // cuBLASLt is part of cuBLAS: a caller that opted out of it (TensorCodecOptions.UseCublas) gets the generated kernels.
         if (!UsesCublas || !CurrentCublasHasWorkspace) return false;
@@ -3813,8 +3901,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (lt is null || _threadCublas?.Value?.Workspace is not { } workspace) return false;
         // The classic handle's fp32 mode: TF32 tensor cores where the init chose them (Ampere+) unless determinism
         // asks for strict fp32, which is what PEDANTIC gives the classic handle.
-        var compute = !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
-            ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
+        // Under matmul autocast the scope's compute type (CUBLAS_COMPUTE_32F_FAST_16F / _16BF).
+        // An autocast route passes the compute type of the state it read (autocastCompute), not a second read of it.
+        if (autocastCompute < 0) autocastCompute = GemmAutocastComputeType;
+        var compute = autocastCompute is int autocast and not 0 ? (CublasComputeType)autocast
+            : !GpuDeterminism.IsActive && _initGemmMathMode == CuBlasNative.CUBLAS_TF32_TENSOR_OP_MATH
+                ? CublasComputeType.Float32FastTf32 : CublasComputeType.Float32;
         return lt.TryMatmulColumnMajor(transA, transB, m, n, k, a, lda, b, ldb, d, ldd, alpha, beta, compute,
             workspace.Handle, (ulong)CublasWorkspaceFloats * sizeof(float), _stream) == CublasStatus.Success;
     }
@@ -3860,6 +3952,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IGpuBuffer? TryGemmBiasFusedEpilogue(
         IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K, CublasLtEpilogue epilogue)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return null;
         if (!CuBlasLtFusedEnabled) return null;
         var lt = TryGetCuBlasLt();
         if (lt is null) return null;
@@ -4572,6 +4666,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private unsafe void LaunchBiasAdd(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
     {
         if (TryDeclaredBiasAdd(A, bias, C, M, N, relu)) return;
+        LaunchBiasAddReference(A, bias, C, M, N, relu);
+    }
+
+    private unsafe void LaunchBiasAddReference(IGpuBuffer A, IGpuBuffer bias, IGpuBuffer C, int M, int N, bool relu)
+    {
         if (!_kernelCache.TryGetValue("bias_add_out", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: bias_add_out");
 
@@ -6229,6 +6328,47 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return new CudaSyncPoint(this, _defaultStream);
     }
 
+    // A transfer larger than a pooled pinned block (over 1 GiB) copies synchronously from the managed array, after
+    // the stream's earlier work: correct, but without overlap, so it says so once.
+    private static int s_unpooledTransferWarned;
+
+    /// <summary>How many transfers took the unpooled synchronous path (tests).</summary>
+    internal static long UnpooledTransferCount;
+
+    private static void WarnUnpooledTransfer(long byteCount)
+    {
+        Interlocked.Increment(ref UnpooledTransferCount);
+        if (Interlocked.Exchange(ref s_unpooledTransferWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning($"CUDA: a {byteCount}-byte host transfer exceeds a pooled pinned block "
+                + $"({CudaPinnedBufferPool.MaxBucketBytes} bytes); it is copied synchronously, without overlap.");
+    }
+
+    private unsafe void UploadUnpooled(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream, long byteCount)
+    {
+        WarnUnpooledTransfer(byteCount);
+        // Queued on the caller's stream (ordered after its work, whatever its flags) and waited for before the array
+        // is unpinned: a pageable copy on the legacy stream may return before its DMA lands.
+        fixed (float* src = data)
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyHtoDAsync(buffer.Handle, (IntPtr)src, (ulong)byteCount, stream.Handle),
+                "cuMemcpyHtoDAsync(unpooled upload)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled upload)");
+        }
+    }
+
+    private unsafe void DownloadUnpooled(IGpuBuffer buffer, float[] destination, IGpuStream stream, long byteCount)
+    {
+        WarnUnpooledTransfer(byteCount);
+        fixed (float* dst = destination)
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyDtoHAsync((IntPtr)dst, buffer.Handle, (ulong)byteCount, stream.Handle),
+                "cuMemcpyDtoHAsync(unpooled download)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream.Handle), "cuStreamSynchronize(unpooled download)");
+        }
+    }
+
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
     {
@@ -6240,7 +6380,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = data.Length * sizeof(float);
+        if (data.Length == 0) return;
+        long byteCount = (long)data.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            UploadUnpooled(data, buffer, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         // Use pinned host memory for true async DMA transfer.
         // Unlike a fixed block, pinned memory stays resident without synchronization,
@@ -6337,7 +6484,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Host data ({data.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = data.Length * sizeof(float);
+        if (data.Length == 0) return;
+        long byteCount = (long)data.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            UploadUnpooled(data, buffer, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         var pinnedPtr = _pinnedPool.Rent(byteSize);
         try
@@ -6374,7 +6528,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new ArgumentException($"Destination ({destination.Length} elements) exceeds buffer size ({buffer.Size} elements).");
 
         using var _ = PushContext();
-        int byteSize = destination.Length * sizeof(float);
+        if (destination.Length == 0) return;
+        long byteCount = (long)destination.Length * sizeof(float);
+        if (byteCount > CudaPinnedBufferPool.MaxBucketBytes)
+        {
+            DownloadUnpooled(buffer, destination, stream, byteCount);
+            return;
+        }
+        int byteSize = (int)byteCount;
 
         var pinnedPtr = _pinnedPool.Rent(byteSize);
         try
@@ -6447,6 +6608,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         ValidateGemmArgs(A, B, C, M, N, K);
 
+        if (TryAutocastGemmOnStream(A, B, C, M, N, K, alpha, beta, stream))
+            return;
+
         if (stream.Handle == _stream && alpha == 1.0f && beta == 0.0f &&
             TryDirectPtxGemmTiled(
                 A, B, C, M, K, N, DirectPtxLinearWeightLayout.InputMajor))
@@ -6506,6 +6670,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             FusedGemmBiasRowSoftmax(A, B, bias, output, M, N, K, stream);
             return;
         }
+
+        if (TryAutocastGemmBiasActivationOnStream(A, B, bias, output, M, N, K, activation, stream))
+            return;
 
         DirectPtxLinearActivation directActivation = activation switch
         {
@@ -7003,6 +7170,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
             && PendingExternalReleases.IsEmpty && PendingAbandonedBackends.IsEmpty) return false;
+        // Nothing queued is freed into a context the circuit breaker found corrupted (any native call there can fault
+        // the process): the queues keep it, and the exit of the process reclaims the memory.
+        if (AiDotNetEngine.GpuCircuitBroken) return false;
         if (IsCapturingOnThisThread || CaptureMemoryPool.Current is not null) return false;
         return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }
@@ -7099,7 +7269,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // buffer to the capture. It keeps cuBLAS's internal allocator, and its capture GEMMs take the
             // per-slice path, as with an older cuBLAS.
             if (IsStreamCapturing()) throw new InvalidOperationException("cuBLAS workspace not allocated during capture");
-            workspace = AllocateBuffer(CublasWorkspaceFloats);
+            // cuBLAS keeps the workspace address: never a loan of idle step memory.
+            using (NoIdleLoans()) workspace = AllocateBuffer(CublasWorkspaceFloats);
             var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
             if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
             {
@@ -7262,7 +7433,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // module unloads and handle destroys act on the CURRENT context, and the draining thread may be on another device.
     private void DisposeAbandoned()
     {
-        if (_disposed || IsRuntimeTearingDown || ProcessExiting) return;
+        // A context the circuit breaker found corrupted is not torn down: the exit of the process reclaims it.
+        if (_disposed || IsRuntimeTearingDown || ProcessExiting || AiDotNetEngine.GpuCircuitBroken) return;
         IntPtr context = _cudaContext;
         if (context == IntPtr.Zero || !IsLiveContext(context, _contextGeneration))
         {
@@ -7319,6 +7491,26 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // catches a deterministic out-of-bounds (a race would serialize away — still informative either way).
     internal static readonly bool s_launchCheck =
         System.Environment.GetEnvironmentVariable("AIDOTNET_KERNEL_LAUNCH_CHECK") == "1";
+
+    /// <summary>A 1D launch on <paramref name="stream"/> (the stream a GEMM fan-out slice runs on, or the backend's).</summary>
+    private unsafe void LaunchKernelOnStream(IntPtr kernel, uint gridX, uint blockX, void** args, IntPtr stream)
+    {
+        if (stream == _stream)
+        {
+            LaunchKernelWithSharedMem(kernel, gridX, blockX, 0, args);
+            return;
+        }
+        lock (GpuDispatchLock)
+        {
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(kernel, gridX, 1, 1, blockX, 1, 1, 0, stream, (IntPtr)args, IntPtr.Zero),
+                "cuLaunchKernel");
+            GpuLaunchProbe.OnLaunch();
+        }
+        // AIDOTNET_KERNEL_LAUNCH_CHECK, as on _stream; the wait is outside the dispatch lock.
+        if (s_launchCheck && !IsStreamCapturingCurrentContext())
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(stream), "kernel launch check (side stream)");
+    }
 
     private unsafe void LaunchKernelWithSharedMem(IntPtr kernel, uint gridX, uint blockX, uint sharedMemBytes, void** args)
     {
@@ -12510,6 +12702,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.ReLU))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearReluCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_relu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_relu");
         using var _ = PushContext();
@@ -12532,6 +12726,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Sigmoid))
+            return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearSigmoidCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid");
@@ -12556,6 +12752,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Tanh))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearTanhCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh");
         using var _ = PushContext();
@@ -12578,6 +12776,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Gelu))
+            return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearGeluCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu");
@@ -12630,6 +12830,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures,
             CodegenActivationKind.Swish))
             return;
+        if (TryAutocastFusedLinear(input, weight, bias, output, batchSize, inFeatures, outFeatures, LinearSwishCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_swish", out var kernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish");
         using var _ = PushContext();
@@ -12652,6 +12854,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.ReLU))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearReluCode))
             return;
         // Grad input kernel
         if (!_kernelCache.TryGetValue("fused_linear_relu_backward_grad_input", out var giKernel))
@@ -12699,6 +12904,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Sigmoid))
             return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearSigmoidCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_sigmoid_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_sigmoid_backward_grad_input");
         using var _ = PushContext();
@@ -12741,6 +12949,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Tanh))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, output, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearTanhCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_tanh_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_tanh_backward_grad_input");
@@ -12785,6 +12996,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Gelu))
             return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearGeluCode))
+            return;
         if (!_kernelCache.TryGetValue("fused_linear_gelu_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_gelu_backward_grad_input");
         using var _ = PushContext();
@@ -12827,6 +13041,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return;
         if (TryDeclaredFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
             batchSize, inFeatures, outFeatures, CodegenActivationKind.Swish))
+            return;
+        if (TryAutocastFusedLinearBackward(gradOutput, input, weight, preActivation, gradInput, gradWeight, gradBias,
+            batchSize, inFeatures, outFeatures, LinearSwishCode))
             return;
         if (!_kernelCache.TryGetValue("fused_linear_swish_backward_grad_input", out var giKernel))
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: fused_linear_swish_backward_grad_input");
@@ -15606,6 +15823,25 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// plan's gradient buffers are stable from step to step, so the tables are built and uploaded once and reused;
     /// rebuilding them per call would cost seven allocations and uploads, more than the kernels themselves.
     /// </summary>
+    /// <summary>
+    /// The first <paramref name="count"/> frames of <paramref name="trace"/> as Type.Method, outside the types whose
+    /// full name holds one of <paramref name="skipTypes"/> (the allocator's own frames). Diagnostics only.
+    /// </summary>
+    internal static List<string> CallerFrames(System.Diagnostics.StackTrace trace, int count, params string[] skipTypes)
+    {
+        var names = new List<string>(count);
+        foreach (var frame in trace.GetFrames() ?? Array.Empty<System.Diagnostics.StackFrame>())
+        {
+            if (names.Count == count) break;
+            if (frame?.GetMethod() is not { DeclaringType: { } type } method) continue;
+            string typeName = type.FullName ?? type.Name;
+            bool skip = false;
+            foreach (var skipped in skipTypes) skip |= typeName.Contains(skipped);
+            if (!skip) names.Add(type.Name + "." + method.Name);
+        }
+        return names;
+    }
+
     private sealed class MultiTensorTable : IDisposable
     {
         public IntPtr[] Handles = Array.Empty<IntPtr>();
@@ -19681,6 +19917,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (n <= 0 || d <= 0 || vocab <= 0)
             throw new ArgumentOutOfRangeException(nameof(n), "Fused CE dimensions (n, d, vocab) must be positive.");
+        // Under matmul autocast the logits product reads its operands cast to 16 bits, as the unfused GEMM would; the
+        // accumulation, the softmax and the loss stay FP32.
+        using var roundedHidden = RoundAutocastOperand(hidden, checked(n * d), kernelName);
+        using var roundedWeight = RoundAutocastOperand(weight, checked(d * vocab), kernelName);
+        if (roundedHidden is not null) hidden = roundedHidden;
+        if (roundedWeight is not null) weight = roundedWeight;
         DirectPtxCrossEntropyTarget directTarget = kernelName == "fused_linear_ce_index"
             ? DirectPtxCrossEntropyTarget.Index
             : DirectPtxCrossEntropyTarget.Dense;
@@ -20178,6 +20420,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         _disposed = true;
         UnregisterDevicePeer();
 
+        // No native teardown on a context the circuit breaker found corrupted, whichever path reaches this (an engine
+        // disposed after losing an adoption race to a trip included): the process exit reclaims it.
+        if (AiDotNetEngine.GpuCircuitBroken)
+        {
+            System.Diagnostics.Trace.TraceWarning("[CUDA] Backend disposed after the GPU circuit breaker tripped: its context is left to the process exit.");
+            return;
+        }
+
         // The multi-tensor tables hold device buffers: free them only on an explicit dispose, never from the
         // finalizer (the context may already be gone).
         if (disposing)
@@ -20334,6 +20584,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 tc.Workspace = null;
                 tc.SkinnyCounters?.Dispose();
                 tc.SkinnyCounters = null;
+                DisposeSplitKBuffers(tc);
             }
 
             try
@@ -21752,6 +22003,53 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         internal bool IsArenaSlot => _arenaBlock is not null;
 
+        // A loan of a compiled plan's idle step memory (CudaBackend.IdleLoans): the memory is the plan's until the loan
+        // is moved, after which _movedTo owns this buffer's memory.
+        private CudaBackend.IdleLoan? _idleLoan;
+        private CudaGpuBuffer? _movedTo;
+
+        internal bool IsIdleLoan => _idleLoan is not null;
+        /// <summary>The loan this buffer still borrows under, or null (not a loan, or moved, or ended).</summary>
+        internal CudaBackend.IdleLoan? IdleLoanState => _idleLoan is { IsLent: true } loan ? loan : null;
+        internal bool HasCapturePins => Volatile.Read(ref _capturePins) is { Length: > 0 };
+
+        internal static CudaGpuBuffer ForIdleLoan(IntPtr context, IntPtr devicePtr, int size) => new(context, devicePtr, size);
+
+        internal void AttachIdleLoan(CudaBackend.IdleLoan loan) => _idleLoan = loan;
+
+        /// <summary>Switches this loan to <paramref name="owned"/>, which already holds a copy of its contents. False when
+        /// the loan ended first.</summary>
+        internal bool MoveIdleLoanTo(CudaGpuBuffer owned)
+        {
+            Volatile.Write(ref _movedTo, owned);
+            if (_idleLoan is { } loan && loan.TryMarkMoved())
+            {
+                Volatile.Write(ref _devicePtr, owned.RawDevicePointer);
+                return true;
+            }
+            Volatile.Write(ref _movedTo, null);
+            return false;
+        }
+
+        // Ends a loan: its range goes back to the lender, or (moved) the memory it now owns is released.
+        private bool TryEndIdleLoan()
+        {
+            if (_idleLoan is not { } loan) return false;
+            if (loan.TryMarkReturned())
+            {
+                Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+                loan.Lender.ReturnIdleLoan(loan);
+            }
+            else
+            {
+                Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+                Interlocked.Exchange(ref _movedTo, null)?.Dispose();
+            }
+            _context = IntPtr.Zero;
+            GC.SuppressFinalize(this);
+            return true;
+        }
+
         internal static CudaGpuBuffer ForArenaSlot(IntPtr context, IntPtr devicePtr, int size, CudaStepArena.Block block, int slot)
         {
             var buffer = new CudaGpuBuffer(context, devicePtr, size);
@@ -21789,6 +22087,13 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 capture.Pin(ref _capturePins, this);
                 _capturedAllocation = true;
+                _capturePool = capture;
+                if (s_captureAllocStacks)
+                {
+                    var frames = CallerFrames(new System.Diagnostics.StackTrace(1, false), 6, "CudaBackend", "CaptureMemory");
+                    AiDotNet.Tensors.Engines.AiDotNetEngine.LogDiagnostic(
+                        $"[CAPTURE-ALLOC] bytes={(long)size * sizeof(float)} at {string.Join(" < ", frames)}");
+                }
             }
             InitCudaBufferLifecycle(
                 context, account is not null ? (long)size * sizeof(float) : 0,
@@ -21798,6 +22103,32 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
         // graph still replays it), always freed.
         private readonly bool _capturedAllocation;
+        internal bool AllocatedInCapture => _capturedAllocation;
+        // The capture that allocated this buffer: a release on that capture's thread while it is still open hands the
+        // memory back to that capture for its later allocations (TryReturnToCapture).
+        private readonly CaptureMemoryPool? _capturePool;
+
+        /// <summary>
+        /// PyTorch's graph-private pool: memory a capture allocated and then released, while that capture is still
+        /// open on this thread, is reused by the capture's later allocations instead of held to the graph's end. The
+        /// capture records one stream, so the next user of the memory is ordered after this buffer's last use on every
+        /// replay, exactly as the eager pool's stream-ordered reuse. The memory goes on under a new wrapper (this one
+        /// reads as released), and stays pinned to the capture until the graph is destroyed.
+        /// </summary>
+        private bool TryReturnToCapture()
+        {
+            if (_capturePool is not { } pool || !ReferenceEquals(CaptureMemoryPool.Current, pool)
+                || !IsCapturingOnThisThread || _arenaBlock is not null
+                || AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.IsActive)   // a recorded op graph still reads it
+                return false;
+            if (Volatile.Read(ref _poolState) != 0) return false;   // already pooled or released
+            var lease = DetachForPool();                             // constructed under the capture: pinned to it
+            if (lease is null) return true;
+            CreditReclaim();
+            if (!pool.TryAddFree(lease)) lease.Release();
+            return true;
+        }
+        private static bool s_captureAllocStacks => global::AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.RecordCaptureAllocationStacks;
 
         public void MarkRented(int size)
         {
@@ -21832,6 +22163,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Release()
         {
+            if (TryReturnToCapture()) return;
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
@@ -21848,7 +22180,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, ReleaseCore)) return;
-            if (TryEndArenaLease()) return;
+            if (TryEndArenaLease() || TryEndIdleLoan()) return;
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
 
@@ -21878,7 +22210,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
+                    // Nor on a context the circuit breaker found corrupted: the pointer is leaked to the exit of the process.
+                    if (_context != IntPtr.Zero && !ProcessExiting && !AiDotNetEngine.GpuCircuitBroken && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {
@@ -21910,6 +22243,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         public void Dispose()
         {
+            if (TryReturnToCapture()) return;
             // #642: defer the whole dispose (free OR pool-return) until the deferred-execution
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
@@ -21927,7 +22261,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // and pinned this buffer: re-check the pins here, so a graph that can still replay keeps its memory.
             var latePins = Volatile.Read(ref _capturePins);
             if (latePins is { Length: > 0 } && CaptureMemoryPool.TryDeferRelease(latePins, DisposeCore)) return;
-            if (TryEndArenaLease()) return;
+            if (TryEndArenaLease() || TryEndIdleLoan()) return;
             if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
@@ -21959,6 +22293,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 // Only marks the slot dead (safe on the finalizer thread): the arena owns the memory.
                 if (Interlocked.Exchange(ref _devicePtr, IntPtr.Zero) != IntPtr.Zero) CudaStepArena.OnSlotDead(block, _arenaSlot);
+                return;
+            }
+            if (_idleLoan is { } idleLoan)
+            {
+                // Only hands the range back (a lock, no driver call). A moved loan's memory is freed by its own finalizer.
+                if (idleLoan.TryMarkReturned()) idleLoan.Lender.ReturnIdleLoan(idleLoan);
                 return;
             }
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
@@ -22066,7 +22406,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
+                    // Nor on a context the circuit breaker found corrupted: the pointer is leaked to the exit of the process.
+                    if (_context != IntPtr.Zero && !ProcessExiting && !AiDotNetEngine.GpuCircuitBroken && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {

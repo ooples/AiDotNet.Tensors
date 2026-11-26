@@ -499,6 +499,34 @@ internal static partial class SimdGemm
         // AiDotNet #1221 / #1331). The explicit FrozenWeightRegistry path keeps
         // its zero-overhead "caller guarantees immutability" contract instead.
         internal ulong Fingerprint;
+
+        private long _accountedBytes;
+
+        /// <summary>Counts this pack's buffers against <see cref="PackedWeightCacheBytes"/> (once, on admission).</summary>
+        internal long PackedBytes()
+        {
+            long bytes = 0;
+            foreach (var sub in PackedSubs) bytes += 4L * (sub?.Length ?? 0);
+            return bytes;
+        }
+
+        internal void AccountBytes()
+        {
+            long bytes = PackedBytes();
+            if (System.Threading.Interlocked.CompareExchange(ref _accountedBytes, bytes, 0) == 0)
+                System.Threading.Interlocked.Add(ref s_packedWeightCacheBytes, bytes);
+        }
+
+        /// <summary>Returns this pack's bytes to the budget (on a re-pack, or when its weight array is collected).</summary>
+        internal void ReleaseAccountedBytes()
+        {
+            long bytes = System.Threading.Interlocked.Exchange(ref _accountedBytes, 0);
+            if (bytes != 0) System.Threading.Interlocked.Add(ref s_packedWeightCacheBytes, -bytes);
+        }
+
+        // The cache's ConditionalWeakTable drops this entry when its weight array dies; the finalizer is what
+        // returns its bytes then.
+        ~PrePackedB() => ReleaseAccountedBytes();
     }
 
     /// <summary>
@@ -553,6 +581,26 @@ internal static partial class SimdGemm
     private static WeakReference<float[]>? _threadPrePackedBKey1;
     [ThreadStatic]
     private static WeakReference<PrePackedB>? _threadPrePackedBValue1;
+
+    /// <summary>The bytes <see cref="BuildPrePackedB"/> allocates for this shape (its layout arithmetic, sizes only).</summary>
+    internal static long PrePackedBBytes(int k, int n, int m)
+    {
+        int Mc = ChooseAdaptiveMc(m, k, n);
+        int numRowBlocks = (m + Mc - 1) / Mc;
+        int maxThreads = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        int numPcIters = (k + Kc - 1) / Kc;
+        int nc0 = System.Math.Min(Nc, n);
+        int desiredColSubs = System.Math.Max(1, maxThreads / numRowBlocks);
+        int maxColSubs = System.Math.Max(1, nc0 / (Nr * 4));
+        int numColSubBlocks = System.Math.Min(desiredColSubs, maxColSubs);
+        int colSubSize = (nc0 / numColSubBlocks / Nr) * Nr;
+        if (colSubSize < Nr) { colSubSize = nc0; numColSubBlocks = 1; }
+        int colSubRounded = ((colSubSize + Nr - 1) / Nr) * Nr;
+        int lastColSubWidth = nc0 - (numColSubBlocks - 1) * colSubSize;
+        int lastColSubRounded = ((lastColSubWidth + Nr - 1) / Nr) * Nr;
+        long perSub = (long)System.Math.Min(Kc, k) * System.Math.Max(colSubRounded, lastColSubRounded);
+        return 4L * numPcIters * numColSubBlocks * perSub;
+    }
 
     /// <summary>
     /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
@@ -690,11 +738,13 @@ internal static partial class SimdGemm
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
         // times and our single-jc assumption breaks. Also skip when this machine
-        // cannot run the packed kernels at all (see PackedKernelsSupported).
+        // cannot run the packed kernels at all (see PackedKernelsSupported), and
+        // when the weight's packed copy is not cached and the cache cannot admit it
+        // (see PackedWeightCacheBudgetBytes): the standard route packs B per call.
         // AVX-512 hosts take this path too: the gate once also skipped it there for "the AVX-512 kernel's layout",
         // but SgemmAddInternal never runs an AVX-512 kernel, so it only cost those hosts the cached B pack and the
         // direct small/medium kernels below (the same AVX2 kernels every AVX-512 CPU runs).
-        if (n > Nc || !PackedKernelsSupported)
+        if (n > Nc || !PackedKernelsSupported || !PackedCacheHoldsOrAdmits(b, k, n, m))
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
@@ -739,6 +789,32 @@ internal static partial class SimdGemm
 
     [ThreadStatic] private static int t_cachedBTiledCalls;
 
+    /// <summary>
+    /// The most bytes of packed weight copies <see cref="SgemmWithCachedB"/> keeps (default 1 GiB). The cache once
+    /// held one packed copy of every weight it ever multiplied, with no bound, so a model served from the CPU held its
+    /// weights twice: a 2-layer cut of a 6.9B-parameter mixture-of-experts model (4.2 GB of fp32 weights) peaked at 21.1 GB private instead of
+    /// 15.5 GB, and the full 6.9B model would have carried 27.6 GB of copies. A weight is admitted while the cache has
+    /// room; one whose packed copy exceeds a quarter of the budget is never cached (it would crowd out everything
+    /// else for a saving that is small next to its own GEMM). A weight that is not admitted takes the standard route,
+    /// which packs B per call into per-thread scratch. Admission is first come, so a model larger than the budget does
+    /// not churn the cache. Entries leave with their weight arrays (or a re-pack), releasing their bytes.
+    /// </summary>
+    internal static long PackedWeightCacheBudgetBytes = 1L << 30;
+
+    private static long s_packedWeightCacheBytes;
+
+    /// <summary>Bytes of packed weight copies the cache holds now (diagnostics, tests).</summary>
+    internal static long PackedWeightCacheBytes => System.Threading.Interlocked.Read(ref s_packedWeightCacheBytes);
+
+    /// <summary>True when <paramref name="b"/> already has a cached pack or the cache can admit one.</summary>
+    private static bool PackedCacheHoldsOrAdmits(float[] b, int k, int n, int m)
+    {
+        if (_prePackedBCache.TryGetValue(b, out _)) return true;
+        long estimate = PrePackedBBytes(k, n, m);
+        long budget = System.Threading.Volatile.Read(ref PackedWeightCacheBudgetBytes);
+        return estimate <= budget / 4 && PackedWeightCacheBytes + estimate <= budget;
+    }
+
     /// <summary>How many SgemmWithCachedB calls on this thread reached the prepacked-B tiled path (tests: which route ran).</summary>
     internal static int CachedBTiledCallsOnThisThread => t_cachedBTiledCalls;
 
@@ -781,9 +857,17 @@ internal static partial class SimdGemm
                 }
 
                 _prePackedBCache.Remove(b);
+                existing.ReleaseAccountedBytes();
             }
 
             var cached = BuildPrePackedB(b, k, n, m);
+            // Admission is decided again here, where every admission is serialized: the caller's check ran outside
+            // the lock, so two threads could each have seen room for one more pack, and a re-pack of a cached weight
+            // at a new shape skipped it. A pack the budget cannot take serves this call only and is not cached.
+            long budget = System.Threading.Volatile.Read(ref PackedWeightCacheBudgetBytes);
+            long bytes = cached.PackedBytes();
+            if (bytes > budget / 4 || PackedWeightCacheBytes + bytes > budget) return cached;
+            cached.AccountBytes();
             _prePackedBCache.Add(b, cached);
             RememberThreadPrePackedB(b, cached);
             return cached;

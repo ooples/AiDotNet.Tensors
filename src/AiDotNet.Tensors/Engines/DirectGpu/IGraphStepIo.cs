@@ -146,12 +146,25 @@ internal interface IGraphStepIo : IDisposable
     void PrepareGlobalNormClip();
 
     /// <summary>
+    /// The norm record (<see cref="Gpu.DeterministicGradientNorm"/> layout) the captured clip writes on every replay, or
+    /// null before <see cref="PrepareGlobalNormClip"/>. Reading it waits for the replay that writes it.
+    /// </summary>
+    IGpuBuffer? GlobalNormRecord { get; }
+
+    /// <summary>
     /// Records, inside the capture and ahead of the update, a global L2-norm clip of the gradients
     /// <see cref="PrepareOptimizer"/> named: their norm and the coefficient min(1, maxNorm / norm) computed on the
     /// device, then every gradient scaled by it, with non-finite gradients handled by <paramref name="policy"/>
     /// (not <see cref="Gpu.NonFiniteGradientPolicy.Error"/>, which needs a host read).
     /// </summary>
     void CaptureGlobalNormClip(float maxNorm, Gpu.NonFiniteGradientPolicy policy);
+
+    /// <summary>
+    /// Records, inside the capture and ahead of the update, a gate: when <paramref name="flag"/>'s first float is nonzero
+    /// at replay time the step's update is discarded, as for non-finite gradients (the applied count does not advance
+    /// and the replay's sum of squares reads non-finite). Requires <see cref="PrepareOptimizer"/>.
+    /// </summary>
+    void CaptureUpdateGate(IGpuBuffer flag);
 
     /// <summary>As <see cref="CaptureSgdUpdate"/> for Adam (or AdamW when <paramref name="decoupled"/>), fp32 moments.</summary>
     void CaptureAdamUpdate(bool decoupled, System.Collections.Generic.IReadOnlyList<IGpuBuffer> parameters,

@@ -325,6 +325,18 @@ struct P { srcRowLen: i32, dstRowLen: i32, numRows: i32, copyLen: i32 };
   let g = i32(gid.x); if (g >= pc.numRows * pc.copyLen) { return; } let i = g % pc.copyLen; let r = g / pc.copyLen; dst[r * pc.dstRowLen + i] = src[r * pc.srcRowLen + i];
 }";
 
+    // bf16 -> fp32 (exact): element i is the low (even i) or high (odd i) 16 bits of 32-bit word i / 2.
+    public static string Bf16ToFloat => @"
+@group(0) @binding(0) var<storage, read> words : array<u32>;
+@group(0) @binding(1) var<storage, read_write> outp : array<f32>;
+struct P { n: i32 };
+@group(0) @binding(2) var<uniform> pc : P;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let g = i32(gid.x); if (g >= pc.n) { return; } let w = words[u32(g) >> 1u];
+  var h : u32 = w & 0xFFFFu; if ((g & 1) != 0) { h = w >> 16u; }
+  outp[g] = bitcast<f32>(h << 16u);
+}";
+
     public static string Int32ToFloat => @"
 @group(0) @binding(0) var<storage, read> raw : array<i32>;
 @group(0) @binding(1) var<storage, read_write> outp : array<f32>;

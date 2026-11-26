@@ -30,6 +30,7 @@ public partial class DirectGpuTensorEngine
         internal readonly DirectGpuTensorEngine Engine;
         internal readonly List<HostIndexBinding> Host = new();
         internal readonly List<(Tensor<int> Source, IntPtr Handle)> Resident = new();
+        internal readonly List<(HostMaskDeviceCopy Copy, Tensor<bool> Source, IntPtr Handle)> Masks = new();
         internal IndexReplayBindings(DirectGpuTensorEngine engine) => Engine = engine;
     }
 
@@ -100,6 +101,7 @@ public partial class DirectGpuTensorEngine
         }
         foreach (var binding in bindings.Resident)
             RefreshResidentIndexInPlace(backend, binding.Source, binding.Handle);
+        RefreshMaskGraphBindings(backend, bindings.Masks);
     }
 
     internal void RetireIndexGraphBindings(IntPtr graphExec)

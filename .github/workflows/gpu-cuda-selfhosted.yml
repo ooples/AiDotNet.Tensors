@@ -178,6 +178,7 @@ jobs:
         FullyQualifiedName~.EmptyBroadcastTests.|
         FullyQualifiedName~.MixtureOfExpertsTests.|
         FullyQualifiedName~.DeviceResultRegistryTests.|
+        FullyQualifiedName~.StreamingBf16InferenceTests.|
         FullyQualifiedName~.CausalAttentionCapture|
         FullyQualifiedName~.GpuPinnedLifetimeTests.|
         FullyQualifiedName~.Interop.DLPack|
@@ -658,6 +659,9 @@ jobs:
         # Must equal the job's timeout-minutes.
         JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || 750 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
+        # Coverage on a pull request's suites and on the nightly SM86 lane; the slower SM75/SM89 lanes run near their
+        # watchdogs without it, and their lines are the same.
+        COLLECT_COVERAGE: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm86') && 'true' || 'false' }}
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         # The embedded-torch class runs in its own test host (the next step). The two parts partition the lane's
@@ -785,6 +789,14 @@ jobs:
               "--filter `"$($part.Filter)`" " +
               "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=$($part.Trx)`" " +
               '--blame-hang --blame-hang-timeout 900s --blame-crash'
+            # Line coverage of the CUDA paths (graph capture, idle-memory lending, the device optimizers), uploaded to
+            # codecov below: no other lane reaches them, so codecov/patch counted every such line as missed. The
+            # exclusions are build.yml's, so this run reports only types the CPU run already reports and the project
+            # denominator does not change; the hand-vectorized kernels stay excluded for the same speed reason.
+            if ($env:COLLECT_COVERAGE -eq 'true') {
+              $testArgs += ' --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura ' +
+                'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*,[*]AiDotNet.Tensors.Engines.CpuJit.*"'
+            }
             $deadline = (Get-Date).AddMinutes($part.Minutes)
             if ($jobDeadline -lt $deadline) { $deadline = $jobDeadline }
             Write-Output "GPU suites, $($part.Name): watchdog deadline $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
@@ -900,6 +912,7 @@ jobs:
       # Allowed skip reasons:
       #   - another backend's device or toolchain (this runner has CUDA, not necessarily HIP, Metal, Vulkan, WebGPU, or a
       #     Python with numpy and torch);
+      #   - hardware the runner may not have: two NVIDIA GPUs (the CUDA_VISIBLE_DEVICES hidden-GPU check);
       #   - platform requirements: a Linux-only driver path (the RM ioctl interface), and the no-NVRTC diagnostic,
       #     which only runs where NVRTC is missing and the lane always installs it;
       #   - architecture requirements (an sm_ level, AVX-512 on the host CPU; off SM86, the specializations validated only
@@ -917,7 +930,7 @@ jobs:
       # The two main parts and the torch interop host are checked apart, so each must have run tests of its own: a
       # filter that selected nothing cannot pass on another part's tests.
       env:
-        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|Linux-only|^NVRTC is present|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b|-architecture-not-implemented$|^Experimental generated convolution is unavailable on this GPU architecture'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)|^The declared route needs the sm_75\+ conveyor|^A declared resident program needs the sm_75\+ conveyor'' || '''' }}'
+        ALLOWED_SKIP: '(?i)(HIP|ROCm|Metal|MoltenVK|Vulkan|WebGPU|Dawn|AIDOTNET_WEBGPU_NODE_DIR|OpenCL|POCL|DirectML|macOS)|two or more NVIDIA GPUs|requires sm_|compute capability|torch|numpy|python|PARITY_PYTHON|AVX-512|^NEEDS SPEC:|TAPE-GRADIENT BASELINE|forward recorded no differentiable leaf|Full PTX transfer not complete|^Not applicable: CUDA |Requires a non-CUDA|Linux-only|^NVRTC is present|benchmark|Wall-clock perf gate|run manually|manual perf harness|Manual CUDA|Diagnostic-only|Set (AIDOTNET|PARITY)_[A-Z0-9_]+=|AIDOTNET_GPU_MEMTRACK|AIDOTNET_KERNEL_REGISTRY_PERSIST${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) != ''sm86'' && ''|\bSM ?86\b|GA10[0-9x]|\bAmpere\b|-architecture-not-implemented$|^Experimental generated convolution is unavailable on this GPU architecture'' || '''' }}${{ (matrix.arch == ''pr'' && steps.gpu.outputs.sm || matrix.arch) == ''sm89'' && ''|declared route is (not released|off for this process)|^The declared route needs the sm_75\+ conveyor|^A declared resident program needs the sm_75\+ conveyor'' || '''' }}'
         SUITE_FILTER: ${{ inputs.suite_filter }}
         ALLOWED_SKIP_TEST: '(Hip|Rocm|Dawn|WebGpu|Vulkan|Metal|MoltenVk|OpenCl|Pocl|DirectMl)[A-Za-z0-9]*Tests\.'
       run: |
@@ -1179,6 +1192,19 @@ jobs:
         foreach ($name in $missing) { Write-Output "::error::Ratchet $name did not run (no pass or failure in the results)." }
         if ($tests -ne 0 -or $skips -ne 0 -or $missing.Count -gt 0) { exit 1 }
 
+    # The suites' coverage, handed to ci.yml's cuda-coverage job, which uploads it to codecov under build.yml's flag
+    # (unittests) only after the CPU unit-test run and the POCL shards have finished. Uploaded from here, it could land
+    # before the CPU report and be counted among codecov.yml's seven (after_n_builds), posting statuses without it.
+    - name: Keep CUDA coverage for the upload job
+      if: ${{ always() && !inputs.ratchets_only && (matrix.arch == 'pr' || matrix.arch == 'sm86') }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: gpu-cuda-coverage-${{ matrix.arch }}
+        path: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
+        # A leg whose suites never ran has no coverage; that failure is the suites' to report, not a second red step.
+        if-no-files-found: warn
+        retention-days: 3
+
     - name: Upload results
       if: always()
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1191,3 +1217,41 @@ jobs:
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
         retention-days: 5
+
+  # A pull request's coverage is uploaded by ci.yml's cuda-coverage job (on a hosted runner). A scheduled or dispatched
+  # run is not called from ci.yml, so it uploads here: main's base coverage keeps its CUDA lines, as each pull request's
+  # does, and the pull request deltas compare like with like.
+  coverage:
+    name: CUDA coverage upload
+    needs: cuda
+    if: ${{ always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && !inputs.ratchets_only && !inputs.suite_filter && (needs.cuda.result == 'success' || needs.cuda.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: AiDotNet.Tensors
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          pattern: gpu-cuda-coverage-*
+          path: ${{ runner.temp }}/cuda-coverage
+      - name: Find the coverage files
+        id: found
+        run: echo "any=$(find '${{ runner.temp }}/cuda-coverage' -name coverage.cobertura.xml 2>/dev/null | head -1 | wc -l)" >> "$GITHUB_OUTPUT"
+      - name: Upload CUDA coverage to Codecov
+        if: ${{ steps.found.outputs.any == '1' }}
+        # A Codecov outage is not a CUDA failure: the nightly stays green on the suites' own result.
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml
+          disable_search: true
+          root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+          flags: unittests
+          name: gpu-cuda
+          fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

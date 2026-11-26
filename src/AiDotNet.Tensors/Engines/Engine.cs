@@ -148,8 +148,9 @@ namespace AiDotNet.Tensors.Engines
                             {
                                 _directGpuEngine = new DirectGpuEngine();
                             }
-                            catch
+                            catch when (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend == GpuBackendType.None)
                             {
+                                // A required backend's failure propagates: it must never become a CPU run.
                                 _directGpuEngine = null;
                             }
                         }
@@ -181,10 +182,14 @@ namespace AiDotNet.Tensors.Engines
 
                 Console.WriteLine("[Engine] DirectGpu: Not available (no compatible GPU backends found)");
             }
-            catch (Exception ex)
+            catch (Exception ex) when (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend == GpuBackendType.None)
             {
                 Console.WriteLine($"[Engine] DirectGpu initialization failed: {ex.Message}");
             }
+            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var required && required != GpuBackendType.None)
+                throw new InvalidOperationException(
+                    $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}, " +
+                    "and no GPU engine is available; refusing to fall back to the CPU.");
 
             // Fallback to CPU (always available)
             var cpuEngine = new CpuEngine();

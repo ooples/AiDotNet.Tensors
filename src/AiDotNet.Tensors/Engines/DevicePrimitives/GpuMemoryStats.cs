@@ -46,7 +46,12 @@ public static class GpuMemoryStats
         public long ActiveAllocations;
     }
 
-    /// <summary>Bytes currently held by GPU allocators.</summary>
+    /// <summary>
+    /// Bytes currently held by the labelled allocators that report through <see cref="RecordAllocation"/> (page-locked
+    /// host staging, workspaces). Device memory is not among them: every backend counts its device allocations per
+    /// device, read through <see cref="Snapshot(IDirectGpuBackend)"/> (<see cref="GpuMemorySnapshot.AllocatedBytes"/>),
+    /// or summed over devices through <see cref="Snapshot()"/>.
+    /// </summary>
     public static long CurrentBytes
     {
         get { lock (_lock) return _currentBytes; }
@@ -153,6 +158,23 @@ public static class GpuMemoryStats
     {
         AccountOf(backend).ResetPeaks();
         HostShadowMemory.ResetPeak();
+    }
+
+    /// <summary>
+    /// Free and total memory of <paramref name="backend"/>'s device as its driver reports them (cuMemGetInfo on CUDA,
+    /// hipMemGetInfo on HIP): what every process on the device uses, as <c>nvidia-smi</c> shows, where
+    /// <see cref="Snapshot(IDirectGpuBackend)"/> counts this process's allocators. False when the backend's driver
+    /// reports no free memory (Metal, WebGPU).
+    /// </summary>
+    public static bool TryGetDeviceMemory(IDirectGpuBackend backend, out long freeBytes, out long totalBytes)
+    {
+        if (backend is null) throw new ArgumentNullException(nameof(backend));
+        freeBytes = totalBytes = 0;
+        if (backend is not IDeviceMemoryPressure pressure || !pressure.TryGetDeviceMemory(out ulong free, out ulong total))
+            return false;
+        freeBytes = (long)free;
+        totalBytes = (long)total;
+        return true;
     }
 
     /// <summary>Device memory summed over every GPU device the process has used.</summary>

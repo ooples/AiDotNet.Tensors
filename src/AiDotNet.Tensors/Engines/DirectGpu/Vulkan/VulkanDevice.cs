@@ -420,6 +420,13 @@ public sealed unsafe partial class VulkanDevice : IDisposable
                 continue;
             }
 
+            // An NVIDIA GPU CUDA_VISIBLE_DEVICES hides: Vulkan enumerates every GPU, and creating a device on a hidden
+            // one opened a context on a GPU the process was told not to use.
+            if (props.vendorID == CudaVisibleDevices.NvidiaVendorId && !IsCudaVisible(device, props.apiVersion))
+            {
+                continue;
+            }
+
             int score = 0;
             switch (props.deviceType)
             {
@@ -596,6 +603,26 @@ public sealed unsafe partial class VulkanDevice : IDisposable
 
     /// <summary>Whether 32-bit float buffer atomic add (VK_EXT_shader_atomic_float) was enabled.</summary>
     public bool BufferFloat32AtomicAddEnabled { get; private set; }
+
+    /// <summary>
+    /// Whether CUDA_VISIBLE_DEVICES leaves this NVIDIA device visible, matched by UUID. Without Vulkan 1.1 the UUID
+    /// cannot be read; the device then counts as hidden whenever the variable is set.
+    /// </summary>
+    private bool IsCudaVisible(IntPtr device, uint deviceApiVersion)
+    {
+        if (CudaVisibleDevices.VisibleNvidiaUuids is null) return true;
+        if (_instanceApiVersion < (uint)VulkanNativeBindings.VK_API_VERSION_1_1
+            || deviceApiVersion < (uint)VulkanNativeBindings.VK_API_VERSION_1_1)
+            return false;
+        var id = new VkPhysicalDeviceIDProperties { sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES };
+        var properties2 = new VkPhysicalDeviceProperties2
+        {
+            sType = VulkanNativeBindings.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            pNext = &id,
+        };
+        VulkanNativeBindings.vkGetPhysicalDeviceProperties2(device, &properties2);
+        return CudaVisibleDevices.IsVisible(new ReadOnlySpan<byte>(id.deviceUUID, 16));
+    }
 
     private static uint SelectInstanceApiVersion()
     {

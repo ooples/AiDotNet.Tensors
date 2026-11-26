@@ -23,7 +23,10 @@ internal static class PackedFloatLibrary
     {
         string text = KernelSourceResources.Read("PackedKernels.float.c");
         text = text.Substring(0, text.IndexOf(end, StringComparison.Ordinal));
-        text = Regex.Replace(text, @"\b(uint|int)\(", "($1)(");
+        text = Regex.Replace(text, @"\b(uint|int|float)\(", "($1)(");
+        // The library's float routines (square root, exponential, logarithm, tangent, sigmoid) read and write the bits
+        // through FBITS and UFLOAT, which each shader language spells its own way: as_uint and as_float in OpenCL C.
+        text = text.Replace("FBITS(", "as_uint(").Replace("UFLOAT(", "as_float(");
         if (uintName != "uint") text = Regex.Replace(text, @"\buint\b", uintName);
         string type = "(" + Regex.Escape(uintName) + "|int|float|bool)";
         return Regex.Replace(text, "^" + type + @" (pk_\w+)\(", functionPrefix + "$1 $2(", RegexOptions.Multiline);

@@ -79,7 +79,8 @@ public partial class DirectGpuTensorEngine
     {
         // Leased: answering may load the head's kernel module.
         using var __gpuOp = EnterGpuOp();
-        return TryGetBackend(out var backend) && backend is IFusedLinearMseLossBackend head
+        // The fused head multiplies in FP32: under matmul autocast the plan keeps the linear layer, whose product casts.
+        return !MatMulAutocastActive && TryGetBackend(out var backend) && backend is IFusedLinearMseLossBackend head
             && head.SupportsLinearMseLoss(m, k, n);
     }
 
@@ -91,8 +92,8 @@ public partial class DirectGpuTensorEngine
     internal Tensor<T>? TryFusedLinearMseLoss<T>(Tensor<T> x, Tensor<T> w, Tensor<T>? b, Tensor<T> y, int[] outputShape)
     {
         using var __gpuOp = EnterGpuOp();
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedLinearMseLossBackend head
-            || !TryGetLinearMseShape(x, w, b, y, out int m, out int k, out int n))
+        if (typeof(T) != typeof(float) || MatMulAutocastActive || !TryGetBackend(out var backend)
+            || backend is not IFusedLinearMseLossBackend head || !TryGetLinearMseShape(x, w, b, y, out int m, out int k, out int n))
             return null;
         using var bufX = GetOrAllocateBuffer(backend, x);
         using var bufW = GetOrAllocateBuffer(backend, w);

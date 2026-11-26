@@ -151,6 +151,18 @@ internal static class SavedStateSerializer
                 writer.Write(tensorMap.GetId(tensor));
                 break;
 
+            case Tensor<bool> boolTensor:
+                // A boolean mask the op reads live (TensorMaskedFill): its values at save time, written as bool[] (read
+                // back as bool[], which the op's rebuild takes with the shape entry beside it).
+                {
+                    var maskValues = boolTensor.ToArray();
+                    writer.Write(PlanFormatConstants.TagBoolArray);
+                    writer.Write(maskValues.Length);
+                    for (int j = 0; j < maskValues.Length; j++)
+                        writer.Write(maskValues[j]);
+                }
+                break;
+
             case Tensor<int> indices:
                 // Not in the plan's tensor table (that holds Tensor<T>): a GPU ReduceMax keeps its argmax as a device
                 // Tensor<int> (AiDotNet#1804), so it is written by value, landed on the host first.
@@ -186,7 +198,7 @@ internal static class SavedStateSerializer
                 // load never encounters a mystery tag byte.
                 throw new NotSupportedException(
                     $"SavedState entry of type {value.GetType().FullName} cannot be serialized. " +
-                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], bool[], FusedActivationParams, Tensor<T>, Tensor<int>, Enum.");
+                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], bool[], Tensor<bool>, FusedActivationParams, Tensor<T>, Tensor<int>, Enum.");
         }
     }
 

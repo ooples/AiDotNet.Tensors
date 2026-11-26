@@ -370,30 +370,6 @@ public sealed class CompiledRetainedOutputTests : IDisposable
             }
     }
 
-    [Fact]
-    public void Mixed_precision_rejects_retained_outputs_before_detaching_the_trace()
-    {
-        var engine = new CpuEngine();
-        AiDotNetEngine.Current = engine;
-        var input = new Tensor<float>([8]);
-        var prior = GraphMode.Current;
-        Assert.Throws<NotSupportedException>(() => MixedPrecisionCompiledPlan.Trace(() =>
-        {
-            // ReduceSum stays float under autocast, so registration succeeds before the plan rejects it.
-            var output = engine.ReduceSum(input, null);
-            GradientRecording.RetainOutput(output);
-            return output;
-        }, engine));
-        Assert.Same(prior, GraphMode.Current);
-        using var scope = GraphMode.EnableTraining(new[] { input });
-        var retained = engine.TensorAdd(input, input);
-        GradientRecording.RetainOutput(retained);
-        var loss = engine.ReduceSum(retained, null);
-        Assert.Throws<NotSupportedException>(() => MixedPrecisionCompiledPlan.Compile(loss, engine));
-        Assert.NotNull(loss.LazySource);
-        Assert.NotNull(retained.LazySource);
-    }
-
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

@@ -694,7 +694,9 @@ __device__ __forceinline__ float warpReduceSum(float val) {
 
 // Parallel softmax: 1 block per row, 256 threads cooperate on reduction
 // Uses warp shuffles for the last 32 elements, shared memory tree for inter-warp
-extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* __restrict__ input, float* __restrict__ output, int batchSize, int features)
+// No __restrict__: output may be input (the chunked fused cross-entropy's in-place softmax). Every element is read
+// before this thread writes it, and no other thread reads it afterwards.
+extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* input, float* output, int batchSize, int features)
 {
     int batch = blockIdx.x;
     if (batch >= batchSize) return;
@@ -834,7 +836,8 @@ extern ""C"" __global__ __launch_bounds__(256) void abs_vector(const float* __re
     B[idx] = xf_absf(A[idx]);
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* __restrict__ A, float* __restrict__ B, int size)
+// No __restrict__: B may be A (in place).
+extern ""C"" __global__ __launch_bounds__(256) void exp_vector(const float* A, float* B, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
@@ -1301,7 +1304,8 @@ extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__
 // per row left most of a block idle for a linear layer's 64-128 columns (~80 GB/s on a GTX 1660 Ti). With cols % 4 == 0
 // (and 16-byte aligned A and C, which the caller checks) each thread moves a float4: vec4 = 1. relu = 1 also applies
 // relu_nan_safe to each sum -- the relu kernel's operation, so the fused pass equals bias_add_out followed by relu.
-extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* __restrict__ A, const float* __restrict__ bias, float* __restrict__ C, int rows, int cols, int vec4, int relu)
+// A and C carry no __restrict__: C may be A (in place); each element is read once, before it is written.
+extern ""C"" __global__ __launch_bounds__(256) void bias_add_out(const float* A, const float* __restrict__ bias, float* C, int rows, int cols, int vec4, int relu)
 {
     long long stride = (long long)gridDim.x * blockDim.x;
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;

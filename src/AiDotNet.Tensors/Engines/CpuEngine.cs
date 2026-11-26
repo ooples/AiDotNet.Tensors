@@ -2148,12 +2148,33 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Tier 3: general broadcast (genuine size-1 → size-N expansion at
-        // some axis). Fall through to the existing broadcast kernel via a
-        // zero-add. Equivalent cost to the old idiom; callers used to
-        // allocate the zero tensor themselves which made Tier 1 / Tier 2
-        // fast paths unreachable. Now the primitive handles Tier 1/2
-        // correctly and only burns the full kernel when genuinely needed.
-        return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+        // some axis): a tile of the size-1 axes, after a reshape that left-pads
+        // the rank. This was a zero-add against a zero tensor of the whole
+        // target shape, which a compiled plan holds as a constant input and
+        // re-uploads every replay ([8,256,4,64] per call, 24 calls in a
+        // 16-layer Gated DeltaNet LM: 48 MiB on the device, 96 MiB of upload
+        // staging and 48 MiB copied from the host each step), and whose
+        // two-sided device broadcast expanded both operands into full-size
+        // temporaries. The tile's backward sums the copies, as the add's did.
+        // A size-1 axis broadcast to 0 has no tile multiple (a tile repeats at least once), so that target keeps the
+        // zero-add; an axis already 0 tiles once like any other.
+        for (int i = 0; i < targetShape.Length; i++)
+        {
+            int inputAxis = i - rankDiff;
+            int srcDim = inputAxis < 0 ? 1 : input._shape[inputAxis];
+            if (srcDim == 1 && targetShape[i] == 0) return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
+        }
+        var multiples = new int[targetShape.Length];
+        var padded = new int[targetShape.Length];
+        for (int i = 0; i < targetShape.Length; i++)
+        {
+            int inputAxis = i - rankDiff;
+            int srcDim = inputAxis < 0 ? 1 : input._shape[inputAxis];
+            padded[i] = srcDim;
+            multiples[i] = srcDim == targetShape[i] ? 1 : targetShape[i];
+        }
+        var aligned = rankDiff == 0 ? input : Reshape(input, padded);
+        return TensorTile(aligned, multiples);
     }
 
     [MethodImpl(Hot)]
@@ -25031,8 +25052,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outWidth = (inWidth - 1) * strideW - 2 * padW + kW + outPadW;
 
         var outputData = new T[batch * outChannels * outDepth * outHeight * outWidth];
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         // PARTITIONED BY OUTPUT, NOT BY INPUT. The previous form parallelised over (b, ic), gave
         // every task a full-size accumulator, and merged those accumulators under a lock -- so the
         // order the partial sums were added in was whatever order the tasks happened to finish in.
@@ -31517,8 +31538,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // CPU path: materialize the shared KV heads (managed, not on the record path — the GPU engine overrides
         // this to the fused GQA kernel that broadcasts inside the kernel with no copy), then run standard SDPA.
-        Tensor<T> k = qHeads == kvHeads ? key : BroadcastKvHeads(key, qHeads);
-        Tensor<T> v = qHeads == kvHeads ? value : BroadcastKvHeads(value, qHeads);
+        // Under a recording tape the heads are repeated by the differentiable TensorRepeatInterleave instead: the
+        // attention node then records against copies whose gradient flows back to key and value. BroadcastKvHeads
+        // records nothing, so a taped GQA attention trained its query projection and left the key and value
+        // projections with no gradient at all.
+        bool recording = DifferentiableOps.IsRecording<T>();
+        Tensor<T> k = qHeads == kvHeads ? key : recording ? TensorRepeatInterleave(key, qHeads / kvHeads, 1) : BroadcastKvHeads(key, qHeads);
+        Tensor<T> v = qHeads == kvHeads ? value : recording ? TensorRepeatInterleave(value, qHeads / kvHeads, 1) : BroadcastKvHeads(value, qHeads);
 
         Tensor<bool>? mask = null;
         if (isCausal)
@@ -43986,13 +44012,15 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor; var cm = mask; var cv = value;
-                var maskData = mask.GetFlattenedData();
                 var maskShape = (int[])mask._shape.Clone();
                 double fillValue = MathHelper.GetNumericOperations<T>().ToDouble(value);
+                // The backward reads the same mask the forward fills with (the live tensor, not a snapshot taken at
+                // trace time): a plan replays both every step, and a mask the caller rewrote between steps must move
+                // the forward and the gradient alike. A snapshot kept the traced mask's gradient after a rewrite.
                 return scope.RecordUnary(LazyNodeType.TensorMaskedFill, "TensorMaskedFill", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.MaskedFillBackward,
-                    new object[] { (bool[])maskData.Clone(), maskShape, fillValue });
+                    new object[] { cm, maskShape, fillValue });
             }
         }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
@@ -45480,7 +45508,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
-                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                         CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
                     }
                     return int4Result;
@@ -45570,7 +45598,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (bias != null || activation != FusedActivationType.None)
                 {
-                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    var bArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 
@@ -45593,7 +45621,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 using var outArrLease = matMulResult.LeaseArray();
                 var outArr = (float[])(object)outArrLease.Array;
-                var bArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                var bArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                 // matMulResult shape: [..batchDims.., M_rows, N]
                 // Collapse batch dims to treat as a single [M_total, N] for the epilogue.
                 int N = matMulResult._shape[matMulResult._shape.Length - 1];
@@ -45707,7 +45735,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         inA, q4.Data, q4.GroupScales, q4.GroupSize, outA, M, K, N);
                     if (bias != null || activation != FusedActivationType.None)
                     {
-                        var bA = bias != null ? (float[])(object)bias.GetDataArray() : null;
+                        var bA = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
                         CpuFusedOperations.ApplyBiasActivationInPlace(outA, bA, M, N, activation, activationParams);
                     }
                     return;
@@ -45774,7 +45802,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 if (bias != null || activation != FusedActivationType.None)
                 {
-                    var bArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+                    var bArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
                     CpuFusedOperations.ApplyBiasActivationInPlaceDouble(outArr, bArr, M, N, activation, activationParams);
                 }
 

@@ -784,6 +784,33 @@ public interface ICompiledTrainingPlanIntrospection<T>
 }
 
 /// <summary>
+/// The global gradient norm a compiled training plan's global-norm clip computes each step, for a reader (a training
+/// monitor) that would otherwise have to reduce every gradient again.
+/// </summary>
+/// <remarks>
+/// Separate from <see cref="ICompiledTrainingPlan{T}"/> so adding it breaks no existing implementer of that interface.
+/// The built-in plan implements both; test for it with <c>plan is ICompiledTrainingPlanGradientNorm norms</c>.
+/// </remarks>
+public interface ICompiledTrainingPlanGradientNorm
+{
+    /// <summary>
+    /// How many steps of this plan computed the global gradient norm, which its global-norm clip
+    /// (<see cref="ICompiledTrainingPlan{T}.SetMaxGradNorm"/>) does on every step it is on: eager, device-resident and
+    /// captured steps alike. Compare it with the value seen last to tell whether <see cref="TryGetLastGradientNorm"/>
+    /// holds a new step's norm.
+    /// </summary>
+    long GradientNormSteps { get; }
+
+    /// <summary>
+    /// The global L2 norm of the parameter gradients before the clip scaled them, from the last step that clipped (what
+    /// <c>torch.nn.utils.clip_grad_norm_</c> returns); NaN or infinity when a gradient was. False when no step has
+    /// computed one (clipping is off). On a device the norm stays in device memory until this reads it: one download
+    /// of a 16-word record, which waits for the step's work to finish.
+    /// </summary>
+    bool TryGetLastGradientNorm(out double norm);
+}
+
+/// <summary>
 /// Chooses which side of global-norm gradient clipping a compiled training plan adds its L2 term on.
 /// </summary>
 /// <remarks>

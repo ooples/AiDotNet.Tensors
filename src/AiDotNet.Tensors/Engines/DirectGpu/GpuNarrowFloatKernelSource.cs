@@ -76,6 +76,12 @@ internal static class GpuNarrowFloatKernelSource
     public static string MatrixMultiply(GpuElementType type) => "nfgemm_" + Suffix(type);
 
     /// <summary>
+    /// The kernel that rounds 32-bit floats to the type and back, <c>o[i] = (float)(type)a[i]</c>: arguments
+    /// (a, o, size), both buffers 32-bit floats. What matmul autocast casts a GEMM's operands with.
+    /// </summary>
+    public static string Round(GpuElementType type) => "nfround_" + Suffix(type);
+
+    /// <summary>
     /// The first pass of a sum: arguments (a, o, count, blocks), <c>o</c> the binary32 bits of each block's sum.
     /// </summary>
     public static string Sum(GpuElementType type) => "nfsum_" + Suffix(type);
@@ -102,6 +108,7 @@ internal static class GpuNarrowFloatKernelSource
 
             foreach (var operation in UnaryOperations) names.Add(Unary(operation, type));
             names.Add(MatrixMultiply(type));
+            names.Add(Round(type));
             names.Add(Sum(type));
             if (!names.Contains(SumPartials)) names.Add(SumPartials);
         }
@@ -292,6 +299,10 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
             string t = Suffix(type);
             string widen = "nf_w_" + t;
             string narrow = "nf_n_" + t;
+            // On the bits on every device: nf_n rounds to nearest even and nf_w widens exactly.
+            source.Append("IK_KERNEL ").Append(Round(type))
+                .Append("(IK_PTR const float* a, IK_PTR float* o, const int size)\n{\n    const int i = IK_GID;\n")
+                .Append("    if (i < size) o[i] = ").Append(widen).Append("((u16t)").Append(narrow).Append("(a[i]));\n}\n");
             if (openCl)
             {
                 AppendBitExact(source, type);
@@ -350,36 +361,57 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
         }
     }
 
-    // The OpenCL kernels: add, subtract, multiply, relu and the matrix product's accumulation on the bits, as the packed
-    // kernels compute them; negate is a sign flip and gelu (a transcendental, checked to a tolerance) stays native.
+    // The OpenCL kernels, every one the name list declares, computed on the bits as the packed kernels compute them
+    // (an OpenCL device may flush binary32 subnormals); gelu, checked to a tolerance, takes the native tanh.
     private static void AppendBitExact(StringBuilder source, GpuElementType type)
     {
         string t = Suffix(type);
         string widen = "pk_w_" + t, narrow = "pk_n_" + t;
         foreach (var operation in BinaryOperations)
         {
+            // `x` is the widened left operand and `y` the right one, both binary32 bits.
             string value = operation switch
             {
-                GpuNarrowFloatBinaryOperation.Add => "pk_fadd(" + widen + "(a[i]), " + widen + "(b[i]))",
-                GpuNarrowFloatBinaryOperation.Subtract => "pk_fadd(" + widen + "(a[i]), " + widen + "(b[i]) ^ 0x80000000u)",
-                _ => "pk_fmul(" + widen + "(a[i]), " + widen + "(b[i]))",
+                GpuNarrowFloatBinaryOperation.Add => "pk_fadd(x, y)",
+                GpuNarrowFloatBinaryOperation.Subtract => "pk_fadd(x, y ^ 0x80000000u)",
+                GpuNarrowFloatBinaryOperation.Divide => "pk_fdiv(x, y)",
+                _ => "pk_fmul(x, y)",
             };
             source.Append("IK_KERNEL ").Append(Binary(operation, type))
                 .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
-                .Append("    if (i < size) o[i] = (u16t)").Append(narrow).Append('(').Append(value).Append(");\n}\n");
+                .Append("    if (i < size) { const u32t x = ").Append(widen).Append("(a[i]); const u32t y = ").Append(widen)
+                .Append("(b[i]); o[i] = (u16t)").Append(narrow).Append('(').Append(value).Append("); }\n}\n");
+            source.Append("IK_KERNEL ").Append(Scalar(operation, type))
+                .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const float s, const int size)\n{\n    const int i = IK_GID;\n")
+                .Append("    if (i < size) { const u32t x = ").Append(widen).Append("(a[i]); const u32t y = as_uint(s); o[i] = (u16t)")
+                .Append(narrow).Append('(').Append(value).Append("); }\n}\n");
         }
 
         // The largest pattern below the sign bit that is not a NaN: infinity.
         string top = type == GpuElementType.Float16 ? "0x7C00u" : "0x7F80u";
-        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Negate, type))
-            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
-            .Append("    if (i < size) o[i] = (u16t)(a[i] ^ 0x8000u);\n}\n");
-        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Relu, type))
-            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
-            .Append("    if (i < size) o[i] = (u16t)pk_relu(a[i], ").Append(top).Append(");\n}\n");
-        source.Append("IK_KERNEL ").Append(Unary(GpuNarrowFloatUnaryOperation.Gelu, type))
-            .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
-            .Append("    if (i < size) o[i] = nf_n_").Append(t).Append("(nf_gelu(nf_w_").Append(t).Append("(a[i])));\n}\n");
+        foreach (var operation in UnaryOperations)
+        {
+            string value = operation switch
+            {
+                GpuNarrowFloatUnaryOperation.Negate => "(u16t)(a[i] ^ 0x8000u)",
+                GpuNarrowFloatUnaryOperation.Abs => "(u16t)(a[i] & 0x7FFFu)",
+                GpuNarrowFloatUnaryOperation.Relu => "(u16t)pk_relu(a[i], " + top + ")",
+                GpuNarrowFloatUnaryOperation.Sqrt => "(u16t)" + narrow + "(pk_usqrt(" + widen + "(a[i])))",
+                GpuNarrowFloatUnaryOperation.Exp => "(u16t)" + narrow + "(pk_uexp(" + widen + "(a[i])))",
+                GpuNarrowFloatUnaryOperation.Log => "(u16t)" + narrow + "(pk_ulog(" + widen + "(a[i])))",
+                GpuNarrowFloatUnaryOperation.Tanh => "(u16t)" + narrow + "(pk_utanh(" + widen + "(a[i])))",
+                GpuNarrowFloatUnaryOperation.Sigmoid => "(u16t)" + narrow + "(pk_usigmoid(" + widen + "(a[i])))",
+                _ => "nf_n_" + t + "(nf_gelu(nf_w_" + t + "(a[i])))",
+            };
+            source.Append("IK_KERNEL ").Append(Unary(operation, type))
+                .Append("(IK_PTR const u16t* a, IK_PTR u16t* o, const int size)\n{\n    const int i = IK_GID;\n")
+                .Append("    if (i < size) o[i] = ").Append(value).Append(";\n}\n");
+        }
+
+        // A block's elements added in order into a binary32 partial, stored as its bits.
+        AppendBitExactSum(source, Sum(type), "u16t", widen + "(a[j])");
+        if (type == Types[0]) AppendBitExactSum(source, SumPartials, "u32t", "a[j]");
+
         // Each product and sum rounded to binary32 in the host's order, as the host's float loop does.
         source.Append("IK_KERNEL ").Append(MatrixMultiply(type))
             .Append("(IK_PTR const u16t* a, IK_PTR const u16t* b, IK_PTR u16t* c, const int m, const int n, const int k)\n{\n")
@@ -387,4 +419,11 @@ NF_FN float nf_sigmoid(float x) { return x < -80.0f ? nf_exp(x) : 1.0f / (1.0f +
             .Append("    u32t s = 0u;\n    for (int j = 0; j < k; j++) s = pk_fadd(s, pk_fmul(").Append(widen).Append("(a[row * k + j]), ")
             .Append(widen).Append("(b[j * n + col])));\n    c[i] = (u16t)").Append(narrow).Append("(s);\n}\n");
     }
+
+    private static void AppendBitExactSum(StringBuilder source, string name, string element, string value)
+        => source.Append("IK_KERNEL ").Append(name).Append("(IK_PTR const ").Append(element)
+            .Append("* a, IK_PTR u32t* o, const int count, const int blocks)\n{\n"
+                + "    const int i = IK_GID;\n    if (i >= blocks) return;\n    const int first = i * " + GpuNarrowFloatLayout.SumBlock
+                + ";\n    const int last = (count - first > " + GpuNarrowFloatLayout.SumBlock + ") ? first + " + GpuNarrowFloatLayout.SumBlock
+                + " : count;\n    u32t s = 0u;\n    for (int j = first; j < last; j++) s = pk_fadd(s, ").Append(value).Append(");\n    o[i] = s;\n}\n");
 }
