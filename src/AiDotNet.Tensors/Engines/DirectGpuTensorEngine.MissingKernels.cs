@@ -9825,7 +9825,7 @@ public partial class DirectGpuTensorEngine
                     var aligned = new int[targetShape.Length];
                     for (int i = 0; i < rankDiff; i++) aligned[i] = 1;
                     for (int i = 0; i < input.Rank; i++) aligned[rankDiff + i] = input._shape[i];
-                    cur = cur.Reshape(aligned);
+                    cur = Reshape(cur, aligned);
                 }
 
                 // Expand each broadcast axis (size 1 -> target) with the GPU TileAxis kernel without allocating a host zero tensor.

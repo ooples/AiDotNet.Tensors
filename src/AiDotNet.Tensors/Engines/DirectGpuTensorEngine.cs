@@ -31198,12 +31198,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool allocated = false, handedOff = false;
         try
         {
-            var input = UploadTensorRaw(backend, tensor);
+            using var input = GetOrAllocateBuffer(backend, tensor);
             // TileAxis writes every element; inside a compiled step's action this is a pooled buffer, not a graph
             // allocation node.
             output = AllocateFullyWrittenOutputBuffer(backend, total);
             allocated = true;
-            backend.TileAxis(input, output.Buffer, outer, axisSize, inner, repeats);
+            backend.TileAxis(input.Buffer, output.Buffer, outer, axisSize, inner, repeats);
+            input.DisposeAfterQueuedUse(backend);
             var outShape = (int[])tensor.Shape._dims.Clone();
             outShape[axis] = checked(axisSize * repeats);
             var result = DeferTensorResult<T>(backend, output.Buffer, total, outShape);

@@ -155,4 +155,83 @@ public sealed class BroadcastAndSliceResidencyTests : IClassFixture<DirectGpuTen
         for (int i = 0; i < expected.Length; i++)
             Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-5f, $"[{i}] expected={expected[i]} actual={actual[i]}");
     }
+
+    [SkippableTheory]
+    [InlineData(0, new[] { 6, 8 })]        // Prefix narrow slice (offset == 0) + same-rank broadcast
+    [InlineData(2, new[] { 6, 8 })]        // Nonzero-offset narrow slice (offset > 0) + same-rank broadcast
+    [InlineData(2, new[] { 3, 6, 8 })]     // Nonzero-offset narrow slice + rank-expanding broadcast
+    public void NarrowSliceOfDeviceAuthoritativeTensor_InTensorBroadcastTo_UnderTape_StaysOnDevice(
+        int rowIndex,
+        int[] targetShape)
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine ?? throw new InvalidOperationException("GPU fixture reported a device without an engine.");
+        var cpu = new CpuEngine();
+        var previous = AiDotNetEngine.Current;
+        try
+        {
+            var rng = RandomHelper.CreateSeededRandom(303 + rowIndex);
+            var hostBase = new Tensor<float>(new[] { 4, 8 });
+            for (int i = 0; i < hostBase.Length; i++)
+                hostBase[i] = (float)(rng.NextDouble() * 2.0 - 1.0);
+
+            var scaleTarget = new Tensor<float>(targetShape);
+            for (int i = 0; i < scaleTarget.Length; i++)
+                scaleTarget[i] = (float)(0.2 * ((i % 7) - 3));
+            gpu.RegisterPersistentTensor(scaleTarget, PersistentTensorRole.Constant);
+
+            // CPU oracle: tanh(hostBase) -> narrow row -> broadcast -> weighted sum
+            AiDotNetEngine.Current = cpu;
+            float[] expectedFwd;
+            float[] expectedGrad;
+            using (var cpuTape = new GradientTape<float>())
+            {
+                var cpuAct = cpu.TensorTanh(hostBase);
+                var cpuRow = cpu.TensorNarrow(cpuAct, 0, rowIndex, 1);
+                var cpuBc = cpu.TensorBroadcastTo(cpuRow, targetShape);
+                expectedFwd = cpuBc.ToArray();
+                var cpuLoss = cpu.ReduceSum(cpu.TensorMultiply(cpuBc, scaleTarget), null, keepDims: false);
+                expectedGrad = cpuTape.ComputeGradients(cpuLoss, new[] { hostBase })[hostBase].ToArray();
+            }
+
+            // GPU: produce a device-only tensor inside TensorScope/GradientTape whose host mirror is unmaterialized,
+            // slice a single row via TensorNarrow, and broadcast it under GradientTape with zero host materialization.
+            AiDotNetEngine.Current = gpu;
+            _ = gpu.TensorMultiplyScalar(scaleTarget, 1.0f);
+
+            Tensor<float> gpuFwd;
+            Tensor<float> gpuGrad;
+            long uploaded;
+            long downloaded;
+            using (var gpuTape = new GradientTape<float>())
+            {
+                var gpuAct = gpu.TensorTanh(hostBase);
+                using (var residency = GpuResidencyScope.Begin())
+                {
+                    var gpuRow = gpu.TensorNarrow(gpuAct, 0, rowIndex, 1);
+                    gpuFwd = gpu.TensorBroadcastTo(gpuRow, targetShape);
+                    var gpuLoss = gpu.ReduceSum(gpu.TensorMultiply(gpuFwd, scaleTarget), null, keepDims: false);
+                    gpuGrad = gpuTape.ComputeGradients(gpuLoss, new[] { hostBase })[hostBase];
+                    residency.Dispose();
+                    uploaded = residency.BytesUploaded;
+                    downloaded = residency.BytesDownloaded;
+                }
+            }
+
+            Assert.True(uploaded == 0, $"BroadcastTo of narrow slice uploaded {uploaded} bytes.");
+            Assert.True(downloaded <= 16, $"BroadcastTo of narrow slice downloaded {downloaded} bytes.");
+
+            var actualFwd = gpuFwd.ToArray();
+            for (int i = 0; i < expectedFwd.Length; i++)
+                Assert.True(Math.Abs(expectedFwd[i] - actualFwd[i]) < 1e-4f, $"Fwd[{i}] cpu={expectedFwd[i]} gpu={actualFwd[i]}");
+
+            var actualGrad = gpuGrad.ToArray();
+            for (int i = 0; i < expectedGrad.Length; i++)
+                Assert.True(Math.Abs(expectedGrad[i] - actualGrad[i]) < 1e-4f, $"Grad[{i}] cpu={expectedGrad[i]} gpu={actualGrad[i]}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
 }
