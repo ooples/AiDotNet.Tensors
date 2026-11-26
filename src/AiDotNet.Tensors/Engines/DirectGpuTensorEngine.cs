@@ -32192,53 +32192,77 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _persistentBufferCache.Clear();
         _tensorVersions.Clear();
         _persistentWeightHostVersion.Clear();
-        ReleaseBf16DeviceWeights();
-        ReleaseHostMaskDeviceCopies();
-        // Reclaim buffers awaiting deferred disposal (engine teardown — no reader to race).
-        foreach (var retired in _retiredWeightBuffers) retired.Dispose();
-        _retiredWeightBuffers.Clear();
-
-        // Dispose cached CSR GPU buffers
-        foreach (var entry in _csrBufferCache.Values)
+        // Each later stage runs even when one throws, and the backend is disposed last either way: an exception from one
+        // stage used to skip the rest and the backend's own disposal, and a retry returned at once, so the context
+        // leaked. The failures are rethrown together at the end.
+        List<Exception>? failures = null;
+        void Stage(Action stage)
         {
-            entry.Dispose();
+            try { stage(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException) { (failures ??= new List<Exception>()).Add(ex); }
         }
-        _csrBufferCache.Clear();
-
-        lock (_adaptivePoolMatricesGate)
+        try
         {
-            // A backward may still have queued a pooling GEMM that reads one of these.
-            foreach (var entry in _adaptivePoolMatrices) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
-            _adaptivePoolMatrices.Clear();
+            Stage(ReleaseBf16DeviceWeights);
+            Stage(ReleaseHostMaskDeviceCopies);
+            Stage(() =>
+            {
+                // Reclaim buffers awaiting deferred disposal (engine teardown — no reader to race).
+                foreach (var retired in _retiredWeightBuffers) retired.Dispose();
+                _retiredWeightBuffers.Clear();
+            });
+            Stage(() =>
+            {
+                foreach (var entry in _csrBufferCache.Values) entry.Dispose();
+                _csrBufferCache.Clear();
+            });
+            Stage(() =>
+            {
+                lock (_adaptivePoolMatricesGate)
+                {
+                    // A backward may still have queued a pooling GEMM that reads one of these.
+                    foreach (var entry in _adaptivePoolMatrices) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
+                    _adaptivePoolMatrices.Clear();
+                }
+            });
+            Stage(() =>
+            {
+                lock (_spectrumConstantsGate)
+                {
+                    // A queued IRFFT, or its adjoint, may still read one of these.
+                    foreach (var entry in _spectrumConstants) DisposeBufferAfterQueuedUse(entry.Key.Backend, entry.Value);
+                    _spectrumConstants.Clear();
+                    _spectrumConstantBytes = 0;
+                }
+            });
+            Stage(() =>
+            {
+                lock (_stridedViewLayoutsGate)
+                {
+                    foreach (var (layoutBackend, layoutBuffer) in _stridedViewLayoutBuffers) DisposeBufferAfterQueuedUse(layoutBackend, layoutBuffer);
+                    _stridedViewLayoutBuffers.Clear();
+                    _stridedViewLayoutCount = 0;
+                }
+            });
+            Stage(() =>
+            {
+                lock (_occupancyBufferCacheGate)
+                {
+                    if (_occupancyBufferCacheBuffer is not null && _occupancyBufferCacheBackend is not null)
+                        DisposeBufferAfterQueuedUse(_occupancyBufferCacheBackend, _occupancyBufferCacheBuffer);
+                    _occupancyBufferCacheTensor = null;
+                    _occupancyBufferCacheBackend = null;
+                    _occupancyBufferCacheBuffer = null;
+                    _occupancyBufferCacheVersion = -1;
+                }
+            });
         }
-
-        lock (_spectrumConstantsGate)
+        finally
         {
-            // A queued IRFFT, or its adjoint, may still read one of these.
-            foreach (var entry in _spectrumConstants) DisposeBufferAfterQueuedUse(entry.Key.Backend, entry.Value);
-            _spectrumConstants.Clear();
-            _spectrumConstantBytes = 0;
+            if (_ownsDirectGpu) Stage(() => _directGpu?.Dispose());
         }
-
-        lock (_stridedViewLayoutsGate)
-        {
-            foreach (var (layoutBackend, layoutBuffer) in _stridedViewLayoutBuffers) DisposeBufferAfterQueuedUse(layoutBackend, layoutBuffer);
-            _stridedViewLayoutBuffers.Clear();
-            _stridedViewLayoutCount = 0;
-        }
-
-        lock (_occupancyBufferCacheGate)
-        {
-            if (_occupancyBufferCacheBuffer is not null && _occupancyBufferCacheBackend is not null)
-                DisposeBufferAfterQueuedUse(_occupancyBufferCacheBackend, _occupancyBufferCacheBuffer);
-            _occupancyBufferCacheTensor = null;
-            _occupancyBufferCacheBackend = null;
-            _occupancyBufferCacheBuffer = null;
-            _occupancyBufferCacheVersion = -1;
-        }
-
-        if (_ownsDirectGpu)
-            _directGpu?.Dispose();
+        if (failures is { Count: 1 }) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is { Count: > 1 }) throw new AggregateException("Disposing the GPU engine failed in several stages.", failures);
         return true;
     }
 

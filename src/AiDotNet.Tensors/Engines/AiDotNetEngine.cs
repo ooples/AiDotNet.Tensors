@@ -439,6 +439,9 @@ public static class AiDotNetEngine
         // again on the dead context. Stay on CPU.
         if (_gpuCircuitBroken)
         {
+            // Superseded engines of other backends are still released here: a CUDA fault does not affect them, and every
+            // later detection returns at this point, so it is the only place a detection can release them.
+            ReleaseSupersededGpu(null);
             if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var requiredWhileBroken && requiredWhileBroken != GpuBackendType.None)
                 throw new InvalidOperationException(
                     $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {requiredWhileBroken}, "
@@ -814,13 +817,17 @@ public static class AiDotNetEngine
         {
             if (engine is not null && !_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
             if (_supersededGpus.Count == 0) return;
+            // After a trip a CUDA engine stays listed and open: CUDA engines share the device's primary context,
+            // which the breaker found corrupted, and a teardown on it can fault the process. Other backends are
+            // unaffected by a CUDA fault and are released as usual. Classified before the list changes, so an
+            // exception escaping the classification leaves every engine listed.
+            var keep = new bool[_supersededGpus.Count];
+            if (_gpuCircuitBroken)
+                for (int i = 0; i < keep.Length; i++) keep[i] = IsCudaEngine(_supersededGpus[i]);
             pending = new System.Collections.Generic.List<DirectGpuTensorEngine>();
             for (int i = _supersededGpus.Count - 1; i >= 0; i--)
             {
-                // After a trip a CUDA engine stays listed and open: CUDA engines share the device's primary context,
-                // which the breaker found corrupted, and a teardown on it can fault the process. Other backends are
-                // unaffected by a CUDA fault and are released as usual.
-                if (_gpuCircuitBroken && IsCudaEngine(_supersededGpus[i])) continue;
+                if (keep[i]) continue;
                 pending.Add(_supersededGpus[i]);
                 _supersededGpus.RemoveAt(i);
             }
@@ -856,13 +863,16 @@ public static class AiDotNetEngine
         }
     }
 
-    // Whether an engine runs on CUDA, the backend a tripped breaker leaves corrupted. A disposed or unreadable engine
-    // counts as CUDA, which only keeps it listed.
+    // Whether an engine runs on CUDA, the backend a tripped breaker leaves corrupted. A disposed engine is not (it has
+    // nothing left to release); one whose backend cannot be read counts as CUDA, which only keeps it listed.
     private static bool IsCudaEngine(DirectGpuTensorEngine engine)
     {
-        try { return !engine.IsDisposed && ((IEngine)engine).DirectGpu?.BackendName is { } name && name.StartsWith("CUDA", StringComparison.OrdinalIgnoreCase); }
+        try { return !engine.IsDisposed && IsCudaBackendName(((IEngine)engine).DirectGpu?.BackendName); }
         catch (Exception ex) when (ex is not OutOfMemoryException) { return true; }
     }
+
+    /// <summary>Whether a backend name is the CUDA backend's (exactly "CUDA"; HIP and the others are not).</summary>
+    internal static bool IsCudaBackendName(string? name) => string.Equals(name, "CUDA", StringComparison.OrdinalIgnoreCase);
 
     // Detection after the circuit breaker tripped mid-way: engines it would publish or release share the corrupted
     // context, so they are kept in the superseded list (reachable, never finalized into a teardown, and not released
@@ -944,12 +954,34 @@ public static class AiDotNetEngine
         return (slot.Engine, slot.CallerAssigned);
     }
 
-    /// <summary>Restores a <see cref="SnapshotCurrentForTests"/> pair, flag included (tests).</summary>
+    /// <summary>
+    /// Restores a <see cref="SnapshotCurrentForTests"/> pair, flag included, and clears a recorded required-backend
+    /// detection failure as assigning <see cref="Current"/> does (tests). Only the slot is restored: the adopted engine,
+    /// the superseded list and the owed detection are left as the test left them.
+    /// </summary>
     internal static void RestoreCurrentForTests((IEngine Engine, bool CallerAssigned) snapshot)
     {
         lock (_deferredLock)
         lock (_adoptionLock)
+        {
+            _requiredDetectionFailure = null;
             PublishCurrent(snapshot.Engine, snapshot.CallerAssigned);
+        }
+    }
+
+    /// <summary>Parks <paramref name="engine"/> in the superseded list and runs a release pass over it (tests).</summary>
+    internal static void ReleaseSupersededGpuForTests(DirectGpuTensorEngine engine) => ReleaseSupersededGpu(engine);
+
+    /// <summary>Whether <paramref name="engine"/> is still in the superseded list (tests).</summary>
+    internal static bool IsSupersededForTests(DirectGpuTensorEngine engine)
+    {
+        lock (_adoptionLock) return _supersededGpus.Contains(engine);
+    }
+
+    /// <summary>Removes <paramref name="engine"/> from the superseded list (tests).</summary>
+    internal static void ForgetSupersededForTests(DirectGpuTensorEngine engine)
+    {
+        lock (_adoptionLock) _supersededGpus.Remove(engine);
     }
 
     /// <summary>Runs <paramref name="action"/> while holding the adoption lock, as an adoption disposing an engine does (tests).</summary>

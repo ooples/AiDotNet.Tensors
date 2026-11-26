@@ -1097,7 +1097,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             {
                 var popped = CuBlasNative.cuCtxPopCurrent(out _);
                 if (popped == CudaResult.Success) _threadCurrentContext = IntPtr.Zero;
-                else if (AiDotNetEngine.GpuCircuitBroken)
+                // A sticky fault the pop itself reports first (700, 709, 719) is the same state: trip the breaker and keep
+                // the marker, rather than clearing it and throwing.
+                else if (((int)popped is 700 or 709 or 719 && TripOnPop(popped)) || AiDotNetEngine.GpuCircuitBroken)
                 {
                     // After a sticky device fault the pop can fail too; throwing then would replace the error that
                     // tripped the breaker with this one, from inside the cleanup of the call that hit it. The marker
@@ -1111,6 +1113,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 }
             }
             CudaCurrentStream.Restore(_previousStream);
+        }
+
+        private static bool TripOnPop(CudaResult popped)
+        {
+            AiDotNetEngine.TripGpuCircuitBreaker("cuCtxPopCurrent", (int)popped);
+            return true;
         }
     }
 
@@ -20356,6 +20364,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
         _disposed = true;
         UnregisterDevicePeer();
+
+        // No native teardown on a context the circuit breaker found corrupted, whichever path reaches this (an engine
+        // disposed after losing an adoption race to a trip included): the process exit reclaims it.
+        if (AiDotNetEngine.GpuCircuitBroken)
+        {
+            System.Diagnostics.Trace.TraceWarning("[CUDA] Backend disposed after the GPU circuit breaker tripped: its context is left to the process exit.");
+            if (disposing) GC.SuppressFinalize(this);
+            return;
+        }
 
         // The multi-tensor tables hold device buffers: free them only on an explicit dispose, never from the
         // finalizer (the context may already be gone).

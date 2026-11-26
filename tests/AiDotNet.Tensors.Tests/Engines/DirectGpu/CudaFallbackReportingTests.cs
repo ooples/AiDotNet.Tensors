@@ -172,7 +172,6 @@ public class CudaFallbackReportingTests
     [Fact]
     public void RequiredBackend_WithGpuDisabledOrTheCircuitOpen_Throws_InsteadOfSwitchingToTheCpu()
     {
-        var saved = AiDotNetEngine.Current;
         var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
         var previousRequired = GpuBackendOptions.RequiredBackend;
         string? previousDisable = Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU");
@@ -234,6 +233,96 @@ public class CudaFallbackReportingTests
                 && !ReferenceEquals(adoptedHere, parked))
                 adoptedHere.Dispose();
             if (parked is { IsDisposed: false }) parked.Dispose();
+        }
+    }
+
+    private sealed class FakeBuffer : AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer
+    {
+        private readonly bool _throws;
+        public FakeBuffer(bool throws) => _throws = throws;
+        public bool Disposed { get; private set; }
+        public int Size => 1;
+        public long SizeInBytes => 4;
+        public GpuElementType ElementType => GpuElementType.Float32;
+        public IntPtr Handle => IntPtr.Zero;
+        public void Dispose()
+        {
+            Disposed = true;
+            if (_throws) throw new InvalidOperationException("release failed");
+        }
+    }
+
+    /// <summary>
+    /// Releasing host-mask copies used to stop the engine's disposal at the first failure: the later stages (retired
+    /// weight buffers, the caches, the backend itself) were skipped and a retry returned at once, so the context
+    /// leaked. Every copy is now tried, every later stage runs, and the failures are reported together.
+    /// </summary>
+    [Fact]
+    public void A_failing_host_mask_release_neither_stops_the_other_copies_nor_the_rest_of_the_disposal()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { Skip.If(true, "The GPU engine cannot be constructed: " + ex.Message); return; }
+        var failing1 = new FakeBuffer(throws: true);
+        var failing2 = new FakeBuffer(throws: true);
+        var fine = new FakeBuffer(throws: false);
+        var retired = new FakeBuffer(throws: false);
+        var copies = new[] { gpu.AddHostMaskDeviceCopyForTests(failing1), gpu.AddHostMaskDeviceCopyForTests(fine),
+            gpu.AddHostMaskDeviceCopyForTests(failing2) };
+        gpu.AddRetiredWeightBufferForTests(retired);
+
+        var thrown = Record.Exception(() => gpu.Dispose());
+        GC.KeepAlive(copies);
+
+        var aggregate = Assert.IsType<AggregateException>(thrown);
+        Assert.Equal(2, aggregate.InnerExceptions.Count);
+        Assert.True(failing1.Disposed && fine.Disposed && failing2.Disposed, "a host-mask copy was not tried");
+        Assert.Equal(0, gpu.LiveHostMaskDeviceCopiesForTests);
+        Assert.True(retired.Disposed, "the disposal stopped at the host-mask stage: a later stage never ran");
+    }
+
+    [Theory]
+    [InlineData("CUDA", true)]
+    [InlineData("cuda", true)]
+    [InlineData("CUDA-compatible", false)]
+    [InlineData("HIP (gfx1100)", false)]
+    [InlineData("OpenCL", false)]
+    [InlineData(null, false)]
+    public void Only_the_CUDA_backend_name_counts_as_CUDA(string? name, bool cuda) =>
+        Assert.Equal(cuda, AiDotNetEngine.IsCudaBackendName(name));
+
+    /// <summary>
+    /// After a trip, a superseded engine on another backend is released (a CUDA fault does not affect it) while a CUDA
+    /// engine stays listed and open on the corrupted context.
+    /// </summary>
+    [SkippableFact]
+    public void After_a_trip_superseded_engines_of_other_backends_are_released_and_CUDA_ones_kept()
+    {
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU") is { Length: > 0 }, "GPU detection is disabled.");
+        var openCl = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.OpenCL);
+        Skip.If(openCl is null || !openCl.BackendName.StartsWith("OpenCL", StringComparison.Ordinal), "No OpenCL device.");
+        var cuda = DirectGpuBackendFactory.CreateNew(GpuBackendPreference.CUDA);
+        DirectGpuTensorEngine other = new(new DirectGpuEngine(openCl!));
+        DirectGpuTensorEngine? onCuda = cuda is not null && AiDotNetEngine.IsCudaBackendName(cuda.BackendName)
+            ? new DirectGpuTensorEngine(new DirectGpuEngine(cuda)) : null;
+        try
+        {
+            AiDotNetEngine.OpenGpuCircuitBreakerForTests();
+            AiDotNetEngine.ReleaseSupersededGpuForTests(other);
+            Assert.True(other.IsDisposed, "a superseded OpenCL engine was kept open after a CUDA trip");
+            Assert.False(AiDotNetEngine.IsSupersededForTests(other));
+            if (onCuda is not null)
+            {
+                AiDotNetEngine.ReleaseSupersededGpuForTests(onCuda);
+                Assert.False(onCuda.IsDisposed, "a CUDA engine was torn down on the corrupted context");
+                Assert.True(AiDotNetEngine.IsSupersededForTests(onCuda));
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            if (onCuda is not null) { AiDotNetEngine.ForgetSupersededForTests(onCuda); onCuda.Dispose(); }
+            if (!other.IsDisposed) { AiDotNetEngine.ForgetSupersededForTests(other); other.Dispose(); }
         }
     }
 

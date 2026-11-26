@@ -34,8 +34,8 @@ public partial class DirectGpuTensorEngine
     /// <summary>Frees every live host-mask device copy (engine disposal).</summary>
     private void ReleaseHostMaskDeviceCopies()
     {
-        // Every copy is released and the list cleared even when one release throws, so a single failure neither keeps
-        // the other copies nor aborts the engine's disposal; the first failure is rethrown at the end.
+        // Every copy is released and the list cleared even when one release throws, so a single failure does not keep
+        // the other copies; the failures are rethrown at the end (the engine's disposal collects them with the rest).
         List<Exception>? failures = null;
         lock (_hostMaskLock)
         {
@@ -50,7 +50,7 @@ public partial class DirectGpuTensorEngine
                     copy.Backend = null;
                     if (buffer is null) continue;
                     try { ReleaseHostMaskBuffer(owner, buffer); }
-                    catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException) { (failures ??= new List<Exception>()).Add(ex); }
                 }
             }
             _hostMaskCopyList.Clear();
@@ -58,6 +58,18 @@ public partial class DirectGpuTensorEngine
         if (failures is { Count: 1 }) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
         if (failures is { Count: > 1 }) throw new AggregateException("Releasing host-mask device copies failed.", failures);
     }
+
+    /// <summary>Registers a device copy holding <paramref name="buffer"/> with no backend; the caller keeps the returned
+    /// copy alive (tests).</summary>
+    internal object AddHostMaskDeviceCopyForTests(IGpuBuffer buffer)
+    {
+        var copy = new HostMaskDeviceCopy { Buffer = buffer };
+        lock (_hostMaskLock) _hostMaskCopyList.Add(new WeakReference<HostMaskDeviceCopy>(copy));
+        return copy;
+    }
+
+    /// <summary>Queues <paramref name="buffer"/> as a retired weight buffer, released by the engine's disposal (tests).</summary>
+    internal void AddRetiredWeightBufferForTests(IGpuBuffer buffer) => _retiredWeightBuffers.Add(buffer);
 
     /// <summary>Device copies of host masks this engine holds (tests).</summary>
     internal int LiveHostMaskDeviceCopiesForTests
@@ -175,8 +187,9 @@ public partial class DirectGpuTensorEngine
     private static void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
     {
         // Not on a CUDA context the circuit breaker found corrupted: the buffer is left to the exit of the process.
-        // Other backends are not affected by a CUDA fault.
-        if (AiDotNetEngine.GpuCircuitBroken && (owner is null || owner.BackendName.StartsWith("CUDA", StringComparison.OrdinalIgnoreCase))) return;
+        // Other backends are not affected by a CUDA fault. Without an owner the buffer's own dispose decides (a CUDA
+        // buffer skips its free once the breaker is open).
+        if (owner is not null && AiDotNetEngine.GpuCircuitBroken && AiDotNetEngine.IsCudaBackendName(owner.BackendName)) return;
         if (owner is not null && owner.IsAvailable)
         {
             // Any other failure propagates: the queued release may already own the buffer (its free waits on an event
