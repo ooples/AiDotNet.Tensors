@@ -254,6 +254,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
 
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+        // A streaming weight whose storage was dropped (paged out, or left on the device by MaterializeForForward)
+        // pages back in first: the view shares the storage and is no streaming weight itself, so it could not.
+        if (Lifetime == WeightLifetime.Streaming) EnsureStorageResident();
         // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
         // vector/storage snapshot and family registration under the detach lock; otherwise a
         // concurrent writer could swap storage between evaluation of the two constructor args.

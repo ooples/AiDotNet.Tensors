@@ -1148,25 +1148,31 @@ public static partial class WeightRegistry
 
     /// <summary>
     /// Makes a streaming weight ready for the computation about to use it: a layer's residency boundary before its
-    /// forward. Like <see cref="Materialize{T}"/>, except for a float weight with a bf16 store while the current
-    /// engine keeps bf16 device copies (a GPU engine): its ops read the device copy and widen it on the device, so no
-    /// fp32 host copy is restored, and one a host path made earlier is released to the pool. A host read of the
-    /// weight still pages it back in on access.
+    /// forward. Like <see cref="Materialize{T}"/>, except for a float weight with a bf16 store when the engine keeps a
+    /// bf16 device copy of it (a GPU engine): its ops read the device copy and widen it on the device, so no fp32 host
+    /// copy is restored. A host copy that already exists is left to the owner budget, and a host read or a view of the
+    /// weight pages it back in.
     /// </summary>
     /// <remarks>
-    /// The weight then lives once on the device, beside its bf16 store, as a PyTorch module's weight on a device
-    /// does. A layer forward that called <see cref="Materialize{T}"/> instead held an fp32 host copy of every weight
-    /// it reached, up to the materialized-owner budget (half the pool's): a mixture of experts on a GPU grew the host
-    /// by two bytes per bf16 byte its forward reached, beside the bf16 device copies that served the ops.
+    /// The weight then lives on the device, beside its bf16 store, as a PyTorch module's weight on a device does. A
+    /// layer forward that called <see cref="Materialize{T}"/> instead restored an fp32 host copy of every weight it
+    /// reached and held it up to the materialized-owner budget (half the pool's): a mixture of experts on a GPU grew
+    /// the host by two bytes per bf16 byte its forward reached, beside the bf16 device copies that served the ops.
     /// </remarks>
     /// <param name="weight">The weight; a tensor that is not a streaming weight is left as it is.</param>
-    public static void MaterializeForForward<T>(Tensor<T> weight)
+    /// <param name="engine">The engine the computation runs on (a layer's own); null for the current engine.</param>
+    public static void MaterializeForForward<T>(Tensor<T> weight, Engines.IEngine? engine = null)
     {
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (weight.Lifetime == WeightLifetime.Streaming && weight.StreamingPoolHandle >= 0
-            && !weight.IsWritableMmapAliased && ServedFromBf16DeviceCopy(weight))
+            && !weight.IsWritableMmapAliased && ServedFromBf16DeviceCopy(weight, engine ?? Engines.AiDotNetEngine.Current))
         {
-            if (weight.DataVector.Length == weight.Length) ReleaseToPool(weight);
+            // Not restored, but used: the bf16 store stays hot in the pool (a re-upload after a device eviction reads
+            // it), and evictions elsewhere drop their owners as Materialize's resident path does.
+            StreamingTensorPool? poolRef;
+            lock (_lock) { poolRef = _streamingPool; }
+            poolRef?.MarkAccessed(weight.StreamingPoolHandle);
+            DrainOwnerDropsAfterEviction();
             return;
         }
         Materialize(weight);
@@ -1333,10 +1339,11 @@ public static partial class WeightRegistry
 
     // Whether the current engine serves this weight from a bf16 device copy (DirectGpuTensorEngine.TryBf16StreamingWeight
     // takes the same contiguous float bf16-store weights).
-    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight)
+    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight, Engines.IEngine? engine)
         => typeof(T) == typeof(float) && weight.StreamingStoreEncoding == StreamingEncoding.Bf16
             && weight.IsContiguous && weight._storageOffset == 0
-            && Engines.AiDotNetEngine.PeekCurrent().As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true };
+            && engine.As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true }
+            && HasBf16Store(weight);
 
     /// <summary>
     /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry
