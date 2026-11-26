@@ -3151,6 +3151,42 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void EnsureHostStorageResident() => EnsureStorageResident();
 
     /// <summary>
+    /// Builds a view of this tensor's raw storage once that storage is resident; <paramref name="pagedIn"/> reports
+    /// whether this call paged it in. A streaming weight pages in outside its transition gate (the page-in takes the
+    /// weight registry's lock) and <paramref name="build"/> then runs under the gate, which every streaming drop holds.
+    /// A drop a release had already claimed therefore either landed first, so the residency check under the gate sees
+    /// it and the page-in runs again, or runs after the view took its storage reference and, finding the storage
+    /// shared, defers. Without the gate the view could wrap the emptied replacement storage with the full shape.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="build"/> must take no weight-registry lock: the registry may hold its lock while it tries the
+    /// gate. Constructing a view (an atomic storage AddRef) takes none.
+    /// </remarks>
+    internal TView BuildViewOfResidentStorage<TView>(Func<TView> build, out bool pagedIn)
+    {
+        pagedIn = false;
+        if (Lifetime != WeightLifetime.Streaming) return build();
+        for (int attempt = 1; ; attempt++)
+        {
+            if (_data.Length != Length)
+            {
+                EnsureStorageResident();
+                pagedIn = true;
+            }
+            lock (StreamingTransitionGate)
+            {
+                // Past the retry bound the view is built as it stands: one that still does not fit fails the view
+                // constructor's bounds check, as a weight that cannot page in always has, rather than spinning.
+                if (_data.Length == Length || attempt >= MaxResidentViewAttempts) return build();
+            }
+        }
+    }
+
+    // Each retry means a release dropped the weight between this thread's page-in and its view; a handful covers any
+    // real interleaving.
+    private const int MaxResidentViewAttempts = 16;
+
+    /// <summary>
     /// The storage half of <see cref="EnsureMaterialized"/>: creates a deferred buffer and pages a dropped
     /// streaming weight (fp32/bf16 snapshot, int8 or int4) back in. Does not realize a lazy node.
     /// </summary>

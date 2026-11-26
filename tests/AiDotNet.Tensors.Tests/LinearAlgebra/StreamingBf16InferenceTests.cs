@@ -379,6 +379,42 @@ public class StreamingBf16InferenceTests
     }
 
     /// <summary>
+    /// Views of a streaming weight that another thread keeps releasing to the pool. Each view either pages the weight
+    /// in and holds its storage before a drop can empty it, or the drop lands first and the view pages in again. A
+    /// release that had already claimed the owner used to drop the storage between a view's residency check and its
+    /// storage reference, so the view wrapped the emptied storage (or failed to take a reference to it).
+    /// </summary>
+    [Fact]
+    public void Views_of_a_streaming_weight_released_concurrently_always_see_its_values()
+    {
+        var dir = Configure();
+        try
+        {
+            var w = Stream(Filled(new[] { K, N }, 4, v => v));
+            var expected = Filled(new[] { K, N }, 4, v => v).ToArray();
+            using var stop = new System.Threading.CancellationTokenSource();
+            var releaser = System.Threading.Tasks.Task.Run(() =>
+            {
+                while (!stop.IsCancellationRequested) WeightRegistry.ReleaseToPool(w);
+            });
+            try
+            {
+                for (int i = 0; i < 2000; i++)
+                {
+                    using var view = w.Reshape(K * N);
+                    Assert.Equal(expected, view.ToArray());
+                }
+            }
+            finally
+            {
+                stop.Cancel();
+                releaser.GetAwaiter().GetResult();
+            }
+        }
+        finally { Cleanup(dir); }
+    }
+
+    /// <summary>
     /// An in-place strided view of a no-upcast int8 weight's storage dequantizes it first, as a host read does; it built
     /// a view over the empty fp32 storage. Re-striding a registered streaming weight itself is refused: it made the weight
     /// a view, which the pool never writes back or sheds.

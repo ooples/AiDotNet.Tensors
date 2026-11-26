@@ -480,12 +480,15 @@ public partial class CpuEngine
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
         // A streaming source whose storage was dropped pages in (a no-upcast int8/int4 one dequantizes) first, marked in
-        // use until the view holds the storage.
+        // use until the view holds the storage, and the view is built under the source's transition gate so a drop a
+        // release already claimed cannot empty the storage between the page-in and the view (BuildViewOfResidentStorage).
         long ownerUse = WeightRegistry.BeginOwnerUse(source);
         try
         {
             source.EnsureHostStorageResident();
-            using var view = new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage);
+            _ = source.DataVector;   // realizes a pending value here, outside the gate the view is built under
+            using var view = source.BuildViewOfResidentStorage(
+                () => new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage), out _);
             tensor.AdoptFrom(view);
         }
         finally { WeightRegistry.EndOwnerUse(ownerUse, shed: true); }
