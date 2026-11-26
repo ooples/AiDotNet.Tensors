@@ -242,6 +242,43 @@ public sealed class CapturedIndexProducerTests
     }
 
     /// <summary>
+    /// Indices that are another op's auxiliary output (TopK's) are that op's to refresh: a gather through them, and
+    /// through an integer op on them, still captures and matches eager.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Gather_through_topk_indices_still_captures(bool offsetIndices)
+    {
+        var engine = new CpuEngine();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = engine;
+        try
+        {
+            var weight = Wave(new[] { 6, 3 }, 1.0);
+            var input = Wave(new[] { 6, 3 }, 0.5);
+            var scores = Wave(new[] { 6 }, 1.7);
+            Tensor<double> Loss()
+            {
+                var x = engine.TensorMultiply(input, weight);
+                engine.TensorTopK(scores, 2, 0, out var winners);
+                var at = offsetIndices ? engine.TensorAddScalar(winners, 0) : winners;
+                var picked = engine.TensorGather(x, at, axis: 0);
+                return engine.Reshape(engine.ReduceSum(engine.TensorMultiply(picked, picked), null), new[] { 1 });
+            }
+
+            double eager = Loss()[0];
+            var plan = new CompiledModelCache<double>().GetOrCompileTraining(new[] { 6, 3, offsetIndices ? 1 : 0 }, Loss, new[] { weight });
+            Assert.Equal(eager, plan.Step()[0], 12);
+            Assert.Equal(eager, plan.Step()[0], 12);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    /// <summary>
     /// The indices are recomputed on each replay, as each eager call recomputes them: an integer tensor the caller
     /// edits between steps moves the gather with it.
     /// </summary>

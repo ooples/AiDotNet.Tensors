@@ -43665,11 +43665,16 @@ public partial class CpuEngine : ITensorLevelEngine
     /// indices are concrete already. Each replay recomputes them, as each eager call would, so an integer tensor the
     /// caller edits between steps is followed too.
     /// </summary>
-    /// <exception cref="NotSupportedException">The indices come from an in-place integer write, or from an op of
-    /// another element type recorded in the same trace: neither can be recomputed in isolation.</exception>
+    /// <remarks>
+    /// Only integer producers are recomputed. Indices that are another op's auxiliary output (TopK's, a max pool's;
+    /// in a probe trace their source is that op's node) are that op's to refresh, and an integer op reading such an
+    /// output is recomputed from the output's current value.
+    /// </remarks>
+    /// <exception cref="NotSupportedException">The indices come from an in-place integer write, which cannot be
+    /// re-run without applying it twice.</exception>
     internal static Action<IEngine>? CaptureIndexProducers(Tensor<int> indices, string opName)
     {
-        if (indices.LazySource is not ILazyNode root || root.IsRealized) return null;
+        if (indices.LazySource is not LazyNode<int> root || root.IsRealized) return null;
 
         var producers = new List<ILazyNode>();
         var pending = new Stack<ILazyNode>();
@@ -43677,8 +43682,8 @@ public partial class CpuEngine : ITensorLevelEngine
         while (pending.Count > 0)
         {
             var node = pending.Pop();
-            if (producers.Contains(node)) continue;
-            if (node is not LazyNode<int> || node.WritesInPlace)
+            if (producers.Contains(node) || node is not LazyNode<int>) continue;
+            if (node.WritesInPlace)
                 throw new NotSupportedException(
                     $"{opName} cannot be captured with indices produced inside the same graph by '{node.OpName}'; "
                     + "compute the indices before entering graph mode.");
