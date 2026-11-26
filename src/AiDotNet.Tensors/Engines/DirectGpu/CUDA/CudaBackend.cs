@@ -5951,6 +5951,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private float SumGpuReduction(IGpuBuffer A, int size)
         => ReduceGpuScalar("reduce_sum", A, size, 0.0f);
 
+    // A NaN maximum or minimum is float.NaN's bit pattern, as on the CPU, also for a single element, which a
+    // reduction with nothing to merge can hand back as it is, payload included.
+    private static float CanonicalNaN(float value) => float.IsNaN(value) ? float.NaN : value;
+
     private float ReduceGpuScalar(string kernelName, IGpuBuffer input, int size, float emptyValue)
     {
         if (!IsAvailable)
@@ -5993,12 +5997,12 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     public float Max(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_max", A, size, float.MinValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_max", A, size, float.MinValue));
     }
 
     public float Min(IGpuBuffer A, int size)
     {
-        return ReduceGpuScalar("reduce_min", A, size, float.MaxValue);
+        return CanonicalNaN(ReduceGpuScalar("reduce_min", A, size, float.MaxValue));
     }
 
     public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -14981,8 +14985,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public unsafe void MaxAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
     {
         if (outerSize <= 0) return;
-        if (TryDirectPtxRowReduceOp(DirectPtxRowReduceOp.Max, A, B, outerSize, reduceSize))
-            return;
+        // The opt-in direct-PTX row maximum is not taken here: its fold is max.f32, which drops a NaN operand, and a
+        // row that holds a NaN must reduce to NaN. Its modules are precompiled (the embedded SM86 cubins are keyed by
+        // the PTX text), so the fold can only change together with regenerated cubins. The kernels below run on the
+        // device as well.
         // Long rows: a block per row (a thread per row read each row serially, uncoalesced: 7 ms for 600 rows of 49k).
         bool rows = reduceSize >= 256 && _kernelCache.ContainsKey("max_axis_rows");
         if (!_kernelCache.TryGetValue(rows ? "max_axis_rows" : "max_axis", out var kernel))

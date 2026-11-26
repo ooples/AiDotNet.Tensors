@@ -248,7 +248,10 @@ public class CoreSaturationFanOutTests
                     for (int a = 0; a < shape[axis]; a++)
                     {
                         int flat = (o * shape[axis] + a) * inner + j;
-                        if (x[flat] > best) { best = x[flat]; bi = flat; }
+                        // The serial rule: a value is taken when strictly greater, and the first NaN is taken and kept
+                        // (a NaN in the reduced range is the result, as for NumPy and PyTorch; this reference skipped it
+                        // while that was the engine's rule).
+                        if (x[flat] > best || (float.IsNaN(x[flat]) && !float.IsNaN(best))) { best = x[flat]; bi = flat; }
                     }
                     Assert.True(best.Equals(r[o * inner + j]), $"max[{o},{j}] at DOP {dop}: {r[o * inner + j]} vs {best}");
                     Assert.Equal(bi, idx[o * inner + j]);
