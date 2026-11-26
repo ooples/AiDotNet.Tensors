@@ -7025,6 +7025,7 @@ public partial class DirectGpuTensorEngine
             if (id < 0 || id >= vocab) return false;
             positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
         }
+        using var _scratch = Engines.DirectGpu.DeviceMemoryReclaim.EnterScopedScratch();
         positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
         return true;
     }

@@ -295,6 +295,401 @@ GDN_VARIANTS(1)
 GDN_VARIANTS(2)
 GDN_VARIANTS(4)
 GDN_VARIANTS(8)
+
+template <int R, int CHUNK>
+__device__ __forceinline__ void gdn_bwd_ckpt(
+    const float* __restrict__ dOut, const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, const float* __restrict__ A, const float* __restrict__ B,
+    float* __restrict__ Hckpt, float* __restrict__ dHckpt, float* __restrict__ dV,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{
+    long w = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    long totalRows = (long)batch * numHeads * headDim;
+    if (w >= 2 * totalRows) return;
+    bool isReverse = (w >= totalRows);
+    long rw = isReverse ? (w - totalRows) : w;
+    int di = (int)(rw % headDim);
+    int h  = (int)((rw / headDim) % numHeads);
+    int b  = (int)(rw / ((long)headDim * numHeads));
+    int hOff = h * headDim;
+    long bh = (long)b * numHeads + h;
+    int nChunks = (seqLen + CHUNK - 1) / CHUNK;
+    long hh = (long)headDim * headDim;
+    long rowOff = (long)di * headDim;
+
+    if (!isReverse)
+    {
+        float S[R];
+#pragma unroll
+        for (int j = 0; j < R; j++) S[j] = 0.0f;
+        for (int t = 0; t < seqLen; t++)
+        {
+            if (t % CHUNK == 0)
+            {
+                long ck = (bh * nChunks + (t / CHUNK)) * hh + rowOff;
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int ki = lane + 32 * j;
+                    if (ki < headDim) Hckpt[ck + ki] = S[j];
+                }
+            }
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gIdx = (b * seqLen + t) * numHeads + h;
+            float a = A[gIdx], bet = B[gIdx];
+            float kk[R];
+            float sK = 0.0f;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                kk[j] = ki < headDim ? K[baseOff + ki] * keyScale : 0.0f;
+                sK += S[j] * kk[j];
+            }
+            sK = gdn_allsum(sK);
+            float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                if (ki < headDim) S[j] = a * S[j] + bd * kk[j];
+            }
+        }
+    }
+    else
+    {
+        float dS[R];
+#pragma unroll
+        for (int j = 0; j < R; j++) dS[j] = 0.0f;
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            if (t == seqLen - 1 || ((t + 1) % CHUNK) == 0)
+            {
+                long ck = (bh * nChunks + (t / CHUNK)) * hh + rowOff;
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int ki = lane + 32 * j;
+                    if (ki < headDim) dHckpt[ck + ki] = dS[j];
+                }
+            }
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gIdx = (b * seqLen + t) * numHeads + h;
+            float a = A[gIdx], bet = B[gIdx];
+            float pa = decayFirst ? a : 1.0f;
+            float dOutVal = dOut[baseOff + di];
+            float kk[R];
+            float dDp = 0.0f;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                bool in = ki < headDim;
+                kk[j] = in ? K[baseOff + ki] * keyScale : 0.0f;
+                if (in) dS[j] += dOutVal * Q[baseOff + ki];
+                dDp += dS[j] * bet * kk[j];
+            }
+            float dDelta = gdn_allsum(dDp);
+            if (lane == 0) dV[baseOff + di] = dDelta;
+            float dSk = -dDelta;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                if (ki < headDim) dS[j] = dS[j] * a + dSk * pa * kk[j];
+            }
+        }
+    }
+}
+
+template <int R, int CHUNK, int TILES>
+__device__ __forceinline__ void gdn_bwd_chunk(
+    const float* __restrict__ dOut, const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, const float* __restrict__ A, const float* __restrict__ B,
+    const float* __restrict__ Hckpt, const float* __restrict__ dHckpt,
+    float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dA, float* __restrict__ dB,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{
+    const int W = 32 * R;
+    __shared__ float s_Sprev[(CHUNK - 1) * 32 * W];
+    __shared__ float s_red[8 * W];
+    __shared__ float s_ab[16];
+    __shared__ float s_dQ[CHUNK * W];
+    __shared__ float s_dK[CHUNK * W];
+    __shared__ float s_dAB[CHUNK * 2];
+
+    int nChunks = (seqLen + CHUNK - 1) / CHUNK;
+    int bid = (int)blockIdx.x;
+    if (bid >= batch * numHeads * nChunks) return;
+    int c = bid % nChunks;
+    int bh = bid / nChunks;
+    int h = bh % numHeads;
+    int b = bh / numHeads;
+    int hOff = h * headDim;
+    int t0 = c * CHUNK;
+    int t1 = min(seqLen, t0 + CHUNK);
+    int len = t1 - t0;
+    int tid = (int)threadIdx.x;
+    int warpId = tid >> 5;
+    int lane = tid & 31;
+    long hh = (long)headDim * headDim;
+    long ckBase = ((long)bh * nChunks + c) * hh;
+
+    for (int i = tid; i < CHUNK * W; i += 256) { s_dQ[i] = 0.0f; s_dK[i] = 0.0f; }
+    for (int i = tid; i < CHUNK * 2; i += 256) { s_dAB[i] = 0.0f; }
+    __syncthreads();
+
+    for (int tile = 0; tile < TILES; tile++)
+    {
+        int tileRow0 = tile * 32;
+        if (tileRow0 >= headDim) break;
+
+        float S[4][R];
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int di = tileRow0 + warpId * 4 + r;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                S[r][j] = (di < headDim && ki < headDim) ? Hckpt[ckBase + (long)di * headDim + ki] : 0.0f;
+            }
+        }
+
+        for (int lt = 0; lt < len; lt++)
+        {
+            int t = t0 + lt;
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gIdx = (b * seqLen + t) * numHeads + h;
+            float a = A[gIdx], bet = B[gIdx];
+            float kk[R];
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                kk[j] = ki < headDim ? K[baseOff + ki] * keyScale : 0.0f;
+            }
+
+            float dqPart[R];
+#pragma unroll
+            for (int j = 0; j < R; j++) dqPart[j] = 0.0f;
+
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+            {
+                int localRow = warpId * 4 + r;
+                int di = tileRow0 + localRow;
+                if (di < headDim)
+                {
+                    if (lt > 0)
+                    {
+                        int spBase = ((lt - 1) * 32 + localRow) * W;
+#pragma unroll
+                        for (int j = 0; j < R; j++) s_Sprev[spBase + lane + 32 * j] = S[r][j];
+                    }
+                    float sK = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < R; j++) sK += S[r][j] * kk[j];
+                    sK = gdn_allsum(sK);
+                    float bd = bet * (V[baseOff + di] - (decayFirst ? a : 1.0f) * sK);
+                    float dOutVal = dOut[baseOff + di];
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + 32 * j;
+                        if (ki < headDim)
+                        {
+                            S[r][j] = a * S[r][j] + bd * kk[j];
+                            dqPart[j] += dOutVal * S[r][j];
+                        }
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + 32 * j] = dqPart[j];
+            __syncthreads();
+            if (warpId == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int col = lane + 32 * j;
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < 8; w++) sum += s_red[w * W + col];
+                    s_dQ[lt * W + col] += sum;
+                }
+            }
+            __syncthreads();
+        }
+
+        float dS[4][R];
+#pragma unroll
+        for (int r = 0; r < 4; r++)
+        {
+            int di = tileRow0 + warpId * 4 + r;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                dS[r][j] = (di < headDim && ki < headDim) ? dHckpt[ckBase + (long)di * headDim + ki] : 0.0f;
+            }
+        }
+
+        for (int lt = len - 1; lt >= 0; lt--)
+        {
+            int t = t0 + lt;
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            int gIdx = (b * seqLen + t) * numHeads + h;
+            float a = A[gIdx], bet = B[gIdx];
+            float pa = decayFirst ? a : 1.0f;
+            float kk[R], qq[R];
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                bool in = ki < headDim;
+                kk[j] = in ? K[baseOff + ki] * keyScale : 0.0f;
+                qq[j] = in ? Q[baseOff + ki] : 0.0f;
+            }
+
+            float dkPart[R];
+#pragma unroll
+            for (int j = 0; j < R; j++) dkPart[j] = 0.0f;
+            float dAPart = 0.0f, dBPart = 0.0f;
+
+#pragma unroll
+            for (int r = 0; r < 4; r++)
+            {
+                int localRow = warpId * 4 + r;
+                int di = tileRow0 + localRow;
+                if (di < headDim)
+                {
+                    float sp[R];
+                    float sK = 0.0f;
+                    int spBase = ((lt - 1) * 32 + localRow) * W;
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + 32 * j;
+                        if (ki < headDim)
+                            sp[j] = (lt > 0) ? s_Sprev[spBase + ki] : Hckpt[ckBase + (long)di * headDim + ki];
+                        else
+                            sp[j] = 0.0f;
+                        sK += sp[j] * kk[j];
+                    }
+                    sK = gdn_allsum(sK);
+                    float delta = V[baseOff + di] - pa * sK;
+                    float dOutVal = dOut[baseOff + di];
+                    float dAp = 0.0f, dBp = 0.0f, dDp = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + 32 * j;
+                        if (ki < headDim) dS[r][j] += dOutVal * qq[j];
+                        dAp += dS[r][j] * sp[j];
+                        dBp += dS[r][j] * delta * kk[j];
+                        dDp += dS[r][j] * bet * kk[j];
+                    }
+                    float dA_row = gdn_allsum(dAp);
+                    float dB_row = gdn_allsum(dBp);
+                    float dDelta = gdn_allsum(dDp);
+                    if (decayFirst) dA_row -= dDelta * sK;
+                    if (lane == 0)
+                    {
+                        dAPart += dA_row;
+                        dBPart += dB_row;
+                    }
+                    float dSk = -dDelta;
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + 32 * j;
+                        if (ki < headDim)
+                        {
+                            float dKS = dS[r][j] * (bet * delta) + dSk * pa * sp[j];
+                            dkPart[j] += dKS * keyScale;
+                            dS[r][j] = dS[r][j] * a + dSk * pa * kk[j];
+                        }
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + 32 * j] = dkPart[j];
+            if (lane == 0) { s_ab[warpId * 2] = dAPart; s_ab[warpId * 2 + 1] = dBPart; }
+            __syncthreads();
+            if (warpId == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int col = lane + 32 * j;
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < 8; w++) sum += s_red[w * W + col];
+                    s_dK[lt * W + col] += sum;
+                }
+                if (lane == 0)
+                {
+                    float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < 8; w++) { sa += s_ab[w * 2]; sb += s_ab[w * 2 + 1]; }
+                    s_dAB[lt * 2] += sa;
+                    s_dAB[lt * 2 + 1] += sb;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int lt = warpId; lt < len; lt += 8)
+    {
+        int t = t0 + lt;
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gIdx = (b * seqLen + t) * numHeads + h;
+#pragma unroll
+        for (int j = 0; j < R; j++)
+        {
+            int ki = lane + 32 * j;
+            if (ki < headDim)
+            {
+                dQ[baseOff + ki] = s_dQ[lt * W + ki];
+                dK[baseOff + ki] = s_dK[lt * W + ki];
+            }
+        }
+        if (lane == 0)
+        {
+            dA[gIdx] = s_dAB[lt * 2];
+            dB[gIdx] = s_dAB[lt * 2 + 1];
+        }
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_ckpt_r1(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
+    float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{ gdn_bwd_ckpt<1, 8>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
+
+extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_chunk_r1(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
+    const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dA, float* dB,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{ gdn_bwd_chunk<1, 8, 1>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dQ, dK, dA, dB, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
+
+extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_ckpt_r2(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
+    float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{ gdn_bwd_ckpt<2, 6>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
+
+extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_chunk_r2(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
+    const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dA, float* dB,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
+{ gdn_bwd_chunk<2, 6, 2>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dQ, dK, dA, dB, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
 ";
     }
 
@@ -304,6 +699,10 @@ GDN_VARIANTS(8)
         foreach (var r in new[] { "_r1", "_r2", "_r4", "_r8" })
             foreach (var kernel in new[] { "forward", "recompute", "backward", "dq", "reduce" })
                 names.Add("gated_delta_scan_" + kernel + r);
+        names.Add("gated_delta_scan_bwd_ckpt_r1");
+        names.Add("gated_delta_scan_bwd_chunk_r1");
+        names.Add("gated_delta_scan_bwd_ckpt_r2");
+        names.Add("gated_delta_scan_bwd_chunk_r2");
         return names.ToArray();
     }
 }

@@ -42,6 +42,16 @@ public static class GpuOptimizer
     private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? tensor)
     {
         if (tensor is null) return;
+        MarkGpuUpdatedWithSync(tensor, CreateWriteSyncPoint(backend));
+    }
+
+    private static void MarkGpuUpdatedWithSync(Tensor<float>? tensor, GpuSyncPoint syncPoint)
+    {
+        if (tensor is null)
+        {
+            syncPoint.Dispose();
+            return;
+        }
         if (tensor._gpuBuffer is { } attachedBuf && attachedBuf.Handle != IntPtr.Zero && tensor.OffloadDevicePointer == IntPtr.Zero
             && tensor.GetBackingArrayForCacheLookupUnsafe() is { } backingArray)
         {
@@ -52,7 +62,7 @@ public static class GpuOptimizer
         {
             Helpers.HostSync.Remove(materializerKey);
         }
-        tensor.MarkModified(CreateWriteSyncPoint(backend));
+        tensor.MarkModified(syncPoint);
         tensor._gpuBufferVersion = tensor.GpuCacheVersion;
     }
 
@@ -209,12 +219,15 @@ public static class GpuOptimizer
     /// after a step (an optimizer state loaded mid-training) never reached the next kernel.
     /// </summary>
     private static void MarkParameterUpdated(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param, IGpuBuffer buffer)
+        => MarkParameterUpdatedWithSync(engine, backend, param, buffer, CreateWriteSyncPoint(backend));
+
+    private static void MarkParameterUpdatedWithSync(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param, IGpuBuffer buffer, GpuSyncPoint syncPoint)
     {
         if (param._gpuBuffer is not null ||
             (param.OffloadDevicePointer == IntPtr.Zero && param.GetBackingArrayForCacheLookupUnsafe() is not null))
-            engine.CommitParameterUpdatedOnDevice(param, buffer, backend, CreateWriteSyncPoint(backend));
+            engine.CommitParameterUpdatedOnDevice(param, buffer, backend, syncPoint);
         else
-            MarkGpuUpdated(backend, param);
+            MarkGpuUpdatedWithSync(param, syncPoint);
     }
 
     private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second)
@@ -440,6 +453,227 @@ public static class GpuOptimizer
     }
 
     /// <summary>
+    /// Adam over a whole parameter list on the GPU in one fused multi-tensor launch when the active backend
+    /// implements <see cref="IMultiTensorGpuOptimizerBackend"/>. Matches calling <see cref="TryAdamStep"/> per tensor.
+    /// </summary>
+    public static bool TryAdamStepMultiTensor(
+        IReadOnlyList<Tensor<float>> parameters,
+        IReadOnlyList<Tensor<float>> gradients,
+        IReadOnlyList<Tensor<float>> firstMoments,
+        IReadOnlyList<Tensor<float>> secondMoments,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => TryAdamOrAdamWStepMultiTensor(
+            decoupledWeightDecay: false,
+            parameters, gradients, firstMoments, secondMoments,
+            learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    /// <summary>
+    /// AdamW (decoupled weight decay) over a whole parameter list on the GPU in one fused multi-tensor launch
+    /// when the active backend implements <see cref="IMultiTensorGpuOptimizerBackend"/>. Matches calling
+    /// <see cref="TryAdamWStep"/> per tensor.
+    /// </summary>
+    public static bool TryAdamWStepMultiTensor(
+        IReadOnlyList<Tensor<float>> parameters,
+        IReadOnlyList<Tensor<float>> gradients,
+        IReadOnlyList<Tensor<float>> firstMoments,
+        IReadOnlyList<Tensor<float>> secondMoments,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+        => TryAdamOrAdamWStepMultiTensor(
+            decoupledWeightDecay: true,
+            parameters, gradients, firstMoments, secondMoments,
+            learningRate, beta1, beta2, epsilon, weightDecay, step);
+
+    private static bool TryAdamOrAdamWStepMultiTensor(
+        bool decoupledWeightDecay,
+        IReadOnlyList<Tensor<float>> parameters,
+        IReadOnlyList<Tensor<float>> gradients,
+        IReadOnlyList<Tensor<float>> firstMoments,
+        IReadOnlyList<Tensor<float>> secondMoments,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    {
+        if (parameters is null) throw new ArgumentNullException(nameof(parameters));
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (firstMoments is null) throw new ArgumentNullException(nameof(firstMoments));
+        if (secondMoments is null) throw new ArgumentNullException(nameof(secondMoments));
+        int n = parameters.Count;
+        if (gradients.Count != n || firstMoments.Count != n || secondMoments.Count != n)
+            throw new ArgumentException("Parameters, gradients, and moment lists must have identical length.");
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false;
+        using var __gpuOp = gpuEngine.EnterGpuOp();
+        var backend = gpuEngine.GetBackend();
+        if (backend is null) return false;
+        if (n == 0) return true;
+
+        var parameterBuffers = new IGpuBuffer[n];
+        var gradientBuffers = new IGpuBuffer[n];
+        var mBuffers = new IGpuBuffer[n];
+        var vBuffers = new IGpuBuffer[n];
+        var sizes = new int[n];
+        List<DirectGpuTensorEngine.TransientDeviceSlice>? slices = null;
+
+        try
+        {
+            for (int i = 0; i < n; i++)
+            {
+                var param = parameters[i];
+                var grad = gradients[i];
+                var m = firstMoments[i];
+                var v = secondMoments[i];
+                if (param is null || grad is null || m is null || v is null)
+                    return false;
+                int len = param.Length;
+                if (len <= 0 || grad.Length != len || m.Length != len || v.Length != len)
+                    return false;
+
+                if (TryResolveStateBuffer(gpuEngine, backend, m, len) is not { } mBuf
+                    || TryResolveStateBuffer(gpuEngine, backend, v, len) is not { } vBuf)
+                {
+                    return false;
+                }
+                if (TryAcquireReadOnlyFloatBuffer(gpuEngine, backend, grad, len) is not { } gradIn)
+                {
+                    return false;
+                }
+                (slices ??= new List<DirectGpuTensorEngine.TransientDeviceSlice>(n)).Add(gradIn.Slice);
+
+                param.EnsureOwnedForDeviceWrite();
+                IGpuBuffer? pBuf;
+                if (DirectGpuTensorEngine.IsFlatParameterView(param))
+                {
+                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _);
+                }
+                else if (param._gpuBuffer is null && param.OffloadDevicePointer != IntPtr.Zero)
+                {
+                    pBuf = param.TryGetGpuBuffer();
+                }
+                else
+                {
+                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _) ?? TryGetCurrentGpuBuffer(gpuEngine, backend, param);
+                }
+
+                if (pBuf is null || pBuf.Size < len)
+                {
+                    return false;
+                }
+
+                parameterBuffers[i] = pBuf;
+                gradientBuffers[i] = gradIn.Buffer;
+                mBuffers[i] = mBuf;
+                vBuffers[i] = vBuf;
+                sizes[i] = len;
+            }
+
+            if (backend is IMultiTensorGpuOptimizerBackend multiTensor)
+            {
+                if (decoupledWeightDecay)
+                {
+                    multiTensor.AdamWMultiTensorUpdate(
+                        parameterBuffers, gradientBuffers, mBuffers, vBuffers, sizes,
+                        learningRate, beta1, beta2, epsilon, weightDecay, step);
+                    GpuLaunchProbe.OnAdamWDispatch();
+                }
+                else
+                {
+                    multiTensor.AdamMultiTensorUpdate(
+                        parameterBuffers, gradientBuffers, mBuffers, vBuffers, sizes,
+                        learningRate, beta1, beta2, epsilon, weightDecay, step);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    if (decoupledWeightDecay)
+                    {
+                        backend.AdamWUpdate(parameterBuffers[i], gradientBuffers[i], mBuffers[i], vBuffers[i],
+                            learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[i]);
+                        GpuLaunchProbe.OnAdamWDispatch();
+                    }
+                    else
+                    {
+                        backend.AdamUpdate(parameterBuffers[i], gradientBuffers[i], mBuffers[i], vBuffers[i],
+                            learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[i]);
+                    }
+                }
+            }
+
+            var syncLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), 3 * n);
+            for (int i = 0; i < n; i++)
+            {
+                MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], syncLeases[3 * i]);
+                MarkGpuUpdatedWithSync(firstMoments[i], syncLeases[3 * i + 1]);
+                MarkGpuUpdatedWithSync(secondMoments[i], syncLeases[3 * i + 2]);
+            }
+
+            return true;
+        }
+        finally
+        {
+            if (slices is not null)
+            {
+                for (int i = 0; i < slices.Count; i++)
+                {
+                    slices[i].Dispose();
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Scales a list of device-resident float gradient tensors in place by <paramref name="scale"/> using a single
+    /// multi-tensor kernel launch when the backend implements <see cref="IMultiTensorKernels"/>.
+    /// </summary>
+    public static bool TryScaleGradientsMultiTensor(IReadOnlyList<Tensor<float>> gradients, float scale)
+    {
+        if (gradients is null) throw new ArgumentNullException(nameof(gradients));
+        if (!AiDotNetEngine.Current.TryGet<DirectGpuTensorEngine>(out var gpuEngine)) return false;
+        using var __gpuOp = gpuEngine.EnterGpuOp();
+        var backend = gpuEngine.GetBackend();
+        if (backend is not IMultiTensorKernels multi) return false;
+        if (gradients.Count == 0) return true;
+
+        var buffers = new List<IGpuBuffer>(gradients.Count);
+        var sizes = new List<int>(gradients.Count);
+        var owners = new List<Tensor<float>>(gradients.Count);
+        for (int i = 0; i < gradients.Count; i++)
+        {
+            var g = gradients[i];
+            if (g is null || g.Length == 0) continue;
+            var buf = TryGetCurrentGpuBuffer(gpuEngine, backend, g);
+            if (buf is null || buf.Size < g.Length) return false;
+            buffers.Add(buf);
+            sizes.Add(g.Length);
+            owners.Add(g);
+        }
+
+        if (buffers.Count == 0) return true;
+
+        var scaleBuf = backend.AllocateBuffer(new[] { scale });
+        try
+        {
+            multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scaleBuf);
+        }
+        finally
+        {
+            if (backend is IQueuedBufferRelease queued)
+            {
+                queued.ReleaseAfterQueuedWork(scaleBuf);
+            }
+            else
+            {
+                scaleBuf.Dispose();
+            }
+        }
+
+        for (int i = 0; i < owners.Count; i++)
+        {
+            gpuEngine.BindResidentBuffer(owners[i], buffers[i], backend);
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// PyTorch's <c>torch.nn.utils.clip_grad_norm_</c> (foreach) on the device: the total L2 norm of every gradient,
     /// the coefficient <c>min(1, maxNorm / (norm + 1e-6))</c> and the in-place scale of every gradient, with no host
     /// read. The norm is exact and overflow-free, and every result bit is the same on every backend
@@ -509,6 +743,7 @@ public static class GpuOptimizer
             gradientIndex.Add(i);
         }
 
+        using var _scratch = DirectGpu.DeviceMemoryReclaim.EnterScopedScratch();
         var sumOfSquares = backend.AllocateBuffer(DeterministicGradientNorm.RecordWords);
         IGpuBuffer? scale = null;
         try

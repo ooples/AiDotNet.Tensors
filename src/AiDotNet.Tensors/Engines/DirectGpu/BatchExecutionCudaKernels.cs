@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource + ChannelBiasResidualSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + HouseholderSource + SequenceMixerSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource + ChannelBiasResidualSource;
 
     private static string CoreSource => KernelSourceResources.Read("BatchExecution.core.c");
 
@@ -44,6 +44,17 @@ internal static partial class BatchExecutionCudaKernels
         GruProjection, GruCell, GruCellBackward, GruHiddenBackward, GruInputGrad, GruWeightIhGrad, GruWeightHhGrad, GruBiasGrad,
         GruRbResetHidden, GruRbCandidateProjection, GruRbCell, GruRbCellBackward, GruRbResetBackward, GruRbHiddenBackward,
         GruRbWeightHhGrad,
-        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw
+        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw,
+        HouseholderNorm, HouseholderForward, HouseholderBackwardInput, HouseholderBackwardReflectorsRaw, HouseholderBackwardReflectorsNorm,
+        SmxGivensForward, SmxGivensBackwardDx, SmxGivensBackwardDphi,
+        SmxConv2TapForward, SmxConv2TapBackwardDx, SmxConv2TapBackwardDw,
+        SmxRopeL2Forward, SmxRopeL2Backward,
+        SmxRopeQuadForward, SmxRopeQuadBackward,
+        SmxProjResForward, SmxProjResBackwardRows, SmxProjResBackwardDgate,
+        SmxSpecCircH, SmxSpecCircW, SmxSpecCircBackwardDhDd, SmxSpecCircBackwardDspec,
+        SmxSigTopKMixForward, SmxSigTopKBiasUpdate, SmxSigTopKMixBackwardDlogits, SmxSigTopKMixBackwardDtable,
+        SmxDualSwiGluForward, SmxDualSwiGluBackwardElem, SmxDualSwiGluBackwardDbase,
+        SmxBornRatioForward, SmxBornRatioBackwardDscan, SmxBornRatioBackwardDsink,
+        SmxBoundSigForward, SmxBoundSigBackwardDlog, SmxBoundSigBackwardDbias
     };
 }

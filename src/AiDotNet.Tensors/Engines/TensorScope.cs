@@ -1,9 +1,30 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
+
+/// <summary>
+/// Implemented by <see cref="VectorBase{T}"/> so <see cref="TensorScope"/> can record scope creation
+/// via a monotonic thread-local tick without allocating <see cref="ConditionalWeakTable{TKey, TValue}"/>
+/// dependent handles on every GPU-resident intermediate tensor.
+/// </summary>
+internal interface IScopeTrackableStorage
+{
+    int CreatedThreadId { get; set; }
+    long CreatedScopeTick { get; set; }
+}
+
+/// <summary>
+/// Implemented by <see cref="Tensor{T}"/> so <see cref="TensorScope"/> can release device-resident
+/// intermediate tensors directly without per-op closure and delegate allocations.
+/// </summary>
+internal interface IScopedDeviceTensor
+{
+    void ReleaseFromScope(DirectGpuTensorEngine engine);
+}
 
 /// <summary>
 /// Frees the GPU memory of the results created inside it when it ends, except the ones passed to
@@ -38,30 +59,35 @@ public sealed class TensorScope : IDisposable
     [ThreadStatic]
     private static int s_suspendedDepth;
 
+    [ThreadStatic]
+    private static long s_clock;
+
     private TensorScope? _outer;
     private readonly int _threadId;
+    private readonly long _openTick;
     // Keyed by storage (the vector), so a kept view keeps the result it views.
-    private readonly Dictionary<object, Action> _results = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+    // Value is either (DirectGpuTensorEngine, IScopedDeviceTensor) for zero-closure GPU tensor tracking
+    // or (null, Action) for custom callbacks.
+    private readonly Dictionary<object, (DirectGpuTensorEngine? Engine, object Target)> _results =
+        new(Autodiff.ReferenceEqualityComparer<object>.Instance);
     // Storage keys (vectors and host arrays) of the kept results: the activation-cache release below spares them.
     private readonly HashSet<object> _kept = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
     // Engines whose activation cache gained entries in this scope, with the cache timestamp from before the first one.
     private Dictionary<DirectGpuTensorEngine, long>? _activationOwners;
-    // Storage keys (vectors and host arrays) of the tensors created on this thread while the scope, or a scope nested in it,
-    // was open. The activation-cache release frees only entries keyed by these: a tensor that existed before the scope (a
-    // destination handed to an *Into op, a parameter written in place) is the caller's, and so is an engine cache built while
-    // the scope was suspended (a folded convolution kernel). Held weakly: a whole inference call's intermediates, host
-    // arrays included, stay collectable while the scope is open.
-    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> _created = new();
+    // Fallback weak table used only for raw host arrays or storages created while an outer scope is suspended.
+    private ConditionalWeakTable<object, object>? _created;
     // Declared before s_mark: static fields initialize in order, and the callback returns it.
     private static readonly object s_marker = new();
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object>.CreateValueCallback s_mark = _ => s_marker;
+    private static readonly ConditionalWeakTable<object, object>.CreateValueCallback s_mark = _ => s_marker;
     private Func<object, bool>? _isReleasablePredicate;
+    private bool _releasing;
     private bool _disposed;
 
     private TensorScope(TensorScope? outer)
     {
         _outer = outer;
         _threadId = Environment.CurrentManagedThreadId;
+        _openTick = ++s_clock;
     }
 
     /// <summary>Opens a scope on the calling thread. Dispose it on the same thread, innermost first.</summary>
@@ -89,10 +115,10 @@ public sealed class TensorScope : IDisposable
         object storage = tensor.DataVector;
         _kept.Add(storage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) _kept.Add(array);
-        if (_results.TryGetValue(storage, out var release))
+        if (_results.TryGetValue(storage, out var entry))
         {
             _results.Remove(storage);
-            _outer?.Adopt(storage, release);
+            _outer?.AdoptEntry(storage, entry);
         }
         return tensor;
     }
@@ -170,6 +196,7 @@ public sealed class TensorScope : IDisposable
             }
         }
     }
+
     /// <summary>
     /// Records a tensor storage created on this thread (its vector, and its host array when it has one) with the innermost
     /// open scope and each scope enclosing it. Callers check <see cref="Current"/> first, so a storage made with no scope
@@ -177,14 +204,41 @@ public sealed class TensorScope : IDisposable
     /// </summary>
     internal static void OnStorageCreated(object vector, object? array)
     {
-        for (var scope = s_current; scope is not null; scope = scope._outer)
+        var current = s_current;
+        if (current is null) return;
+
+        if (s_suspendedDepth == 0 && vector is IScopeTrackableStorage trackable)
         {
-            scope._created.GetValue(vector, s_mark);
-            if (array is not null) scope._created.GetValue(array, s_mark);
+            trackable.CreatedThreadId = current._threadId;
+            trackable.CreatedScopeTick = ++s_clock;
+            if (array is not null)
+            {
+                for (var scope = current; scope is not null; scope = scope._outer)
+                {
+                    (scope._created ??= new ConditionalWeakTable<object, object>()).GetValue(array, s_mark);
+                }
+            }
+            return;
+        }
+
+        for (var scope = current; scope is not null; scope = scope._outer)
+        {
+            var table = scope._created ??= new ConditionalWeakTable<object, object>();
+            table.GetValue(vector, s_mark);
+            if (array is not null) table.GetValue(array, s_mark);
         }
     }
 
-    private bool Created(object key) => _created.TryGetValue(key, out _);
+    private bool Created(object key)
+    {
+        if (key is IScopeTrackableStorage trackable
+            && trackable.CreatedScopeTick > _openTick
+            && trackable.CreatedThreadId == _threadId)
+        {
+            return true;
+        }
+        return _created is not null && _created.TryGetValue(key, out _);
+    }
 
     /// <summary>Records a GPU result created on this thread with the innermost open scope, if any.</summary>
     internal static void Track(object storage, Action release)
@@ -192,7 +246,34 @@ public sealed class TensorScope : IDisposable
         var scope = s_current;
         // A buffer created while a graph is captured belongs to the compiled plan, which outlives any scope.
         if (scope is null || scope._threadId != Environment.CurrentManagedThreadId || Compilation.GraphMode.IsActive) return;
-        scope._results[storage] = release;
+        scope._results[storage] = (null, release);
+    }
+
+    /// <summary>
+    /// Records a device-resident tensor result on the innermost open scope without allocating a closure or delegate.
+    /// </summary>
+    internal static void TrackTensor(object storage, DirectGpuTensorEngine engine, IScopedDeviceTensor tensor)
+    {
+        var scope = s_current;
+        if (scope is null || scope._threadId != Environment.CurrentManagedThreadId || Compilation.GraphMode.IsActive) return;
+        scope._results[storage] = (engine, tensor);
+    }
+
+    /// <summary>
+    /// Drops a storage from active scopes once its device buffer has already been released mid-scope
+    /// (for example by <c>BackwardStorageReleasePlan</c> or <c>ReleaseDroppedGradients</c>), allowing the
+    /// managed <see cref="Tensor{T}"/> wrapper to be collected in Gen-0 instead of surviving to Gen-2.
+    /// </summary>
+    internal static void Untrack(object storage)
+    {
+        int tid = Environment.CurrentManagedThreadId;
+        for (var scope = s_current; scope is not null; scope = scope._outer)
+        {
+            if (scope._threadId == tid && !scope._releasing)
+            {
+                scope._results.Remove(storage);
+            }
+        }
     }
 
     /// <summary>
@@ -213,9 +294,9 @@ public sealed class TensorScope : IDisposable
         }
     }
 
-    private void Adopt(object storage, Action release)
+    private void AdoptEntry(object storage, (DirectGpuTensorEngine? Engine, object Target) entry)
     {
-        if (!_disposed) _results[storage] = release;
+        if (!_disposed) _results[storage] = entry;
     }
 
     /// <summary>Frees the device memory of every result created in this scope and not kept.</summary>
@@ -244,8 +325,26 @@ public sealed class TensorScope : IDisposable
 
     private void Release()
     {
-        foreach (var release in _results.Values) release();
-        _results.Clear();
+        _releasing = true;
+        try
+        {
+            foreach (var entry in _results.Values)
+            {
+                if (entry.Engine is { } engine && entry.Target is IScopedDeviceTensor scopedTensor)
+                {
+                    scopedTensor.ReleaseFromScope(engine);
+                }
+                else if (entry.Target is Action release)
+                {
+                    release();
+                }
+            }
+        }
+        finally
+        {
+            _releasing = false;
+            _results.Clear();
+        }
         if (_activationOwners is not null)
         {
             var releasable = _isReleasablePredicate ??= IsReleasable;

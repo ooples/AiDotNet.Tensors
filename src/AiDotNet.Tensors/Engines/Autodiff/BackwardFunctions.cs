@@ -2721,11 +2721,12 @@ internal static partial class BackwardFunctions<T>
             }
         }
 
-        // Dense device scatter when no sparse-gradient consumer is wired for this parameter: reads the ids on the
-        // device, so neither the ids nor the upstream gradient is downloaded, and the [V, E] result stays resident
-        // for accumulation with the other uses of a tied table.
+        // Dense device scatter when no sparse-gradient consumer is wired for this parameter (or when the lookup count
+        // already meets or exceeds the table's vocabulary size, making dense [V, E] strictly smaller than sparse
+        // [N, E] + [N] indices): reads the ids on the device, so neither the ids nor the upstream gradient is
+        // downloaded, and the [V, E] result stays resident for accumulation with other uses of a tied table.
         if (engine.TryGet<AiDotNet.Tensors.Engines.DirectGpuTensorEngine>(out var deFloat)
-            && !DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0])
+            && (!DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0]) || capturedFloatIdx.Length >= vocabSize)
             && deFloat.TryEmbeddingBackwardFromFloatIds(gradOutput, capturedFloatIdx, vocabSize, embeddingDim) is { } deviceTableGrad)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceTableGrad, engine);

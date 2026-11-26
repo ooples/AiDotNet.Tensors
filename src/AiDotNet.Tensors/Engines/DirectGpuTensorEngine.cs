@@ -3269,6 +3269,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (afterQueuedWork && tensor._gpuBackend is IQueuedBufferRelease queued) queued.ReleaseAfterQueuedWork(buffer);
         else buffer.Dispose();
+        if (TensorScope.Current is not null) TensorScope.Untrack(vector);
     }
 
     internal void DetachToTensorLifetime(IEnumerable<object> keys)
@@ -5510,7 +5511,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         // Inside a TensorScope the result is freed when the scope ends unless kept (#1432), not when the GC finalizes it.
-        if (TensorScope.Current is not null) TensorScope.Track(vector, () => ReleaseDeadDeviceStorage(tensor, afterQueuedWork: true));
+        if (TensorScope.Current is not null) TensorScope.TrackTensor(vector, this, tensor);
         return tensor;
     }
 
@@ -31113,10 +31114,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size) =>
-        backend is IStreamOrderedScratch cuda
+    private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size)
+    {
+        using var _ = Engines.DirectGpu.DeviceMemoryReclaim.EnterScopedScratch();
+        return backend is IStreamOrderedScratch cuda
             ? cuda.AllocateStreamOrderedScratchBuffer(size)
             : backend.AllocateBuffer(size);
+    }
 
     private Tensor<T>? TryDeviceSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {

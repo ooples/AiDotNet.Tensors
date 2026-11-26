@@ -293,6 +293,22 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
     param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
 }
 
+typedef struct {
+    unsigned long long ptrs[384];
+} InlinePointerChunk384;
+
+extern ""C"" __global__ __launch_bounds__(384) void refresh_pointer_table_384(
+    unsigned long long* __restrict__ dst,
+    int offset,
+    int count,
+    InlinePointerChunk384 src)
+{
+    int i = threadIdx.x;
+    if (i < count) {
+        dst[offset + i] = src.ptrs[i];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Adam optimizer update with bfloat16 moment storage
 // ---------------------------------------------------------------------------
@@ -1394,6 +1410,7 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
             "sgd_multi_tensor_update",
             "adam_multi_tensor_update",
             "adamw_multi_tensor_update",
+            "refresh_pointer_table_384",
             "multi_tensor_sum_squares",
             "clip_scale_from_sum_squares",
             "multi_tensor_scale_by_device_scalar",
