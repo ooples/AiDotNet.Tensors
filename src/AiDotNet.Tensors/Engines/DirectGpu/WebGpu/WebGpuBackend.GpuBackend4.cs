@@ -931,48 +931,22 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend, IGate
         if (modelDim != numHeads * headDim || headDim > 256)
             throw new ArgumentException($"Invalid GatedDeltaNet head layout (modelDim={modelDim}, numHeads={numHeads}, headDim={headDim}).");
         GatedDeltaNetBackwardResolver.ValidateBuffers(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads);
-        int hh = headDim * headDim;
-        long totalLong = checked((long)batch * numHeads * headDim);
-        long trajLenLong = checked((long)batch * numHeads * seqLen * hh);
-        if (totalLong > int.MaxValue || trajLenLong > int.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(batch), "GatedDeltaNet dimensions exceed WebGPU launch/buffer limits.");
-        int total = (int)totalLong;
+        // Checkpointed, deterministic BPTT (GatedDeltaNetCheckpoint): O(sqrt(seqLen)) state memory per head instead of
+        // the seqLen * headDim^2 trajectory, every gradient element written, nothing to clear first.
+        var (chunk, headStride, workLen) = GatedDeltaNetCheckpoint.Plan(batch, seqLen, numHeads, headDim);
         int qkCount = checked(batch * seqLen * modelDim);
         int gateCount = checked(batch * seqLen * numHeads);
-        bool det = GpuDeterminism.IsActive;
-        if (!det)
-        {
-            Fill(dQ, 0f, qkCount);
-            Fill(dK, 0f, qkCount);
-        }
-        using var traj = AllocateBuffer((int)trajLenLong);
-        var pc = new[] { batch, seqLen, modelDim, numHeads, headDim };
-        // The rule kernels (recompute, backward) also take the key scale's bits and the decay-first flag.
-        var rulePc = new[] { batch, seqLen, modelDim, numHeads, headDim,
-            GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1 : 0 };
-        DispatchRecurrence("gdn_recompute", WebGpuRecurrenceKernels.GatedDeltaRecompute, total,
-            new[] { k, v, alpha, beta, traj }, rulePc);
+        // One 256-invocation workgroup per (batch, head): the shader's workgroup size, which CalculateWorkgroups1D uses.
+        int dispatch = checked(batch * numHeads * 256);
         using var qk = PackPair(q, k, qkCount);
-        using var abTraj = AllocateBuffer(checked(2 * gateCount + (int)trajLenLong));
-        Copy(alpha, 0, abTraj, 0, gateCount);
-        Copy(beta, 0, abTraj, gateCount, gateCount);
-        Copy(traj, 0, abTraj, 2 * gateCount, (int)trajLenLong);
-        if (det)
-        {
-            // Fixed-order reduction instead of CAS accumulation (see GatedDeltaBackwardDeterministic); every gradient
-            // element is written, so nothing needs clearing first.
-            using var partials = AllocateBuffer(checked(2 * qkCount));
-            DispatchRecurrence("gdn_dq", WebGpuRecurrenceKernels.GatedDeltaDq, qkCount, new[] { dOut, traj, dQ }, pc);
-            DispatchRecurrence("gdn_backward_det", WebGpuRecurrenceKernels.GatedDeltaBackwardDeterministic, total,
-                new[] { dOut, qk, v, abTraj, partials, dV }, rulePc);
-            DispatchRecurrence("gdn_reduce", WebGpuRecurrenceKernels.GatedDeltaReduce, qkCount,
-                new[] { abTraj, partials, dK, dAlpha, dBeta }, pc);
-            return;
-        }
+        using var work = AllocateBuffer(checked(2 * gateCount + workLen));
+        Copy(alpha, 0, work, 0, gateCount);
+        Copy(beta, 0, work, gateCount, gateCount);
         using var dAb = AllocateBuffer(checked(2 * gateCount));
-        Fill(dAb, 0f, 2 * gateCount);
-        DispatchRecurrence("gdn_backward", WebGpuRecurrenceKernels.GatedDeltaBackward, total,
-            new[] { dOut, qk, v, abTraj, dQ, dK, dV, dAb }, rulePc);
+        var pc = new[] { batch, seqLen, modelDim, numHeads, headDim, chunk, headStride,
+            GatedDeltaNetBackwardResolver.FloatBits(keyScale), decayFirst ? 1 : 0 };
+        DispatchRecurrence("gdn_backward_ckpt", WebGpuRecurrenceKernels.GatedDeltaBackwardCheckpointed, dispatch,
+            new[] { dOut, qk, v, work, dQ, dK, dV, dAb }, pc);
         Copy(dAb, 0, dAlpha, 0, gateCount);
         Copy(dAb, gateCount, dBeta, 0, gateCount);
     }

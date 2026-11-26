@@ -406,176 +406,141 @@ void main() {
     dw[jc] = acc;
 }";
 
-    public static string GatedDeltaRecompute => Header + @"
-layout(set=0,binding=0) readonly buffer Kb { float K[]; };
-layout(set=0,binding=1) readonly buffer Vb { float Vd[]; };
-layout(set=0,binding=2) readonly buffer Ab { float A[]; };
-layout(set=0,binding=3) readonly buffer Bb { float Bt[]; };
-layout(set=0,binding=4) buffer Sb { float Straj[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; uint keyScaleBits; uint decayFirst; };
-void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
-    if (gid >= B*NH*HD) return;
-    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
-    float kappa = uintBitsToFloat(keyScaleBits);
-    float Srow[256];
-    for (int ki=0; ki<HD; ki++) Srow[ki]=0.0;
-    for (int t=0; t<SL; t++) {
-        int baseOff = (b*SL+t)*MD + hOff; int gIdx = (b*SL+t)*NH + h;
-        float a = A[gIdx], bet = Bt[gIdx];
-        float sK = 0.0; for (int ki=0; ki<HD; ki++) sK += Srow[ki]*(K[baseOff+ki]*kappa);
-        float bd = bet*(Vd[baseOff+di]-(decayFirst != 0u ? a : 1.0)*sK);
-        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        for (int ki=0; ki<HD; ki++) { float s = a*Srow[ki] + bd*(K[baseOff+ki]*kappa); Srow[ki]=s; Straj[trajBase+ki]=s; }
-    }
-}";
-
-    public static string GatedDeltaBackward => GatedDeltaBackwardSource(deterministic: false);
+    /// <summary>Threads per workgroup of <see cref="GatedDeltaBackwardCheckpointed"/>; they stride over the state rows.</summary>
+    internal const int GatedDeltaCheckpointGroupSize = 64;
 
     /// <summary>
-    /// The backward without atomics: dQ comes from <see cref="GatedDeltaDq"/>, each row's dK contribution overwrites
-    /// that row of the trajectory (read only by this invocation, and last read at step t + 1), and dA/dB go to per-row
-    /// partials P = [dA | dB]. <see cref="GatedDeltaReduce"/> then sums the rows in a fixed order.
+    /// The checkpointed, deterministic backward (<see cref="GatedDeltaNetCheckpoint"/>): one workgroup per (batch, head)
+    /// saves the state entering every chunk, recomputes one chunk at a time and runs BPTT over it, summing dQ, dK, dA
+    /// and dB over the state rows in ascending order behind barriers. Every output element is written.
     /// </summary>
-    public static string GatedDeltaBackwardDeterministic => GatedDeltaBackwardSource(deterministic: true);
-
-    private static string GatedDeltaBackwardSource(bool deterministic) => Header + (deterministic ? @"
+    public static string GatedDeltaBackwardCheckpointed => @"#version 450
+layout(local_size_x = 64) in;
 layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
 layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
 layout(set=0,binding=2) readonly buffer Kb { float K[]; };
 layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
 layout(set=0,binding=4) readonly buffer Ab { float A[]; };
 layout(set=0,binding=5) readonly buffer Bb { float Bt[]; };
-layout(set=0,binding=6) buffer Sb { float Straj[]; };
-layout(set=0,binding=7) writeonly buffer Pb { float P[]; };
-layout(set=0,binding=8) writeonly buffer DVb { float dV[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; uint keyScaleBits; uint decayFirst; };
-void addDQ(int idx, float val){ }
-void addDK(int idx, float val){ }
-" : @"
-layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
-layout(set=0,binding=1) readonly buffer Qb { float Q[]; };
-layout(set=0,binding=2) readonly buffer Kb { float K[]; };
-layout(set=0,binding=3) readonly buffer Vb { float Vd[]; };
-layout(set=0,binding=4) readonly buffer Ab { float A[]; };
-layout(set=0,binding=5) readonly buffer Bb { float Bt[]; };
-layout(set=0,binding=6) readonly buffer Sb { float Straj[]; };
-layout(set=0,binding=7) buffer DQb { uint dQ[]; };
-layout(set=0,binding=8) buffer DKb { uint dK[]; };
-layout(set=0,binding=9) buffer DVb { float dV[]; };
-layout(set=0,binding=10) buffer DAb { uint dA[]; };
-layout(set=0,binding=11) buffer DBb { uint dB[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; uint keyScaleBits; uint decayFirst; };
-void addDQ(int idx, float val){ uint old=dQ[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dQ[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
-void addDK(int idx, float val){ uint old=dK[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dK[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
-void addDA(int idx, float val){ uint old=dA[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dA[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
-void addDB(int idx, float val){ uint old=dB[idx]; uint assumed; do { assumed=old; old=atomicCompSwap(dB[idx], assumed, floatBitsToUint(uintBitsToFloat(assumed)+val)); } while(old!=assumed); }
-") + (deterministic ? @"
-#define DET 1
-" : @"
-#define DET 0
-") + @"
+layout(set=0,binding=6) buffer Wb { float Work[]; };
+layout(set=0,binding=7) writeonly buffer DQb { float dQ[]; };
+layout(set=0,binding=8) writeonly buffer DKb { float dK[]; };
+layout(set=0,binding=9) writeonly buffer DVb { float dV[]; };
+layout(set=0,binding=10) writeonly buffer DAb { float dA[]; };
+layout(set=0,binding=11) writeonly buffer DBb { float dB[]; };
+layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; uint chunk; uint headStride; uint keyScaleBits; uint decayFirst; };
 void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int B=int(batch), SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
-    if (gid >= B*NH*HD) return;
-    int di = gid % HD; int h = (gid/HD) % NH; int b = gid/(HD*NH); int hOff = h*HD; int hh = HD*HD;
+    int bh = int(gl_WorkGroupID.x);
+    int NH = int(numHeads), SL = int(seqLen), MD = int(modelDim), HD = int(headDim), CH = int(chunk);
+    if (bh >= int(batch) * NH) return;
+    int tid = int(gl_LocalInvocationID.x), nt = int(gl_WorkGroupSize.x);
+    int h = bh % NH, b = bh / NH, hOff = h * HD, hh = HD * HD;
+    int nChunks = (SL + CH - 1) / CH;
+    int ck = bh * int(headStride);
+    int sc = ck + nChunks * hh;
+    int dsb = sc + CH * hh;
+    int part = dsb + hh;
     float kappa = uintBitsToFloat(keyScaleBits);
-    float dSrow[256];
-    for (int ki=0; ki<HD; ki++) dSrow[ki]=0.0;
-    for (int t=SL-1; t>=0; t--) {
-        int baseOff = (b*SL+t)*MD + hOff; int gIdx = (b*SL+t)*NH + h;
-        float a = A[gIdx], bet = Bt[gIdx];
-        int trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        int sprevBase = (t>0) ? (((b*NH+h)*SL+(t-1))*hh + di*HD) : 0;
-        float sK = 0.0;
-        for (int ki=0; ki<HD; ki++) { float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0; sK += sprev*(K[baseOff+ki]*kappa); }
-        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
-        float pa = decayFirst != 0u ? a : 1.0;
-        float delta = Vd[baseOff+di] - pa*sK;
-        float dOutVal = dOut[baseOff+di];
-        for (int ki=0; ki<HD; ki++) { if (DET == 0) addDQ(baseOff+ki, dOutVal*Straj[trajBase+ki]); dSrow[ki]+=dOutVal*Q[baseOff+ki]; }
-        float dA_acc=0.0, dB_acc=0.0, dDelta=0.0;
-        for (int ki=0; ki<HD; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0;
-            float kScaled = K[baseOff+ki]*kappa;
-            dA_acc += dSt*sprev;
-            dB_acc += dSt*delta*kScaled;
-            dDelta += dSt*bet*kScaled;
-        }
-        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
-        if (decayFirst != 0u) dA_acc -= dDelta*sK;
-        dV[baseOff+di] = dDelta;
-#if DET
-        P[gIdx*HD + di] = dA_acc;
-        P[B*SL*MD + gIdx*HD + di] = dB_acc;
-#else
-        addDA(gIdx, dA_acc);
-        addDB(gIdx, dB_acc);
-#endif
-        float dSk = -dDelta;
-        for (int ki=0; ki<HD; ki++) {
-            float dSt = dSrow[ki];
-            float sprev = (t>0) ? Straj[sprevBase+ki] : 0.0;
-            float kScaled = K[baseOff+ki]*kappa;
-            float dKS = dSt*(bet*delta) + dSk*pa*sprev;
-#if DET
-            Straj[trajBase+ki] = dKS*kappa;
-#else
-            addDK(baseOff+ki, dKS*kappa);
-#endif
-            dSrow[ki] = dSt*a + dSk*pa*kScaled;
+    bool df = decayFirst != 0u;
+    float R[256];
+    int tLast = (nChunks - 1) * CH;
+
+    for (int di = tid; di < HD; di += nt) {
+        int rowOff = di * HD;
+        for (int ki = 0; ki < HD; ki++) { R[ki] = 0.0; Work[dsb + rowOff + ki] = 0.0; }
+        for (int t = 0; ; t++) {
+            if (t % CH == 0) { int dst = ck + (t / CH) * hh + rowOff; for (int ki = 0; ki < HD; ki++) Work[dst + ki] = R[ki]; }
+            if (t == tLast) break;
+            int baseOff = (b * SL + t) * MD + hOff; int gIdx = (b * SL + t) * NH + h;
+            float a = A[gIdx], bet = Bt[gIdx];
+            float sK = 0.0; for (int ki = 0; ki < HD; ki++) sK += R[ki] * (K[baseOff + ki] * kappa);
+            float bd = bet * (Vd[baseOff + di] - (df ? a : 1.0) * sK);
+            for (int ki = 0; ki < HD; ki++) R[ki] = a * R[ki] + bd * (K[baseOff + ki] * kappa);
         }
     }
-}";
 
-    /// <summary>Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].</summary>
-    public static string GatedDeltaDq => Header + @"
-layout(set=0,binding=0) readonly buffer DOb { float dOut[]; };
-layout(set=0,binding=1) readonly buffer Sb { float Straj[]; };
-layout(set=0,binding=2) writeonly buffer DQb { float dQ[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
-void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
-    if (gid >= int(batch)*SL*MD) return;
-    int ki = gid % HD; int h = (gid/HD) % NH; int bt = gid / MD; int t = bt % SL; int b = bt / SL;
-    int trajT = ((b*NH+h)*SL+t)*HD*HD;
-    int base = bt*MD + h*HD;
-    float acc = 0.0;
-    for (int di=0; di<HD; di++) acc += dOut[base+di]*Straj[trajT + di*HD + ki];
-    dQ[gid] = acc;
-}";
+    for (int c = nChunks - 1; c >= 0; c--) {
+        int t0 = c * CH;
+        int len = min(SL - t0, CH);
+        int ckc = ck + c * hh;
+        for (int di = tid; di < HD; di += nt) {
+            int rowOff = di * HD;
+            for (int ki = 0; ki < HD; ki++) R[ki] = Work[ckc + rowOff + ki];
+            for (int lt = 0; lt < len; lt++) {
+                int t = t0 + lt;
+                int baseOff = (b * SL + t) * MD + hOff; int gIdx = (b * SL + t) * NH + h;
+                float a = A[gIdx], bet = Bt[gIdx];
+                float sK = 0.0; for (int ki = 0; ki < HD; ki++) sK += R[ki] * (K[baseOff + ki] * kappa);
+                float bd = bet * (Vd[baseOff + di] - (df ? a : 1.0) * sK);
+                int dst = sc + lt * hh + rowOff;
+                for (int ki = 0; ki < HD; ki++) { float s = a * R[ki] + bd * (K[baseOff + ki] * kappa); R[ki] = s; Work[dst + ki] = s; }
+            }
+        }
+        memoryBarrierBuffer(); barrier();
 
-    /// <summary>
-    /// Deterministic reduction of <see cref="GatedDeltaBackwardDeterministic"/>'s partials: dK from the rows of PK (the
-    /// overwritten trajectory) and dA/dB from P = [dA | dB], each summed over di in ascending order.
-    /// </summary>
-    public static string GatedDeltaReduce => Header + @"
-layout(set=0,binding=0) readonly buffer PKb { float PK[]; };
-layout(set=0,binding=1) readonly buffer Pb { float P[]; };
-layout(set=0,binding=2) writeonly buffer DKb { float dK[]; };
-layout(set=0,binding=3) writeonly buffer DAb { float dA[]; };
-layout(set=0,binding=4) writeonly buffer DBb { float dB[]; };
-layout(push_constant) uniform PC { uint batch; uint seqLen; uint modelDim; uint numHeads; uint headDim; };
-void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int SL=int(seqLen), MD=int(modelDim), NH=int(numHeads), HD=int(headDim);
-    int n = int(batch)*SL*MD;
-    if (gid >= n) return;
-    int ki = gid % HD; int h = (gid/HD) % NH; int bt = gid / MD; int t = bt % SL; int b = bt / SL;
-    int trajT = ((b*NH+h)*SL+t)*HD*HD;
-    float acc = 0.0;
-    for (int di=0; di<HD; di++) acc += PK[trajT + di*HD + ki];
-    dK[gid] = acc;
-    if (ki == 0) {
-        int gIdx = bt*NH + h;
-        float sa = 0.0, sb = 0.0;
-        for (int di=0; di<HD; di++) { sa += P[gIdx*HD + di]; sb += P[n + gIdx*HD + di]; }
-        dA[gIdx] = sa;
-        dB[gIdx] = sb;
+        for (int e = tid; e < len * HD; e += nt) {
+            int lt = e / HD, ki = e % HD;
+            int base0 = (b * SL + t0 + lt) * MD + hOff;
+            int st = sc + lt * hh;
+            float acc = 0.0;
+            for (int di = 0; di < HD; di++) acc += dOut[base0 + di] * Work[st + di * HD + ki];
+            dQ[base0 + ki] = acc;
+        }
+        memoryBarrierBuffer(); barrier();
+
+        for (int di = tid; di < HD; di += nt) {
+            int rowOff = di * HD;
+            for (int ki = 0; ki < HD; ki++) R[ki] = Work[dsb + rowOff + ki];
+            for (int lt = len - 1; lt >= 0; lt--) {
+                int t = t0 + lt;
+                int baseOff = (b * SL + t) * MD + hOff; int gIdx = (b * SL + t) * NH + h;
+                float a = A[gIdx], bet = Bt[gIdx];
+                float pa = df ? a : 1.0;
+                int sp = (lt > 0 ? sc + (lt - 1) * hh : ckc) + rowOff;
+                int kOut = sc + lt * hh + rowOff;
+                float sK = 0.0; for (int ki = 0; ki < HD; ki++) sK += Work[sp + ki] * (K[baseOff + ki] * kappa);
+                float delta = Vd[baseOff + di] - pa * sK;
+                float dOutVal = dOut[baseOff + di];
+                for (int ki = 0; ki < HD; ki++) R[ki] += dOutVal * Q[baseOff + ki];
+                float dA_acc = 0.0, dB_acc = 0.0, dDelta = 0.0;
+                for (int ki = 0; ki < HD; ki++) {
+                    float kScaled = K[baseOff + ki] * kappa;
+                    dA_acc += R[ki] * Work[sp + ki];
+                    dB_acc += R[ki] * delta * kScaled;
+                    dDelta += R[ki] * bet * kScaled;
+                }
+                if (df) dA_acc -= dDelta * sK;
+                dV[baseOff + di] = dDelta;
+                Work[part + (2 * lt) * HD + di] = dA_acc;
+                Work[part + (2 * lt + 1) * HD + di] = dB_acc;
+                float dSk = -dDelta;
+                for (int ki = 0; ki < HD; ki++) {
+                    float dSt = R[ki];
+                    float kScaled = K[baseOff + ki] * kappa;
+                    Work[kOut + ki] = (dSt * (bet * delta) + dSk * pa * Work[sp + ki]) * kappa;
+                    R[ki] = dSt * a + dSk * pa * kScaled;
+                }
+            }
+            for (int ki = 0; ki < HD; ki++) Work[dsb + rowOff + ki] = R[ki];
+        }
+        memoryBarrierBuffer(); barrier();
+
+        for (int e = tid; e < len * HD; e += nt) {
+            int lt = e / HD, ki = e % HD;
+            int base0 = (b * SL + t0 + lt) * MD + hOff;
+            int pk = sc + lt * hh;
+            float acc = 0.0;
+            for (int di = 0; di < HD; di++) acc += Work[pk + di * HD + ki];
+            dK[base0 + ki] = acc;
+        }
+        for (int lt = tid; lt < len; lt += nt) {
+            int gIdx = (b * SL + t0 + lt) * NH + h;
+            float sa = 0.0, sb = 0.0;
+            for (int di = 0; di < HD; di++) { sa += Work[part + (2 * lt) * HD + di]; sb += Work[part + (2 * lt + 1) * HD + di]; }
+            dA[gIdx] = sa;
+            dB[gIdx] = sb;
+        }
+        memoryBarrierBuffer(); barrier();
     }
 }";
 

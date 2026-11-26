@@ -29,6 +29,15 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// </summary>
 internal static class RebindablePlanCache<T>
 {
+    private const int CacheCapacity = 32;
+
+    private struct PlanSlot
+    {
+        public long PatternHash;
+        public int RecordedEntryCount;
+        public int[]? ReverseTopoIndices;
+    }
+
     [ThreadStatic]
     private static long _cachedPatternHash;
 
@@ -37,6 +46,12 @@ internal static class RebindablePlanCache<T>
 
     [ThreadStatic]
     private static int[]? _cachedReverseTopoIndices;
+
+    [ThreadStatic]
+    private static PlanSlot[]? s_slots;
+
+    [ThreadStatic]
+    private static int s_nextEvictSlot;
 
     /// <summary>
     /// Thread-local per-arity inputs buffers (length 1 / 2 / 3) reused
@@ -56,15 +71,37 @@ internal static class RebindablePlanCache<T>
     /// <summary>Quick-check for cache presence without a full lookup.</summary>
     internal static bool IsEmpty => _cachedReverseTopoIndices is null;
 
-    /// <summary>Validates the cached signature against the caller's pattern.</summary>
+    /// <summary>Validates the cached signature against the caller's pattern, promoting multi-slot hits to MRU.</summary>
     internal static bool TrySignature(long patternHash, int currentEntryCount)
-        => _cachedReverseTopoIndices is not null
-           && _cachedPatternHash == patternHash
-           && _cachedRecordedEntryCount == currentEntryCount;
+    {
+        if (_cachedReverseTopoIndices is not null
+            && _cachedPatternHash == patternHash
+            && _cachedRecordedEntryCount == currentEntryCount)
+        {
+            return true;
+        }
+
+        var slots = s_slots;
+        if (slots is null) return false;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            var indices = slots[i].ReverseTopoIndices;
+            if (indices is not null
+                && slots[i].PatternHash == patternHash
+                && slots[i].RecordedEntryCount == currentEntryCount)
+            {
+                _cachedPatternHash = patternHash;
+                _cachedRecordedEntryCount = currentEntryCount;
+                _cachedReverseTopoIndices = indices;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// <summary>
     /// Stores the reverse-topo entry-index sequence for the most recent
-    /// forward pattern on this thread.
+    /// forward pattern on this thread in the 32-slot thread-local cache.
     /// <para>
     /// When <see cref="CompiledBackwardWalk{T}.Enabled"/> is true, also
     /// captures each entry's static backward <see cref="System.Reflection.MethodInfo"/>
@@ -80,6 +117,29 @@ internal static class RebindablePlanCache<T>
         _cachedPatternHash = patternHash;
         _cachedRecordedEntryCount = recordedEntryCount;
         _cachedReverseTopoIndices = reverseTopoIndices;
+
+        var slots = s_slots ??= new PlanSlot[CacheCapacity];
+        int targetSlot = -1;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            if (slots[i].ReverseTopoIndices is null
+                || (slots[i].PatternHash == patternHash && slots[i].RecordedEntryCount == recordedEntryCount))
+            {
+                targetSlot = i;
+                break;
+            }
+        }
+        if (targetSlot < 0)
+        {
+            targetSlot = s_nextEvictSlot;
+            s_nextEvictSlot = (s_nextEvictSlot + 1) & (CacheCapacity - 1);
+        }
+        slots[targetSlot] = new PlanSlot
+        {
+            PatternHash = patternHash,
+            RecordedEntryCount = recordedEntryCount,
+            ReverseTopoIndices = reverseTopoIndices,
+        };
 
         // Issue #338 Item 3: also register a compiled-backward walker
         // keyed by the same pattern hash so the
@@ -143,14 +203,13 @@ internal static class RebindablePlanCache<T>
         IEngine engine,
         IReadOnlyCollection<Tensor<T>>? retainedTensors = null)
     {
-        if (_cachedReverseTopoIndices is null) return null;
-        if (_cachedPatternHash != patternHash) return null;
-        if (_cachedRecordedEntryCount != currentEntries.Count) return null;
+        if (!TrySignature(patternHash, currentEntries.Count) || _cachedReverseTopoIndices is not { } indices)
+            return null;
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(
-            _cachedReverseTopoIndices.Length + 1,
+            indices.Length + 1,
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Seed gradient — fresh per call, sized to the current iteration's
@@ -173,7 +232,6 @@ internal static class RebindablePlanCache<T>
         }
         grads[loss] = seedGrad;
 
-        var indices = _cachedReverseTopoIndices;
         for (int i = 0; i < indices.Length; i++)
         {
             int checkIdx = indices[i];
@@ -302,5 +360,7 @@ internal static class RebindablePlanCache<T>
         _cachedPatternHash = 0;
         _cachedRecordedEntryCount = 0;
         _cachedReverseTopoIndices = null;
+        s_slots = null;
+        s_nextEvictSlot = 0;
     }
 }

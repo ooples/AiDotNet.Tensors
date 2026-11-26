@@ -425,210 +425,141 @@ struct P { rows: i32, seqLen: i32, channels: i32, taps: i32 };
     dw[jc] = acc;
 }";
 
-    public const string GatedDeltaRecompute = @"
-@group(0) @binding(0) var<storage, read> K: array<f32>;
-@group(0) @binding(1) var<storage, read> Vd: array<f32>;
-@group(0) @binding(2) var<storage, read> A: array<f32>;
-@group(0) @binding(3) var<storage, read> Bt: array<f32>;
-@group(0) @binding(4) var<storage, read_write> Straj: array<f32>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32, keyScaleBits: i32, decayFirst: i32 };
-@group(0) @binding(5) var<uniform> p: P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    if (gid >= B*NH*HD) { return; }
-    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
-    let kappa = bitcast<f32>(p.keyScaleBits);
-    var Srow: array<f32, 256>;
-    for (var ki: i32 = 0; ki < HD; ki = ki+1) { Srow[ki] = 0.0; }
-    for (var t: i32 = 0; t < SL; t = t+1) {
-        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
-        let a = A[gIdx]; let bet = Bt[gIdx];
-        var sK: f32 = 0.0; for (var ki: i32 = 0; ki < HD; ki = ki+1) { sK = sK + Srow[ki]*(K[baseOff+ki]*kappa); }
-        let bd = bet*(Vd[baseOff+di] - select(1.0, a, p.decayFirst != 0)*sK);
-        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = a*Srow[ki] + bd*(K[baseOff+ki]*kappa); Srow[ki] = s; Straj[trajBase+ki] = s; }
-    }
-}";
-
-    public const string GatedDeltaBackward = @"
+    // The checkpointed, deterministic backward (GatedDeltaNetCheckpoint): one workgroup per (batch, head) saves the state
+    // entering every chunk, recomputes one chunk at a time and runs BPTT over it, summing dQ, dK, dA and dB over the
+    // state rows in ascending order behind storage barriers. Every output element is written. QKpk = Q|K,
+    // Work = A|B|per-head workspace and dAB = dA|dB keep it within WebGPU's guaranteed 8 storage bindings.
+    public const string GatedDeltaBackwardCheckpointed = @"
 @group(0) @binding(0) var<storage, read> dOut: array<f32>;
-// QKpk = Q|K, ABSpk = A|Bt|Straj, dAB = dA|dB to stay within WebGPU's 8 storage bindings per stage.
 @group(0) @binding(1) var<storage, read> QKpk: array<f32>;
 @group(0) @binding(2) var<storage, read> Vd: array<f32>;
-@group(0) @binding(3) var<storage, read> ABSpk: array<f32>;
-@group(0) @binding(4) var<storage, read_write> dQ: array<atomic<u32>>;
-@group(0) @binding(5) var<storage, read_write> dK: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> Work: array<f32>;
+@group(0) @binding(4) var<storage, read_write> dQ: array<f32>;
+@group(0) @binding(5) var<storage, read_write> dK: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dV: array<f32>;
-@group(0) @binding(7) var<storage, read_write> dAB: array<atomic<u32>>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32, keyScaleBits: i32, decayFirst: i32 };
+@group(0) @binding(7) var<storage, read_write> dAB: array<f32>;
+struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32, chunk: i32, headStride: i32, keyScaleBits: i32, decayFirst: i32 };
 @group(0) @binding(8) var<uniform> p: P;
-fn addDQ(idx: i32, val: f32) { var old = atomicLoad(&dQ[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dQ[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
-fn addDK(idx: i32, val: f32) { var old = atomicLoad(&dK[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dK[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
-fn addDAB(idx: i32, val: f32) { var old = atomicLoad(&dAB[idx]); loop { let nv = bitcast<u32>(bitcast<f32>(old) + val); let r = atomicCompareExchangeWeak(&dAB[idx], old, nv); if (r.exchanged) { break; } old = r.old_value; } }
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    if (gid >= B*NH*HD) { return; }
-    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
-    let qkCount = B*SL*MD; let gCount = B*SL*NH; let trajOff = 2*gCount;
+@compute @workgroup_size(256) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>) {
+    let bh = i32(wid.x + wid.y * nwg.x);
+    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim; let CH = p.chunk;
+    if (bh >= B*NH) { return; }
+    let tid = i32(lid.x); let nt = 256;
+    let h = bh % NH; let b = bh / NH; let hOff = h*HD; let hh = HD*HD;
+    let qkCount = B*SL*MD; let gCount = B*SL*NH;
+    let nChunks = (SL + CH - 1) / CH;
+    let ck = 2*gCount + bh*p.headStride;
+    let sc = ck + nChunks*hh;
+    let dsb = sc + CH*hh;
+    let part = dsb + hh;
     let kappa = bitcast<f32>(p.keyScaleBits);
-    var dSrow: array<f32, 256>;
-    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
-    for (var t: i32 = SL-1; t >= 0; t = t-1) {
-        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
-        let a = ABSpk[gIdx]; let bet = ABSpk[gCount + gIdx];
-        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
-        var sK: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            sK = sK + sprev * (QKpk[qkCount + baseOff + ki] * kappa);
-        }
-        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
-        let pa = select(1.0, a, p.decayFirst != 0);
-        let delta = Vd[baseOff+di] - pa*sK;
-        let dOutVal = dOut[baseOff+di];
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            let sval = ABSpk[trajOff + trajBase + ki];
-            addDQ(baseOff+ki, dOutVal*sval);
-            dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki];
-        }
-        var dA_acc: f32 = 0.0; var dB_acc: f32 = 0.0; var dDelta: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            let dSt = dSrow[ki];
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
-            dA_acc = dA_acc + dSt*sprev;
-            dB_acc = dB_acc + dSt*delta*kScaled;
-            dDelta = dDelta + dSt*bet*kScaled;
-        }
-        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
-        if (p.decayFirst != 0) { dA_acc = dA_acc - dDelta*sK; }
-        dV[baseOff+di] = dDelta;
-        addDAB(gIdx, dA_acc);
-        addDAB(gCount + gIdx, dB_acc);
-        let dSk = -dDelta;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            let dSt = dSrow[ki];
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
-            let dKS = dSt*(bet*delta) + dSk*pa*sprev;
-            addDK(baseOff+ki, dKS*kappa);
-            dSrow[ki] = dSt*a + dSk*pa*kScaled;
+    let df = p.decayFirst != 0;
+    let tLast = (nChunks - 1) * CH;
+    var R: array<f32, 256>;
+
+    for (var di: i32 = tid; di < HD; di = di + nt) {
+        let rowOff = di*HD;
+        for (var ki: i32 = 0; ki < HD; ki = ki+1) { R[ki] = 0.0; Work[dsb + rowOff + ki] = 0.0; }
+        var t: i32 = 0;
+        loop {
+            if (t % CH == 0) { let dst = ck + (t / CH)*hh + rowOff; for (var ki: i32 = 0; ki < HD; ki = ki+1) { Work[dst + ki] = R[ki]; } }
+            if (t == tLast) { break; }
+            let baseOff = (b*SL + t)*MD + hOff; let gIdx = (b*SL + t)*NH + h;
+            let a = Work[gIdx]; let bet = Work[gCount + gIdx];
+            var sK: f32 = 0.0;
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { sK = sK + R[ki]*(QKpk[qkCount + baseOff + ki]*kappa); }
+            let bd = bet*(Vd[baseOff + di] - select(1.0, a, df)*sK);
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { R[ki] = a*R[ki] + bd*(QKpk[qkCount + baseOff + ki]*kappa); }
+            t = t + 1;
         }
     }
-}";
 
-    public const string GatedDeltaBackwardDeterministic = @"
-@group(0) @binding(0) var<storage, read> dOut: array<f32>;
-// QKpk = Q|K and ABSpk = A|Bt|Straj as in GatedDeltaBackward. Each row's dK contribution overwrites that row of the
-// trajectory in ABSpk (read only by this invocation, and last read at step t + 1); Part = [dA | dB] per-row partials.
-@group(0) @binding(1) var<storage, read> QKpk: array<f32>;
-@group(0) @binding(2) var<storage, read> Vd: array<f32>;
-@group(0) @binding(3) var<storage, read_write> ABSpk: array<f32>;
-@group(0) @binding(4) var<storage, read_write> Part: array<f32>;
-@group(0) @binding(5) var<storage, read_write> dV: array<f32>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32, keyScaleBits: i32, decayFirst: i32 };
-@group(0) @binding(6) var<uniform> p: P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let B = p.batch; let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    if (gid >= B*NH*HD) { return; }
-    let di = gid % HD; let h = (gid/HD) % NH; let b = gid/(HD*NH); let hOff = h*HD; let hh = HD*HD;
-    let qkCount = B*SL*MD; let gCount = B*SL*NH; let trajOff = 2*gCount;
-    let kappa = bitcast<f32>(p.keyScaleBits);
-    var dSrow: array<f32, 256>;
-    for (var ki: i32 = 0; ki < HD; ki = ki+1) { dSrow[ki] = 0.0; }
-    for (var t: i32 = SL-1; t >= 0; t = t-1) {
-        let baseOff = (b*SL+t)*MD + hOff; let gIdx = (b*SL+t)*NH + h;
-        let a = ABSpk[gIdx]; let bet = ABSpk[gCount + gIdx];
-        let trajBase = ((b*NH+h)*SL+t)*hh + di*HD;
-        let sprevBase = ((b*NH+h)*SL+(t-1))*hh + di*HD;
-        var sK: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            sK = sK + sprev * (QKpk[qkCount + baseOff + ki] * kappa);
+    for (var c: i32 = nChunks - 1; c >= 0; c = c-1) {
+        let t0 = c*CH;
+        let clen = min(SL - t0, CH);
+        let ckc = ck + c*hh;
+        for (var di: i32 = tid; di < HD; di = di + nt) {
+            let rowOff = di*HD;
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { R[ki] = Work[ckc + rowOff + ki]; }
+            for (var lt: i32 = 0; lt < clen; lt = lt+1) {
+                let t = t0 + lt;
+                let baseOff = (b*SL + t)*MD + hOff; let gIdx = (b*SL + t)*NH + h;
+                let a = Work[gIdx]; let bet = Work[gCount + gIdx];
+                var sK: f32 = 0.0;
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) { sK = sK + R[ki]*(QKpk[qkCount + baseOff + ki]*kappa); }
+                let bd = bet*(Vd[baseOff + di] - select(1.0, a, df)*sK);
+                let dst = sc + lt*hh + rowOff;
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) { let s = a*R[ki] + bd*(QKpk[qkCount + baseOff + ki]*kappa); R[ki] = s; Work[dst + ki] = s; }
+            }
         }
-        // pa scales the prediction: a under the paper's rule (a S_{t-1} k), 1 under the original one.
-        let pa = select(1.0, a, p.decayFirst != 0);
-        let delta = Vd[baseOff+di] - pa*sK;
-        let dOutVal = dOut[baseOff+di];
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            dSrow[ki] = dSrow[ki] + dOutVal*QKpk[baseOff+ki];
-        }
-        var dA_acc: f32 = 0.0; var dB_acc: f32 = 0.0; var dDelta: f32 = 0.0;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            let dSt = dSrow[ki];
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
-            dA_acc = dA_acc + dSt*sprev;
-            dB_acc = dB_acc + dSt*delta*kScaled;
-            dDelta = dDelta + dSt*bet*kScaled;
-        }
-        // The prediction a S_{t-1} k also depends on a: its adjoint -dDelta times the undecayed read.
-        if (p.decayFirst != 0) { dA_acc = dA_acc - dDelta*sK; }
-        dV[baseOff+di] = dDelta;
-        Part[gIdx*HD + di] = dA_acc;
-        Part[qkCount + gIdx*HD + di] = dB_acc;
-        let dSk = -dDelta;
-        for (var ki: i32 = 0; ki < HD; ki = ki+1) {
-            let dSt = dSrow[ki];
-            var sprev: f32 = 0.0; if (t > 0) { sprev = ABSpk[trajOff + sprevBase + ki]; }
-            let kScaled = QKpk[qkCount + baseOff + ki] * kappa;
-            let dKS = dSt*(bet*delta) + dSk*pa*sprev;
-            ABSpk[trajOff + trajBase + ki] = dKS*kappa;
-            dSrow[ki] = dSt*a + dSk*pa*kScaled;
-        }
-    }
-}";
+        storageBarrier();
 
-    // Deterministic dQ: dQ[b,t,h,ki] = sum over di (ascending) of dOut[b,t,h,di] * S_t[di,ki].
-    public const string GatedDeltaDq = @"
-@group(0) @binding(0) var<storage, read> dOut: array<f32>;
-@group(0) @binding(1) var<storage, read> Straj: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dQ: array<f32>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(3) var<uniform> p: P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    if (gid >= p.batch*SL*MD) { return; }
-    let ki = gid % HD; let h = (gid/HD) % NH; let bt = gid / MD; let t = bt % SL; let b = bt / SL;
-    let trajT = ((b*NH+h)*SL+t)*HD*HD;
-    let base = bt*MD + h*HD;
-    var acc: f32 = 0.0;
-    for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + dOut[base+di]*Straj[trajT + di*HD + ki]; }
-    dQ[gid] = acc;
-}";
+        for (var e: i32 = tid; e < clen*HD; e = e + nt) {
+            let lt = e / HD; let ki = e % HD;
+            let base0 = (b*SL + t0 + lt)*MD + hOff;
+            let st = sc + lt*hh;
+            var acc: f32 = 0.0;
+            for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + dOut[base0 + di]*Work[st + di*HD + ki]; }
+            dQ[base0 + ki] = acc;
+        }
+        storageBarrier();
 
-    // Deterministic reduction of GatedDeltaBackwardDeterministic's partials: dK from the overwritten trajectory rows
-    // in ABSpk and dA/dB from Part = [dA | dB], each summed over di in ascending order.
-    public const string GatedDeltaReduce = @"
-@group(0) @binding(0) var<storage, read> ABSpk: array<f32>;
-@group(0) @binding(1) var<storage, read> Part: array<f32>;
-@group(0) @binding(2) var<storage, read_write> dK: array<f32>;
-@group(0) @binding(3) var<storage, read_write> dA: array<f32>;
-@group(0) @binding(4) var<storage, read_write> dB: array<f32>;
-struct P { batch: i32, seqLen: i32, modelDim: i32, numHeads: i32, headDim: i32 };
-@group(0) @binding(5) var<uniform> p: P;
-@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid3: vec3<u32>) {
-    let gid = i32(gid3.x);
-    let SL = p.seqLen; let MD = p.modelDim; let NH = p.numHeads; let HD = p.headDim;
-    let n = p.batch*SL*MD;
-    if (gid >= n) { return; }
-    let ki = gid % HD; let h = (gid/HD) % NH; let bt = gid / MD; let t = bt % SL; let b = bt / SL;
-    let trajOff = 2*p.batch*SL*NH;
-    let trajT = trajOff + ((b*NH+h)*SL+t)*HD*HD;
-    var acc: f32 = 0.0;
-    for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + ABSpk[trajT + di*HD + ki]; }
-    dK[gid] = acc;
-    if (ki == 0) {
-        let gIdx = bt*NH + h;
-        var sa: f32 = 0.0; var sb: f32 = 0.0;
-        for (var di: i32 = 0; di < HD; di = di+1) { sa = sa + Part[gIdx*HD + di]; sb = sb + Part[n + gIdx*HD + di]; }
-        dA[gIdx] = sa;
-        dB[gIdx] = sb;
+        for (var di: i32 = tid; di < HD; di = di + nt) {
+            let rowOff = di*HD;
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { R[ki] = Work[dsb + rowOff + ki]; }
+            for (var lt: i32 = clen - 1; lt >= 0; lt = lt-1) {
+                let t = t0 + lt;
+                let baseOff = (b*SL + t)*MD + hOff; let gIdx = (b*SL + t)*NH + h;
+                let a = Work[gIdx]; let bet = Work[gCount + gIdx];
+                let pa = select(1.0, a, df);
+                var sp: i32 = ckc + rowOff;
+                if (lt > 0) { sp = sc + (lt - 1)*hh + rowOff; }
+                let kOut = sc + lt*hh + rowOff;
+                var sK: f32 = 0.0;
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) { sK = sK + Work[sp + ki]*(QKpk[qkCount + baseOff + ki]*kappa); }
+                let delta = Vd[baseOff + di] - pa*sK;
+                let dOutVal = dOut[baseOff + di];
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) { R[ki] = R[ki] + dOutVal*QKpk[baseOff + ki]; }
+                var dA_acc: f32 = 0.0; var dB_acc: f32 = 0.0; var dDelta: f32 = 0.0;
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+                    let kScaled = QKpk[qkCount + baseOff + ki]*kappa;
+                    dA_acc = dA_acc + R[ki]*Work[sp + ki];
+                    dB_acc = dB_acc + R[ki]*delta*kScaled;
+                    dDelta = dDelta + R[ki]*bet*kScaled;
+                }
+                if (df) { dA_acc = dA_acc - dDelta*sK; }
+                dV[baseOff + di] = dDelta;
+                Work[part + (2*lt)*HD + di] = dA_acc;
+                Work[part + (2*lt + 1)*HD + di] = dB_acc;
+                let dSk = -dDelta;
+                for (var ki: i32 = 0; ki < HD; ki = ki+1) {
+                    let dSt = R[ki];
+                    let kScaled = QKpk[qkCount + baseOff + ki]*kappa;
+                    Work[kOut + ki] = (dSt*(bet*delta) + dSk*pa*Work[sp + ki])*kappa;
+                    R[ki] = dSt*a + dSk*pa*kScaled;
+                }
+            }
+            for (var ki: i32 = 0; ki < HD; ki = ki+1) { Work[dsb + rowOff + ki] = R[ki]; }
+        }
+        storageBarrier();
+
+        for (var e: i32 = tid; e < clen*HD; e = e + nt) {
+            let lt = e / HD; let ki = e % HD;
+            let base0 = (b*SL + t0 + lt)*MD + hOff;
+            let pk = sc + lt*hh;
+            var acc: f32 = 0.0;
+            for (var di: i32 = 0; di < HD; di = di+1) { acc = acc + Work[pk + di*HD + ki]; }
+            dK[base0 + ki] = acc;
+        }
+        for (var lt: i32 = tid; lt < clen; lt = lt + nt) {
+            let gIdx = (b*SL + t0 + lt)*NH + h;
+            var sa: f32 = 0.0; var sb: f32 = 0.0;
+            for (var di: i32 = 0; di < HD; di = di+1) { sa = sa + Work[part + (2*lt)*HD + di]; sb = sb + Work[part + (2*lt + 1)*HD + di]; }
+            dAB[gIdx] = sa;
+            dAB[gCount + gIdx] = sb;
+        }
+        storageBarrier();
     }
 }";
 
