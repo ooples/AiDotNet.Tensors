@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -34,6 +35,15 @@ public class GpuMatrixVectorDoublePrecisionTests
     {
         var values = new double[length];
         for (int i = 0; i < length; i++) values[i] = Value(i, seed);
+        return new Vector<double>(values);
+    }
+
+    // Alternating signs with low bits a float cannot hold: Abs and ReLU then see magnitudes that a float round trip
+    // would move, and ReLU also exercises its zero branch.
+    private static Vector<double> SignedVectorOf(double seed)
+    {
+        var values = VectorOf(seed).ToArray();
+        for (int i = 0; i < values.Length; i += 2) values[i] = -values[i];
         return new Vector<double>(values);
     }
 
@@ -136,7 +146,7 @@ public class GpuMatrixVectorDoublePrecisionTests
             "DivideScalar" => engine.Divide(a, 0.3000000000000123).ToArray(),
             "Max" => engine.Max(a, b).ToArray(),
             "Min" => engine.Min(a, b).ToArray(),
-            "Abs" => engine.Abs(engine.Subtract(a, b)).ToArray(),
+            "Abs" => engine.Abs(SignedVectorOf(0.25)).ToArray(),
             "Exp" => engine.Exp(a).ToArray(),
             "Exp2" => engine.Exp2(a).ToArray(),
             "Exp10" => engine.Exp10(a).ToArray(),
@@ -146,7 +156,7 @@ public class GpuMatrixVectorDoublePrecisionTests
             "Power" => engine.Power(a, 1.5000000000000123).ToArray(),
             "Tanh" => engine.Tanh(engine.Divide(a, 16.0)).ToArray(),
             "Sigmoid" => engine.Sigmoid(engine.Divide(a, 16.0)).ToArray(),
-            "ReLU" => engine.ReLU(engine.Subtract(a, b)).ToArray(),
+            "ReLU" => engine.ReLU(SignedVectorOf(0.25)).ToArray(),
             "GELU" => engine.GELU(engine.Divide(a, 16.0)).ToArray(),
             "DotProduct" => new[] { engine.DotProduct(a, b) },
             "StridedGather" => engine.StridedGather(a, 3, 5, 1000).ToArray(),
@@ -163,5 +173,23 @@ public class GpuMatrixVectorDoublePrecisionTests
         }
 
         AssertSame(Run(cpu), Run(gpu), op);
+    }
+
+    [SkippableFact]
+    public void StridedScatter_SpeedFirst_LeavesUntouchedDoublesExact()
+    {
+        var gpu = GpuEngineOrSkip();
+        // Speed-first may round the scattered values through float, never the elements the scatter does not write.
+        using var speedFirst = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
+        var destination = VectorOf(0.75);
+        var before = destination.ToArray();
+        gpu.StridedScatter(destination, VectorOf(0.125, 1000), 3, 5);
+        var after = destination.ToArray();
+        for (int i = 0; i < after.Length; i++)
+        {
+            if (i >= 3 && (i - 3) % 5 == 0 && (i - 3) / 5 < 1000) continue;
+            Assert.True(BitConverter.DoubleToInt64Bits(before[i]) == BitConverter.DoubleToInt64Bits(after[i]),
+                $"[{i}]: untouched element changed from {before[i]:R} to {after[i]:R}");
+        }
     }
 }

@@ -8188,7 +8188,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.StridedScatter(srcBuf, dstBuf, offset, stride, source.Length);
             var resultFloat = backend.DownloadBuffer(dstBuf);
             var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-            Array.Copy(resultT, destination.GetDataArray(), resultT.Length);
+            // Copy back only the scattered elements: under a speed-first policy the float round trip would
+            // otherwise round every untouched destination element too.
+            var target = destination.GetDataArray();
+            for (int i = 0, index = offset; i < source.Length; i++, index += stride)
+                target[index] = resultT[index];
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("CreateTapeBailStats", capabilityGap);
             base.StridedScatter(destination, source, offset, stride);
