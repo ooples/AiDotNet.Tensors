@@ -411,19 +411,55 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // deterministic across runs (reproducible training) — the golden-ratio multiplier decorrelates
     // sequential counter values for Philox.
     private long _stochasticSeedCounter;
-    private ulong NextStochasticSeed() =>
-        unchecked((ulong)System.Threading.Interlocked.Increment(ref _stochasticSeedCounter) * 0x9E3779B97F4A7C15UL);
+    // A replay (see ReplayStochasticSeedsFrom) on this thread: its engine and where it is in the replayed sequence.
+    [ThreadStatic] private static DirectGpuTensorEngine? t_seedReplayEngine;
+    [ThreadStatic] private static long t_seedReplayPosition;
+    private ulong NextStochasticSeed()
+    {
+        long position = ReferenceEquals(t_seedReplayEngine, this)
+            ? ++t_seedReplayPosition
+            : System.Threading.Interlocked.Increment(ref _stochasticSeedCounter);
+        return unchecked((ulong)position * 0x9E3779B97F4A7C15UL);
+    }
+
+    /// <summary>Draws a stochastic-op seed as an op would (tests).</summary>
+    internal ulong NextStochasticSeedForTests() => NextStochasticSeed();
 
     /// <summary>
-    /// Where the engine's stochastic ops (dropout) are in their seed sequence. A compiled plan that runs a forward
-    /// action a second time (an activation-checkpoint recompute) puts the position back to where the first run started,
-    /// so the second run draws what the first drew, as <c>torch.utils.checkpoint</c> does with
-    /// <c>preserve_rng_state</c>.
+    /// Where the engine's stochastic ops (dropout) are in their seed sequence: the position a compiled plan records
+    /// before a forward action, so an activation-checkpoint recompute can replay it (<see cref="ReplayStochasticSeedsFrom"/>).
     /// </summary>
-    internal long StochasticSeedPosition
+    internal long StochasticSeedPosition => System.Threading.Interlocked.Read(ref _stochasticSeedCounter);
+
+    /// <summary>
+    /// Until the returned scope is disposed, the stochastic ops this thread runs on this engine draw the seeds that
+    /// followed <paramref name="position"/>, so a recomputed forward action draws what its first run drew, as
+    /// <c>torch.utils.checkpoint</c> does with <c>preserve_rng_state</c>. The replay is this thread's only: the engine's
+    /// own sequence is not rewound, so ops other threads run meanwhile keep drawing fresh seeds, and none of them can
+    /// draw a seed the step already used.
+    /// </summary>
+    internal SeedReplayScope ReplayStochasticSeedsFrom(long position)
     {
-        get => System.Threading.Interlocked.Read(ref _stochasticSeedCounter);
-        set => System.Threading.Interlocked.Exchange(ref _stochasticSeedCounter, value);
+        var scope = new SeedReplayScope(t_seedReplayEngine, t_seedReplayPosition);
+        t_seedReplayEngine = this;
+        t_seedReplayPosition = position;
+        return scope;
+    }
+
+    internal readonly struct SeedReplayScope : IDisposable
+    {
+        private readonly DirectGpuTensorEngine? _previousEngine;
+        private readonly long _previousPosition;
+        internal SeedReplayScope(DirectGpuTensorEngine? previousEngine, long previousPosition)
+        {
+            _previousEngine = previousEngine;
+            _previousPosition = previousPosition;
+        }
+        public void Dispose()
+        {
+            t_seedReplayEngine = _previousEngine;
+            t_seedReplayPosition = _previousPosition;
+        }
     }
 
     // CSR buffer cache for sparse tensors — avoids re-uploading static sparse matrices every call.

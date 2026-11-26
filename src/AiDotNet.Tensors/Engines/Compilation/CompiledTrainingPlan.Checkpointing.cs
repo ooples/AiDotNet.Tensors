@@ -560,16 +560,19 @@ internal sealed partial class CompiledTrainingPlan<T>
             }
             // A recomputed stochastic op (a dropout) draws what its forward drew: the segment's kept outputs were
             // computed from that draw, so a new one would backpropagate through a different function. Each action starts
-            // from the seed position its forward started from; the position the step had reached is put back after.
-            long seedPosition = de?.StochasticSeedPosition ?? 0;
+            // from the seed position its forward started from. The replay is this thread's: the engine's sequence is not
+            // rewound, so another thread's ops on the engine meanwhile cannot draw seeds the step already used.
             try
             {
                 foreach (int a in _checkpoint.RecomputeActions[k])
                 {
                     de?.SetCurrentScratchAction(recomputeKeyBase + a);
                     if (pool is not null) pool.HoldLeasesIn = _checkpoint.HeldRecompute[k];
-                    if (de is not null) de.StochasticSeedPosition = _checkpoint.SeedBeforeForwardAction[a];
-                    forward[a](engine);
+                    if (de is not null)
+                        using (de.ReplayStochasticSeedsFrom(_checkpoint.SeedBeforeForwardAction[a]))
+                            forward[a](engine);
+                    else
+                        forward[a](engine);
                     if (pool is not null) pool.HoldLeasesIn = null;
                     de?.EndScratchAction();
                 }
@@ -577,7 +580,6 @@ internal sealed partial class CompiledTrainingPlan<T>
             finally
             {
                 if (pool is not null) pool.HoldLeasesIn = null;
-                if (de is not null) de.StochasticSeedPosition = seedPosition;
             }
             for (int j = 0; j < state.Length; j++)
                 CopyDevice(backend,
