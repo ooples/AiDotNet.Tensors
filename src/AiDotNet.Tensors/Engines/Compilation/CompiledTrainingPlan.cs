@@ -127,8 +127,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // %TEMP%/aidotnet_graphstep_diag.txt writes must NOT run for ordinary
     // production compiles. Gate those behind a separate explicit opt-in so a
     // default compile never touches the filesystem for diagnostics.
-    private static readonly bool s_graphStepDiagnosticsEnabled =
-        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
+    private static bool s_graphStepDiagnosticsEnabled => CompiledTrainingDiagnostics.GraphStepTraceEnabled;
     private IntPtr _stepGraphExec;
     private DirectGpuTensorEngine? _stepGraphOwner;
     // The step graph for odd replays, when the plan alternates two (NeedsParityGraphs): replay r runs

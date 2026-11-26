@@ -46,7 +46,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
     private int _idleSuspended;
     [ThreadStatic] private static int t_noIdleLoan;
 
-    private static readonly bool s_idleLoanDiag = Environment.GetEnvironmentVariable("AIDOTNET_IDLE_LOAN_DIAG") == "1";
+    private static bool s_idleLoanDiag => global::AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.TraceIdleLoans;
 
     /// <summary>Loans served, bytes served, requests not served while memory was lent, loans moved and bytes moved.</summary>
     internal (long Loans, long LoanBytes, long Misses, long MissBytes, long Moves, long MoveBytes) IdleLoanCounters
@@ -107,7 +107,7 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
         internal readonly long Offset;
         internal readonly long Length;
         internal readonly WeakReference<CudaGpuBuffer> Borrower;
-        // AIDOTNET_IDLE_LOAN_DIAG: where the loan was taken, reported if it has to be moved.
+        // CompiledTrainingDiagnostics.TraceIdleLoans: where the loan was taken, reported if it has to be moved.
         internal string? Origin;
         private int _state;   // 0 lent, 1 returned, 2 moved to memory of its own
 

@@ -379,7 +379,7 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal StepScratchPool? ScratchPoolForTest => _scratchPool;
 
     private string? _workspaceOpaqueSavedType;
-    private static readonly bool s_idleLendDiag = Environment.GetEnvironmentVariable("AIDOTNET_IDLE_LOAN_DIAG") == "1";
+    private static bool s_idleLendDiag => CompiledTrainingDiagnostics.TraceIdleLoans;
 
     /// <summary>Process switch for tests that need the backend's own allocations between steps.</summary>
     internal static bool LendIdleStepMemoryEnabled { get; set; } = true;

@@ -385,7 +385,7 @@ internal sealed partial class CompiledTrainingPlan<T>
                 if (!(item is Tensor<T> t && kept.Contains(t))) internals.Add(item);
             schedule.Internal[k] = internals.ToArray();
         }
-        if (Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1")
+        if (CompiledTrainingDiagnostics.GraphStepTraceEnabled)
             for (int k = 0; k < segments; k++)
             {
                 AiDotNetEngine.LogDiagnostic($"[PLAN-CKPT] segment {k}: forward actions ..{schedule.LastForwardAction[k]} "

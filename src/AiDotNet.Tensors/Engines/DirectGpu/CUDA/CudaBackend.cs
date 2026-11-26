@@ -21975,7 +21975,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (!pool.TryAddFree(lease)) lease.Release();
             return true;
         }
-        private static readonly bool s_captureAllocStacks = Environment.GetEnvironmentVariable("AIDOTNET_CAPTURE_ALLOC_STACKS") == "1";
+        private static bool s_captureAllocStacks => global::AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.RecordCaptureAllocationStacks;
 
         public void MarkRented(int size)
         {

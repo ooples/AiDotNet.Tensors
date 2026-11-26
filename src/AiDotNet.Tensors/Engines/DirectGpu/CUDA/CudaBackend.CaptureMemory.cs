@@ -281,8 +281,7 @@ public sealed partial class CudaBackend
         foreach (var pool in pools) pool.Retire();
     }
 
-    private static readonly bool s_captureMemoryDiag =
-        Environment.GetEnvironmentVariable("AIDOTNET_GRAPHSTEP_DIAG") == "1";
+    private static bool s_captureMemoryDiag => global::AiDotNet.Tensors.Engines.Compilation.CompiledTrainingDiagnostics.GraphStepTraceEnabled;
 
     /// <summary>Diagnostic: what a capture pinned -- memory it allocated vs memory that existed before it.</summary>
     private void LogCaptureMemory(CaptureMemoryPool pool)

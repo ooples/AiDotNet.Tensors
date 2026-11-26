@@ -202,6 +202,10 @@ public sealed class DirectGpuEngine : IDisposable
         if (required != GpuBackendType.None)
         {
             // The required backend is the only one tried: running on another would be the error it exists to prevent.
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(BackendOrderEnvVar)))
+                Trace.TraceWarning(
+                    $"{BackendOrderEnvVar} is ignored: {nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} "
+                    + $"is {required}, so only the {GpuBackendOptions.NameOf(required)} backend is tried.");
             backendOrder = new[] { GpuBackendOptions.NameOf(required) };
         }
         if (backendOrder.Count == 0)
