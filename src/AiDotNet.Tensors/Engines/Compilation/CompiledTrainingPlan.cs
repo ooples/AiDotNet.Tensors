@@ -561,6 +561,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_updateGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_epilogueGraphExec);
+        // The engine would keep the weights' buffers for its whole life. Guarded: a plan whose construction never
+        // completed has no list, and a finalizer must not throw.
+        if (_deviceOptimizerWeightsLock is not null && _deviceOptimizerWeights is not null)
+        {
+            try { ReleaseDeviceOptimizerWeights(); }
+            catch (Exception) { /* nothing to report to from a finalizer */ }
+        }
     }
 
     /// <summary>Set once every stage of <see cref="Dispose"/> has run, whether or not one of them threw (tests).</summary>
@@ -1501,6 +1508,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             io.WriteLearningRates(replay, first, rates);
         }
         LaunchStepGraph(cb, exec);
+        _lastLaunchDeferred = false;   // only a split launch can defer; a stale true would skip later verdicts
         if (_updateGraphExec != IntPtr.Zero)
         {
             // The backward graph's gradients, reduced across ranks, then the update graph on them. The exchange's
@@ -1924,6 +1932,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var parameter = _parameters[p];
             var buffer = parameter._gpuBuffer;
+            // A weight the device optimizer holds that an invalidation unbound (its host values are authoritative): the
+            // lookup uploads them into the held buffer and binds it again, before this step's update (or a replayed
+            // graph) reads it. Not bound back to that buffer means it was replaced under the optimizer: fail loudly.
+            if (buffer is null && _optimizerGpuParams is { } held && p < held.Length && held[p] is { } heldBuffer
+                && heldBuffer.Handle != IntPtr.Zero)
+            {
+                gte.BindResidentParamBuffer(parameter);
+                if (!ReferenceEquals(parameter._gpuBuffer, heldBuffer))
+                    throw new InvalidOperationException(
+                        $"Parameter {p}'s device buffer, which this plan's optimizer updates in place, was replaced while "
+                        + "the parameter was unbound; reconfigure the optimizer (ConfigureOptimizer) after replacing a "
+                        + "parameter's device storage.");
+                continue;
+            }
             if (buffer is null || buffer.Handle == IntPtr.Zero || parameter._gpuBackend is not { } backend) continue;
             if (parameter._gpuBufferVersion == parameter.GpuCacheVersion) continue;
 
@@ -2184,6 +2206,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool _tracedRetainedStorage;
     private long _diagnosticObservations;
     private long _planGraphReplayCount;
+
+    /// <summary>Replays of this plan's captured step graph (tests).</summary>
+    internal long PlanGraphReplayCountForTests => _planGraphReplayCount;
 
 
     // Diagnostic metadata only: never obtains readable spans, realizes deferred tensors or downloads device values.
@@ -4778,7 +4803,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // embedding gather reads the now-resident index buffer WITHOUT an inline upload (a cuMemcpyHtoD
                     // inside capture is CUDA 906 STREAM_CAPTURE_UNSUPPORTED). Flag cleared after capture so the eager
                     // fallback (and warmup steps) upload inline again.
-                    IntPtr exec;
+                    IntPtr exec = IntPtr.Zero;
                     try
                     {
                         // CAPTURE-PATH SCOPE (issue #26): the resident-buffer op branches engage ONLY inside this
@@ -4859,8 +4884,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     catch (Exception captureFailure)
                     {
                         RecordGraphCaptureFailure(captureFailure.GetType().Name + ": " + captureFailure.Message);
-                        // An update or epilogue graph captured before the throw is never launched: release it now.
+                        // An update or epilogue graph captured before the throw is never launched: release it now, and
+                        // the step graph too when it was captured but not yet stored.
                         DestroyUpdateGraph(gte);
+                        if (exec != IntPtr.Zero) gte.DestroyGpuGraph(exec);
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
@@ -7439,23 +7466,28 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ReleaseDeviceOptimizerWeights();
     }
 
-    // The parameters whose persistent weight buffers this plan's device optimizer updates in place, held in the engine
-    // (RetainDeviceOptimizerWeight) from ConfigureOptimizer until the optimizer state is freed: a weight-cache
-    // invalidation between ConfigureOptimizer and the first update (FusedTrainingSession invalidates after every fused
-    // step, deferred ones included) freed the buffer the optimizer, and the update graph captured from it, still wrote.
-    private readonly List<(Engines.DirectGpuTensorEngine Engine, Tensor<T> Parameter)> _deviceOptimizerWeights = new();
+    // The persistent weight buffers this plan's device optimizer updates in place, held in the engine
+    // (RetainDeviceOptimizerWeight) from ConfigureOptimizer until the optimizer state is freed (or the plan is
+    // finalized). A training loop that invalidates the weight caches after every step (before the first update a
+    // configured weight has no pending device data) otherwise freed the buffer the optimizer, and the update graph
+    // captured from it, still wrote. Released by the key retained, which outlives a later change of storage.
+    private readonly List<(Engines.DirectGpuTensorEngine Engine, object Key)> _deviceOptimizerWeights = new();
+    private readonly object _deviceOptimizerWeightsLock = new();
 
     private void RetainDeviceOptimizerWeight(int p)
     {
         if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var engine)) return;
-        engine.RetainDeviceOptimizerWeight(_parameters[p]);
-        _deviceOptimizerWeights.Add((engine, _parameters[p]));
+        if (engine.RetainDeviceOptimizerWeight(_parameters[p]) is not { } key) return;
+        lock (_deviceOptimizerWeightsLock) _deviceOptimizerWeights.Add((engine, key));
     }
 
     private void ReleaseDeviceOptimizerWeights()
     {
-        foreach (var (engine, parameter) in _deviceOptimizerWeights) engine.ReleaseDeviceOptimizerWeight(parameter);
-        _deviceOptimizerWeights.Clear();
+        lock (_deviceOptimizerWeightsLock)
+        {
+            foreach (var (engine, key) in _deviceOptimizerWeights) engine.ReleaseDeviceOptimizerWeight(key);
+            _deviceOptimizerWeights.Clear();
+        }
     }
 
     /// <summary>

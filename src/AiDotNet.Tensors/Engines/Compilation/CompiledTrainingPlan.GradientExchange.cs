@@ -92,6 +92,9 @@ internal sealed class GradientExchange<T>
     /// </summary>
     /// <param name="weight">The step's weight (for a token-weighted mean, its valid-token count), rounded to the
     /// gradient type.</param>
+    /// <summary>Whether <see cref="DeferUpdate"/> or <see cref="CombineAccumulated"/> began writing the accumulator.</summary>
+    internal bool AccumulatorTouched { get; private set; }
+
     public void DeferUpdate(double weight)
     {
         if (_deferRefusal is { } why) throw new InvalidOperationException("This step's update cannot be deferred: " + why + ".");
@@ -100,6 +103,7 @@ internal sealed class GradientExchange<T>
         if (double.IsNaN(weight) || double.IsInfinity(weight))
             throw new ArgumentOutOfRangeException(nameof(weight), "The weight must be finite.");
         var acc = _accumulation!;
+        AccumulatorTouched = true;   // from here a throw leaves it part-written: the plan drops the window
         acc.EnsureLayout(_gradients, _deviceGradients, _backend);
         bool first = acc.Steps == 0;
         for (int i = 0; i < _gradients.Length; i++)
@@ -140,8 +144,11 @@ internal sealed class GradientExchange<T>
             throw new InvalidOperationException("There are no accumulated gradients to combine.");
         if (UpdateDeferred || _combined)
             throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
-        if (double.IsNaN(accumulatedScale) || double.IsInfinity(accumulatedScale) || double.IsNaN(weight) || double.IsInfinity(weight))
-            throw new ArgumentOutOfRangeException(nameof(weight), "The scales must be finite.");
+        if (double.IsNaN(accumulatedScale) || double.IsInfinity(accumulatedScale))
+            throw new ArgumentOutOfRangeException(nameof(accumulatedScale), "The scale must be finite.");
+        if (double.IsNaN(weight) || double.IsInfinity(weight))
+            throw new ArgumentOutOfRangeException(nameof(weight), "The weight must be finite.");
+        AccumulatorTouched = true;   // from here a throw leaves it part-scaled: the plan drops the window
         acc.EnsureLayout(_gradients, _deviceGradients, _backend);
         for (int i = 0; i < _gradients.Length; i++)
         {
@@ -526,7 +533,7 @@ internal sealed class GradientAccumulation<T> : IDisposable
         {
             int length = _lengths[i];
             if (length == 0) continue;
-            if (device[i] is not null && backend is not null)
+            if (typeof(T) == typeof(float) && device[i] is not null && backend is not null)
             {
                 if (Device[i] is not null) continue;
                 Engines.DirectGpu.IGpuBuffer buffer;
@@ -554,6 +561,8 @@ internal sealed class GradientAccumulation<T> : IDisposable
     private void MoveToHost(int i)
     {
         if (Device[i] is not { } buffer) return;
+        if (typeof(T) != typeof(float))
+            throw new InvalidOperationException("A device gradient accumulator exists only for a float plan.");
         var values = new T[_lengths[i]];
         if (Steps > 0)
         {
@@ -737,12 +746,21 @@ internal sealed partial class CompiledTrainingPlan<T>
         {
             exchange(step);
         }
-        catch when (step.UpdateDeferred || step.CombinedAccumulation)
+        catch when (step.AccumulatorTouched)
         {
-            // The accumulator already took this step's gradients (or was folded into them): a retried step would count
-            // twice, and a combined window lives only in this step's gradients. The window is dropped.
+            // The accumulator took (some of) this step's gradients, or was (partly) folded into them: a retried step
+            // would count twice, and a combined window lives only in this step's gradients. The window is dropped.
             _gradientAccumulation.Release();
             throw;
+        }
+        if (!step.UpdateDeferred && !step.CombinedAccumulation && _gradientAccumulation.Steps > 0)
+        {
+            // An update would run with the window still open, and the next combine would mix gradients from before and
+            // after it. The window is dropped and the step refused before its update.
+            _gradientAccumulation.Release();
+            throw new InvalidOperationException(
+                "The exchange neither deferred this step's update nor combined the accumulated gradients, with "
+                + "accumulated steps pending; the accumulation window was dropped.");
         }
         GradientExchangeCount++;
         if (step.UpdateDeferred)
