@@ -1749,7 +1749,7 @@ public partial class CpuEngine
         var logits = inputs[0];
         var table = inputs[1];
         if (savedIndices is null)
-            return;
+            throw new InvalidOperationException("SigmoidTopKExpertMix backward is missing the selection its forward saved.");
 
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
@@ -1783,7 +1783,7 @@ public partial class CpuEngine
             var sTbl = table.IsContiguous ? table : table.Contiguous();
             if (typeof(T) == typeof(float))
             {
-                if (savedState[6] is not float[] savedGatesF) return;
+                if (savedState[6] is not float[] savedGatesF) throw new InvalidOperationException("SigmoidTopKExpertMix backward is missing the selection its forward saved.");
                 SigmoidTopKMixBackwardFloat(
                     ((Tensor<float>)(object)sDy).AsSpan(),
                     ((Tensor<float>)(object)sLog).AsSpan(),
@@ -1796,7 +1796,7 @@ public partial class CpuEngine
             }
             else
             {
-                if (savedState[6] is not double[] savedGatesD) return;
+                if (savedState[6] is not double[] savedGatesD) throw new InvalidOperationException("SigmoidTopKExpertMix backward is missing the selection its forward saved.");
                 SigmoidTopKMixBackwardDouble(
                     ((Tensor<double>)(object)sDy).AsSpan(),
                     ((Tensor<double>)(object)sLog).AsSpan(),

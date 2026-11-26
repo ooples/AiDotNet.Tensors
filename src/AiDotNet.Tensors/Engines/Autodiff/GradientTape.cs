@@ -2151,9 +2151,9 @@ public sealed class GradientTape<T> : IDisposable
             foreach (var t in _retainGrad)
                 if (t.Grad is { } g) kept.Add(g.DataVector);
         bool rentedReleased = !s_inReleaseDroppedGradients;
-        if (rentedReleased) s_inReleaseDroppedGradients = true;
+        if (rentedReleased) s_inReleaseDroppedGradients = true; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
         var released = rentedReleased
-            ? (s_scratchReleasedStorages ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance))
+            ? (s_scratchReleasedStorages ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
             : new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         try
         {
@@ -2170,7 +2170,7 @@ public sealed class GradientTape<T> : IDisposable
             if (rentedReleased)
             {
                 released.Clear();
-                s_inReleaseDroppedGradients = false;
+                s_inReleaseDroppedGradients = false; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
             }
         }
     }
@@ -2832,11 +2832,11 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         bool rentedScratch = !s_inCleanupCachedReplay;
-        if (rentedScratch) s_inCleanupCachedReplay = true;
+        if (rentedScratch) s_inCleanupCachedReplay = true; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
 
         HashSet<Tensor<T>>? sourceSet = null;
         HashSet<Tensor<T>> intermediates = rentedScratch
-            ? (s_scratchReplayIntermediates ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance))
+            ? (s_scratchReplayIntermediates ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
             : new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         List<Tensor<T>>? replayDropped = null;
         HashSet<object>? forwardStorage = null;
@@ -2846,7 +2846,7 @@ public sealed class GradientTape<T> : IDisposable
             if (sources is not null)
             {
                 sourceSet = rentedScratch
-                    ? (s_scratchReplaySources ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance))
+                    ? (s_scratchReplaySources ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
                     : new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
                 foreach (var s in sources) sourceSet.Add(s);
             }
@@ -2860,16 +2860,10 @@ public sealed class GradientTape<T> : IDisposable
             var fromReplay = DroppedGradients<T>.Take();
             if (_engine.Is<DirectGpuTensorEngine>())
             {
-                if (fromReplay is not null)
-                {
-                    replayDropped = fromReplay;
-                }
-                else
-                {
-                    replayDropped = rentedScratch
-                        ? (s_scratchReplayDropped ??= new List<Tensor<T>>(256))
-                        : new List<Tensor<T>>();
-                }
+                replayDropped = fromReplay
+                    ?? (rentedScratch
+                        ? (s_scratchReplayDropped ??= new List<Tensor<T>>(256)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+                        : new List<Tensor<T>>());
             }
 
             for (int i = 0; i < _entries.Count; i++)
@@ -2905,7 +2899,7 @@ public sealed class GradientTape<T> : IDisposable
             if (replayDropped is not null && replayDropped.Count > 0)
             {
                 forwardStorage = rentedScratch
-                    ? (s_scratchReplayForwardStorage ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance))
+                    ? (s_scratchReplayForwardStorage ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
                     : new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
                 PopulateForwardStorageOfEntries(forwardStorage);
                 ReleaseDroppedGradients(replayDropped, forwardStorage, result, loss);
@@ -2920,7 +2914,7 @@ public sealed class GradientTape<T> : IDisposable
                 if (ReferenceEquals(replayDropped, s_scratchReplayDropped))
                     replayDropped?.Clear();
                 forwardStorage?.Clear();
-                s_inCleanupCachedReplay = false;
+                s_inCleanupCachedReplay = false; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
             }
         }
     }
