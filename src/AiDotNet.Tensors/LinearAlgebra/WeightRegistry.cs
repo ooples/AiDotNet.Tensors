@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
+using AiDotNet.Tensors.Engines;
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -1146,6 +1147,32 @@ public static partial class WeightRegistry
     }
 
     /// <summary>
+    /// Makes a streaming weight ready for the computation about to use it: a layer's residency boundary before its
+    /// forward. Like <see cref="Materialize{T}"/>, except for a float weight with a bf16 store while the current
+    /// engine keeps bf16 device copies (a GPU engine): its ops read the device copy and widen it on the device, so no
+    /// fp32 host copy is restored, and one a host path made earlier is released to the pool. A host read of the
+    /// weight still pages it back in on access.
+    /// </summary>
+    /// <remarks>
+    /// The weight then lives once on the device, beside its bf16 store, as a PyTorch module's weight on a device
+    /// does. A layer forward that called <see cref="Materialize{T}"/> instead held an fp32 host copy of every weight
+    /// it reached, up to the materialized-owner budget (half the pool's): a mixture of experts on a GPU grew the host
+    /// by two bytes per bf16 byte its forward reached, beside the bf16 device copies that served the ops.
+    /// </remarks>
+    /// <param name="weight">The weight; a tensor that is not a streaming weight is left as it is.</param>
+    public static void MaterializeForForward<T>(Tensor<T> weight)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Lifetime == WeightLifetime.Streaming && weight.StreamingPoolHandle >= 0
+            && !weight.IsWritableMmapAliased && ServedFromBf16DeviceCopy(weight))
+        {
+            if (weight.DataVector.Length == weight.Length) ReleaseToPool(weight);
+            return;
+        }
+        Materialize(weight);
+    }
+
+    /// <summary>
     /// Restores a streaming weight's in-memory data from the pool. If the
     /// pool has already paged the bytes out to disk, the backing file is
     /// read first. No-op for tensors that aren't <see cref="WeightLifetime.Streaming"/>
@@ -1303,6 +1330,13 @@ public static partial class WeightRegistry
         // holds them all, which would otherwise OOM (the pool only accounts its own snapshots).
         NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
     }
+
+    // Whether the current engine serves this weight from a bf16 device copy (DirectGpuTensorEngine.TryBf16StreamingWeight
+    // takes the same contiguous float bf16-store weights).
+    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight)
+        => typeof(T) == typeof(float) && weight.StreamingStoreEncoding == StreamingEncoding.Bf16
+            && weight.IsContiguous && weight._storageOffset == 0
+            && Engines.AiDotNetEngine.PeekCurrent().As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true };
 
     /// <summary>
     /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry

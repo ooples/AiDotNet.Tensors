@@ -257,6 +257,74 @@ public class StreamingBf16InferenceTests
     }
 
     /// <summary>
+    /// A layer-by-layer GPU forward over bf16-stored weights (each weight made ready before its op, as a layer's
+    /// forward does) holds no fp32 host copy of them: the ops read the bf16 device copies. A Materialize before each op
+    /// restored an fp32 host copy that stayed referenced up to the owner budget (half the pool's), so a mixture of
+    /// experts grew the host by two bytes per bf16 byte its forward reached. A host read still sees the values.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_forward_over_bf16_weights_holds_no_fp32_host_copy_of_them()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true }) { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies"); return; }
+        const int k = 512, n = 1024, experts = 16;   // 2 MiB of fp32 per expert weight
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-bf16-experts-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 256L * 1024 * 1024,   // all resident; the owner budget is 128 MiB
+            StreamingStoreDtype = StreamingStoreDtype.Bf16,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var x = Filled(new[] { 4, k }, 1, v => v);
+            var w = new Tensor<float>[experts];
+            var b = new Tensor<float>[experts];
+            for (int e = 0; e < experts; e++)
+            {
+                w[e] = Stream(Filled(new[] { k, n }, 10 + e, v => v));
+                b[e] = Stream(Filled(new[] { n }, 100 + e, v => v));
+            }
+            var cpu = new CpuEngine();
+            var expected = new float[experts][];
+            for (int e = 0; e < experts; e++)
+                expected[e] = cpu.FusedLinear(x, w[e], b[e], FusedActivationType.None).ToArray();
+            for (int e = 0; e < experts; e++) { WeightRegistry.ReleaseToPool(w[e]); WeightRegistry.ReleaseToPool(b[e]); }
+
+            long before = GC.GetTotalMemory(forceFullCollection: true);
+            var outputs = new Tensor<float>[experts];
+            using (AiDotNetEngine.UseInCurrentContext(gpu))
+                for (int e = 0; e < experts; e++)
+                {
+                    WeightRegistry.MaterializeForForward(w[e]);
+                    WeightRegistry.MaterializeForForward(b[e]);
+                    outputs[e] = gpu.FusedLinear(x, w[e], b[e], FusedActivationType.None);
+                    _ = outputs[e].GetFlat(0);
+                }
+            long held = GC.GetTotalMemory(forceFullCollection: true) - before;
+            GC.KeepAlive(outputs);
+
+            long oneWeight = 4L * k * n;
+            Assert.True(held < oneWeight,
+                $"{held} host bytes held after a forward over {experts} bf16 weights of {oneWeight} fp32 bytes each");
+            // A host read of a weight the forward left on the device pages it back in.
+            Assert.Equal(new CpuEngine().FusedLinear(x, w[3], b[3], FusedActivationType.None).ToArray(), expected[3]);
+            for (int e = 0; e < experts; e++)
+            {
+                var got = outputs[e].ToArray();
+                for (int i = 0; i < got.Length; i++)
+                    Assert.True(Math.Abs(got[i] - expected[e][i]) <= 2e-2f * (1f + Math.Abs(expected[e][i])),
+                        $"expert {e} [{i}]: {got[i]} vs {expected[e][i]}");
+            }
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
+    /// <summary>
     /// A bf16 copy whose weight has been collected is released by the next upload, on an unbounded engine too. The copies
     /// are held strongly (the eviction list), so without that release a dropped model's copies stayed on the device until
     /// the engine was disposed.

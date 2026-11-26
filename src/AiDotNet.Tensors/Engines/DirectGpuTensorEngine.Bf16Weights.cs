@@ -150,6 +150,10 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>Whether this engine keeps bf16 device copies of bf16-stored weights, so their ops need no fp32 host copy.</summary>
+    internal bool ServesBf16WeightCopies
+        => !IsDisposed && IsGpuAvailable && GetBackend() is IBf16WidenBackend { CanWidenBf16: true };
+
     /// <summary>Bytes of bf16 weight data uploaded to the device by this engine (2 per element; diagnostics, tests).</summary>
     internal long Bf16WeightBytesUploaded => Interlocked.Read(ref _bf16WeightBytesUploaded);
 
