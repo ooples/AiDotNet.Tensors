@@ -3,6 +3,8 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.Gpu;
 using System.Threading;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -115,6 +117,39 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    // The weight's bf16 store uploaded as its raw bit pattern (the copy does not interpret the packed 32-bit words), or
+    // null when the store is gone. An even element count streams straight from the pool's resident bytes through the
+    // backend's pooled page-locked staging: no host array per upload. Each upload used to make two of the weight's size
+    // (the store snapshot and a packed float[] of it), so under a device budget every eviction and re-upload left two
+    // fresh large-object arrays behind, and host memory grew about two bytes per byte uploaded faster than the collector
+    // reclaimed it. An odd count (a last half word), or a backend without async uploads, takes one packed array.
+    private static IGpuBuffer? UploadBf16Store<T>(IDirectGpuBackend backend, Tensor<T> t, int words)
+    {
+        var bits = backend.AllocateBuffer(words);
+        try
+        {
+            bool read;
+            if (backend is IAsyncGpuBackend async && t.Length % 2 == 0)
+            {
+                read = WeightRegistry.TryReadBf16Store(t, bytes =>
+                    async.UploadBufferAsync(MemoryMarshal.Cast<byte, float>(bytes), bits, async.DefaultStream));
+            }
+            else
+            {
+                var packed = new float[words];
+                read = WeightRegistry.TryReadBf16Store(t, bytes => bytes.CopyTo(MemoryMarshal.AsBytes(packed.AsSpan())));
+                if (read) backend.UploadBufferInPlace(packed, bits);
+            }
+            if (!read) { bits.Dispose(); return null; }
+            return bits;
+        }
+        catch
+        {
+            bits.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>Bytes of bf16 weight data uploaded to the device by this engine (2 per element; diagnostics, tests).</summary>
     internal long Bf16WeightBytesUploaded => Interlocked.Read(ref _bf16WeightBytesUploaded);
 
@@ -145,14 +180,15 @@ public partial class DirectGpuTensorEngine
             if (!_bf16Weights.TryGetValue(t, out entry) || entry.PoolHandle != t.StreamingPoolHandle
                 || !ReferenceEquals(entry.Backend, backend) || entry.Bits.Handle == IntPtr.Zero)
             {
-                var bytes = WeightRegistry.TryReadBf16Store(t);
-                if (bytes is null) return false;
+                if (!WeightRegistry.HasBf16Store(t)) return false;
                 // The weight was re-registered (a new pool handle) or the backend changed: the old copy is dead.
                 if (entry is not null) ReleaseBf16Copy(entry, queued: true);
                 // Copies of weights that have been collected go first: neither the budget nor an unbounded engine should
                 // keep a dropped model's weights on the device while it uploads another's.
                 ReleaseCollectedBf16Copies();
-                long size = 4L * ((bytes.Length + 3) / 4);
+                long byteLength = 2L * t.Length;
+                int words = checked((int)((byteLength + 3) / 4));
+                long size = 4L * words;
                 long budget = Bf16WeightDeviceBudgetBytes;
                 if (budget > 0)
                     while (_bf16Lru.Last is { } oldest && Bf16WeightDeviceBytes + size > budget)
@@ -160,12 +196,11 @@ public partial class DirectGpuTensorEngine
                         ReleaseBf16Copy(oldest.Value, queued: true);
                         Interlocked.Increment(ref _bf16WeightEvictions);
                     }
-                // Uploaded as the raw bit pattern: the copy does not interpret the packed 32-bit words.
-                var packed = new float[(bytes.Length + 3) / 4];
-                Buffer.BlockCopy(bytes, 0, packed, 0, bytes.Length);
+                var bits = UploadBf16Store(backend, t, words);
+                if (bits is null) return false;
                 entry = new Bf16DeviceWeight
                 {
-                    Bits = backend.AllocateBuffer(packed),
+                    Bits = bits,
                     Backend = backend,
                     PoolHandle = t.StreamingPoolHandle,
                     Length = t.Length,

@@ -648,6 +648,24 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    /// <summary>Receives a weight's resident bytes, valid only for the duration of the call.</summary>
+    internal delegate void ResidentBytesReader(ReadOnlySpan<byte> bytes);
+
+    /// <summary>
+    /// Hands a weight's bytes to <paramref name="reader"/> straight from the pool's resident buffer, under the pool
+    /// lock, with no copy: for a caller that only streams them elsewhere (a device upload) and keeps nothing.
+    /// </summary>
+    internal void ReadResident(long handleId, ResidentBytesReader reader)
+    {
+        if (reader is null) throw new ArgumentNullException(nameof(reader));
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            // Not lent: the span does not outlive the lock, so a later write-back may still refill the buffer in place.
+            reader(RehydrateCore(handleId, isPrefetch: false, lend: false));
+        }
+    }
+
     /// <summary>
     /// Reads a weight back into a freshly-allocated byte[] under the pool
     /// lock. Faster path for callers who'd otherwise call Rehydrate then
