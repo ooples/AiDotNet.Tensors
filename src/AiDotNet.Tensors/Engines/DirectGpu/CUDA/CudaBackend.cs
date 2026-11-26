@@ -506,6 +506,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // one by one, so without this the budget would admit every later block against a total that holds none of them.
     private IntPtr AllocArenaBlock(ulong bytes)
     {
+        // Reclaim warm-up and recording pool buffers before reserving the arena block: on Windows WDDM
+        // cuMemAlloc succeeds past physical VRAM by paging into shared system RAM rather than returning
+        // OutOfMemory, so leaving the recorded step's pool cache resident alongside the arena block
+        // doubles temporary VRAM and induces PCIe paging stalls.
+        DrainDeferredFrees(blockOldest: true);
+        _stepArena?.FreeRetiredBlocks();
+        _bufferPool.DrainAll();
+        if (_asyncMemPool != IntPtr.Zero && !IsCapturingOnThisThread && !_backendStreamCaptureActive)
+        {
+            CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (arena block reclamation)");
+            var trimStatus = TrimPool(_asyncMemPool);
+            if (trimStatus != CudaResult.Success)
+                System.Diagnostics.Trace.TraceWarning($"[CudaBackend] cuMemPoolTrimTo failed during arena block reclamation: {trimStatus}.");
+        }
         IntPtr block = AllocDeviceMemoryWithRetry(bytes);
         CudaAccountedMemory.Track(block, _memoryAccount, (long)bytes);
         return block;
@@ -19462,16 +19476,16 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (gate.Size < gateElems)
             throw new ArgumentException("gate buffer is too small for the requested GLA shape.");
 
-        if (!_kernelCache.TryGetValue("gla_scan_forward", out var kernel))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_forward");
+        string variant = Kernels.CudaGlaKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gla_scan_forward" + variant, out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_forward" + variant);
 
         using var _ = PushContext();
         IntPtr pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle, po = output.Handle;
         void** args = stackalloc void*[10];
         args[0] = &pq; args[1] = &pk; args[2] = &pv; args[3] = &pg; args[4] = &po;
         args[5] = &batch; args[6] = &seqLen; args[7] = &modelDim; args[8] = &numHeads; args[9] = &headDim;
-        uint total = (uint)(batch * numHeads * headDim);
-        LaunchKernel(kernel, (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize, (uint)DefaultBlockSize, args);
+        LaunchKernel(kernel, GatedDeltaNetWarpGrid((long)batch * numHeads * headDim), (uint)DefaultBlockSize, args);
     }
 
     // dQ/dK/dV ([batch,seqLen,modelDim]) and dG ([batch,seqLen,numHeads]); dQ/dK/dG are the
@@ -19488,24 +19502,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (headDim > Kernels.CudaGlaKernels.MaxHeadDim)
             throw new InvalidOperationException(
                 $"GLA headDim ({headDim}) exceeds max ({Kernels.CudaGlaKernels.MaxHeadDim}).");
-        if (!_kernelCache.TryGetValue("gla_scan_backward_ckpt", out var backward))
-            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_ckpt");
+        string variant = Kernels.CudaGlaKernels.Variant(headDim);
+        if (!_kernelCache.TryGetValue("gla_scan_backward_warp" + variant, out var warpBackward))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_warp" + variant);
 
         using var _ = PushContext();
         if (TryGlaScanBackwardTiled(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
             return;
-        // dQ/dK/dG are atomic accumulators in the backward kernel — zero them here so the
-        // method is self-contained and correct even if the caller reuses dirty buffers.
         Fill(dQ, 0f, batch * seqLen * modelDim);
         Fill(dK, 0f, batch * seqLen * modelDim);
         Fill(dG, 0f, batch * seqLen * numHeads);
-        // State checkpoints every `chunk` steps plus one chunk of recomputed states: memory
-        // batch*heads*(nChunks + chunk)*headDim^2 instead of batch*heads*seqLen*headDim^2.
         var (chunk, ckptLen, scratchLen) = GlaScanCheckpoint.Plan(batch, seqLen, numHeads, headDim);
         using var ckptBuf = AllocateBuffer(ckptLen);
         using var scratchBuf = AllocateBuffer(scratchLen);
-        uint total = (uint)(batch * numHeads * headDim);
-        uint grid = (total + (uint)DefaultBlockSize - 1) / (uint)DefaultBlockSize;
+        uint grid = GatedDeltaNetWarpGrid((long)batch * numHeads * headDim);
 
         IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
         IntPtr pck = ckptBuf.Handle, psc = scratchBuf.Handle;
@@ -19515,7 +19525,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdv; ba[10] = &pdg;
         ba[11] = &batch; ba[12] = &seqLen; ba[13] = &modelDim; ba[14] = &numHeads; ba[15] = &headDim;
         ba[16] = &chunk;
-        LaunchKernel(backward, grid, (uint)DefaultBlockSize, ba);
+        LaunchKernel(warpBackward, grid, (uint)DefaultBlockSize, ba);
     }
 
     // gla_scan_backward_tiled: one 1024-thread block per (batch, head), up to 12 state elements per thread (headDim*headDim <= 12,288),

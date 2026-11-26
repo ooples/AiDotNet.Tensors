@@ -9869,37 +9869,78 @@ public partial class DirectGpuTensorEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (targetShape is null) throw new ArgumentNullException(nameof(targetShape));
 
-        // Tape-active / no-GPU / rank-shrink defer to base (which records BroadcastToBackward and
-        // validates). The base also keeps Tier 1 (identity) and Tier 2 (pure size-1 prepend == Reshape)
-        // already GPU-resident, so we only need the genuine Tier-3 size-1→N expansion here.
-        if (IsTapeActive<T>() || targetShape.Length < input.Rank || !TryGetBackend(out _))
+        // Graph-capture / non-float / rank-shrink / no-GPU defer to base (which validates and handles CPU/GraphMode).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float) || targetShape.Length < input.Rank || !TryGetBackend(out _))
             return base.TensorBroadcastTo(input, targetShape);
+
+        // Tier 1: exact shape match -> identity (zero allocation, zero kernel, zero tape node).
+        if (ShapesEqual(input._shape, targetShape))
+            return input;
+
+        // Tier 2: pure size-1 leading prepend -> Reshape (zero data copy, records ReshapeBackward when tape is active).
+        int rankDiff = targetShape.Length - input.Rank;
+        bool leadingAllOne = true;
+        for (int i = 0; i < rankDiff; i++)
+        {
+            if (targetShape[i] != 1) { leadingAllOne = false; break; }
+        }
+        if (leadingAllOne)
+        {
+            bool tailMatches = true;
+            for (int i = 0; i < input.Rank; i++)
+            {
+                if (targetShape[rankDiff + i] != input._shape[i]) { tailMatches = false; break; }
+            }
+            if (tailMatches)
+                return Reshape(input, targetShape);
+        }
+
+        // Validate broadcast compatibility up front; incompatible or zero-sized target axes defer to base.
+        for (int i = 0; i < targetShape.Length; i++)
+        {
+            int srcDim = i < rankDiff ? 1 : input._shape[i - rankDiff];
+            int tgtDim = targetShape[i];
+            if (tgtDim <= 0 || (srcDim != tgtDim && srcDim != 1))
+                return base.TensorBroadcastTo(input, targetShape);
+        }
 
         try
         {
-            // Align to the target rank by prepending size-1 axes (a residency-preserving reshape).
-            Tensor<T> cur = input;
-            if (targetShape.Length > input.Rank)
+            Tensor<T> cur;
+            // The base fallback must run after the no-grad scope closes, or it would record no gradient edge to input.
+            bool declined = false;
+            using (new Autodiff.NoGradScope<T>())
             {
-                var aligned = new int[targetShape.Length];
-                int rd = targetShape.Length - input.Rank;
-                for (int i = 0; i < rd; i++) aligned[i] = 1;
-                for (int i = 0; i < input.Rank; i++) aligned[rd + i] = input._shape[i];
-                cur = cur.Reshape(aligned);
-            }
+                // Align to the target rank by prepending size-1 axes (a residency-preserving reshape).
+                cur = input;
+                if (rankDiff > 0)
+                {
+                    var aligned = new int[targetShape.Length];
+                    for (int i = 0; i < rankDiff; i++) aligned[i] = 1;
+                    for (int i = 0; i < input.Rank; i++) aligned[rankDiff + i] = input._shape[i];
+                    cur = Reshape(cur, aligned);
+                }
 
-            // Expand each broadcast axis (size 1 → target) with the GPU TileAxis kernel. With the
-            // strided-view materialize fix in GetOrAllocateBuffer, this multi-step chain stays correct
-            // and device-resident. A genuinely incompatible axis falls back to base (which throws).
-            for (int d = 0; d < targetShape.Length; d++)
-            {
-                if (cur._shape[d] == targetShape[d]) continue;
-                if (cur._shape[d] != 1) return base.TensorBroadcastTo(input, targetShape);
+                // Expand each broadcast axis (size 1 -> target) with the GPU TileAxis kernel without allocating a host zero tensor.
+                for (int d = 0; d < targetShape.Length; d++)
+                {
+                    if (cur._shape[d] == targetShape[d]) continue;
+                    if (cur._shape[d] != 1) { declined = true; break; }
 
-                if (TryRepeatAxisOnDevice(cur, targetShape[d], d) is not { } expanded)
-                    return base.TensorBroadcastTo(input, targetShape);
-                cur = expanded;
+                    if (TryRepeatAxisOnDevice(cur, targetShape[d], d) is not { } expanded) { declined = true; break; }
+                    cur = expanded;
+                }
             }
+            if (declined)
+                return base.TensorBroadcastTo(input, targetShape);
+
+            var originalShape = (int[])input._shape.Clone();
+            Autodiff.DifferentiableOps.RecordUnary(
+                "Expand",
+                cur,
+                input,
+                Autodiff.BackwardFunctions<T>.ExpandBackward,
+                new object[] { originalShape });
             return cur;
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorBroadcastTo", capabilityGap); return base.TensorBroadcastTo(input, targetShape); }

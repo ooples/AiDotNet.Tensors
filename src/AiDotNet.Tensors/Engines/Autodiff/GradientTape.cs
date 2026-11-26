@@ -399,7 +399,9 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         // An outermost tape is a training step: a backend's step arena records one and replays the rest.
-        _beganTrainingStep = _parent is null && !_options.SuppressArenaScope;
+        // Guard against TrainingStep.InStep so a nested tape opened during backward (where _current is null)
+        // never splits or ends the enclosing training step.
+        _beganTrainingStep = _parent is null && !_options.SuppressArenaScope && !Engines.DirectGpu.TrainingStep.InStep;
         if (_beganTrainingStep) Engines.DirectGpu.TrainingStep.Begin();
 
         SetCurrentTape(this);

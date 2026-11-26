@@ -114,6 +114,10 @@ public sealed class CudaKernelLookupIntegrityTests
             return Enumerable.Range(1, AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.MaxHeadDim)
                 .Select(AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGatedDeltaNetKernels.Variant)
                 .Distinct(StringComparer.Ordinal).ToList();
+        if (prefix is "gla_scan_forward" or "gla_scan_backward_warp")
+            return Enumerable.Range(1, AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGlaKernels.MaxHeadDim)
+                .Select(AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels.CudaGlaKernels.Variant)
+                .Distinct(StringComparer.Ordinal).ToList();
         // A per-element-type module's entry point, selected by FftElementType.KernelSuffix() (_f32, _f16, _bf16).
         if (prefix.StartsWith("fftg_", StringComparison.Ordinal))
             return Enum.GetValues(typeof(AiDotNet.Tensors.Engines.DirectGpu.FftElementType))

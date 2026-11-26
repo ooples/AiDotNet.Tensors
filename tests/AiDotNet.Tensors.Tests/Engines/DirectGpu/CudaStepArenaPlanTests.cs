@@ -231,4 +231,72 @@ public sealed class CudaStepArenaPlanTests
         var sizes = recordedField.GetValue(arena) as List<int> ?? throw new InvalidOperationException("_sizes is not a list.");
         Assert.Single(sizes);
     }
+
+    [Fact]
+    public void Twenty_thousand_overlapping_lifetimes_pack_in_milliseconds_without_aliasing()
+    {
+        const int segments = 8;
+        const int perSegment = 2500;
+        const int totalCount = segments * perSegment;
+        var rng = new Random(20261125);
+        var sizes = new int[totalCount];
+        for (int i = 0; i < totalCount; i++)
+            sizes[i] = 64 * (1 + rng.Next(32));
+
+        using var arena = NewArena();
+        TrainingStep.Begin();
+        Assert.Null(arena.TryRent(64));
+        TrainingStep.End();
+
+        // Record checkpoint-like lifetime structure: each segment keeps one boundary tensor until backward,
+        // while internal buffers overlap within a sliding window of 16 live buffers.
+        TrainingStep.Begin();
+        var boundaries = new List<CudaBackend.CudaGpuBuffer>(segments);
+        var window = new Queue<CudaBackend.CudaGpuBuffer>(16);
+        int idx = 0;
+        for (int seg = 0; seg < segments; seg++)
+        {
+            boundaries.Add(RecordedAllocation(arena, sizes[idx++]));
+            for (int k = 1; k < perSegment; k++)
+            {
+                var buf = RecordedAllocation(arena, sizes[idx++]);
+                window.Enqueue(buf);
+                if (window.Count > 16) arena.OnReturned(window.Dequeue());
+            }
+            while (window.Count > 0) arena.OnReturned(window.Dequeue());
+        }
+        for (int seg = segments - 1; seg >= 0; seg--)
+            arena.OnReturned(boundaries[seg]);
+        TrainingStep.End();
+
+        // Replay with identical lifetimes: BuildPlan() + 20,000 claims/releases must finish in well under 500 ms
+        // with zero pool fallbacks (proving zero overlapping live intervals).
+        var sw = Stopwatch.StartNew();
+        TrainingStep.Begin();
+        var replayBoundaries = new List<CudaBackend.CudaGpuBuffer>(segments);
+        var replayWindow = new Queue<CudaBackend.CudaGpuBuffer>(16);
+        idx = 0;
+        for (int seg = 0; seg < segments; seg++)
+        {
+            var bSlot = arena.TryRent(sizes[idx++]);
+            Assert.NotNull(bSlot);
+            if (bSlot is not null) replayBoundaries.Add(bSlot);
+            for (int k = 1; k < perSegment; k++)
+            {
+                var slot = arena.TryRent(sizes[idx++]);
+                Assert.NotNull(slot);
+                if (slot is not null) replayWindow.Enqueue(slot);
+                if (replayWindow.Count > 16) replayWindow.Dequeue().Dispose();
+            }
+            while (replayWindow.Count > 0) replayWindow.Dequeue().Dispose();
+        }
+        for (int seg = replayBoundaries.Count - 1; seg >= 0; seg--)
+            replayBoundaries[seg].Dispose();
+        TrainingStep.End();
+        sw.Stop();
+
+        Assert.Equal(totalCount, arena.SlotHits);
+        Assert.Equal(0, arena.PoolFallbacks);
+        Assert.True(sw.ElapsedMilliseconds < 500, $"20,000-slot BuildPlan + Replay took {sw.ElapsedMilliseconds} ms (expected < 500 ms)");
+    }
 }
