@@ -347,6 +347,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr _attentionModule;
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
+    private IntPtr _householderModule;
+    private IntPtr _sequenceMixerModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
     private IntPtr _dotProductModule;
@@ -1641,6 +1643,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 $"{ex.GetType().Name}: {ex.Message}. Other CUDA kernels remain available.");
         }
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
+        _householderModule = CompileKernelModule(device, Kernels.CudaHouseholderKernels.GetSource(), "householder_kernels", Kernels.CudaHouseholderKernels.GetKernelNames());
+        _sequenceMixerModule = CompileKernelModule(device, Kernels.CudaSequenceMixerKernels.GetSource(), "sequence_mixer_kernels", Kernels.CudaSequenceMixerKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
 
@@ -15643,13 +15647,91 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         return true;
     }
 
+    private const int InlinePointerRefreshChunk = 384;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct InlinePointerChunk384
+    {
+        public fixed ulong Ptrs[InlinePointerRefreshChunk];
+    }
+
+    private unsafe bool TryRefreshTablePointersInPlace(
+        MultiTensorTable table, int dstOffset, IReadOnlyList<IGpuBuffer> srcBuffers)
+    {
+        if (table.Pointers is not { } ptrBuf) return false;
+        int count = srcBuffers.Count;
+        if (dstOffset < 0 || dstOffset + count > table.Handles.Length) return false;
+
+        bool anyDiff = false;
+        for (int i = 0; i < count; i++)
+        {
+            if (table.Handles[dstOffset + i] != srcBuffers[i].Handle)
+            {
+                anyDiff = true;
+                break;
+            }
+        }
+        if (!anyDiff) return true;
+
+        if (!_kernelCache.TryGetValue("refresh_pointer_table_384", out var kernel))
+            return false;
+
+        using var _ = PushContext();
+        IntPtr dstPtr = ptrBuf.Handle;
+        void** args = stackalloc void*[4];
+        for (int off = 0; off < count; off += InlinePointerRefreshChunk)
+        {
+            int chunkLen = Math.Min(InlinePointerRefreshChunk, count - off);
+            InlinePointerChunk384 chunk = default;
+            bool chunkDiff = false;
+            for (int j = 0; j < chunkLen; j++)
+            {
+                IntPtr h = srcBuffers[off + j].Handle;
+                if (table.Handles[dstOffset + off + j] != h)
+                    chunkDiff = true;
+                chunk.Ptrs[j] = unchecked((ulong)h.ToInt64());
+            }
+            if (!chunkDiff) continue;
+
+            int writeOffset = dstOffset + off;
+            args[0] = &dstPtr;
+            args[1] = &writeOffset;
+            args[2] = &chunkLen;
+            args[3] = &chunk;
+            LaunchKernel(kernel, 1, (uint)chunkLen, args);
+            for (int j = 0; j < chunkLen; j++)
+                table.Handles[writeOffset + j] = srcBuffers[off + j].Handle;
+        }
+        return true;
+    }
+
+    private static bool AdamTableMatchesStaticPart(MultiTensorTable table,
+        IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> firstMoments,
+        IReadOnlyList<IGpuBuffer> secondMoments, IReadOnlyList<int> sizes)
+    {
+        int n = parameters.Count;
+        if (table.Handles.Length != 4 * n || table.Sizes.Length != n) return false;
+        for (int t = 0; t < n; t++)
+        {
+            if (table.Handles[t] != parameters[t].Handle
+                || table.Handles[2 * n + t] != firstMoments[t].Handle
+                || table.Handles[3 * n + t] != secondMoments[t].Handle
+                || table.Sizes[t] != sizes[t])
+                return false;
+        }
+        return true;
+    }
+
     private MultiTensorTable GetAdamTable(
         IReadOnlyList<IGpuBuffer> parameters, IReadOnlyList<IGpuBuffer> gradients,
         IReadOnlyList<IGpuBuffer> firstMoments, IReadOnlyList<IGpuBuffer> secondMoments,
         IReadOnlyList<int> sizes)
     {
         if (_adamTable is { } cached && AdamTableMatches(cached, parameters, gradients, firstMoments, secondMoments, sizes))
+        {
+            if (IsStreamCapturing()) cached.CapturedByGraph = true;
             return cached;
+        }
         for (int i = 0; i < _retainedAdamTables.Count; i++)
         {
             var retained = _retainedAdamTables[i];
@@ -15657,11 +15739,39 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _retainedAdamTables.RemoveAt(i);
             _retainedAdamTables.Add(retained);
             _adamTable = retained;
+            if (IsStreamCapturing()) retained.CapturedByGraph = true;
             return retained;
         }
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor Adam table must be built before stream capture; run an eager step first.");
+        int n = parameters.Count;
+        for (int i = _retainedAdamTables.Count - 1; i >= 0; i--)
+        {
+            var retained = _retainedAdamTables[i];
+            if (retained.CapturedByGraph) continue;
+            if (!AdamTableMatchesStaticPart(retained, parameters, firstMoments, secondMoments, sizes)) continue;
+            if (!TryRefreshTablePointersInPlace(retained, n, gradients)) break;
+            _retainedAdamTables.RemoveAt(i);
+            _retainedAdamTables.Add(retained);
+            _adamTable = retained;
+            return retained;
+        }
+        for (int i = _retainedAdamTables.Count - 1; i >= 0; i--)
+        {
+            var retained = _retainedAdamTables[i];
+            if (retained.CapturedByGraph) continue;
+            if (retained.Handles.Length != 4 * n || !retained.MatchesSizes(sizes)) continue;
+            if (!TryRefreshTablePointersInPlace(retained, 0, parameters)
+                || !TryRefreshTablePointersInPlace(retained, n, gradients)
+                || !TryRefreshTablePointersInPlace(retained, 2 * n, firstMoments)
+                || !TryRefreshTablePointersInPlace(retained, 3 * n, secondMoments))
+                break;
+            _retainedAdamTables.RemoveAt(i);
+            _retainedAdamTables.Add(retained);
+            _adamTable = retained;
+            return retained;
+        }
         var built = BuildAdamTable(parameters, gradients, firstMoments, secondMoments, sizes);
         RetainMultiTensorTable(_retainedAdamTables, built);
         _adamTable = built;
@@ -15669,14 +15779,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     // Preserve a bounded working set of independent plans; alternating plans must not evict each other every step.
-    // Captured graphs use caller-owned tables from StepIo and are independent of this ordinary-call cache.
-    private const int MultiTensorTableCacheCapacity = 8;
+    // Tables referenced by a captured CUDA graph (CapturedByGraph) are pinned for the backend's lifetime and skipped
+    // during eager in-place refresh and eviction.
+    private const int MultiTensorTableCacheCapacity = 32;
     private static void RetainMultiTensorTable(List<MultiTensorTable> tables, MultiTensorTable table)
     {
-        if (tables.Count == MultiTensorTableCacheCapacity)
+        int uncaptured = 0;
+        int oldestUncaptured = -1;
+        for (int i = 0; i < tables.Count; i++)
         {
-            var retired = tables[0];
-            tables.RemoveAt(0);
+            if (tables[i].CapturedByGraph) continue;
+            if (oldestUncaptured < 0) oldestUncaptured = i;
+            uncaptured++;
+        }
+        if (uncaptured >= MultiTensorTableCacheCapacity && oldestUncaptured >= 0)
+        {
+            var retired = tables[oldestUncaptured];
+            tables.RemoveAt(oldestUncaptured);
             retired.Dispose();
         }
         tables.Add(table);
@@ -15719,6 +15838,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
         {
+            using var _scratch = DeviceMemoryReclaim.EnterScopedScratch();
             table.Pointers = AllocateByteBuffer(addresses.Length);
             UploadByteBuffer(table.Pointers, addresses);
             table.SizesBuffer = AllocateIntBuffer(sizeArray);
@@ -15862,12 +15982,20 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         public int[] Sizes = Array.Empty<int>();
         public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
         public int TotalChunks;
-
+        public bool CapturedByGraph;
         public bool Matches(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
         {
             if (Handles.Length != tensors.Count) return false;
             for (int i = 0; i < Handles.Length; i++)
                 if (Handles[i] != tensors[i].Handle || Sizes[i] != sizes[i]) return false;
+            return true;
+        }
+
+        public bool MatchesSizes(IReadOnlyList<int> sizes)
+        {
+            if (Sizes.Length != sizes.Count) return false;
+            for (int i = 0; i < Sizes.Length; i++)
+                if (Sizes[i] != sizes[i]) return false;
             return true;
         }
 
@@ -15901,7 +16029,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (sizes.Count != tensors.Count)
             throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
         if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
+        {
+            if (IsStreamCapturing()) cached.CapturedByGraph = true;
             return cached;
+        }
         for (int i = 0; i < _retainedGradientTables.Count; i++)
         {
             var retained = _retainedGradientTables[i];
@@ -15909,12 +16040,29 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _retainedGradientTables.RemoveAt(i);
             _retainedGradientTables.Add(retained);
             _gradientTable = retained;
+            if (IsStreamCapturing()) retained.CapturedByGraph = true;
             return retained;
         }
         // A miss allocates/uploads and may evict an old table: never do either during stream capture.
         if (IsStreamCapturing())
             throw new InvalidOperationException(
                 "The multi-tensor gradient table must be built before stream capture; run an eager step first.");
+        for (int i = _retainedGradientTables.Count - 1; i >= 0; i--)
+        {
+            var retained = _retainedGradientTables[i];
+            if (retained.CapturedByGraph) continue;
+            if (retained.Handles.Length != tensors.Count || !retained.MatchesSizes(sizes)) continue;
+            for (int t = 0; t < tensors.Count; t++)
+            {
+                if (tensors[t].Size < sizes[t])
+                    throw new ArgumentException("A tensor buffer is smaller than its size.", nameof(tensors));
+            }
+            if (!TryRefreshTablePointersInPlace(retained, 0, tensors)) break;
+            _retainedGradientTables.RemoveAt(i);
+            _retainedGradientTables.Add(retained);
+            _gradientTable = retained;
+            return retained;
+        }
         var table = BuildGradientTable(tensors, sizes);
         RetainMultiTensorTable(_retainedGradientTables, table);
         _gradientTable = table;
@@ -15956,6 +16104,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
         try
         {
+            using var _scratch = DeviceMemoryReclaim.EnterScopedScratch();
             using (PushContext())
             {
                 table.Pointers = AllocateByteBuffer(addresses.Length);
@@ -19507,6 +19656,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gla_scan_backward_warp" + variant);
 
         using var _ = PushContext();
+        if (TryGlaScanBackwardChunkParallel(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
+            return;
         if (TryGlaScanBackwardTiled(dOut, q, k, v, gate, dQ, dK, dV, dG, batch, seqLen, modelDim, numHeads, headDim))
             return;
         Fill(dQ, 0f, batch * seqLen * modelDim);
@@ -19638,6 +19789,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw new GpuCapabilityUnavailableException("CUDA kernel not found: gated_delta_scan_recompute / gated_delta_scan_backward" + variant);
 
         using var _ = PushContext();
+        if (TryGatedDeltaNetScanBackwardChunkParallel(dOut, q, k, v, alpha, beta, dQ, dK, dV, dAlpha, dBeta, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst))
+            return;
         // Deterministic mode replaces the atomic accumulation with per-row partials summed in a fixed order (see
         // gated_delta_scan_backward); dq and reduce write every element, so nothing needs clearing first.
         bool det = GpuDeterminism.IsActive;
@@ -19701,6 +19854,110 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             rd[5] = &batch; rd[6] = &seqLen; rd[7] = &modelDim; rd[8] = &numHeads; rd[9] = &headDim;
             LaunchKernel(reduceKernel, nGrid, (uint)DefaultBlockSize, rd);
         }
+    }
+
+    private unsafe bool TryGlaScanBackwardChunkParallel(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer gate,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        if (headDim > 64 || seqLen < 16) return false;
+        int chunk = headDim <= 32 ? 8 : 6;
+        int nChunks = (seqLen + chunk - 1) / chunk;
+        long ckptElemsL = (long)batch * numHeads * nChunks * headDim * headDim;
+        long totalBlocksL = (long)batch * numHeads * nChunks;
+        if (ckptElemsL <= 0 || ckptElemsL * 2 > int.MaxValue || totalBlocksL > uint.MaxValue) return false;
+        string ckptName = headDim <= 32 ? "gla_scan_bwd_ckpt_r1" : "gla_scan_bwd_ckpt_r2";
+        string chunkName = headDim <= 32 ? "gla_scan_bwd_chunk_r1" : "gla_scan_bwd_chunk_r2";
+        if (!_kernelCache.TryGetValue(ckptName, out var ckptKernel)
+            || !_kernelCache.TryGetValue(chunkName, out var chunkKernel))
+            return false;
+
+        IGpuBuffer ckptPair;
+        try
+        {
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+                ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        }
+        catch (GpuOutOfMemoryException)
+        {
+            return false;
+        }
+        using var ckptOwner = ckptPair;
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
+        IntPtr phCkpt = ckptPair.Handle;
+        IntPtr pdhCkpt = new IntPtr(ckptPair.Handle.ToInt64() + ckptElemsL * sizeof(float));
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pdg = dG.Handle;
+
+        uint ckptGrid = GatedDeltaNetWarpGrid(2L * batch * numHeads * headDim);
+        void** ca = stackalloc void*[13];
+        ca[0] = &pdo; ca[1] = &pq; ca[2] = &pk; ca[3] = &pv; ca[4] = &pg;
+        ca[5] = &phCkpt; ca[6] = &pdhCkpt; ca[7] = &pdv;
+        ca[8] = &batch; ca[9] = &seqLen; ca[10] = &modelDim; ca[11] = &numHeads; ca[12] = &headDim;
+        LaunchKernel(ckptKernel, ckptGrid, (uint)Kernels.CudaGlaKernels.ChunkBlockThreads, ca);
+
+        void** ba = stackalloc void*[15];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg;
+        ba[5] = &phCkpt; ba[6] = &pdhCkpt;
+        ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdg;
+        ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
+        LaunchKernel(chunkKernel, (uint)totalBlocksL, (uint)Kernels.CudaGlaKernels.ChunkBlockThreads, ba);
+        return true;
+    }
+
+    private unsafe bool TryGatedDeltaNetScanBackwardChunkParallel(
+        IGpuBuffer dOut, IGpuBuffer q, IGpuBuffer k, IGpuBuffer v, IGpuBuffer alpha, IGpuBuffer beta,
+        IGpuBuffer dQ, IGpuBuffer dK, IGpuBuffer dV, IGpuBuffer dAlpha, IGpuBuffer dBeta,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, bool decayFirst)
+    {
+        if (headDim > 64 || seqLen < 16) return false;
+        int chunk = headDim <= 32 ? 8 : 6;
+        int nChunks = (seqLen + chunk - 1) / chunk;
+        long ckptElemsL = (long)batch * numHeads * nChunks * headDim * headDim;
+        long totalBlocksL = (long)batch * numHeads * nChunks;
+        if (ckptElemsL <= 0 || ckptElemsL * 2 > int.MaxValue || totalBlocksL > uint.MaxValue) return false;
+        string ckptName = headDim <= 32 ? "gated_delta_scan_bwd_ckpt_r1" : "gated_delta_scan_bwd_ckpt_r2";
+        string chunkName = headDim <= 32 ? "gated_delta_scan_bwd_chunk_r1" : "gated_delta_scan_bwd_chunk_r2";
+        if (!_kernelCache.TryGetValue(ckptName, out var ckptKernel)
+            || !_kernelCache.TryGetValue(chunkName, out var chunkKernel))
+            return false;
+
+        IGpuBuffer ckptPair;
+        try
+        {
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+                ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        }
+        catch (GpuOutOfMemoryException)
+        {
+            return false;
+        }
+        using var ckptOwner = ckptPair;
+
+        IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle;
+        IntPtr phCkpt = ckptPair.Handle;
+        long byteOff = ckptElemsL * sizeof(float);
+        IntPtr pdhCkpt = new IntPtr(ckptPair.Handle.ToInt64() + byteOff);
+        IntPtr pdq = dQ.Handle, pdk = dK.Handle, pdv = dV.Handle, pda = dAlpha.Handle, pdb = dBeta.Handle;
+        int decay = decayFirst ? 1 : 0;
+
+        uint ckptGrid = GatedDeltaNetWarpGrid(2L * batch * numHeads * headDim);
+        void** ca = stackalloc void*[16];
+        ca[0] = &pdo; ca[1] = &pq; ca[2] = &pk; ca[3] = &pv; ca[4] = &pa; ca[5] = &pb;
+        ca[6] = &phCkpt; ca[7] = &pdhCkpt; ca[8] = &pdv;
+        ca[9] = &batch; ca[10] = &seqLen; ca[11] = &modelDim; ca[12] = &numHeads; ca[13] = &headDim;
+        ca[14] = &keyScale; ca[15] = &decay;
+        LaunchKernel(ckptKernel, ckptGrid, (uint)Kernels.CudaGatedDeltaNetKernels.ChunkBlockThreads, ca);
+
+        void** ba = stackalloc void*[19];
+        ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv;
+        ba[4] = &pa; ba[5] = &pb; ba[6] = &phCkpt; ba[7] = &pdhCkpt;
+        ba[8] = &pdq; ba[9] = &pdk; ba[10] = &pda; ba[11] = &pdb;
+        ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
+        ba[17] = &keyScale; ba[18] = &decay;
+        LaunchKernel(chunkKernel, (uint)totalBlocksL, (uint)Kernels.CudaGatedDeltaNetKernels.ChunkBlockThreads, ba);
+        return true;
     }
 
     // ── Fused RG-LRU scan forward (#1464) ──────────────────────────────────────────────────
@@ -20718,6 +20975,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             UnloadModule(_spectralPerfModule);
             _spectralPerfModule = IntPtr.Zero;
+        }
+
+        if (_householderModule != IntPtr.Zero)
+        {
+            UnloadModule(_householderModule);
+            _householderModule = IntPtr.Zero;
+        }
+
+        if (_sequenceMixerModule != IntPtr.Zero)
+        {
+            UnloadModule(_sequenceMixerModule);
+            _sequenceMixerModule = IntPtr.Zero;
         }
 
         if (_spatialTransformerModule != IntPtr.Zero)

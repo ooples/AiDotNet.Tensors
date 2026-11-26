@@ -7110,6 +7110,7 @@ public partial class DirectGpuTensorEngine
             if (id < 0 || id >= vocab) return false;
             positionBits[r] = AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx.PtxCompat.Int32BitsToSingle((r % chunk) * vocab + id);
         }
+        using var _scratch = Engines.DirectGpu.DeviceMemoryReclaim.EnterScopedScratch();
         positions = new OwnedBuffer(backend.AllocateBuffer(positionBits), ownsBuffer: true);
         return true;
     }
@@ -9907,8 +9908,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             Tensor<T> cur;
-            // The base fallback must run after the no-grad scope closes, or it would record no gradient edge to input.
-            bool declined = false;
+            bool fallbackToBase = false;
             using (new Autodiff.NoGradScope<T>())
             {
                 // Align to the target rank by prepending size-1 axes (a residency-preserving reshape).
@@ -9925,13 +9925,18 @@ public partial class DirectGpuTensorEngine
                 for (int d = 0; d < targetShape.Length; d++)
                 {
                     if (cur._shape[d] == targetShape[d]) continue;
-                    if (cur._shape[d] != 1) { declined = true; break; }
+                    if (cur._shape[d] != 1) { fallbackToBase = true; break; }
 
-                    if (TryRepeatAxisOnDevice(cur, targetShape[d], d) is not { } expanded) { declined = true; break; }
+                    if (TryRepeatAxisOnDevice(cur, targetShape[d], d) is not { } expanded)
+                    {
+                        fallbackToBase = true;
+                        break;
+                    }
                     cur = expanded;
                 }
             }
-            if (declined)
+
+            if (fallbackToBase)
                 return base.TensorBroadcastTo(input, targetShape);
 
             var originalShape = (int[])input._shape.Clone();

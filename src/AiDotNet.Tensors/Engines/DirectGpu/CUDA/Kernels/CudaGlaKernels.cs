@@ -18,6 +18,10 @@ internal static class CudaGlaKernels
     internal const int TileWarpSize = 32;
     internal const int TileWarpPartials = TileThreads / TileWarpSize;
     internal const int TileSharedMemoryLimitBytes = 48 * 1024;
+    internal const int ChunkBlockThreads = 256;
+    internal const int ChunkWarpsPerBlock = ChunkBlockThreads / TileWarpSize;
+    internal const int ChunkRowsPerWarp = 4;
+    internal const int ChunkTileRows = ChunkWarpsPerBlock * ChunkRowsPerWarp;
 
     /// <summary>The kernel-name suffix for a head size: register entries per warp lane (1, 2, 4 or 8).</summary>
     internal static string Variant(int headDim) => headDim <= 32 ? "_r1" : headDim <= 64 ? "_r2" : headDim <= 128 ? "_r4" : "_r8";
@@ -27,6 +31,10 @@ internal static class CudaGlaKernels
         return "#define GLA_TILE_THREADS " + TileThreads + "\n"
             + "#define GLA_TILE_EPT " + TileElementsPerThread + "\n"
             + "#define GLA_TILE_WARP_SIZE " + TileWarpSize + "\n"
+            + "#define GLA_CHUNK_BLOCK_THREADS " + ChunkBlockThreads + "\n"
+            + "#define GLA_CHUNK_WARPS " + ChunkWarpsPerBlock + "\n"
+            + "#define GLA_CHUNK_ROWS_PER_WARP " + ChunkRowsPerWarp + "\n"
+            + "#define GLA_CHUNK_TILE_ROWS " + ChunkTileRows + "\n"
             + @"
 #include <math.h>
 
@@ -77,12 +85,12 @@ __device__ __forceinline__ void gla_forward_warp(
     float* __restrict__ output,
     int batch, int seqLen, int modelDim, int numHeads, int headDim)
 {
-    long w = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    long long w = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
-    if (w >= (long)batch * numHeads * headDim) return;
+    if (w >= (long long)batch * numHeads * headDim) return;
     int di = (int)(w % headDim);
     int h  = (int)((w / headDim) % numHeads);
-    int b  = (int)(w / ((long)headDim * numHeads));
+    int b  = (int)(w / ((long long)headDim * numHeads));
     int hOff = h * headDim;
 
     float S[R];
@@ -116,12 +124,12 @@ __device__ __forceinline__ void gla_backward_warp(
     float* dQ, float* dK, float* __restrict__ dV, float* dG,
     int batch, int seqLen, int modelDim, int numHeads, int headDim, int chunk)
 {
-    long w = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    long long w = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
     int lane = threadIdx.x & 31;
-    if (w >= (long)batch * numHeads * headDim) return;
+    if (w >= (long long)batch * numHeads * headDim) return;
     int di = (int)(w % headDim);
     int h  = (int)((w / headDim) % numHeads);
-    int b  = (int)(w / ((long)headDim * numHeads));
+    int b  = (int)(w / ((long long)headDim * numHeads));
     int hOff = h * headDim;
     long hh = (long)headDim * headDim;
     long bh = (long)b * numHeads + h;
@@ -189,8 +197,10 @@ __device__ __forceinline__ void gla_backward_warp(
             for (int j = 0; j < R; j++) {
                 int ki = lane + 32 * j;
                 if (ki < headDim) {
-                    if (dOutVal != 0.0f) {
+                    if (dOutVal != 0.0f || !isfinite(S[j])) {
                         atomicAdd(&dQ[baseOff + ki], dOutVal * S[j]);
+                    }
+                    if (dOutVal != 0.0f || !isfinite(Q[baseOff + ki])) {
                         dS[j] += dOutVal * Q[baseOff + ki];
                     }
                     float sp = sprevRow[ki];
@@ -227,6 +237,341 @@ GLA_WARP_KERNELS(_r1, 1)
 GLA_WARP_KERNELS(_r2, 2)
 GLA_WARP_KERNELS(_r4, 4)
 GLA_WARP_KERNELS(_r8, 8)
+
+template <int R, int CHUNK>
+__device__ __forceinline__ void gla_bwd_ckpt(
+    const float* __restrict__ dOut, const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, const float* __restrict__ G,
+    float* __restrict__ Hckpt, float* __restrict__ dHckpt, float* __restrict__ dV,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{
+    long long w = ((long long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    long long totalRows = (long long)batch * numHeads * headDim;
+    if (w >= 2 * totalRows) return;
+    bool isReverse = (w >= totalRows);
+    long long rw = isReverse ? (w - totalRows) : w;
+    int di = (int)(rw % headDim);
+    int h  = (int)((rw / headDim) % numHeads);
+    int b  = (int)(rw / ((long long)headDim * numHeads));
+    int hOff = h * headDim;
+    long bh = (long)b * numHeads + h;
+    int nChunks = (seqLen + CHUNK - 1) / CHUNK;
+    long hh = (long)headDim * headDim;
+    long rowOff = (long)di * headDim;
+
+    if (!isReverse)
+    {
+        float S[R];
+#pragma unroll
+        for (int j = 0; j < R; j++) S[j] = 0.0f;
+        for (int t = 0; t < seqLen; t++)
+        {
+            if (t % CHUNK == 0)
+            {
+                long ck = (bh * nChunks + (t / CHUNK)) * hh + rowOff;
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int ki = lane + 32 * j;
+                    if (ki < headDim) Hckpt[ck + ki] = S[j];
+                }
+            }
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g = G[(b * seqLen + t) * numHeads + h];
+            float vd = V[baseOff + di];
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                if (ki < headDim) S[j] = g * S[j] + vd * K[baseOff + ki];
+            }
+        }
+    }
+    else
+    {
+        float dS[R];
+#pragma unroll
+        for (int j = 0; j < R; j++) dS[j] = 0.0f;
+        for (int t = seqLen - 1; t >= 0; t--)
+        {
+            if (t == seqLen - 1 || ((t + 1) % CHUNK) == 0)
+            {
+                long ck = (bh * nChunks + (t / CHUNK)) * hh + rowOff;
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int ki = lane + 32 * j;
+                    if (ki < headDim) dHckpt[ck + ki] = dS[j];
+                }
+            }
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g = G[(b * seqLen + t) * numHeads + h];
+            float dOutVal = dOut[baseOff + di];
+            float dVacc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + 32 * j;
+                if (ki < headDim)
+                {
+                    dS[j] += dOutVal * Q[baseOff + ki];
+                    dVacc += dS[j] * K[baseOff + ki];
+                    dS[j] *= g;
+                }
+            }
+            dVacc = gla_allsum(dVacc);
+            if (lane == 0) dV[baseOff + di] = dVacc;
+        }
+    }
+}
+
+template <int R, int CHUNK, int TILES>
+__device__ __forceinline__ void gla_bwd_chunk(
+    const float* __restrict__ dOut, const float* __restrict__ Q, const float* __restrict__ K,
+    const float* __restrict__ V, const float* __restrict__ G,
+    const float* __restrict__ Hckpt, const float* __restrict__ dHckpt,
+    float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dG,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{
+    const int W = GLA_TILE_WARP_SIZE * R;
+    __shared__ float s_Sprev[(CHUNK - 1) * GLA_CHUNK_TILE_ROWS * W];
+    __shared__ float s_red[GLA_CHUNK_WARPS * W];
+    __shared__ float s_g[GLA_CHUNK_WARPS];
+    __shared__ float s_dQ[CHUNK * W];
+    __shared__ float s_dK[CHUNK * W];
+    __shared__ float s_dG[CHUNK];
+
+    int nChunks = (seqLen + CHUNK - 1) / CHUNK;
+    int bid = (int)blockIdx.x;
+    if (bid >= batch * numHeads * nChunks) return;
+    int c = bid % nChunks;
+    int bh = bid / nChunks;
+    int h = bh % numHeads;
+    int b = bh / numHeads;
+    int hOff = h * headDim;
+    int t0 = c * CHUNK;
+    int t1 = min(seqLen, t0 + CHUNK);
+    int len = t1 - t0;
+    int tid = (int)threadIdx.x;
+    int warpId = tid >> 5;
+    int lane = tid & 31;
+    long hh = (long)headDim * headDim;
+    long ckBase = ((long)bh * nChunks + c) * hh;
+
+    for (int i = tid; i < CHUNK * W; i += GLA_CHUNK_BLOCK_THREADS) { s_dQ[i] = 0.0f; s_dK[i] = 0.0f; }
+    for (int i = tid; i < CHUNK; i += GLA_CHUNK_BLOCK_THREADS) { s_dG[i] = 0.0f; }
+    __syncthreads();
+
+    for (int tile = 0; tile < TILES; tile++)
+    {
+        int tileRow0 = tile * GLA_CHUNK_TILE_ROWS;
+        if (tileRow0 >= headDim) break;
+
+        float S[GLA_CHUNK_ROWS_PER_WARP][R];
+#pragma unroll
+        for (int r = 0; r < GLA_CHUNK_ROWS_PER_WARP; r++)
+        {
+            int di = tileRow0 + warpId * GLA_CHUNK_ROWS_PER_WARP + r;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + GLA_TILE_WARP_SIZE * j;
+                S[r][j] = (di < headDim && ki < headDim) ? Hckpt[ckBase + (long)di * headDim + ki] : 0.0f;
+            }
+        }
+
+        for (int lt = 0; lt < len; lt++)
+        {
+            int t = t0 + lt;
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g = G[(b * seqLen + t) * numHeads + h];
+            float kk[R];
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + GLA_TILE_WARP_SIZE * j;
+                kk[j] = ki < headDim ? K[baseOff + ki] : 0.0f;
+            }
+
+            float dqPart[R];
+#pragma unroll
+            for (int j = 0; j < R; j++) dqPart[j] = 0.0f;
+
+#pragma unroll
+            for (int r = 0; r < GLA_CHUNK_ROWS_PER_WARP; r++)
+            {
+                int localRow = warpId * GLA_CHUNK_ROWS_PER_WARP + r;
+                int di = tileRow0 + localRow;
+                if (di < headDim)
+                {
+                    if (lt > 0)
+                    {
+                        int spBase = ((lt - 1) * GLA_CHUNK_TILE_ROWS + localRow) * W;
+#pragma unroll
+                        for (int j = 0; j < R; j++) s_Sprev[spBase + lane + GLA_TILE_WARP_SIZE * j] = S[r][j];
+                    }
+                    float vd = V[baseOff + di];
+                    float dOutVal = dOut[baseOff + di];
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + GLA_TILE_WARP_SIZE * j;
+                        if (ki < headDim)
+                        {
+                            S[r][j] = g * S[r][j] + vd * kk[j];
+                            dqPart[j] += dOutVal * S[r][j];
+                        }
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + GLA_TILE_WARP_SIZE * j] = dqPart[j];
+            __syncthreads();
+            if (warpId == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int col = lane + GLA_TILE_WARP_SIZE * j;
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < GLA_CHUNK_WARPS; w++) sum += s_red[w * W + col];
+                    s_dQ[lt * W + col] += sum;
+                }
+            }
+            __syncthreads();
+        }
+
+        float dS[GLA_CHUNK_ROWS_PER_WARP][R];
+#pragma unroll
+        for (int r = 0; r < GLA_CHUNK_ROWS_PER_WARP; r++)
+        {
+            int di = tileRow0 + warpId * GLA_CHUNK_ROWS_PER_WARP + r;
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + GLA_TILE_WARP_SIZE * j;
+                dS[r][j] = (di < headDim && ki < headDim) ? dHckpt[ckBase + (long)di * headDim + ki] : 0.0f;
+            }
+        }
+
+        for (int lt = len - 1; lt >= 0; lt--)
+        {
+            int t = t0 + lt;
+            int baseOff = (b * seqLen + t) * modelDim + hOff;
+            float g = G[(b * seqLen + t) * numHeads + h];
+            float qq[R];
+#pragma unroll
+            for (int j = 0; j < R; j++)
+            {
+                int ki = lane + GLA_TILE_WARP_SIZE * j;
+                qq[j] = ki < headDim ? Q[baseOff + ki] : 0.0f;
+            }
+
+            float dkPart[R];
+#pragma unroll
+            for (int j = 0; j < R; j++) dkPart[j] = 0.0f;
+            float dgPart = 0.0f;
+
+#pragma unroll
+            for (int r = 0; r < GLA_CHUNK_ROWS_PER_WARP; r++)
+            {
+                int localRow = warpId * GLA_CHUNK_ROWS_PER_WARP + r;
+                int di = tileRow0 + localRow;
+                if (di < headDim)
+                {
+                    float vd = V[baseOff + di];
+                    float dOutVal = dOut[baseOff + di];
+                    int spBase = ((lt - 1) * GLA_CHUNK_TILE_ROWS + localRow) * W;
+                    float dgRow = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < R; j++)
+                    {
+                        int ki = lane + GLA_TILE_WARP_SIZE * j;
+                        if (ki < headDim)
+                        {
+                            float sp = (lt > 0) ? s_Sprev[spBase + ki] : Hckpt[ckBase + (long)di * headDim + ki];
+                            dS[r][j] += dOutVal * qq[j];
+                            float dStv = dS[r][j];
+                            dgRow += dStv * sp;
+                            dkPart[j] += dStv * vd;
+                            dS[r][j] = dStv * g;
+                        }
+                    }
+                    dgRow = gla_allsum(dgRow);
+                    if (lane == 0) dgPart += dgRow;
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + GLA_TILE_WARP_SIZE * j] = dkPart[j];
+            if (lane == 0) s_g[warpId] = dgPart;
+            __syncthreads();
+            if (warpId == 0)
+            {
+#pragma unroll
+                for (int j = 0; j < R; j++)
+                {
+                    int col = lane + GLA_TILE_WARP_SIZE * j;
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < GLA_CHUNK_WARPS; w++) sum += s_red[w * W + col];
+                    s_dK[lt * W + col] += sum;
+                }
+                if (lane == 0)
+                {
+                    float sg = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < GLA_CHUNK_WARPS; w++) sg += s_g[w];
+                    s_dG[lt] += sg;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int lt = warpId; lt < len; lt += GLA_CHUNK_WARPS)
+    {
+        int t = t0 + lt;
+        int baseOff = (b * seqLen + t) * modelDim + hOff;
+        int gIdx = (b * seqLen + t) * numHeads + h;
+#pragma unroll
+        for (int j = 0; j < R; j++)
+        {
+            int ki = lane + GLA_TILE_WARP_SIZE * j;
+            if (ki < headDim)
+            {
+                dQ[baseOff + ki] = s_dQ[lt * W + ki];
+                dK[baseOff + ki] = s_dK[lt * W + ki];
+            }
+        }
+        if (lane == 0) dG[gIdx] = s_dG[lt];
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(GLA_CHUNK_BLOCK_THREADS) void gla_scan_bwd_ckpt_r1(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* G,
+    float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{ gla_bwd_ckpt<1, 8>(dOut, Q, K, V, G, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim); }
+
+extern ""C"" __global__ __launch_bounds__(GLA_CHUNK_BLOCK_THREADS) void gla_scan_bwd_chunk_r1(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* G,
+    const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dG,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{ gla_bwd_chunk<1, 8, 1>(dOut, Q, K, V, G, Hckpt, dHckpt, dQ, dK, dG, batch, seqLen, modelDim, numHeads, headDim); }
+
+extern ""C"" __global__ __launch_bounds__(GLA_CHUNK_BLOCK_THREADS) void gla_scan_bwd_ckpt_r2(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* G,
+    float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{ gla_bwd_ckpt<2, 6>(dOut, Q, K, V, G, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim); }
+
+extern ""C"" __global__ __launch_bounds__(GLA_CHUNK_BLOCK_THREADS) void gla_scan_bwd_chunk_r2(
+    const float* dOut, const float* Q, const float* K, const float* V, const float* G,
+    const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dG,
+    int batch, int seqLen, int modelDim, int numHeads, int headDim)
+{ gla_bwd_chunk<2, 6, 2>(dOut, Q, K, V, G, Hckpt, dHckpt, dQ, dK, dG, batch, seqLen, modelDim, numHeads, headDim); }
 
 // Checkpointed BPTT backward. The previous recompute + backward pair kept the whole state
 // trajectory, batch*heads*seqLen*headDim^2 floats (2.1 GB at batch 16, seqLen 256, 8 heads of 128).
@@ -798,6 +1143,10 @@ extern ""C"" __global__ void minmax_reduce_int32(
             "gla_scan_backward_warp_r2",
             "gla_scan_backward_warp_r4",
             "gla_scan_backward_warp_r8",
+            "gla_scan_bwd_ckpt_r1",
+            "gla_scan_bwd_chunk_r1",
+            "gla_scan_bwd_ckpt_r2",
+            "gla_scan_bwd_chunk_r2",
             "causal_dwconv1d_forward",
             "causal_dwconv1d_backward_input",
             "causal_dwconv1d_backward_kernel",

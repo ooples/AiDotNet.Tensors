@@ -651,8 +651,11 @@ public sealed class GradientTape<T> : IDisposable
         Action<Tensor<T>, Tensor<T>> onSourceGradient)
     {
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
-        ComputeGradientsStreamingTyped(loss, sources, (source, gradient) =>
-            onSourceGradient(source, MaterializeStreamingGradient(gradient)));
+        ComputeGradientsStreamingCore(
+            loss,
+            sources,
+            (source, gradient) => onSourceGradient(source, MaterializeStreamingGradient(gradient)),
+            collectSparseEmbeddingGrads: false);
     }
 
     /// <summary>
@@ -668,6 +671,13 @@ public sealed class GradientTape<T> : IDisposable
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>> sources,
         Action<Tensor<T>, StreamingSourceGradient<T>> onSourceGradient)
+        => ComputeGradientsStreamingCore(loss, sources, onSourceGradient, collectSparseEmbeddingGrads: true);
+
+    private void ComputeGradientsStreamingCore(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        Action<Tensor<T>, StreamingSourceGradient<T>> onSourceGradient,
+        bool collectSparseEmbeddingGrads)
     {
         using var accumulationPrecisionScope = new GradientAccumulationPrecisionScope(
             _options.GradientAccumulationPrecision);
@@ -821,7 +831,7 @@ public sealed class GradientTape<T> : IDisposable
                 }
             }
             var indexedGrads = new object?[gradIndexCount];
-            var indexedSparseGrads = new object?[gradIndexCount];
+            var indexedSparseGrads = collectSparseEmbeddingGrads ? new object?[gradIndexCount] : null;
             DifferentiableOps.SetIndexedGrads(indexedGrads);
             DifferentiableOps.SetIndexedSparseGrads(indexedSparseGrads);
 
@@ -935,7 +945,8 @@ public sealed class GradientTape<T> : IDisposable
                                 if (gradientIndex >= 0 && gradientIndex < indexedGrads.Length)
                                 {
                                     indexedGrads[gradientIndex] = null;
-                                    indexedSparseGrads[gradientIndex] = null;
+                                    if (indexedSparseGrads is not null)
+                                        indexedSparseGrads[gradientIndex] = null;
                                 }
                             }
                         }
@@ -2139,17 +2150,38 @@ public sealed class GradientTape<T> : IDisposable
         if (_retainGrad is not null)
             foreach (var t in _retainGrad)
                 if (t.Grad is { } g) kept.Add(g.DataVector);
-        var released = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
-        int zzKept = 0, zzNoDev = 0;
-        foreach (var gradient in dropped)
+        bool rentedReleased = !s_inReleaseDroppedGradients;
+        if (rentedReleased) s_inReleaseDroppedGradients = true; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+        var released = rentedReleased
+            ? (s_scratchReleasedStorages ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+            : new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        try
         {
-            var storage = gradient.DataVector;
-            if (kept.Contains(storage)) { zzKept++; continue; }
-            if (!released.Add(storage)) continue;
-            if (storage._deviceState?.Buffer is null) zzNoDev++;
-            gpu.ReleaseDeadDeviceStorage(gradient);
+            foreach (var gradient in dropped)
+            {
+                var storage = gradient.DataVector;
+                if (kept.Contains(storage)) continue;
+                if (!released.Add(storage)) continue;
+                gpu.ReleaseDeadDeviceStorage(gradient);
+            }
+        }
+        finally
+        {
+            if (rentedReleased)
+            {
+                released.Clear();
+                s_inReleaseDroppedGradients = false; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+            }
         }
     }
+
+    [ThreadStatic] private static bool s_inReleaseDroppedGradients;
+    [ThreadStatic] private static HashSet<object>? s_scratchReleasedStorages;
+    [ThreadStatic] private static bool s_inCleanupCachedReplay;
+    [ThreadStatic] private static HashSet<Tensor<T>>? s_scratchReplaySources;
+    [ThreadStatic] private static HashSet<Tensor<T>>? s_scratchReplayIntermediates;
+    [ThreadStatic] private static List<Tensor<T>>? s_scratchReplayDropped;
+    [ThreadStatic] private static HashSet<object>? s_scratchReplayForwardStorage;
 
     private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsViaGraph(
         Tensor<T> loss,
@@ -2798,82 +2830,105 @@ public sealed class GradientTape<T> : IDisposable
             DroppedGradients<T>.Take();   // nothing is freed under create-graph; just empty the slot
             return;
         }
+
+        bool rentedScratch = !s_inCleanupCachedReplay;
+        if (rentedScratch) s_inCleanupCachedReplay = true; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+
         HashSet<Tensor<T>>? sourceSet = null;
-        if (sources is not null)
-        {
-            sourceSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-            foreach (var s in sources) sourceSet.Add(s);
-        }
+        HashSet<Tensor<T>> intermediates = rentedScratch
+            ? (s_scratchReplayIntermediates ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+            : new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        List<Tensor<T>>? replayDropped = null;
+        HashSet<object>? forwardStorage = null;
 
-        // Pre-collect the set of tensors that are outputs of THIS tape's
-        // entries — those are the intermediates we own. Inputs that don't
-        // appear in this set are leaves (sources, externally-supplied
-        // values) and must be left alone: their .Grad is the BC contract
-        // the optimizer-step pattern reads, and their .GradFn is either
-        // null (leaf) or owned by an OUTER tape (nested-tape pattern).
-        var intermediates = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
-        for (int i = 0; i < _entries.Count; i++)
+        try
         {
-            var o = _entries[i].Output;
-            if (o is not null) intermediates.Add(o);
-        }
-        // As in the graph walk: the gradients the replay did not return, and those dropped below, go back to the pool
-        // once they are proven unshared. Always take the replay's slot, so a CPU run leaves nothing behind in it.
-        var fromReplay = DroppedGradients<T>.Take();
-        List<Tensor<T>>? replayDropped = _engine.Is<DirectGpuTensorEngine>() ? (fromReplay ?? new List<Tensor<T>>()) : null;
-
-        for (int i = 0; i < _entries.Count; i++)
-        {
-            ref var entry = ref _entries[i];
-            var output = entry.Output;
-            if (output is null) continue;
-            var fn = output.GradFn;
-            if (fn is not null && ReferenceEquals(fn.OwningTape, this))
+            if (sources is not null)
             {
-                output.GradFn = null;
-                // Issue #338 tape-pinning: backward replay has consumed
-                // this output (and the entry above re-registered it via
-                // Record*). Cleared regardless of source/retain — the pin
-                // guards the pool, not .Grad.
-                output._pinnedByTape = false;
-                bool keepGrad = sourceSet?.Contains(output) == true
-                    || (_retainGrad is not null && _retainGrad.Contains(output));
-                if (!keepGrad)
+                sourceSet = rentedScratch
+                    ? (s_scratchReplaySources ??= new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+                    : new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var s in sources) sourceSet.Add(s);
+            }
+
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                var o = _entries[i].Output;
+                if (o is not null) intermediates.Add(o);
+            }
+
+            var fromReplay = DroppedGradients<T>.Take();
+            if (_engine.Is<DirectGpuTensorEngine>())
+            {
+                replayDropped = fromReplay
+                    ?? (rentedScratch
+                        ? (s_scratchReplayDropped ??= new List<Tensor<T>>(256)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+                        : new List<Tensor<T>>());
+            }
+
+            for (int i = 0; i < _entries.Count; i++)
+            {
+                ref var entry = ref _entries[i];
+                var output = entry.Output;
+                if (output is null) continue;
+                var fn = output.GradFn;
+                if (fn is not null && ReferenceEquals(fn.OwningTape, this))
                 {
-                    if (replayDropped is not null && output.Grad is { } dropped) replayDropped.Add(dropped);
-                    output.Grad = null;
+                    output.GradFn = null;
+                    output._pinnedByTape = false;
+                    bool keepGrad = sourceSet?.Contains(output) == true
+                        || (_retainGrad is not null && _retainGrad.Contains(output));
+                    if (!keepGrad)
+                    {
+                        if (replayDropped is not null && output.Grad is { } dropped) replayDropped.Add(dropped);
+                        output.Grad = null;
+                    }
+                    GradNodePool<T>.Return(fn);
                 }
-                GradNodePool<T>.Return(fn);
+
+                CleanupCachedReplayInput(entry.Input0, sourceSet, intermediates);
+                if (entry.InputCount >= 2) CleanupCachedReplayInput(entry.Input1, sourceSet, intermediates);
+                if (entry.InputCount >= 3) CleanupCachedReplayInput(entry.Input2, sourceSet, intermediates);
+                if (entry.InputsOverflow is not null)
+                {
+                    foreach (var inp in entry.InputsOverflow)
+                        CleanupCachedReplayInput(inp, sourceSet, intermediates);
+                }
             }
 
-            // Also clear .GradFn / .Grad on every INPUT that this tape
-            // owns. The graph-walk cleanup at the bottom of
-            // ComputeGradientsViaGraphCore does this via topoOrder; the
-            // tape-walk path does it via _entries (lines 611-625). The
-            // cached-replay path was visiting Outputs only — leaving each
-            // intermediate's .Grad mirror (set during backward by
-            // AccumulateGrad) pinned through the GradNode that was about
-            // to be pool-recycled. On Linux Server GC the timing exposed
-            // this as 7 surviving intermediates; on Workstation GC the
-            // promotion order hid it.
-            CleanupCachedReplayInput(entry.Input0, sourceSet, intermediates);
-            if (entry.InputCount >= 2) CleanupCachedReplayInput(entry.Input1, sourceSet, intermediates);
-            if (entry.InputCount >= 3) CleanupCachedReplayInput(entry.Input2, sourceSet, intermediates);
-            if (entry.InputsOverflow is not null)
+            if (replayDropped is not null && replayDropped.Count > 0)
             {
-                foreach (var inp in entry.InputsOverflow)
-                    CleanupCachedReplayInput(inp, sourceSet, intermediates);
+                forwardStorage = rentedScratch
+                    ? (s_scratchReplayForwardStorage ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance)) // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+                    : new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+                PopulateForwardStorageOfEntries(forwardStorage);
+                ReleaseDroppedGradients(replayDropped, forwardStorage, result, loss);
             }
         }
-
-        if (replayDropped is not null && replayDropped.Count > 0)
-            ReleaseDroppedGradients(replayDropped, ForwardStorageOfEntries(), result, loss);
+        finally
+        {
+            if (rentedScratch)
+            {
+                sourceSet?.Clear();
+                intermediates.Clear();
+                if (ReferenceEquals(replayDropped, s_scratchReplayDropped))
+                    replayDropped?.Clear();
+                forwardStorage?.Clear();
+                s_inCleanupCachedReplay = false; // lgtm[cs/static-field-written-by-instance] thread-static scratch, rented under the reentrancy flag
+            }
+        }
     }
 
     /// <summary>The storage of every tensor the recorded forward read or wrote: none of it may be freed as a gradient.</summary>
     private HashSet<object> ForwardStorageOfEntries()
     {
         var forwardStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        PopulateForwardStorageOfEntries(forwardStorage);
+        return forwardStorage;
+    }
+
+    private void PopulateForwardStorageOfEntries(HashSet<object> forwardStorage)
+    {
         for (int i = 0; i < _entries.Count; i++)
         {
             ref var entry = ref _entries[i];
@@ -2885,7 +2940,6 @@ public sealed class GradientTape<T> : IDisposable
                 foreach (var inp in entry.InputsOverflow)
                     if (inp is not null) forwardStorage.Add(inp.DataVector);
         }
-        return forwardStorage;
     }
 
     private void CleanupCachedReplayInput(
