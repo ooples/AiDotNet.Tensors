@@ -1568,7 +1568,10 @@ public static partial class WeightRegistry
             _materializedBytes.Remove(handle);
             _materializedResidentBytes -= bytes;
         }
-        _materializedActiveUses.Remove(handle);
+        // Active uses are NOT cleared here: each belongs to a holder (a view being built, a MaterializeMany scope, a
+        // release's own claim) that removes it when it ends. Clearing them let one completed release erase every other
+        // holder's use, so the next ReleaseToPool saw an idle owner and dropped the storage under a view still paging
+        // it in. Handles are never reused, so a count left on an unregistered handle cannot pin another weight.
     }
 
     /// <summary>
