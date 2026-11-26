@@ -125,6 +125,63 @@ public class IdleStepMemoryLoanTests
         }
     }
 
+    // A move whose copy fails gives its fresh memory back (it leaked before) and the failure reaches the reclaim.
+    [SkippableFact]
+    public void AMoveWhoseCopyFails_ReleasesTheFreshMemory()
+    {
+        using var backend = OpenBackendOrSkip();
+        IIdleDeviceMemoryLender lender = backend;
+        using var scratch = backend.AllocateBuffer(N);
+        var owner = new object();
+        IGpuBuffer? fresh = null;
+        lender.LendIdle(owner, new[] { scratch });
+        var kept = backend.AllocateBuffer(N / 2);
+        try
+        {
+            Assert.True(Inside(scratch, kept), "the allocation did not borrow the idle memory");
+            CudaBackend.TestFaultBeforeIdleLoanMoveCopy = buffer =>
+            {
+                fresh = buffer;
+                throw new InvalidOperationException("injected copy fault");
+            };
+            var error = Assert.Throws<InvalidOperationException>(() => lender.ReclaimIdle(owner));
+            Assert.Contains("injected", error.Message);
+            var released = Assert.IsAssignableFrom<IGpuBuffer>(fresh);
+            Assert.True(((CudaBackend.CudaGpuBuffer)released).IsReleased, "the fresh memory of the failed move leaked");
+        }
+        finally
+        {
+            CudaBackend.TestFaultBeforeIdleLoanMoveCopy = null;
+            lender.ReclaimIdle(owner);
+            kept.Dispose();
+        }
+    }
+
+    // On-demand lenders are collected when an allocation asks. One that throws lends nothing, but the others still
+    // lend, and the allocation that asked does not fail (before, the exception escaped it and the others' registrations
+    // were dropped).
+    [SkippableFact]
+    public void AThrowingOnDemandLender_DoesNotFailTheAllocation_OrDropTheOtherLenders()
+    {
+        using var backend = OpenBackendOrSkip();
+        IIdleDeviceMemoryLender lender = backend;
+        using var scratch = backend.AllocateBuffer(N);
+        var failing = new object();
+        var good = new object();
+        lender.LendIdleOnDemand(failing, () => throw new InvalidOperationException("injected collector fault"));
+        lender.LendIdleOnDemand(good, () => new[] { scratch });
+        try
+        {
+            using var odd = backend.AllocateBuffer(12_345);   // no pooled buffer serves it: it asks the lenders
+            Assert.True(Inside(scratch, odd), "the other lender's idle memory was not lent");
+        }
+        finally
+        {
+            lender.ReclaimIdle(failing);
+            lender.ReclaimIdle(good);
+        }
+    }
+
     [SkippableFact]
     public void ACaptureNeverBakesInLentMemory()
     {

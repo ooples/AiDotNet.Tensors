@@ -160,12 +160,27 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
 
     // Collects what the on-demand owners lend: an allocation needs memory the pool could not serve. Under _idleLock,
     // so an owner's reclaim (the start of its next step) waits for its collection and finds it registered.
+    // A collector that throws lends nothing (its owner keeps its memory); the others still lend, and the failure does
+    // not surface in the allocation that happened to ask (it is traced instead).
     private void CollectPendingIdleLocked()
     {
         var pending = _idlePending.ToArray();
         _idlePending.Clear();
         foreach (var (owner, collect) in pending)
-            if (collect() is { Count: > 0 } buffers) AddIdleRegionsLocked(owner, buffers);
+        {
+            IReadOnlyCollection<IGpuBuffer>? buffers;
+            try
+            {
+                buffers = collect();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Trace.TraceWarning(
+                    "Idle step memory: a lender's collection failed, so it lends nothing this time: " + ex.Message);
+                continue;
+            }
+            if (buffers is { Count: > 0 }) AddIdleRegionsLocked(owner, buffers);
+        }
     }
 
     private void ReclaimIdle(object owner)
@@ -354,6 +369,9 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
     // The copy is queued on the backend's stream and the borrower switches to its own memory after it. A borrower is
     // used between the lending plan's steps; a kernel another thread queues on it while the plan starts its next step
     // (the only caller of a reclaim) races that step the same way as any buffer used by two threads at once.
+    /// <summary>Test hook: runs with the fresh memory just before a loan's contents are copied into it.</summary>
+    internal static Action<IGpuBuffer>? TestFaultBeforeIdleLoanMoveCopy;
+
     internal void MoveIdleLoan(IdleLoan loan)
     {
         if (!loan.IsLent) return;
@@ -379,10 +397,19 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
                 : (CudaGpuBuffer)AllocateBufferFromPool(size);
         }
         var from = borrower.RawDevicePointer;
-        if (from != IntPtr.Zero)
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuMemcpyDtoDAsync(owned.Handle, from, (ulong)size * sizeof(float), _stream),
-                "cuMemcpyDtoDAsync(idle loan move)");
+        try
+        {
+            TestFaultBeforeIdleLoanMoveCopy?.Invoke(owned);
+            if (from != IntPtr.Zero)
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemcpyDtoDAsync(owned.Handle, from, (ulong)size * sizeof(float), _stream),
+                    "cuMemcpyDtoDAsync(idle loan move)");
+        }
+        catch
+        {
+            owned.Dispose();   // the move did not happen: the fresh memory goes back, the borrower keeps its loan
+            throw;
+        }
         if (!borrower.MoveIdleLoanTo(owned))
         {
             owned.Dispose();   // released meanwhile: its range went back through ReturnIdleLoan
