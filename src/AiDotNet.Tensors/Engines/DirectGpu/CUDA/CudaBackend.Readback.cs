@@ -75,8 +75,10 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
                         using (_backend.PushContext())
                         {
                             // The copy may still be writing the pinned bytes; they are freed only once it is done.
-                            if (_event is { } evt && _unread) evt.Synchronize();
-                            _event?.Dispose();
+                            // The event goes even when that wait fails, except on a context the circuit breaker
+                            // found corrupted, which is not called into again.
+                            try { if (_event is { } evt && _unread) evt.Synchronize(); }
+                            finally { if (!AiDotNetEngine.GpuCircuitBroken) _event?.Dispose(); }
                         }
                     }
                     catch (ObjectDisposedException)

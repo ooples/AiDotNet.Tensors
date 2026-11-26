@@ -227,8 +227,41 @@ public class CudaFallbackReportingTests
         {
             GpuBackendOptions.RequiredBackend = previousRequired;
             AiDotNetEngine.Current = saved;
-            AiDotNetEngine.ParkGpuForTests(previousParked);
+            // The engine this adoption parked is the test's: disposed, not left holding a context.
+            var adoptedHere = AiDotNetEngine.ParkGpuForTests(previousParked);
+            if (adoptedHere is not null && !ReferenceEquals(adoptedHere, previousParked) && !ReferenceEquals(adoptedHere, saved)
+                && !ReferenceEquals(adoptedHere, parked))
+                adoptedHere.Dispose();
             if (parked is { IsDisposed: false }) parked.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The trip runs inside CUDA error paths that hold a context lock, while an adoption can dispose an engine (which
+    /// takes that context lock) under the adoption lock. The trip used to take the adoption lock, so the two could
+    /// deadlock; it now takes no lock and completes while another thread holds the adoption lock.
+    /// </summary>
+    [Fact]
+    public void The_circuit_breaker_trip_does_not_wait_for_the_adoption_lock()
+    {
+        var saved = AiDotNetEngine.Current;
+        try
+        {
+            bool tripped = false;
+            AiDotNetEngine.RunUnderAdoptionLockForTests(() =>
+            {
+                var trip = new System.Threading.Thread(() => AiDotNetEngine.TripGpuCircuitBreaker("test", 700));
+                trip.IsBackground = true;
+                trip.Start();
+                tripped = trip.Join(TimeSpan.FromSeconds(10));
+            });
+            Assert.True(tripped, "the trip blocked on the adoption lock");
+            Assert.True(AiDotNetEngine.GpuCircuitBroken);
+        }
+        finally
+        {
+            AiDotNetEngine.ResetGpuCircuitBreakerForTests();
+            AiDotNetEngine.Current = saved;
         }
     }
 
@@ -243,6 +276,9 @@ public class CudaFallbackReportingTests
         var previousRequired = GpuBackendOptions.RequiredBackend;
         try
         {
+            // Nothing caller-assigned left over from an earlier test: a caller's own engine is exempt from the refusal.
+            AiDotNetEngine.ResetToCpu();
+            Assert.False(AiDotNetEngine.IsCallerAssigned);
             GpuBackendOptions.RequiredBackend = GpuBackendType.Hip;
             AiDotNetEngine.TripGpuCircuitBreaker("test", 700);
             var ex = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);

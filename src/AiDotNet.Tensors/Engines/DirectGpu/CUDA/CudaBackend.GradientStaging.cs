@@ -43,13 +43,15 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
     /// <summary>
     /// Frees (or unregisters) page-locked host memory in <paramref name="context"/>, only while it is still the
     /// registration <paramref name="generation"/> named and the runtime is not tearing down: a driver call against a
-    /// destroyed context, or during teardown, is an access violation no catch traps. Returns null when it was skipped
-    /// (the context's destruction, or the process's exit, takes the memory back).
+    /// destroyed context, during teardown, or on a context the circuit breaker found corrupted, can be an access violation
+    /// no catch traps. Returns null when it was skipped (the context's destruction, or the process's exit, takes the
+    /// memory back).
     /// </summary>
     internal static CudaResult? ReleaseHostInLiveContext(IntPtr host, IntPtr context, long generation, bool unregister)
     {
         if (host == IntPtr.Zero) return null;
-        if (IsRuntimeTearingDown || ProcessExiting) { Interlocked.Increment(ref HostReleasesSkipped); return null; }
+        // A context the circuit breaker found corrupted is not called into either: the exit of the process takes the memory.
+        if (IsRuntimeTearingDown || ProcessExiting || AiDotNetEngine.GpuCircuitBroken) { Interlocked.Increment(ref HostReleasesSkipped); return null; }
         lock (ContextLifecycleLock)   // no destroy between the check and the call
         {
             if (!IsLiveContext(context, generation)) { Interlocked.Increment(ref HostReleasesSkipped); return null; }

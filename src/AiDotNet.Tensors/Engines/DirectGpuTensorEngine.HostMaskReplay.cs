@@ -171,6 +171,11 @@ public partial class DirectGpuTensorEngine
         {
             try { DisposeBufferAfterQueuedUse(owner, buffer); return; }
             catch (ObjectDisposedException) { /* closed meanwhile: dispose directly below */ }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // The fields no longer hold the buffer, so nothing else frees it: dispose it directly rather than leak it.
+                System.Diagnostics.Trace.TraceWarning("Host mask: a deferred buffer release failed ({0}); freeing it directly.", ex.Message);
+            }
         }
         buffer.Dispose();
     }

@@ -281,6 +281,12 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             };
             Assert.Throws<InvalidOperationException>(() => plan.Dispose());
             Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Step);
+            // The rest of the teardown still ran: the other graphs are gone and the eviction suspension is balanced,
+            // rather than left to the finalizer with eviction off for the engine shared by the later tests.
+            Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Odd);
+            Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Update);
+            Assert.False(compiled.GraphEvictionSuspendedForTests, "the graph-lifetime eviction suspension was left on");
+            compiled.TestFaultAfterStepGraphDestroy = null;
         }
         finally
         {

@@ -713,21 +713,36 @@ public sealed partial class CudaBackend
                 return;
             }
             using var _ = PushContext();
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo? waitFailure = null;
             try
             {
                 CuBlasNative.CheckCudaResult(
                     CudaNativeBindings.cuStreamSynchronize(_stream),
                     "cuStreamSynchronize (graph destroy)");
             }
-            finally
+            catch (Exception ex)
             {
-                // Destroyed and unpinned even when the wait failed: the caller has already let go of the handle, so
-                // nothing else would ever destroy this graph or release what it pins.
+                waitFailure = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+            }
+
+            // Destroyed and unpinned even when the wait failed: the caller has already let go of the handle, so
+            // nothing else would ever destroy this graph or release what it pins. Not on a context the circuit
+            // breaker found corrupted, where any native call can fault: only the tracking goes, and the context's
+            // memory goes with the process, as the breaker itself leaves it.
+            if (AiDotNetEngine.GpuCircuitBroken)
+            {
+                ReleaseDirectPtxGraphPins(graphExec);
+                ForgetGraphMemoryPool(graphExec);
+            }
+            else
+            {
                 try
                 {
-                    CuBlasNative.CheckCudaResult(
-                        CudaNativeBindings.cuGraphExecDestroy(graphExec),
-                        "cuGraphExecDestroy");
+                    var destroyed = CudaNativeBindings.cuGraphExecDestroy(graphExec);
+                    // The failed wait is the error reported; a destroy failing after it is only traced.
+                    if (waitFailure is null) CuBlasNative.CheckCudaResult(destroyed, "cuGraphExecDestroy");
+                    else if (destroyed != CudaResult.Success)
+                        System.Diagnostics.Trace.TraceWarning("cuGraphExecDestroy returned " + destroyed + " after a failed wait.");
                 }
                 finally
                 {
@@ -735,6 +750,8 @@ public sealed partial class CudaBackend
                     RetireGraphMemoryPool(graphExec);
                 }
             }
+
+            waitFailure?.Throw();
         }
     }
 

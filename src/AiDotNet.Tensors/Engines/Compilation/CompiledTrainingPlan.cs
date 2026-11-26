@@ -575,6 +575,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// <summary>The captured graphs' handles (tests).</summary>
     internal (IntPtr Step, IntPtr Odd, IntPtr Update) GraphHandlesForTests => (_stepGraphExec, _stepGraphExecOdd, _updateGraphExec);
 
+    /// <summary>Whether the plan still holds the engine's graph-lifetime eviction suspension (tests).</summary>
+    internal bool GraphEvictionSuspendedForTests => _graphEvictionSuspended;
+
     /// <summary>The stages <see cref="Dispose"/> ran, in order, while <see cref="RecordTeardownStagesForTests"/> is set.</summary>
     internal List<string>? TeardownStagesForTests { get; private set; }
 
@@ -1807,6 +1810,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // while the graphs that pin the second buffers still keep them alive.
         ReleasePingPong();
         bool hadGraph = _stepGraphExec != IntPtr.Zero;
+        // Every part runs even when an earlier one throws, so one failing destroy cannot leave the other graphs, the
+        // step I/O, the residency rollback or the eviction suspension behind; the first failure is rethrown at the end
+        // (all of them, as an AggregateException, when more than one part failed).
+        List<Exception>? failures = null;
+        void Part(Action part)
+        {
+            try { part(); }
+            catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
+        }
         // Each handle is cleared before its destroy: a destroy that throws then leaves no field naming a graph that was
         // already destroyed, which the finalizer (armed while a teardown stage fails) would destroy a second time.
         if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
@@ -1814,12 +1826,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var even = _stepGraphExec;
             _stepGraphExec = IntPtr.Zero;
-            if (even != IntPtr.Zero) gte.DestroyGpuGraph(even);
-            TestFaultAfterStepGraphDestroy?.Invoke();
             var odd = _stepGraphExecOdd;
             _stepGraphExecOdd = IntPtr.Zero;
-            if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd);
-            DestroyUpdateGraph(gte);
+            Part(() => { if (even != IntPtr.Zero) gte.DestroyGpuGraph(even); });
+            Part(() => TestFaultAfterStepGraphDestroy?.Invoke());
+            Part(() => { if (odd != IntPtr.Zero) gte.DestroyGpuGraph(odd); });
+            Part(() => DestroyUpdateGraph(gte));
         }
         _updateGraphExec = IntPtr.Zero;
         _stepGraphOwner = null;
@@ -1830,18 +1842,21 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_scratchPool is { } graphPool) graphPool.GraphsHoldBuffers = false;
         _scratchPinsAtCapture = -1;
         _graphStepCalls = 0;
-        DisposeStepIo();   // before the rollback below, which may read the loss
+        Part(DisposeStepIo);   // before the rollback below, which may read the loss
         // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
         // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
         if (hadGraph && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gRoll))
-            RollBackCaptureResidency(gRoll, deviceHoldsResults: true);
+            Part(() => RollBackCaptureResidency(gRoll, deviceHoldsResults: true));
         // Balance the graph-lifetime eviction suspension (Step()): once the captured graph is gone,
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
         if (_graphEvictionSuspended && _engine.TryGet<Engines.DirectGpuTensorEngine>(out var gEvict))
         {
-            gEvict.EndGraphLifetime();
             _graphEvictionSuspended = false;
+            Part(gEvict.EndGraphLifetime);
         }
+
+        if (failures is { Count: 1 }) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is { Count: > 1 }) throw new AggregateException("The captured step graph teardown failed.", failures);
     }
 
     /// <summary>

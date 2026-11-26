@@ -297,6 +297,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     private void CompleteLossScaledStep()
     {
         if (!_lossScaleVerdictPending) return;
+        // Refused before the verdict is consumed, so a bug that reaches this inside a capture leaves the step pending.
+        ThrowIfLossScaleAdvancesInsideCapture();
         _lossScaleVerdictPending = false;
         ResolveDeferredFiniteness();
         AdvanceHostLossScale(LastStepSkippedNonFiniteGradients);
@@ -314,6 +316,16 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     internal float[]? ReadDeviceLossSeedForTests()
         => _lossGradSeed.TryGetGpuBuffer() is { } seed && _lossGradSeed._gpuBackend is { } backend
             ? backend.DownloadBuffer(seed) : null;
+
+    // Inside a capture the seed fill of AdvanceHostLossScale would be recorded into the graph as a constant: the host
+    // scale never advances there (the captured scaler runs on the device), so reaching it is a bug, refused before any
+    // state changes (the scale, its growth tracker and step count, or the pending verdict) rather than leaving the host
+    // state and the seed apart.
+    private void ThrowIfLossScaleAdvancesInsideCapture()
+    {
+        if (_lossGradSeed._gpuBackend is Engines.DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing())
+            throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
+    }
 
     private void AdvanceHostLossScale(bool nonFinite)
     {
@@ -337,12 +349,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
                 tracker = 0;
             }
         }
-        // Inside a capture the seed fill below would be recorded into the graph as a constant: the host scale never
-        // advances there (the captured scaler runs on the device), so reaching this is a bug, refused before any state
-        // changes rather than leaving the host scale and the seed apart.
-        var seedOwner = _lossGradSeed._gpuBackend;
-        if (scale != state.Scale && seedOwner is Engines.DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing())
-            throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
+        ThrowIfLossScaleAdvancesInsideCapture();
         _lossScaleHost = new LossScaleState(scale, tracker, overflows, state.Steps + 1);
         // A captured step graph copies the device seed into the loss gradient in its prologue and nothing in it rewrites
         // the seed when the scale is advanced here, on the host: rewrite it, or the next replay scales the gradients by

@@ -32,9 +32,10 @@ public sealed class HostMaskDeviceCopyTests
     }
 
     /// <summary>
-    /// A mask whose device copy was made on a backend that has since closed is refreshed on another engine. The stale
-    /// buffer used to be released through the closed backend's queued free, which threw, before the copy was cleared,
-    /// so every later use of the mask threw the same way.
+    /// A mask whose device copy was made on a backend that has since closed is refreshed on another engine, and every
+    /// later use of the mask still works. A regression guard for the release order (the copy is cleared before its
+    /// stale buffer is released, and a closed backend is never asked to queue the free); it passed on the code before
+    /// that change as well, since the CUDA queued free did not throw there.
     /// </summary>
     [SkippableFact]
     public void A_masks_copy_from_a_closed_backend_is_replaced_on_another_engine()
@@ -59,7 +60,7 @@ public sealed class HostMaskDeviceCopyTests
             Assert.Equal(-1f, b.TensorMaskedFill(x, mask, -1f).GetFlat(1));
             Assert.Equal(-1f, b.TensorMaskedFill(x, mask, -1f).GetFlat(1));
         }
-        GC.KeepAlive(a);
+        a.Dispose();
         GC.KeepAlive(mask);
     }
 }

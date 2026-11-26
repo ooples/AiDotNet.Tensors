@@ -228,6 +228,13 @@ public sealed partial class CudaBackend
         previous?.Retire();
     }
 
+    // Drops a graph's pool from the tracking without freeing its buffers, for a context the circuit breaker found
+    // corrupted: a free there can fault the process, and the exit of the process reclaims the memory.
+    private static void ForgetGraphMemoryPool(IntPtr graphExec)
+    {
+        lock (s_graphMemoryLock) s_graphMemoryPools.Remove(graphExec);
+    }
+
     private static void RetireGraphMemoryPool(IntPtr graphExec)
     {
         CaptureMemoryPool? pool;

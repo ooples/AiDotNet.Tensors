@@ -448,27 +448,36 @@ public static class AiDotNetEngine
         {
             var gpuEngine = new DirectGpuTensorEngine();
             bool supportsGpu = gpuEngine.SupportsGpu;
+            bool lostRace = false;
 
             if (supportsGpu && GpuPassesCorrectnessProbe(gpuEngine))
             {
                 lock (_adoptionLock)
                 {
                     // Another thread adopted while this one probed: keep its engine. This one was never published,
-                    // so no other thread can hold it and disposing it here is safe.
+                    // so no other thread can hold it and disposing it (below, after the lock) is safe.
                     if (_adoptedGpu is { IsDisposed: false } winner && winner.SupportsGpu && SatisfiesRequiredBackend(winner))
                     {
-                        gpuEngine.Dispose();
                         PublishCurrent(winner);
                         Volatile.Write(ref _callerAssigned, false);
-                        return true;
+                        lostRace = true;
                     }
-
-                    // An engine parked earlier on a backend the requirement now rules out is superseded: released
-                    // below (after its ops drain), not left holding its context for the life of the process.
-                    superseded = _adoptedGpu is { IsDisposed: false } old && !ReferenceEquals(old, gpuEngine) ? old : null;
-                    _adoptedGpu = gpuEngine;
-                    PublishCurrent(gpuEngine);
-                    Volatile.Write(ref _callerAssigned, false);
+                    else
+                    {
+                        // An engine parked earlier on a backend the requirement now rules out is superseded: released
+                        // below (after its ops drain), not left holding its context for the life of the process.
+                        superseded = _adoptedGpu is { IsDisposed: false } old && !ReferenceEquals(old, gpuEngine) ? old : null;
+                        _adoptedGpu = gpuEngine;
+                        PublishCurrent(gpuEngine);
+                        Volatile.Write(ref _callerAssigned, false);
+                    }
+                }
+                // Disposed outside the adoption lock: a dispose takes the backend's context lock, which CUDA error paths
+                // hold while they trip the breaker, so disposing under the adoption lock inverted the order.
+                if (lostRace)
+                {
+                    gpuEngine.Dispose();
+                    return true;
                 }
                 if (superseded is not null) ReleaseSupersededGpu(superseded);
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
@@ -765,23 +774,37 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             if (engine is not null && !_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
+            if (_supersededGpus.Count == 0) return;
             pending = new System.Collections.Generic.List<DirectGpuTensorEngine>(_supersededGpus);
             _supersededGpus.Clear();
         }
-        foreach (var candidate in pending)
+        try
         {
-            bool released;
-            try
+            foreach (var candidate in pending)
             {
-                released = candidate.IsDisposed || candidate.TryCloseAndDispose(TimeSpan.Zero);
-                if (!released) candidate.ReopenAfterTimedOutClose();
+                try
+                {
+                    if (!candidate.IsDisposed && !candidate.TryCloseAndDispose(TimeSpan.Zero))
+                        candidate.ReopenAfterTimedOutClose();
+                }
+                catch (Exception ex) when (ex is not OutOfMemoryException)
+                {
+                    // Never escapes: this runs at the top of every detection, which does not throw for an unrelated engine.
+                    System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
+                }
             }
-            catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or TimeoutException)
+        }
+        finally
+        {
+            // Every engine not released goes back, also any a failure that did escape left untried, so none is dropped
+            // with its context open.
+            lock (_adoptionLock)
             {
-                System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
-                released = false;
+                foreach (var candidate in pending)
+                {
+                    if (!candidate.IsDisposed && !_supersededGpus.Contains(candidate)) _supersededGpus.Add(candidate);
+                }
             }
-            if (!released) lock (_adoptionLock) if (!_supersededGpus.Contains(candidate)) _supersededGpus.Add(candidate);
         }
     }
 
@@ -808,6 +831,13 @@ public static class AiDotNetEngine
     /// When the current engine already is a plain <see cref="CpuEngine"/> it is kept rather than replaced, so a reset
     /// never swaps the engine under work running on another thread.
     /// </para>
+    /// <para>
+    /// After the GPU circuit breaker has tripped, a reset does not lift the refusal: while
+    /// <see cref="DirectGpu.GpuBackendOptions.RequiredBackend"/> names a backend, reading <see cref="Current"/> keeps
+    /// throwing, since the CPU engine installed here is the library's, not a caller's choice. Clear the requirement, or
+    /// assign an engine of your own to <see cref="Current"/>, to run on the CPU. <see cref="ReleaseGpu()"/> behaves the
+    /// same way.
+    /// </para>
     /// </remarks>
     public static void ResetToCpu()
     {
@@ -832,6 +862,12 @@ public static class AiDotNetEngine
 
     /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
     internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
+
+    /// <summary>Runs <paramref name="action"/> while holding the adoption lock, as an adoption disposing an engine does (tests).</summary>
+    internal static void RunUnderAdoptionLockForTests(Action action)
+    {
+        lock (_adoptionLock) action();
+    }
 
     /// <summary>Opens the circuit breaker without the demotion a device fault performs (tests).</summary>
     internal static void OpenGpuCircuitBreakerForTests() => _gpuCircuitBroken = true;
@@ -874,26 +910,29 @@ public static class AiDotNetEngine
             return;
         }
 
-        // Read by Current while a backend is required (ThrowIfTrippedUnderRequirement): written before the flag, and no
-        // lock is taken here, since this runs inside CUDA error paths that may hold the context or detection locks.
+        // Read by Current while a backend is required (ThrowIfTrippedUnderRequirement): written before the flag. No lock
+        // is taken anywhere in the trip: it runs inside CUDA error paths that may hold a context lock, while an engine
+        // dispose (which takes that context lock) can run under the adoption lock, so taking it here could deadlock.
         _tripDescription = $"{operation} (CUDA error {cudaErrorCode})";
         _gpuCircuitBroken = true;
         try
         {
-            lock (_adoptionLock)
+            // Demote with a compare-and-swap so the CPU engine replaces only the GPU engine observed here. The flag is
+            // cleared first: a reader between the two steps then refuses the CPU engine instead of being handed it.
+            var observed = ReadCurrent();
+            while (observed.Is<DirectGpuTensorEngine>())
             {
-                if (ReadCurrent().Is<DirectGpuTensorEngine>())
-                {
-                    // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
-                    // This runs from inside a CUDA fault handler on an already-corrupted context; calling
-                    // cuCtxDestroy/cuMemFree on a dead context can raise an uncatchable native 0xC0000005,
-                    // crashing the very process the breaker is trying to keep alive on CPU. The breaker
-                    // trips at most once per process, so leaking this one context until process exit (the
-                    // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
-                    PublishCurrent(new CpuEngine());
-                    // The library installed this CPU engine, even when the GPU it replaced was the caller's.
-                    Volatile.Write(ref _callerAssigned, false);
-                }
+                // Deliberately do NOT Dispose() the demoted engine here (unlike SwitchToCpuEngine).
+                // This runs from inside a CUDA fault handler on an already-corrupted context; calling
+                // cuCtxDestroy/cuMemFree on a dead context can raise an uncatchable native 0xC0000005,
+                // crashing the very process the breaker is trying to keep alive on CPU. The breaker
+                // trips at most once per process, so leaking this one context until process exit (the
+                // OS reclaims it) is the strictly safer trade than risking a fatal teardown.
+                // The library installs this CPU engine, even when the GPU it replaces was the caller's.
+                Volatile.Write(ref _callerAssigned, false);
+                var seen = Interlocked.CompareExchange(ref _current, new CpuEngine(), observed);
+                if (ReferenceEquals(seen, observed)) break;
+                observed = seen;
             }
         }
         catch

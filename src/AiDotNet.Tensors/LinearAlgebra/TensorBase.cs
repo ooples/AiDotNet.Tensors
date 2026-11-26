@@ -226,8 +226,6 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         internal StreamingInt4Weight? StreamingInt4;
         internal IDisposable? StreamingMmapOwner;
         internal object? StreamingTransitionGate;
-        // The array a streaming drop orphaned, handed to the device caches once the gate is released.
-        internal object? OrphanedByStreamingDrop;
         internal long StreamingPoolHandle = -1;
         internal long StreamingReservedBytes;
         internal bool StreamingDropDeferred;
@@ -733,8 +731,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
     {
         bool dropped;
-        lock (StreamingTransitionGate) dropped = TryDropStorageForStreamingGated(throwOnSharedRefcount);
-        ReleaseDeviceCopiesOfOrphanedArray();
+        object? orphaned;
+        lock (StreamingTransitionGate) dropped = TryDropStorageForStreamingGated(throwOnSharedRefcount, out orphaned);
+        ReleaseDeviceCopiesOfOrphanedArray(orphaned);
         return dropped;
     }
 
@@ -744,11 +743,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// buffer a GPU forward uploaded before the weight was streamed. Releasing it here keeps the engines' locks out of
     /// the gate; the caller may still hold the weight registry's lock, so the order is registry, then engine caches.
     /// </summary>
-    private void ReleaseDeviceCopiesOfOrphanedArray()
+    /// <remarks>
+    /// The array comes back from the drop as a local, not through state on the tensor: a second drop of the same
+    /// tensor between the first one leaving the gate and getting here would otherwise overwrite it, and the first
+    /// array would be neither released nor pooled.
+    /// </remarks>
+    private static void ReleaseDeviceCopiesOfOrphanedArray(object? orphaned)
     {
-        var cold = _cold;
-        if (cold is null) return;
-        var orphaned = System.Threading.Interlocked.Exchange(ref cold.OrphanedByStreamingDrop, null);
         if (orphaned is null) return;
         try { Helpers.PooledArrayRecycling.Notify(orphaned); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming drop: releasing device copies failed: {0}", error); }
@@ -781,6 +782,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     {
         object gate = StreamingTransitionGate;
         bool taken = false;
+        object? orphaned = null;
         try
         {
             if (wait) System.Threading.Monitor.Enter(gate, ref taken);
@@ -793,7 +795,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             bool storeIsReadOnly = StreamingStoreEncoding != StreamingEncoding.Native
                 && StreamingStoreEncoding != StreamingEncoding.Lossless;
             if (!storeIsReadOnly && !TryWriteBackResidentForStreaming()) return StreamingReleaseOutcome.Retained;
-            return TryDropStorageForStreamingGated(throwOnSharedRefcount: false)
+            return TryDropStorageForStreamingGated(throwOnSharedRefcount: false, out orphaned)
                 ? StreamingReleaseOutcome.Released
                 : StreamingReleaseOutcome.Retained;
         }
@@ -802,13 +804,14 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             if (taken)
             {
                 System.Threading.Monitor.Exit(gate);
-                ReleaseDeviceCopiesOfOrphanedArray();
+                ReleaseDeviceCopiesOfOrphanedArray(orphaned);
             }
         }
     }
 
-    private bool TryDropStorageForStreamingGated(bool throwOnSharedRefcount)
+    private bool TryDropStorageForStreamingGated(bool throwOnSharedRefcount, out object? orphanedArray)
     {
+        orphanedArray = null;
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
         if (!IsContiguous || _storageOffset != 0 || IsView)
             throw new InvalidOperationException(
@@ -872,7 +875,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // released once the gate is (ReleaseDeviceCopiesOfOrphanedArray), or every streamed weight keeps its
         // full-precision device copy for the engine's life, outside any budget. Only an array nothing else can read:
         // checked before the restore pool can take it.
-        if (OrphanedArray(claimedStorage, droppedData) is { } orphaned) Cold().OrphanedByStreamingDrop = orphaned;
+        orphanedArray = OrphanedArray(claimedStorage, droppedData);
         // The restore pool takes the array after that (ReleaseDeviceCopiesOfOrphanedArray), not here inside the gate.
         // Reclamation must not turn a successful storage swap into a failed transaction.
         try { claimedStorage.DisposeClaimedOwners(); }
