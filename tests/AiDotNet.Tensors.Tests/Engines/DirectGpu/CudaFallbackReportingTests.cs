@@ -173,6 +173,7 @@ public class CudaFallbackReportingTests
     public void RequiredBackend_WithGpuDisabledOrTheCircuitOpen_Throws_InsteadOfSwitchingToTheCpu()
     {
         var saved = AiDotNetEngine.Current;
+        var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
         var previousRequired = GpuBackendOptions.RequiredBackend;
         string? previousDisable = Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU");
         try
@@ -192,7 +193,7 @@ public class CudaFallbackReportingTests
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
             Environment.SetEnvironmentVariable("AIDOTNET_DISABLE_GPU", previousDisable);
             GpuBackendOptions.RequiredBackend = previousRequired;
-            AiDotNetEngine.Current = saved;
+            AiDotNetEngine.RestoreCurrentForTests(savedSlot);
         }
     }
 
@@ -245,7 +246,7 @@ public class CudaFallbackReportingTests
     public void The_circuit_breaker_trip_does_not_wait_for_the_adoption_lock()
     {
         var saved = AiDotNetEngine.Current;
-        bool savedAssigned = AiDotNetEngine.IsCallerAssigned;
+        var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
         try
         {
             bool tripped = false;
@@ -262,9 +263,8 @@ public class CudaFallbackReportingTests
         finally
         {
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
-            AiDotNetEngine.Current = saved;
-            // Restoring the engine is not a caller's choice: later tests must not inherit a caller-assigned flag.
-            if (!savedAssigned && saved.Unwrap().GetType() == typeof(CpuEngine)) AiDotNetEngine.ResetToCpu();
+            // Restored with its flag: later tests must not inherit a caller-assigned flag from the restore.
+            AiDotNetEngine.RestoreCurrentForTests(savedSlot);
         }
     }
 
@@ -276,7 +276,7 @@ public class CudaFallbackReportingTests
     public void A_tripped_circuit_breaker_under_a_required_backend_makes_Current_throw()
     {
         var saved = AiDotNetEngine.Current;
-        bool savedAssigned = AiDotNetEngine.IsCallerAssigned;
+        var savedSlot = AiDotNetEngine.SnapshotCurrentForTests();
         var previousRequired = GpuBackendOptions.RequiredBackend;
         try
         {
@@ -300,9 +300,8 @@ public class CudaFallbackReportingTests
         {
             GpuBackendOptions.RequiredBackend = previousRequired;
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
-            AiDotNetEngine.Current = saved;
-            // Restoring the engine is not a caller's choice: later tests must not inherit a caller-assigned flag.
-            if (!savedAssigned && saved.Unwrap().GetType() == typeof(CpuEngine)) AiDotNetEngine.ResetToCpu();
+            // Restored with its flag: later tests must not inherit a caller-assigned flag from the restore.
+            AiDotNetEngine.RestoreCurrentForTests(savedSlot);
         }
     }
 

@@ -34,6 +34,9 @@ public partial class DirectGpuTensorEngine
     /// <summary>Frees every live host-mask device copy (engine disposal).</summary>
     private void ReleaseHostMaskDeviceCopies()
     {
+        // Every copy is released and the list cleared even when one release throws, so a single failure neither keeps
+        // the other copies nor aborts the engine's disposal; the first failure is rethrown at the end.
+        List<Exception>? failures = null;
         lock (_hostMaskLock)
         {
             foreach (var weak in _hostMaskCopyList)
@@ -45,11 +48,15 @@ public partial class DirectGpuTensorEngine
                     var owner = copy.Backend;
                     copy.Buffer = null;
                     copy.Backend = null;
-                    if (buffer is not null) ReleaseHostMaskBuffer(owner, buffer);
+                    if (buffer is null) continue;
+                    try { ReleaseHostMaskBuffer(owner, buffer); }
+                    catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
                 }
             }
             _hostMaskCopyList.Clear();
         }
+        if (failures is { Count: 1 }) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        if (failures is { Count: > 1 }) throw new AggregateException("Releasing host-mask device copies failed.", failures);
     }
 
     /// <summary>Device copies of host masks this engine holds (tests).</summary>
@@ -167,8 +174,9 @@ public partial class DirectGpuTensorEngine
     // a live context itself. The fields are cleared before this runs, so a failure cannot leave a freed buffer behind.
     private static void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
     {
-        // Not on a context the circuit breaker found corrupted: the buffer is left to the exit of the process.
-        if (AiDotNetEngine.GpuCircuitBroken) return;
+        // Not on a CUDA context the circuit breaker found corrupted: the buffer is left to the exit of the process.
+        // Other backends are not affected by a CUDA fault.
+        if (AiDotNetEngine.GpuCircuitBroken && (owner is null || owner.BackendName.StartsWith("CUDA", StringComparison.OrdinalIgnoreCase))) return;
         if (owner is not null && owner.IsAvailable)
         {
             // Any other failure propagates: the queued release may already own the buffer (its free waits on an event

@@ -515,7 +515,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         // Returned whether or not the free below runs: a block it skips goes with its context.
         CudaAccountedMemory.Untrack(ptr);
-        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting) return;
+        if (ptr == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting || AiDotNetEngine.GpuCircuitBroken) return;
         lock (ContextLifecycleLock)
         {
             if (_cudaContext == IntPtr.Zero || !IsLiveContext(_cudaContext, _contextGeneration)) return;
@@ -815,7 +815,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     public CudaBackend(int deviceIndex)
     {
         // Backends collected without Dispose release their native resources before this one takes more.
-        if (!PendingAbandonedBackends.IsEmpty && !IsCapturingOnThisThread) DrainPendingAbandonedBackends();
+        // Not after the circuit breaker tripped: their contexts may be the corrupted one (see DisposeAbandoned).
+        if (!PendingAbandonedBackends.IsEmpty && !IsCapturingOnThisThread && !AiDotNetEngine.GpuCircuitBroken) DrainPendingAbandonedBackends();
         DeviceOrdinal = deviceIndex;
         _memoryAccount = DeviceMemoryAccount.For("cuda", deviceIndex);
         _kernelCache = new ConcurrentDictionary<string, IntPtr>(StringComparer.Ordinal);
@@ -1095,10 +1096,19 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             if (_pushed)
             {
                 var popped = CuBlasNative.cuCtxPopCurrent(out _);
-                _threadCurrentContext = IntPtr.Zero;
-                // After a sticky device fault the pop can fail too; throwing then would replace the error that tripped
-                // the breaker with this one, from inside the cleanup of the call that hit it.
-                if (!AiDotNetEngine.GpuCircuitBroken) CuBlasNative.CheckCudaResult(popped, "cuCtxPopCurrent");
+                if (popped == CudaResult.Success) _threadCurrentContext = IntPtr.Zero;
+                else if (AiDotNetEngine.GpuCircuitBroken)
+                {
+                    // After a sticky device fault the pop can fail too; throwing then would replace the error that
+                    // tripped the breaker with this one, from inside the cleanup of the call that hit it. The marker
+                    // stays: the context may still be on this thread's stack, so the next push is not repeated.
+                    System.Diagnostics.Trace.TraceWarning("cuCtxPopCurrent returned " + popped + " after the GPU circuit breaker tripped.");
+                }
+                else
+                {
+                    _threadCurrentContext = IntPtr.Zero;
+                    CuBlasNative.CheckCudaResult(popped, "cuCtxPopCurrent");
+                }
             }
             CudaCurrentStream.Restore(_previousStream);
         }
@@ -7363,7 +7373,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     // module unloads and handle destroys act on the CURRENT context, and the draining thread may be on another device.
     private void DisposeAbandoned()
     {
-        if (_disposed || IsRuntimeTearingDown || ProcessExiting) return;
+        // A context the circuit breaker found corrupted is not torn down: the exit of the process reclaims it.
+        if (_disposed || IsRuntimeTearingDown || ProcessExiting || AiDotNetEngine.GpuCircuitBroken) return;
         IntPtr context = _cudaContext;
         if (context == IntPtr.Zero || !IsLiveContext(context, _contextGeneration))
         {
@@ -22128,7 +22139,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
+                    // Nor on a context the circuit breaker found corrupted: the pointer is leaked to the exit of the process.
+                    if (_context != IntPtr.Zero && !ProcessExiting && !AiDotNetEngine.GpuCircuitBroken && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {
@@ -22323,7 +22335,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
+                    // Nor on a context the circuit breaker found corrupted: the pointer is leaked to the exit of the process.
+                    if (_context != IntPtr.Zero && !ProcessExiting && !AiDotNetEngine.GpuCircuitBroken && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {

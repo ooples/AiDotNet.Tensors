@@ -467,7 +467,7 @@ public static class AiDotNetEngine
         {
             var parked = _adoptedGpu;
             if (parked is not null && !parked.IsDisposed && parked.SupportsGpu && SatisfiesRequiredBackend(parked))
-                return TryPublishAdoptedGpu(parked);
+                return TryPublishAdoptedGpu(parked) || AbandonAfterTrip(null, null);
         }
 
         DirectGpuTensorEngine? superseded = null;
@@ -502,7 +502,7 @@ public static class AiDotNetEngine
                 // hold while they trip the breaker, so disposing under the adoption lock inverted the order.
                 // A trip during the probe: the context this engine shares is corrupted, so it is neither published nor
                 // torn down (the process exit reclaims it), and the CPU engine stays.
-                if (_gpuCircuitBroken) return false;
+                if (_gpuCircuitBroken) return AbandonAfterTrip(gpuEngine, superseded);
                 if (lostRace)
                 {
                     try { gpuEngine.Dispose(); }
@@ -528,6 +528,9 @@ public static class AiDotNetEngine
             // returns the right values, else we dispose it and stay on CPU. This
             // is a self-validation gate, not a CPU force — a working GPU is still
             // adopted.
+            // A probe that faulted the device trips the breaker and reports a failed check: that engine shares the
+            // corrupted context, so it is kept, not torn down, and the trip is what is reported.
+            if (_gpuCircuitBroken) return AbandonAfterTrip(gpuEngine, null);
             gpuEngine.Dispose();
             string why = supportsGpu
                 ? "GPU detected but failed its correctness self-check"
@@ -810,11 +813,18 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             if (engine is not null && !_supersededGpus.Contains(engine)) _supersededGpus.Add(engine);
-            // After a trip they stay listed and open: CUDA engines share the device's primary context, which the
-            // breaker found corrupted, and a teardown on it can fault the process.
-            if (_supersededGpus.Count == 0 || _gpuCircuitBroken) return;
-            pending = new System.Collections.Generic.List<DirectGpuTensorEngine>(_supersededGpus);
-            _supersededGpus.Clear();
+            if (_supersededGpus.Count == 0) return;
+            pending = new System.Collections.Generic.List<DirectGpuTensorEngine>();
+            for (int i = _supersededGpus.Count - 1; i >= 0; i--)
+            {
+                // After a trip a CUDA engine stays listed and open: CUDA engines share the device's primary context,
+                // which the breaker found corrupted, and a teardown on it can fault the process. Other backends are
+                // unaffected by a CUDA fault and are released as usual.
+                if (_gpuCircuitBroken && IsCudaEngine(_supersededGpus[i])) continue;
+                pending.Add(_supersededGpus[i]);
+                _supersededGpus.RemoveAt(i);
+            }
+            if (pending.Count == 0) return;
         }
         try
         {
@@ -844,6 +854,32 @@ public static class AiDotNetEngine
                 }
             }
         }
+    }
+
+    // Whether an engine runs on CUDA, the backend a tripped breaker leaves corrupted. A disposed or unreadable engine
+    // counts as CUDA, which only keeps it listed.
+    private static bool IsCudaEngine(DirectGpuTensorEngine engine)
+    {
+        try { return !engine.IsDisposed && ((IEngine)engine).DirectGpu?.BackendName is { } name && name.StartsWith("CUDA", StringComparison.OrdinalIgnoreCase); }
+        catch (Exception ex) when (ex is not OutOfMemoryException) { return true; }
+    }
+
+    // Detection after the circuit breaker tripped mid-way: engines it would publish or release share the corrupted
+    // context, so they are kept in the superseded list (reachable, never finalized into a teardown, and not released
+    // while the breaker is open). Throws the trip while a backend is required, as detection does when it starts
+    // already tripped; otherwise returns false (the CPU engine stays).
+    private static bool AbandonAfterTrip(DirectGpuTensorEngine? engine, DirectGpuTensorEngine? superseded)
+    {
+        lock (_adoptionLock)
+        {
+            foreach (var kept in new[] { engine, superseded })
+                if (kept is not null && !ReferenceEquals(kept, _adoptedGpu) && !_supersededGpus.Contains(kept)) _supersededGpus.Add(kept);
+        }
+        if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var required && required != GpuBackendType.None)
+            throw new InvalidOperationException(
+                $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {required}, "
+                + $"but the GPU circuit breaker tripped on {_tripDescription ?? "a device fault"}: the GPU cannot be used again in this process.");
+        return false;
     }
 
     /// <summary>Superseded engines not yet released because ops were still running on them (tests).</summary>
@@ -900,6 +936,21 @@ public static class AiDotNetEngine
 
     /// <summary>Re-arms the circuit breaker so a test can trip it without leaving the process on the CPU.</summary>
     internal static void ResetGpuCircuitBreakerForTests() => _gpuCircuitBroken = false;
+
+    /// <summary>The current engine with its caller-assigned flag, for a test to restore exactly (tests).</summary>
+    internal static (IEngine Engine, bool CallerAssigned) SnapshotCurrentForTests()
+    {
+        var slot = Volatile.Read(ref _slot);
+        return (slot.Engine, slot.CallerAssigned);
+    }
+
+    /// <summary>Restores a <see cref="SnapshotCurrentForTests"/> pair, flag included (tests).</summary>
+    internal static void RestoreCurrentForTests((IEngine Engine, bool CallerAssigned) snapshot)
+    {
+        lock (_deferredLock)
+        lock (_adoptionLock)
+            PublishCurrent(snapshot.Engine, snapshot.CallerAssigned);
+    }
 
     /// <summary>Runs <paramref name="action"/> while holding the adoption lock, as an adoption disposing an engine does (tests).</summary>
     internal static void RunUnderAdoptionLockForTests(Action action)
