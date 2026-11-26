@@ -118,6 +118,7 @@ public sealed class TensorScope : IDisposable
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         object storage = tensor.GraphVectorIdentity;   // reads no value: a traced tensor stays in the graph (see Keep)
         MarkRetainedIfTraced(tensor);
+        // Unrealized, a lazily allocated host array is not there yet; nothing registered it with a scope either.
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         // A result kept in a nested scope was adopted by the enclosing one, and each scope's activation release spares
         for (var scope = s_current; scope is not null; scope = scope._outer)

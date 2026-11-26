@@ -1939,6 +1939,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (explicitOutput is not null) protectedOutputs.Add(explicitOutput);
         if (stateUpdates is not null)
             protectedOutputs.AddRange(stateUpdates.Select(update => update.Next).Where(next => next is not null));
+        // A tensor the forward kept or detached (LazyTensorScope.RetainedNodes) is read after Execute like the output.
+        // Memory planning must not count it dead after its last reader in the plan and hand its storage to a later
+        // result: the caller's reference would then show that result's values.
+        if (scope.RetainedNodes is { Count: > 0 } retainedNodes)
+            foreach (var node in retainedNodes)
+                if (node is LazyNode<T> { Output: { } kept } && !protectedOutputs.Contains(kept)) protectedOutputs.Add(kept);
         steps = RunStepMutatingPasses(steps, engine, protectedOutputs);
         Tensor<T>[] stateTensors = Array.Empty<Tensor<T>>();
         if (stateUpdates is { Count: > 0 })

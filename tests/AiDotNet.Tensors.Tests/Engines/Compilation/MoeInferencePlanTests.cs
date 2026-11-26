@@ -58,6 +58,59 @@ public class MoeInferencePlanTests
         using (gpu) RunDetached(gpu!);
     }
 
+    /// <summary>
+    /// A detached traced tensor keeps its own storage in a CPU plan long enough for memory planning. The plan reads it
+    /// once, early; after that read memory planning counted it dead and handed its storage to the next same-shaped
+    /// result, so without the plan protecting it the caller's reference showed that later result's values.
+    /// </summary>
+    [Fact]
+    public void A_detached_traced_tensor_keeps_its_storage_in_a_memory_planned_cpu_plan()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>([2, D]);
+        Tensor<float>? kept = null;
+        static Tensor<float> Forward(IEngine e, Tensor<float> xi, out Tensor<float> side)
+        {
+            side = e.TensorMultiply(xi, xi);                  // kept past the call, and read once below
+            var a = e.TensorAdd(side, xi);                    // side's last read in the plan
+            var b = e.TensorAdd(a, xi);                       // same shape, produced after: memory planning's candidate
+            var c = e.TensorMultiply(b, a);
+            return e.TensorAdd(c, b);
+        }
+        using (new EngineScope(engine))
+        using (var cache = new CompiledModelCache<float>())
+        {
+            var plan = cache.GetOrCompileInference(x, xi =>
+            {
+                var y = Forward(engine, xi, out var side);
+                kept = TensorScope.Detach(side);
+                return y;
+            });
+            var cpu = new CpuEngine();
+            for (int t = 0; t < 3; t++)
+            {
+                var xt = T([2, D], i => MathF.Sin(i * 0.7f + t) + 0.1f * t);
+                plan.SetInputs(new[] { xt });
+                var got = plan.Execute().ToArray();
+                var expect = Forward(cpu, xt, out var side).ToArray();
+                for (int i = 0; i < got.Length; i++)
+                    Assert.True(Math.Abs(got[i] - expect[i]) <= 1e-5f * (1 + Math.Abs(expect[i])), $"t{t} y[{i}]: {got[i]} vs {expect[i]}");
+                Assert.Equal(side.ToArray(), kept!.ToArray());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Inside an open TensorScope, keeping the loads in the scope and detaching them both read no value: the plan
+    /// compiles and the loads follow every replay.
+    /// </summary>
+    [Fact]
+    public void Keeping_and_detaching_the_moe_loads_inside_a_tensor_scope_compiles()
+    {
+        using var scope = TensorScope.Begin();
+        RunDetached(new CpuEngine(), keepInScope: scope);
+    }
+
     /// <summary>A real host read of the loads inside the forward still makes the trace uncompilable.</summary>
     [Fact]
     public void A_host_read_of_the_moe_loads_inside_the_forward_still_refuses_the_compile()
@@ -79,7 +132,7 @@ public class MoeInferencePlanTests
 
     private static Tensor<float> Router() => T([D, G], i => MathF.Sin(i * 0.37f + 2));
 
-    private static void RunDetached(IEngine engine)
+    private static void RunDetached(IEngine engine, TensorScope? keepInScope = null)
     {
         var (w1, w3, w2) = Weights();
         var router = Router();
@@ -91,6 +144,7 @@ public class MoeInferencePlanTests
             var plan = cache.GetOrCompileInference(x, xi =>
             {
                 var y = MixtureOfExperts.SwiGluExperts(engine, xi, engine.TensorMatMul(xi, router), null, w1, w3, w2, K, 1, out var loads);
+                if (keepInScope is not null) keepInScope.Keep(loads);
                 kept = TensorScope.Detach(loads);
                 return y;
             });
