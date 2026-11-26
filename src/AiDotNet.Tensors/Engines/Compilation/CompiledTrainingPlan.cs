@@ -7435,6 +7435,49 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
         _lrVelocityScratch.Clear();
+        ReleaseDeviceOptimizerWeights();
+    }
+
+    // The parameters whose persistent weight buffers this plan's device optimizer updates in place, held in the engine
+    // (RetainDeviceOptimizerWeight) from ConfigureOptimizer until the optimizer state is freed: a weight-cache
+    // invalidation between ConfigureOptimizer and the first update (FusedTrainingSession invalidates after every fused
+    // step, deferred ones included) freed the buffer the optimizer, and the update graph captured from it, still wrote.
+    private readonly List<(Engines.DirectGpuTensorEngine Engine, Tensor<T> Parameter)> _deviceOptimizerWeights = new();
+
+    private void RetainDeviceOptimizerWeight(int p)
+    {
+        if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var engine)) return;
+        engine.RetainDeviceOptimizerWeight(_parameters[p]);
+        _deviceOptimizerWeights.Add((engine, _parameters[p]));
+    }
+
+    private void ReleaseDeviceOptimizerWeights()
+    {
+        foreach (var (engine, parameter) in _deviceOptimizerWeights) engine.ReleaseDeviceOptimizerWeight(parameter);
+        _deviceOptimizerWeights.Clear();
+    }
+
+    /// <summary>
+    /// A buffer the configured device optimizer updates in place (a parameter's, or its moments) that was freed under it
+    /// would make the update, eager or captured, write freed memory: a sticky CUDA 700 with no hint of the cause. Throws
+    /// a clear error instead. CUDA buffers only (the captured update is CUDA's; a WebGPU handle is always zero).
+    /// </summary>
+    private void ThrowIfDeviceOptimizerBufferReleased(Engines.DirectGpu.IGpuBuffer?[] gpuParam,
+        Engines.DirectGpu.IGpuBuffer?[] gpuM, Engines.DirectGpu.IGpuBuffer?[] gpuV, string where)
+    {
+        for (int p = 0; p < gpuParam.Length; p++)
+        {
+            if (!IsOptimizerParameterActive(p)) continue;
+            string? which = gpuParam[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "weight"
+                : gpuM[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "first-moment"
+                : gpuV[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "second-moment"
+                : null;
+            if (which is not null)
+                throw new InvalidOperationException(
+                    $"Parameter {p}'s {which} device buffer, which this plan's optimizer was configured to update in place, "
+                    + $"was released before {where}. Something freed it while the optimizer held it; reconfigure the "
+                    + "optimizer (ConfigureOptimizer) after replacing a parameter's device storage.");
+        }
     }
 
     /// <summary>The optimizer's device buffers (moments, scratch) currently allocated; for tests.</summary>
@@ -7616,6 +7659,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 gpuParam[p] = paramGpuBuf;
                 gpuBackends[p] = paramBackend;
+                RetainDeviceOptimizerWeight(p);
                 // Gradient may be CPU or GPU. If CPU (the common case where
                 // backward ran on the engine the tape was bound to, which
                 // for a GPU-resident param SHOULD also be GPU but isn't
@@ -7894,6 +7938,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the optimizer update");
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
@@ -8850,6 +8895,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (clipNorm > 0.0 && (typeof(T) != typeof(float) || clipNorm > float.MaxValue
                     || clipPolicy == Engines.Gpu.NonFiniteGradientPolicy.Error))
                 return null;
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the update graph was captured");
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
             var capGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -9149,6 +9195,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 gpuParam[p] = paramGpuBuf;
                 gpuBackends[p] = paramBackend;
+                RetainDeviceOptimizerWeight(p);
                 if (_gradients[p] is not null)
                 {
                     var gradGpuBuf = _gradients[p].TryGetGpuBuffer();
@@ -9338,6 +9385,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the optimizer update");
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try

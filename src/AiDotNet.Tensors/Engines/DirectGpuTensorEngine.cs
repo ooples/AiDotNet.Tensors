@@ -361,6 +361,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly ConcurrentDictionary<object, GpuBufferCacheEntry> _persistentBufferCache = new();
     private readonly object _persistentBufferLock = new();
 
+    // Persistent weight buffers a compiled plan's device optimizer was configured to update in place (keyed like
+    // _persistentBufferCache, by backing array), with the number of plans holding each. Under _persistentBufferLock.
+    private readonly Dictionary<object, int> _deviceOptimizerWeights = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+
     // Roles of tensors registered persistent but not yet read on the GPU. Registration defers the upload to the first
     // read; without this record an op that fetched a registered weight through GetOrAllocateBuffer (TensorMatMul,
     // BatchNormInference, ...) found no persistent-cache entry and uploaded it UNCACHED on every call (a 256x64 weight
@@ -2661,6 +2665,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return;
         if (pendingBacking is not null)
             Helpers.HostSync.Remove(pendingBacking);
+        // A configured device optimizer updates this weight's buffer in place (and an update graph may have baked its
+        // address): the host values go into that buffer, which stays bound. Dropping it freed memory the optimizer kept
+        // writing, and a re-upload into a new buffer would have left the optimizer training a copy nothing reads.
+        if (typeof(T) == typeof(float) && TryRefreshDeviceOptimizerWeight((LinearAlgebra.Tensor<float>)(object)tensor))
+            return;
 
         InvalidateGpuCacheForTensor(tensor);
         // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
@@ -11009,6 +11018,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Marks <paramref name="param"/>'s persistent weight buffer as updated in place by a configured device optimizer:
+    /// <see cref="InvalidateAllWeightCaches"/> keeps it until <see cref="ReleaseDeviceOptimizerWeight"/>. Counted, so
+    /// several plans may hold one parameter.
+    /// </summary>
+    internal void RetainDeviceOptimizerWeight<T>(Tensor<T> param)
+    {
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return;
+        lock (_persistentBufferLock)
+        {
+            _deviceOptimizerWeights.TryGetValue(key, out int holders);
+            _deviceOptimizerWeights[key] = holders + 1;
+        }
+    }
+
+    // InvalidateResidentWeightBuffer for a weight a device optimizer holds: the host values (authoritative, by that
+    // method's contract) are uploaded into the held buffer, which stays the tensor's binding. False: not held, or no
+    // usable binding (the caller then drops the device copy as for any weight).
+    private bool TryRefreshDeviceOptimizerWeight(LinearAlgebra.Tensor<float> tensor)
+    {
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is not { } key) return false;
+        lock (_persistentBufferLock)
+            if (!_deviceOptimizerWeights.ContainsKey(key)) return false;
+        if (tensor._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero || tensor._gpuBackend is not { } backend
+            || buffer.Size < tensor.Length)
+            return false;
+        // Ordered on the compute stream after every replay already enqueued (UploadBufferInPlace stages it there, or
+        // copies synchronously on that blocking stream), so an in-flight update graph finishes with the buffer first.
+        backend.UploadBufferInPlace(tensor.ToArray(), buffer);
+        CommitParameterUpdatedOnDevice(tensor, buffer, backend, syncPoint: null);
+        return true;
+    }
+
+    /// <summary>Ends one <see cref="RetainDeviceOptimizerWeight"/>.</summary>
+    internal void ReleaseDeviceOptimizerWeight<T>(Tensor<T> param)
+    {
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return;
+        lock (_persistentBufferLock)
+        {
+            if (!_deviceOptimizerWeights.TryGetValue(key, out int holders)) return;
+            if (holders <= 1) _deviceOptimizerWeights.Remove(key);
+            else _deviceOptimizerWeights[key] = holders - 1;
+        }
+    }
+
+    /// <summary>Whether a configured device optimizer holds <paramref name="param"/>'s weight buffer; for tests.</summary>
+    internal bool IsDeviceOptimizerWeight<T>(Tensor<T> param)
+    {
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return false;
+        lock (_persistentBufferLock) return _deviceOptimizerWeights.ContainsKey(key);
+    }
+
+    /// <summary>
     /// Invalidates all cached weight buffers.
     /// Thread-safe: Uses _persistentBufferLock to synchronize with GetOrCacheWeightBuffer.
     /// </summary>
@@ -11034,7 +11095,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             List<KeyValuePair<object, GpuBufferCacheEntry>>? kept = null;
             foreach (var pair in _persistentBufferCache)
             {
-                if (Helpers.HostSync.IsPending(pair.Key) || pair.Value.Role == PersistentTensorRole.Constant)
+                // A buffer a configured device optimizer updates in place is the parameter's binding for that optimizer
+                // (as torch's optimizer holds its parameters) even before its first update: freeing it left the
+                // optimizer, and any update graph captured from it, writing freed memory (a sticky CUDA 700).
+                if (Helpers.HostSync.IsPending(pair.Key) || pair.Value.Role == PersistentTensorRole.Constant
+                    || _deviceOptimizerWeights.ContainsKey(pair.Key))
                     (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
                 else if (CacheMayFreeReleasedBuffers)
                     pair.Value.Dispose();
