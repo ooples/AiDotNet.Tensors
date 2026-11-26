@@ -31024,67 +31024,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorCumSum(tensor,axis);
     }
 
-    Tensor<T> IEngine.TensorLogSumExp<T>(Tensor<T> tensor, int axis, bool keepDims)
-    {
-        using var __gpuOp = EnterGpuOp();
-        if (IsTapeActive<T>()) return base.TensorLogSumExp(tensor, axis, keepDims);
-        if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
-        {
-            int rank = tensor.Rank;
-            int normalizedAxis = axis < 0 ? rank + axis : axis;
-            if (normalizedAxis >= 0 && normalizedAxis < rank)
-            {
-                try
-                {
-                    var axes = new[] { normalizedAxis };
-                    var max = ReduceAxisGpu(tensor, axes, keepDims: true, backend, ReduceOperation.Max);
-                    var shifted = TensorBroadcastSubtract(tensor, max);
-                    var sum = ReduceSum(TensorExp(shifted), axes, keepDims: true);
-                    var result = TensorAdd(TensorLog(sum), max);
-                    if (keepDims) return result;
-
-                    var outShape = new int[rank - 1];
-                    for (int i = 0, j = 0; i < rank; i++)
-                        if (i != normalizedAxis) outShape[j++] = tensor.Shape._dims[i];
-                    // A rank-1 input reduces to a 0-d tensor, as on the CPU engine and in torch.
-                    return result.Reshape(outShape);
-                }
-                catch
-                {
-                    if (ThrowOnGpuKernelFallback) throw;
-                }
-            }
-        }
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { int rank=tensor.Rank; int ea=axis<0?rank+axis:axis;
-            // The GPU kernel (LogSumExpAxis) reduces `reduceSize` CONTIGUOUS elements per group,
-            // which is only correct when `ea` is the LAST axis. For an interior axis the elements
-            // along it are strided and there are trailing dims the kernel ignores, so the result is
-            // garbage — fall back to the CPU reduction in that case.
-            if (ea == rank-1) {
-                int outerSize=1; for(int i=0;i<ea;i++)outerSize*=tensor.Shape._dims[i];
-                int reduceSize=tensor.Shape._dims[ea];
-                using var gi=GetOrAllocateBuffer(bb, tensor);
-                var go=bb.AllocateBuffer(outerSize);
-                // Ownership transfer pattern: dispose `go` if anything throws
-                // between Allocate and DeferTensorResult (LogSumExpAxis kernel
-                // launch, shape-array construction). Without this guard the
-                // outer empty catch{} swallowed the exception and silently
-                // leaked the native GPU buffer. CodeRabbit PRRT_kwDOQ-aYaM6ExmA_.
-                bool transferredOwnership = false;
-                try {
-                    bb.LogSumExpAxis(gi.Buffer,go,outerSize,reduceSize);
-                    int[] outShape;
-                    if(keepDims){outShape=(int[])tensor.Shape._dims.Clone();outShape[ea]=1;}
-                    else{outShape=new int[rank-1]; for(int i=0,j=0;i<rank;i++) if(i!=ea) outShape[j++]=tensor.Shape._dims[i];}
-                    transferredOwnership = true;
-                    return DeferTensorResult<T>(bb,go,outerSize,outShape);
-                }
-                finally { if (!transferredOwnership) go.Dispose(); }
-            }
-        } catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TryCropLast2OnDevice", capabilityGap);} }
-        return base.TensorLogSumExp(tensor,axis,keepDims);
-    }
+    // IEngine.TensorLogSumExp: DirectGpuTensorEngine.LogSumExp.cs.
 
     Tensor<T> IEngine.TensorNorm<T>(Tensor<T> tensor, int axis, bool keepDims)
     {
@@ -32733,7 +32673,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.GLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (IsTapeActive<T>()) return base.GLU(input, axis);
+        // Under a tape the kernel runs too and the CPU op's node is recorded on its result: the backward
+        // (GLUBackward) runs on the device. Returning the CPU op instead downloaded the input every step.
+        bool taped = IsTapeActive<T>();
+        if (taped && typeof(T) != typeof(float)) return base.GLU(input, axis);
         if (TryGetBackend(out var b))
         {
             try
@@ -32747,7 +32690,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (InnerSize(input, ea) != 1)
                 {
                     // The device permutation converts through float; any other T keeps its precision on the host.
-                    if (typeof(T) != typeof(float)) return base.GLU(input, axis);
+                    // Recorded through the CPU op under a tape: the device permutations record no node of their own.
+                    if (taped || typeof(T) != typeof(float)) return base.GLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).GLU(t, -1));
                 }
                 int halfDim = input.Shape._dims[ea] / 2;
@@ -32757,8 +32701,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gi = UploadTensorRaw(b, input);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                var result = DispatchDeferredGpuOp<T>(b, outputLen, outShape,
                     output => b.GluForward(gi, output, outerSize, halfDim));
+                if (taped)
+                    Autodiff.DifferentiableOps.RecordUnary("GLU", result, input, Autodiff.BackwardFunctions<T>.GLUBackward,
+                        new object[] { ea });
+                return result;
             }
             catch { }
         }
@@ -32768,7 +32716,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.GeGLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (IsTapeActive<T>()) return base.GeGLU(input, axis);
+        // Under a tape the kernel runs too and the CPU op's node is recorded on its result: the backward
+        // (GeGLUBackward) runs on the device. Returning the CPU op instead downloaded the input every step.
+        bool taped = IsTapeActive<T>();
+        if (taped && typeof(T) != typeof(float)) return base.GeGLU(input, axis);
         if (TryGetBackend(out var b))
         {
             try
@@ -32782,7 +32733,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (InnerSize(input, ea) != 1)
                 {
                     // The device permutation converts through float; any other T keeps its precision on the host.
-                    if (typeof(T) != typeof(float)) return base.GeGLU(input, axis);
+                    // Recorded through the CPU op under a tape: the device permutations record no node of their own.
+                    if (taped || typeof(T) != typeof(float)) return base.GeGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).GeGLU(t, -1));
                 }
                 int halfDim = input.Shape._dims[ea] / 2;
@@ -32792,8 +32744,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gi = UploadTensorRaw(b, input);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                var result = DispatchDeferredGpuOp<T>(b, outputLen, outShape,
                     output => b.GeGluForward(gi, output, outerSize, halfDim));
+                if (taped)
+                    Autodiff.DifferentiableOps.RecordUnary("GeGLU", result, input, Autodiff.BackwardFunctions<T>.GeGLUBackward,
+                        new object[] { ea });
+                return result;
             }
             catch { }
         }
@@ -32803,7 +32759,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.ReGLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (IsTapeActive<T>()) return base.ReGLU(input, axis);
+        // Under a tape the kernel runs too and the CPU op's node is recorded on its result: the backward
+        // (ReGLUBackward) runs on the device. Returning the CPU op instead downloaded the input every step.
+        bool taped = IsTapeActive<T>();
+        if (taped && typeof(T) != typeof(float)) return base.ReGLU(input, axis);
         if (TryGetBackend(out var b))
         {
             try
@@ -32816,7 +32775,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (InnerSize(input, ea) != 1)
                 {
                     // The device permutation converts through float; any other T keeps its precision on the host.
-                    if (typeof(T) != typeof(float)) return base.ReGLU(input, axis);
+                    // Recorded through the CPU op under a tape: the device permutations record no node of their own.
+                    if (taped || typeof(T) != typeof(float)) return base.ReGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).ReGLU(t, -1));
                 }
                 int halfDim = input.Shape._dims[ea] / 2;
@@ -32826,8 +32786,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gi = UploadTensorRaw(b, input);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                var result = DispatchDeferredGpuOp<T>(b, outputLen, outShape,
                     output => b.ReGluForward(gi, output, outerSize, halfDim));
+                if (taped)
+                    Autodiff.DifferentiableOps.RecordUnary("ReGLU", result, input, Autodiff.BackwardFunctions<T>.ReGLUBackward,
+                        new object[] { ea });
+                return result;
             }
             catch { }
         }
@@ -32837,7 +32801,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.SwiGLU<T>(Tensor<T> input, int axis)
     {
         using var __gpuOp = EnterGpuOp();
-        if (IsTapeActive<T>()) return base.SwiGLU(input, axis);
+        // Under a tape the kernel runs too and the CPU op's node is recorded on its result: the backward
+        // (SwiGLUBackward) runs on the device. Returning the CPU op instead downloaded the input every step.
+        bool taped = IsTapeActive<T>();
+        if (taped && typeof(T) != typeof(float)) return base.SwiGLU(input, axis);
         if (TryGetBackend(out var b))
         {
             try
@@ -32850,7 +32817,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (InnerSize(input, ea) != 1)
                 {
                     // The device permutation converts through float; any other T keeps its precision on the host.
-                    if (typeof(T) != typeof(float)) return base.SwiGLU(input, axis);
+                    // Recorded through the CPU op under a tape: the device permutations record no node of their own.
+                    if (taped || typeof(T) != typeof(float)) return base.SwiGLU(input, axis);
                     return AlongLastAxis(input, ea, t => ((IEngine)this).SwiGLU(t, -1));
                 }
                 int halfDim = input.Shape._dims[ea] / 2;
@@ -32860,8 +32828,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var gi = UploadTensorRaw(b, input);
                 int[] outShape = (int[])input.Shape._dims.Clone();
                 outShape[ea] = halfDim;
-                return DispatchDeferredGpuOp<T>(b, outputLen, outShape,
+                var result = DispatchDeferredGpuOp<T>(b, outputLen, outShape,
                     output => b.SwiGluForward(gi, output, outerSize, halfDim));
+                if (taped)
+                    Autodiff.DifferentiableOps.RecordUnary("SwiGLU", result, input, Autodiff.BackwardFunctions<T>.SwiGLUBackward,
+                        new object[] { ea });
+                return result;
             }
             catch { }
         }

@@ -31538,8 +31538,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // CPU path: materialize the shared KV heads (managed, not on the record path — the GPU engine overrides
         // this to the fused GQA kernel that broadcasts inside the kernel with no copy), then run standard SDPA.
-        Tensor<T> k = qHeads == kvHeads ? key : BroadcastKvHeads(key, qHeads);
-        Tensor<T> v = qHeads == kvHeads ? value : BroadcastKvHeads(value, qHeads);
+        // Under a recording tape the heads are repeated by the differentiable TensorRepeatInterleave instead: the
+        // attention node then records against copies whose gradient flows back to key and value. BroadcastKvHeads
+        // records nothing, so a taped GQA attention trained its query projection and left the key and value
+        // projections with no gradient at all.
+        bool recording = DifferentiableOps.IsRecording<T>();
+        Tensor<T> k = qHeads == kvHeads ? key : recording ? TensorRepeatInterleave(key, qHeads / kvHeads, 1) : BroadcastKvHeads(key, qHeads);
+        Tensor<T> v = qHeads == kvHeads ? value : recording ? TensorRepeatInterleave(value, qHeads / kvHeads, 1) : BroadcastKvHeads(value, qHeads);
 
         Tensor<bool>? mask = null;
         if (isCausal)

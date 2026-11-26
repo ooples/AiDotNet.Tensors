@@ -260,7 +260,9 @@ public class GradientExchangeSplitStepTests
             var ts = Values(Batch * Out, 2, 2f);
             // mode 0: per-buffer Read/Write; 1: the plan's page-locked staging; 2: caller-owned host memory registered in
             // place, written back in two ranges (as a 2-rank shared-memory exchange writes each partition from its owner).
-            (List<float> Losses, List<float> ExchangedLosses, float[] Weights, int Staged) Run(int mode)
+            // coalesce: the host transfers go through one contiguous device buffer of the gradients (the default), or one
+            // copy per gradient.
+            (List<float> Losses, List<float> ExchangedLosses, float[] Weights, int Staged) Run(int mode, bool coalesce = true)
             {
                 bool staged = mode == 1;
                 var x = Rows(xs, In, 0, Batch);
@@ -280,6 +282,7 @@ public class GradientExchangeSplitStepTests
                 using (plan)
                 {
                     var compiled = (CompiledTrainingPlan<float>)plan;
+                    compiled.CoalesceExchangeTransfers = coalesce;
                     plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
                     plan.SetMaxGradNorm(1.0);
                     IntPtr external = IntPtr.Zero;
@@ -287,6 +290,8 @@ public class GradientExchangeSplitStepTests
                     compiled.SetGradientExchange(exchange =>
                     {
                         Assert.Equal(In * hidden + hidden * Out, exchange.TotalLength);
+                        // Both gradients are on the device on CUDA: coalesced exactly when asked.
+                        if (mode != 0) Assert.Equal(cuda && coalesce, exchange.Coalesced);
                         if (mode == 2)
                         {
                             int total = exchange.TotalLength;
@@ -344,6 +349,8 @@ public class GradientExchangeSplitStepTests
             var perBuffer = Run(0);
             var pageLocked = Run(1);
             var external = Run(2);
+            var pageLockedPerGradient = Run(1, coalesce: false);
+            var externalPerGradient = Run(2, coalesce: false);
             Console.WriteLine($"cuda={cuda} stagedSteps={pageLocked.Staged} "
                 + $"maxDiff={perBuffer.Weights.Zip(pageLocked.Weights, (a, b) => Math.Abs(a - b)).Max():G4}");
             // CUDA has the page-locked staging (every step, warm-up and replay); other backends and the host fall back.
@@ -357,6 +364,14 @@ public class GradientExchangeSplitStepTests
             Assert.Equal(perBuffer.Losses, external.Losses);
             Assert.Equal(perBuffer.ExchangedLosses, external.ExchangedLosses);
             Assert.Equal(perBuffer.Weights, external.Weights);
+            // A copy per gradient instead of the contiguous buffer: bitwise the same.
+            foreach (var arm in new[] { pageLockedPerGradient, externalPerGradient })
+            {
+                Assert.Equal(cuda ? Steps : 0, arm.Staged);
+                Assert.Equal(perBuffer.Losses, arm.Losses);
+                Assert.Equal(perBuffer.ExchangedLosses, arm.ExchangedLosses);
+                Assert.Equal(perBuffer.Weights, arm.Weights);
+            }
             Assert.True(perBuffer.Weights.Zip(Values(In * 8, 5, 0.4f), (a, b) => Math.Abs(a - b)).Max() > 1e-2,
                 "training must move the weights");
         }

@@ -640,6 +640,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
         Stage("exchange staging", ReleasePinnedExchangeStaging);
+        Stage("flat exchange buffer", ReleaseFlatExchangeBuffer);
         Stage("shared moments", LeaveSharedMoments);
         Stage("optimizer buffers", DisposeGpuOptimizerBuffers);
         Stage("pooled moments", () => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });

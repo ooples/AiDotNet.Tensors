@@ -34,10 +34,16 @@ internal sealed class GradientExchange<T>
     private readonly Engines.DirectGpu.IGradientHostStaging? _pinned;
     private bool _readStaged;
 
+    // One contiguous device buffer of every gradient in plan order (TotalLength floats), owned by the plan; null when
+    // the step does not coalesce. The device gradients are gathered into it on the compute stream (device-to-device),
+    // so a host transfer is one large copy instead of one per gradient (many of them a few KB, which run at a fraction
+    // of the link's bandwidth), and scattered back from it the same way, ordered before the update.
+    private readonly Engines.DirectGpu.IGpuBuffer? _flat;
+
     internal GradientExchange(Tensor<T>[] parameters, Tensor<T>[] gradients,
         Engines.DirectGpu.IGpuBuffer?[] deviceGradients, Engines.DirectGpu.IDirectGpuBackend? backend,
         Tensor<T> loss, Engines.DirectGpu.IGpuBuffer? deviceLoss, float[]?[][] staging,
-        Engines.DirectGpu.IGradientHostStaging? pinned = null)
+        Engines.DirectGpu.IGradientHostStaging? pinned = null, Engines.DirectGpu.IGpuBuffer? flat = null)
     {
         _pinned = pinned;
         _loss = loss;
@@ -50,6 +56,37 @@ internal sealed class GradientExchange<T>
         long total = 0;
         foreach (var g in gradients) total += g.Length;
         TotalLength = checked((int)total);
+        _flat = flat is not null && backend is not null && flat.Size >= TotalLength ? flat : null;
+    }
+
+    /// <summary>Whether host transfers go through one contiguous device buffer (see the field).</summary>
+    internal bool Coalesced => _flat is not null;
+
+    // Device gradients -> the flat buffer, on the compute stream after the backward.
+    private void GatherIntoFlat()
+    {
+        var flat = _flat!;
+        int offset = 0;
+        for (int i = 0; i < _gradients.Length; i++)
+        {
+            int length = _gradients[i].Length;
+            if (_deviceGradients[i] is { } buffer && length > 0) Backend.Copy(buffer, 0, flat, offset, length);
+            offset += length;
+        }
+    }
+
+    // The flat range [lo, hi) -> the device gradients it covers, on the compute stream (after the upload into it).
+    private void ScatterFromFlat(int lo, int hi)
+    {
+        var flat = _flat!;
+        int start = 0;
+        for (int i = 0; i < _gradients.Length && start < hi; i++)
+        {
+            int length = _gradients[i].Length;
+            int a = Math.Max(start, lo), b = Math.Min(start + length, hi);
+            if (a < b && _deviceGradients[i] is { } buffer) Backend.Copy(flat, a, buffer, a - start, b - a);
+            start += length;
+        }
     }
 
     /// <summary>The exchanged parameters, in plan order (only those with a gradient this step).</summary>
@@ -127,11 +164,19 @@ internal sealed class GradientExchange<T>
         if (host.Length < TotalLength + 1)
             throw new InvalidOperationException("The page-locked gradient staging is smaller than the step's gradients.");
         int offset = 0;
-        for (int i = 0; i < _gradients.Length; i++)
+        if (_flat is not null)
         {
-            int length = _gradients[i].Length;
-            if (_deviceGradients[i] is { } buffer) _pinned.EnqueueDownload(buffer, offset, length);
-            offset += length;
+            GatherIntoFlat();
+            if (TotalLength > 0) _pinned.EnqueueDownload(_flat, 0, TotalLength);
+        }
+        else
+        {
+            for (int i = 0; i < _gradients.Length; i++)
+            {
+                int length = _gradients[i].Length;
+                if (_deviceGradients[i] is { } buffer) _pinned.EnqueueDownload(buffer, offset, length);
+                offset += length;
+            }
         }
         if (_deviceLoss is { } lossBuffer) _pinned.EnqueueDownload(lossBuffer, TotalLength, 1);
         _pinned.WaitForTransfers();
@@ -170,13 +215,18 @@ internal sealed class GradientExchange<T>
         if (!_readStaged || _pinned is null)
             throw new InvalidOperationException("WriteStaged needs a TryReadStaged of the same step first.");
         var host = _pinned.Host;
+        if (_flat is not null && TotalLength > 0)
+        {
+            _pinned.EnqueueUploadAt(_flat, 0, 0, TotalLength);
+            ScatterFromFlat(0, TotalLength);
+        }
         int offset = 0;
         for (int i = 0; i < _gradients.Length; i++)
         {
             int length = _gradients[i].Length;
             if (_deviceGradients[i] is { } buffer)
             {
-                _pinned.EnqueueUpload(buffer, offset, length);
+                if (_flat is null) _pinned.EnqueueUpload(buffer, offset, length);
             }
             else
             {
@@ -221,11 +271,19 @@ internal sealed class GradientExchange<T>
         if (hostOffset < 0 || (long)hostOffset + TotalLength > target.Host.Length)
             throw new ArgumentOutOfRangeException(nameof(hostOffset), "The gradients do not fit the staging area.");
         int offset = 0;
-        for (int i = 0; i < _gradients.Length; i++)
+        if (_flat is not null)
         {
-            int length = _gradients[i].Length;
-            if (_deviceGradients[i] is { } buffer) target.EnqueueDownload(buffer, hostOffset + offset, length);
-            offset += length;
+            GatherIntoFlat();
+            if (TotalLength > 0) target.EnqueueDownload(_flat, hostOffset, TotalLength);
+        }
+        else
+        {
+            for (int i = 0; i < _gradients.Length; i++)
+            {
+                int length = _gradients[i].Length;
+                if (_deviceGradients[i] is { } buffer) target.EnqueueDownload(buffer, hostOffset + offset, length);
+                offset += length;
+            }
         }
         target.WaitForTransfers();
         var host = target.Host;
@@ -256,6 +314,12 @@ internal sealed class GradientExchange<T>
         if (flatOffset < 0 || count < 0 || (long)flatOffset + count > TotalLength)
             throw new ArgumentOutOfRangeException(nameof(count), "The range is outside the gradients.");
         int end = flatOffset + count;
+        if (_flat is not null && count > 0)
+        {
+            // One upload of the range into the flat buffer, then device-to-device into the gradients it covers.
+            source.EnqueueUploadAt(_flat, flatOffset, hostOffset + flatOffset, count);
+            ScatterFromFlat(flatOffset, end);
+        }
         int start = 0;
         for (int i = 0; i < _gradients.Length && start < end; i++)
         {
@@ -265,7 +329,7 @@ internal sealed class GradientExchange<T>
             {
                 if (_deviceGradients[i] is { } buffer)
                 {
-                    source.EnqueueUploadAt(buffer, lo - start, hostOffset + lo, hi - lo);
+                    if (_flat is null) source.EnqueueUploadAt(buffer, lo - start, hostOffset + lo, hi - lo);
                 }
                 else
                 {
@@ -370,9 +434,49 @@ internal sealed partial class CompiledTrainingPlan<T>
             && (deviceAuthoritative || loss._gpuBufferVersion == loss.GpuCacheVersion) ? lossBuffer : null;
         for (int kind = 0; kind < _exchangeStaging.Length; kind++)
             if (_exchangeStaging[kind].Length != gradients.Count) _exchangeStaging[kind] = new float[]?[gradients.Count];
-        exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), device.ToArray(), backend, loss, deviceLoss,
-            _exchangeStaging, PinnedExchangeStaging(backend, gradients)));
+        var deviceArray = device.ToArray();
+        exchange(new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
+            _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray)));
         GradientExchangeCount++;
+    }
+
+    /// <summary>
+    /// Whether the exchange's host transfers go through one contiguous device buffer of the gradients (on by default:
+    /// one large copy each way instead of one per gradient). Off keeps a copy per gradient and no extra device memory.
+    /// </summary>
+    internal bool CoalesceExchangeTransfers { get; set; } = true;
+
+    // The flat device buffer (every gradient in plan order), sized to the step and kept across steps, for the backend
+    // that made it.
+    private Engines.DirectGpu.IGpuBuffer? _exchangeFlat;
+    private Engines.DirectGpu.IDirectGpuBackend? _exchangeFlatBackend;
+
+    private Engines.DirectGpu.IGpuBuffer? FlatExchangeBuffer(Engines.DirectGpu.IDirectGpuBackend? backend,
+        List<Tensor<T>> gradients, Engines.DirectGpu.IGpuBuffer?[] device)
+    {
+        if (!CoalesceExchangeTransfers || typeof(T) != typeof(float) || backend is null) return null;
+        long total = 0;
+        int onDevice = 0;
+        for (int i = 0; i < gradients.Count; i++)
+        {
+            total += gradients[i].Length;
+            if (device[i] is not null) onDevice++;
+        }
+        if (onDevice < 2 || total <= 0 || total > int.MaxValue) return null;   // nothing to coalesce
+        if (_exchangeFlat is { } held && held.Size >= total && ReferenceEquals(_exchangeFlatBackend, backend)) return held;
+        ReleaseFlatExchangeBuffer();
+        // The plan's own memory for its life: never a loan of idle step memory (a loan would be moved at the next step).
+        using (Engines.DirectGpu.CUDA.CudaBackend.NoIdleLoans())
+            _exchangeFlat = backend.AllocateBuffer((int)total);
+        _exchangeFlatBackend = backend;
+        return _exchangeFlat;
+    }
+
+    private void ReleaseFlatExchangeBuffer()
+    {
+        _exchangeFlat?.Dispose();
+        _exchangeFlat = null;
+        _exchangeFlatBackend = null;
     }
 
     // The exchange's page-locked staging (every gradient, then the loss), sized to the step and kept across steps.
