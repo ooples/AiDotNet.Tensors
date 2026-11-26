@@ -329,6 +329,12 @@ public class GradientExchangeSplitStepTests
                     });
                     for (int s = 0; s < Steps; s++) losses.Add(plan.Step().ToArray()[0]);
                     Assert.Equal(cuda, compiled.HasSplitStepGraph);
+                    // The plan's own staging: present on CUDA, otherwise absent with the reason recorded.
+                    if (mode == 1)
+                    {
+                        if (cuda) Assert.Null(compiled.PinnedExchangeStagingUnavailableReason);
+                        else Assert.False(string.IsNullOrEmpty(compiled.PinnedExchangeStagingUnavailableReason));
+                    }
                     registered?.Dispose();
                     if (external != IntPtr.Zero) System.Runtime.InteropServices.Marshal.FreeHGlobal(external);
                 }

@@ -1,5 +1,6 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 using System;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -8,7 +9,8 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
     IGradientHostStaging? IGradientHostStagingSource.TryCreateGradientHostStaging(int floats)
     {
         if (floats <= 0 || _disposed || !IsAvailable) return null;
-        if ((long)floats * sizeof(float) > int.MaxValue) return null;
+        // Its own page-locked allocation, not a pool bucket: the area lives as long as the plan, can exceed the pool's
+        // power-of-two buckets (which stop at 1 GiB), and must be freed even after the pool is gone.
         return new PinnedGradientStaging(this, floats);
     }
 
@@ -29,41 +31,57 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
     {
         private readonly CudaBackend _owner;
         private readonly int _floats;
-        private readonly int _bytes;
         private IntPtr _host;
-
-        // Registered: the memory is the caller's (page-locked in place); disposing unregisters it instead of pooling it.
+        // Registered: the memory is the caller's (page-locked in place); disposing unregisters it. Otherwise this
+        // staging allocated it (cuMemHostAlloc, portable) and frees it.
         private readonly bool _registered;
 
         internal PinnedGradientStaging(CudaBackend owner, int floats)
         {
             _owner = owner;
             _floats = floats;
-            _bytes = floats * sizeof(float);
-            _host = owner._pinnedPool.Rent(_bytes);
+            ulong bytes = (ulong)floats * sizeof(float);
+            using (owner.PushContext())
+                CuBlasNative.CheckCudaResult(CudaPinnedBufferPool.AllocatePortablePinnedHost(out _host, bytes),
+                    "cuMemHostAlloc(gradient staging)");
+            GpuMemoryStats.RecordAllocation("cuda_pinned_host", (long)bytes);
         }
 
         internal PinnedGradientStaging(CudaBackend owner, IntPtr registeredHost, int floats)
         {
             _owner = owner;
             _floats = floats;
-            _bytes = floats * sizeof(float);
             _host = registeredHost;
             _registered = true;
+        }
+
+        // A plan finalized without Dispose still frees its own allocation (registered memory is the caller's to
+        // unregister: the caller ties it to the memory's lifetime).
+        ~PinnedGradientStaging()
+        {
+            if (_registered || _host == IntPtr.Zero) return;
+            try { CuBlasNative.cuMemFreeHost(_host); } catch { /* finalizer: the process may be tearing the driver down */ }
+            _host = IntPtr.Zero;
         }
 
         public Span<float> Host
         {
             get
             {
-                if (_host == IntPtr.Zero) throw new ObjectDisposedException(nameof(PinnedGradientStaging));
+                ThrowIfUnusable();
                 return new Span<float>((void*)_host, _floats);
             }
         }
 
-        private void Check(IGpuBuffer buffer, int offset, int count)
+        private void ThrowIfUnusable()
         {
             if (_host == IntPtr.Zero) throw new ObjectDisposedException(nameof(PinnedGradientStaging));
+            if (_owner._disposed) throw new ObjectDisposedException(nameof(CudaBackend), "The staging's backend was disposed.");
+        }
+
+        private void Check(IGpuBuffer buffer, int offset, int count)
+        {
+            ThrowIfUnusable();
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
             if (buffer.Handle == IntPtr.Zero)
                 throw new ObjectDisposedException(nameof(buffer), "GPU buffer was released before its staged transfer.");
@@ -102,7 +120,7 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
 
         public void WaitForTransfers()
         {
-            if (_host == IntPtr.Zero) throw new ObjectDisposedException(nameof(PinnedGradientStaging));
+            ThrowIfUnusable();
             using var _ = _owner.PushContext();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_owner._stream),
                 "cuStreamSynchronize(gradient staging)");
@@ -111,31 +129,32 @@ public sealed partial class CudaBackend : IGradientHostStagingSource
         public void Dispose()
         {
             if (_host == IntPtr.Zero) return;
-            try
+            GC.SuppressFinalize(this);
+            IntPtr host = _host;
+            _host = IntPtr.Zero;
+            if (!_owner._disposed)
             {
-                if (!_owner._disposed)
-                {
-                    // In-flight uploads still read the area: it goes back to the pool only once they have finished.
-                    using var _ = _owner.PushContext();
-                    CudaNativeBindings.cuStreamSynchronize(_owner._stream);
-                }
+                // In-flight copies still use the memory: it is released only after they finish. A failed wait (a
+                // sticky device error) means the context is lost and no copy will complete; say so, then release.
+                using var _ = _owner.PushContext();
+                var synced = CudaNativeBindings.cuStreamSynchronize(_owner._stream);
+                if (synced != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning(
+                        "Gradient staging: the stream wait before releasing the page-locked memory returned " + synced + ".");
+                var released = _registered ? CudaNativeBindings.cuMemHostUnregister(host) : CuBlasNative.cuMemFreeHost(host);
+                if (released != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning(
+                        "Gradient staging: releasing the page-locked memory returned " + released + ".");
             }
-            finally
+            else if (!_registered)
             {
-                if (_registered)
-                {
-                    if (!_owner._disposed)
-                    {
-                        using var _ = _owner.PushContext();
-                        CudaNativeBindings.cuMemHostUnregister(_host);
-                    }
-                }
-                else
-                {
-                    _owner._pinnedPool.Return(_host, _bytes);
-                }
-                _host = IntPtr.Zero;
+                // The backend (and its context) is gone; the allocation is portable, so it is still freed.
+                var released = CuBlasNative.cuMemFreeHost(host);
+                if (released != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning(
+                        "Gradient staging: freeing the page-locked memory after its backend returned " + released + ".");
             }
+            if (!_registered) GpuMemoryStats.RecordFree("cuda_pinned_host", (long)_floats * sizeof(float));
         }
     }
 }

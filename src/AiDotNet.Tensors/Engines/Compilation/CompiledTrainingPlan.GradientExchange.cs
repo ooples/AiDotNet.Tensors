@@ -376,21 +376,50 @@ internal sealed partial class CompiledTrainingPlan<T>
     }
 
     // The exchange's page-locked staging (every gradient, then the loss), sized to the step and kept across steps.
+    // Kept for the backend that made it: a different (or recreated) backend gets its own.
     private Engines.DirectGpu.IGradientHostStaging? _exchangePinned;
     private int _exchangePinnedFloats;
+    private Engines.DirectGpu.IDirectGpuBackend? _exchangePinnedBackend;
+
+    /// <summary>Why the exchange has no page-locked staging (null while it has one, or before the first exchange).</summary>
+    internal string? PinnedExchangeStagingUnavailableReason { get; private set; }
 
     private Engines.DirectGpu.IGradientHostStaging? PinnedExchangeStaging(
         Engines.DirectGpu.IDirectGpuBackend? backend, List<Tensor<T>> gradients)
     {
-        if (typeof(T) != typeof(float) || backend is not Engines.DirectGpu.IGradientHostStagingSource source) return null;
+        string? why = typeof(T) != typeof(float) ? "the plan is not float"
+            : backend is null ? "the step has no device backend"
+            : backend is not Engines.DirectGpu.IGradientHostStagingSource ? "the backend has no page-locked staging"
+            : null;
         long total = 1;
         foreach (var g in gradients) total += g.Length;
-        if (total > int.MaxValue / sizeof(float)) return null;
-        if (_exchangePinned is not null && _exchangePinnedFloats == total) return _exchangePinned;
+        if (why is null && total > int.MaxValue) why = $"the gradients ({total} floats) exceed one staging area";
+        if (why is not null) return NoPinnedExchangeStaging(why);
+        if (_exchangePinned is not null && _exchangePinnedFloats == total && ReferenceEquals(_exchangePinnedBackend, backend))
+            return _exchangePinned;
         ReleasePinnedExchangeStaging();
-        _exchangePinned = source.TryCreateGradientHostStaging((int)total);
-        _exchangePinnedFloats = _exchangePinned is null ? 0 : (int)total;
+        try
+        {
+            _exchangePinned = ((Engines.DirectGpu.IGradientHostStagingSource)backend!).TryCreateGradientHostStaging((int)total);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or OutOfMemoryException or DllNotFoundException)
+        {
+            return NoPinnedExchangeStaging("the page-locked allocation failed: " + ex.Message);
+        }
+        if (_exchangePinned is null) return NoPinnedExchangeStaging("the backend could not create page-locked staging");
+        _exchangePinnedFloats = (int)total;
+        _exchangePinnedBackend = backend;
+        PinnedExchangeStagingUnavailableReason = null;
         return _exchangePinned;
+    }
+
+    private Engines.DirectGpu.IGradientHostStaging? NoPinnedExchangeStaging(string why)
+    {
+        if (PinnedExchangeStagingUnavailableReason != why)
+            System.Diagnostics.Trace.TraceWarning("Gradient exchange: no page-locked staging (" + why
+                + "); the exchange copies each gradient on its own.");
+        PinnedExchangeStagingUnavailableReason = why;
+        return null;
     }
 
     private void ReleasePinnedExchangeStaging()
@@ -398,6 +427,7 @@ internal sealed partial class CompiledTrainingPlan<T>
         _exchangePinned?.Dispose();
         _exchangePinned = null;
         _exchangePinnedFloats = 0;
+        _exchangePinnedBackend = null;
     }
 
     private void DestroyUpdateGraph(Engines.DirectGpuTensorEngine? gte)

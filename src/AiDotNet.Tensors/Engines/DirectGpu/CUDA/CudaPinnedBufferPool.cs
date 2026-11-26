@@ -20,7 +20,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     [DllImport("libcuda.so.1", EntryPoint = "cuMemHostAlloc")]
     private static extern CudaResult cuMemHostAllocLinux(out IntPtr pp, ulong bytesize, uint flags);
 
-    private static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
+    internal static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
     {
         try
         {
@@ -54,6 +54,11 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     public IntPtr Rent(int sizeInBytes)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CudaPinnedBufferPool));
+        // Over 1 GiB the next power of two does not fit an int (the int rounding wrapped to int.MinValue, and the
+        // allocation then asked the driver for ~1.8e19 bytes). Such a block is not a pool bucket: refuse it here.
+        if (BucketSize(sizeInBytes) > MaxBucketBytes)
+            throw new ArgumentOutOfRangeException(nameof(sizeInBytes),
+                $"A pooled pinned block is at most {MaxBucketBytes} bytes; {sizeInBytes} bytes needs its own allocation.");
         int bucketSize = NextPowerOfTwo(sizeInBytes);
 
         if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryPop(out var ptr))
@@ -75,8 +80,15 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     /// </summary>
     public void Return(IntPtr ptr, int sizeInBytes)
     {
-        if (_disposed || ptr == IntPtr.Zero)
+        if (ptr == IntPtr.Zero)
             return;
+        if (_disposed)
+        {
+            // The pool is gone: the block is not lost to the process, it is freed (it is portable, so no context is needed).
+            CuBlasNative.cuMemFreeHost(ptr);
+            if (BucketSize(sizeInBytes) <= MaxBucketBytes) GpuMemoryStats.RecordFree("cuda_pinned_host", BucketSize(sizeInBytes));
+            return;
+        }
 
         int bucketSize = NextPowerOfTwo(sizeInBytes);
         var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentStack<IntPtr>());
@@ -94,6 +106,19 @@ internal sealed class CudaPinnedBufferPool : IDisposable
             CuBlasNative.cuMemFreeHost(ptr);
             GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
         }
+    }
+
+    /// <summary>The largest pooled block: 2^30 bytes (the largest power of two an int bucket size holds).</summary>
+    internal const long MaxBucketBytes = 1L << 30;
+
+    /// <summary>The bucket a request rounds to, in long (no wrap above 1 GiB).</summary>
+    internal static long BucketSize(int sizeInBytes)
+    {
+        if (sizeInBytes <= 1) return 1;
+        long value = sizeInBytes - 1L;
+        int shift = 0;
+        while (value > 0) { value >>= 1; shift++; }
+        return 1L << shift;
     }
 
     private static int NextPowerOfTwo(int value)
