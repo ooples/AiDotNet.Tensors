@@ -89,6 +89,9 @@ internal sealed class DeviceMemoryAccount
     /// </summary>
     internal long? LimitBytes => GpuMemoryBudget.LimitFor(Device, DeviceTotalBytes);
 
+    /// <summary>Memory in buffers currently handed to callers (excludes reusable buffers parked in pools).</summary>
+    internal long AllocatedBytes => Interlocked.Read(ref _allocated);
+
     /// <summary>Memory the library holds from the driver now: its own reservations and the driver pool's.</summary>
     internal long ReservedBytes => Interlocked.Read(ref _reserved) + (ReadDriver()?.Current ?? 0);
 

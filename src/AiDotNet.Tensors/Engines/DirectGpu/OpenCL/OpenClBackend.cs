@@ -7321,7 +7321,7 @@ KERNEL VARIANTS (A/B testing):
                 int tileInW = TILE_OUT * strideW + (kernelW - 1) * dilationW;
                 int sharedMemSize = tileInH * tileInW * sizeof(float);
                 k.SetLocalArg(arg++, sharedMemSize);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle); // no bias: the epilogue flags are 0 (the filter stands in; see ConvEpilogueBias)
                 k.SetArg(arg++, 0);
 
                 int numTilesX = (outWidth + TILE_OUT - 1) / TILE_OUT;
@@ -7351,7 +7351,7 @@ KERNEL VARIANTS (A/B testing):
                 k.SetArg(arg++, padW);
                 k.SetArg(arg++, dilationH);
                 k.SetArg(arg++, dilationW);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle); // no bias: the epilogue flags are 0
+                k.SetArg(arg++, ((DirectOpenClGpuBuffer)kernel).Buffer.Handle); // no bias: the epilogue flags are 0 (the filter stands in; see ConvEpilogueBias)
                 k.SetArg(arg++, 0);
 
                 k.ExecutePlanes(outWidth, outHeight, batch * outChannels);
@@ -9175,7 +9175,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)mask).Buffer.Handle);
             k.SetArg(arg++, size);
             k.SetArg(arg++, dropoutRate);
-            k.SetArg(arg++, seed);
+            k.SetArg(arg++, GpuSeed.Mix(seed));
             k.SetArg(arg++, training ? 1 : 0);
 
             k.Execute1D(size, Math.Min(256, size));

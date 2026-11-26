@@ -2077,16 +2077,26 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                                 $"action {action}: d[{i}] {d[i]} != unpooled {expected[i]} (a shared slot was not re-zeroed?)");
                         if (action == 0) afterOne = Slots();
                     }
+                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
+                    // The claim itself, on every backend: six actions of the same op hold what one of them holds.
+                    Assert.Equal(afterOne, Slots());
                     // A pooled slot is a size class larger than the request; what an op gets is exactly its length
                     // (a dropout mask downloads its buffer into the returned vector).
                     gpu.SetCurrentScratchAction(Depth);
                     var mask = ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 7);
                     Assert.Equal(5, mask.Length);
+                    // A scratch of another length (RentTransientScratch): where views are free (CUDA, HIP) a slot is
+                    // one per local index, grown to the largest request, and the mask's 5 elements are a view of the
+                    // slot the distances used. Elsewhere a view can be refused or allocate, so a slot is keyed by
+                    // its exact length and the new length takes one slot, which later actions of that length share.
+                    // This asserted the first case alone and failed on OpenCL (12 slots for 11).
+                    bool freeViews = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
+                    int withMask = freeViews ? afterOne : afterOne + 1;
+                    Assert.Equal(withMask, Slots());
+                    gpu.SetCurrentScratchAction(Depth + 1);
+                    Assert.Equal(5, ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 8).Length);
                     gpu.SetCurrentScratchAction(-1);
-                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
-                    // A CUDA slot is one per local index, grown to the largest request: the mask's 5 elements are a view
-                    // of the slot the distances used, not a new size class.
-                    Assert.Equal(afterOne, Slots());
+                    Assert.Equal(withMask, Slots());
                 }
             }
             finally
