@@ -372,38 +372,58 @@ public partial class CpuEngine
     {
         var table = inputs[0];
         var weights = inputs[1];
-        if (!TopKIndicesInRange(savedIndices, table._shape[0])) return false;
+        // With no index there is nothing to select: the output is a constant zero and the kernels' zero gradients are exact.
+        if (savedIndices.Length == 0 || savedIndices._shape[savedIndices.Rank - 1] == 0) return false;
+        var (indices, mask) = TopKInRangeIndicesAndMask<T>(savedIndices, table._shape[0]);
         var outShape = (int[])gradOutput._shape.Clone();
-        return BackwardFunctions<T>.TryCompositeBackward(gradOutput, inputs, engine, grads,
-            eng => TopKWeightedRowMixComposed(eng, table, savedIndices, weights, outShape));
+        return BackwardFunctions<T>.TryCompositeBackward(gradOutput, new[] { table, weights }, engine, grads,
+            eng => TopKWeightedRowMixComposed(eng, table, indices, weights, mask, outShape));
     }
 
     // The mix as recorded engine ops: gather the K selected rows of the [G, C] table per output row, scale each by its
-    // weight, sum over K. Valid only when every index is in [0, G) (an out-of-range index contributes zero to the
-    // kernel; the gather would reject it).
+    // weight, sum over K. The gather needs every index in [0, G), while the kernel lets an out-of-range index contribute
+    // zero; so such an index selects row 0 here and a constant 0/1 mask zeroes its weight, which keeps the composition
+    // equal to the kernel and its gradients (to the table and to the weights) zero for that slot.
     private static Tensor<T> TopKWeightedRowMixComposed<T>(
-        IEngine engine, Tensor<T> table, Tensor<int> indices, Tensor<T> weights, int[] outShape)
+        IEngine engine, Tensor<T> table, Tensor<int> indices, Tensor<T> weights, Tensor<T>? mask, int[] outShape)
     {
         int k = indices._shape[indices.Rank - 1];
-        int rows = k == 0 ? 0 : indices.Length / k;
+        int rows = indices.Length / k;
         int channels = table._shape[1];
         var flat = indices.Rank == 1 ? indices : indices.Reshape(new[] { indices.Length });
         var picked = engine.Reshape(engine.TensorIndexSelect(table, flat, 0), new[] { rows, k, channels });
-        var w = engine.TensorBroadcastTo(engine.Reshape(weights, new[] { rows, k, 1 }), new[] { rows, k, channels });
+        var w = engine.Reshape(weights, new[] { rows, k, 1 });
+        if (mask is not null) w = engine.TensorMultiply(w, mask);
+        w = engine.TensorBroadcastTo(w, new[] { rows, k, channels });
         var mixed = engine.ReduceSum(engine.TensorMultiply(picked, w), new[] { 1 }, keepDims: false);
         return engine.Reshape(mixed, outShape);
     }
 
-    private static bool TopKIndicesInRange(Tensor<int> indices, int numEntries)
+    // The indices with every out-of-range entry replaced by 0, and a [rows, K, 1] 0/1 mask marking the in-range entries
+    // (null when all are in range).
+    private static (Tensor<int> Indices, Tensor<T>? Mask) TopKInRangeIndicesAndMask<T>(Tensor<int> indices, int numEntries)
     {
-        if (indices.Length == 0) return false;
         var arr = HostArray(indices, out int off);
-        for (int i = 0; i < indices.Length; i++)
+        int n = indices.Length;
+        bool allInRange = true;
+        for (int i = 0; i < n && allInRange; i++)
         {
             int v = arr[off + i];
-            if (v < 0 || v >= numEntries) return false;
+            allInRange = v >= 0 && v < numEntries;
         }
-        return true;
+        if (allInRange) return (indices, null);
+        var ops = MathHelper.GetNumericOperations<T>();
+        var clamped = new int[n];
+        var mask = new T[n];
+        for (int i = 0; i < n; i++)
+        {
+            int v = arr[off + i];
+            bool ok = v >= 0 && v < numEntries;
+            clamped[i] = ok ? v : 0;
+            mask[i] = ok ? ops.One : ops.Zero;
+        }
+        int k = indices._shape[indices.Rank - 1];
+        return (new Tensor<int>(clamped, (int[])indices._shape.Clone()), new Tensor<T>(mask, new[] { n / k, k, 1 }));
     }
 
     private static Tensor<int> CloneIndicesHost(Tensor<int> indices)

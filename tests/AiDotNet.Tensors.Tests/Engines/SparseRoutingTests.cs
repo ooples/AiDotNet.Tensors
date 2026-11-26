@@ -131,6 +131,18 @@ public sealed class SparseRoutingTests
     [Theory]
     [MemberData(nameof(RoutingShapes))]
     public void GatherRowValuesAndTopKMix_SecondOrderGradients_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+        => AssertSecondOrderMatchesOneHotComposition(valShape, g, k, c, includeOutOfBounds: false);
+
+    // An out-of-range index contributes zero; under create-graph its slot must still differentiate to zero rather than
+    // dropping the whole op's second-order gradients.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void GatherRowValuesAndTopKMix_SecondOrderGradients_WithOutOfRangeIndices_MatchOneHotComposition(
+        int[] valShape, int g, int k, int c)
+        => AssertSecondOrderMatchesOneHotComposition(valShape, g, k, c, includeOutOfBounds: true);
+
+    private static void AssertSecondOrderMatchesOneHotComposition(
+        int[] valShape, int g, int k, int c, bool includeOutOfBounds)
     {
         var e = new CpuEngine();
         var gShape = valShape.ToArray();
@@ -139,7 +151,7 @@ public sealed class SparseRoutingTests
         idxShape[^1] = k;
         var outShape = valShape.ToArray();
         outShape[^1] = c;
-        var indices = RandIndices(idxShape, g, 31);
+        var indices = RandIndices(idxShape, g, 31, includeOutOfBounds);
         var values = RandFloat(gShape, 32);
         var table = RandFloat([g, c], 33);
         var weights = RandFloat(idxShape, 34);
