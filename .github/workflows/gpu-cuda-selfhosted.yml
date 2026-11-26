@@ -659,6 +659,9 @@ jobs:
         # Must equal the job's timeout-minutes.
         JOB_LIMIT_MINUTES: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm75' || matrix.arch == 'sm89') && 305 || 750 }}
         DIAGNOSTICS_RESERVE_MINUTES: '30'
+        # Coverage on a pull request's suites and on the nightly SM86 lane; the slower SM75/SM89 lanes run near their
+        # watchdogs without it, and their lines are the same.
+        COLLECT_COVERAGE: ${{ (matrix.arch == 'pr' || matrix.arch == 'sm86') && 'true' || 'false' }}
       run: |
         New-Item -ItemType Directory -Force "${{ runner.temp }}/trx" | Out-Null
         # The embedded-torch class runs in its own test host (the next step). The two parts partition the lane's
@@ -786,6 +789,14 @@ jobs:
               "--filter `"$($part.Filter)`" " +
               "--results-directory `"${{ runner.temp }}/trx`" --logger `"trx;LogFileName=$($part.Trx)`" " +
               '--blame-hang --blame-hang-timeout 900s --blame-crash'
+            # Line coverage of the CUDA paths (graph capture, idle-memory lending, the device optimizers), uploaded to
+            # codecov below: no other lane reaches them, so codecov/patch counted every such line as missed. The
+            # exclusions are build.yml's, so this run reports only types the CPU run already reports and the project
+            # denominator does not change; the hand-vectorized kernels stay excluded for the same speed reason.
+            if ($env:COLLECT_COVERAGE -eq 'true') {
+              $testArgs += ' --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura ' +
+                'DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*,[*]AiDotNet.Tensors.Engines.CpuJit.*"'
+            }
             $deadline = (Get-Date).AddMinutes($part.Minutes)
             if ($jobDeadline -lt $deadline) { $deadline = $jobDeadline }
             Write-Output "GPU suites, $($part.Name): watchdog deadline $($deadline.ToUniversalTime().ToString('u')) (job started $($jobStart.ToUniversalTime().ToString('u')))."
@@ -1180,6 +1191,37 @@ jobs:
           Where-Object { -not $ran.ContainsKey($_) })
         foreach ($name in $missing) { Write-Output "::error::Ratchet $name did not run (no pass or failure in the results)." }
         if ($tests -ne 0 -or $skips -ne 0 -or $missing.Count -gt 0) { exit 1 }
+
+    # The suites' coverage, under build.yml's flag (unittests): codecov merges it with the CPU run's. codecov.yml still
+    # posts its statuses after the seven CPU and POCL uploads (after_n_builds: 7) and updates them when this one lands,
+    # so a pull request whose CUDA jobs do not run (a draft, skip-gpu-ci, no runner) still gets a coverage status.
+    - name: Upload CUDA coverage to Codecov
+      id: codecov-upload
+      if: ${{ always() && !inputs.ratchets_only && (matrix.arch == 'pr' || matrix.arch == 'sm86') }}
+      continue-on-error: true
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        files: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
+        disable_search: true
+        root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+        flags: unittests
+        name: gpu-cuda
+        fail_ci_if_error: true
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    - name: Retry CUDA coverage upload
+      if: ${{ always() && !inputs.ratchets_only && (matrix.arch == 'pr' || matrix.arch == 'sm86') && steps.codecov-upload.outcome == 'failure' }}
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        files: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
+        disable_search: true
+        root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+        flags: unittests
+        name: gpu-cuda
+        fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Upload results
       if: always()
