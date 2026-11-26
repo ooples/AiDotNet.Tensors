@@ -41,7 +41,11 @@ public partial class DirectGpuTensorEngine
                 if (!weak.TryGetTarget(out var copy)) continue;
                 lock (copy)
                 {
-                    copy.Buffer?.Dispose();
+                    if (copy.Buffer is { } buffer)
+                    {
+                        if (copy.Backend is { } owner) DisposeBufferAfterQueuedUse(owner, buffer);
+                        else buffer.Dispose();
+                    }
                     copy.Buffer = null;
                     copy.Backend = null;
                 }
@@ -111,7 +115,8 @@ public partial class DirectGpuTensorEngine
             if (copy.Buffer is not null && !ReferenceEquals(copy.Backend, backend))
             {
                 // Made on another backend: its buffer is that context's memory. A fresh copy is made on this one.
-                copy.Buffer.Dispose();
+                if (copy.Backend is { } previous) DisposeBufferAfterQueuedUse(previous, copy.Buffer);
+                else copy.Buffer.Dispose();
                 copy.Buffer = null;
             }
             if (copy.Buffer is not null && copy.Capacity != n)

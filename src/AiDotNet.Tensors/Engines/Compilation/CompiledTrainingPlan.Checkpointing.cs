@@ -69,7 +69,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         internal int[]?[] StashBeforeForwardAction = Array.Empty<int[]?>();
         // Per forward action: the engine's stochastic seed position when the action's forward started, which its
         // recompute starts from again.
-        internal long[] SeedBeforeForwardAction = Array.Empty<long>();
+        // The seed positions each forward action's run drew on its thread, replayed by the action's recompute.
+        internal List<long>[] SeedsDrawnByForwardAction = Array.Empty<List<long>>();
         internal int[][] RecomputeActions = Array.Empty<int[]>();          // per segment, in forward order
         internal int[][] RecomputeSteps = Array.Empty<int[]>();
         internal int[]?[] RecomputeBeforeBackward = Array.Empty<int[]?>();
@@ -226,7 +227,7 @@ internal sealed partial class CompiledTrainingPlan<T>
             LastForwardAction = Enumerable.Repeat(-1, segments).ToArray(),
             ForwardReads = new (object, int)[segments][],
             StashBeforeForwardAction = new int[]?[forwardActionCount],
-            SeedBeforeForwardAction = new long[forwardActionCount],
+            SeedsDrawnByForwardAction = NewSeedLists(forwardActionCount),
             RecomputeActions = new int[segments][],
             RecomputeSteps = new int[segments][],
             RecomputeBeforeBackward = new int[]?[backwardActionCount],
@@ -460,11 +461,30 @@ internal sealed partial class CompiledTrainingPlan<T>
 
     // ---- the resident (and captured) step body ----
 
+    private static List<long>[] NewSeedLists(int count)
+    {
+        var lists = new List<long>[count];
+        for (int i = 0; i < lists.Length; i++) lists[i] = new List<long>();
+        return lists;
+    }
+
+    /// <summary>
+    /// Runs forward action <paramref name="action"/> of the step, recording the seeds its stochastic ops draw on this
+    /// thread when a checkpoint recompute will repeat it.
+    /// </summary>
+    private void RunForwardActionRecordingSeeds(int action, DirectGpuTensorEngine? de, Action<IEngine> run, IEngine engine)
+    {
+        if (_checkpoint is { } schedule && de is not null && action < schedule.SeedsDrawnByForwardAction.Length)
+            using (de.RecordStochasticSeeds(schedule.SeedsDrawnByForwardAction[action]))
+                run(engine);
+        else
+            run(engine);
+    }
+
     /// <summary>Before forward action <paramref name="action"/>: copies the state its segments' recomputes will read.</summary>
     private void CheckpointBeforeForwardAction(int action, DirectGpuTensorEngine? de, IDirectGpuBackend backend, bool capturing)
     {
         if (_checkpoint is not { } schedule) return;
-        if (de is not null) schedule.SeedBeforeForwardAction[action] = de.StochasticSeedPosition;
         if (schedule.StashBeforeForwardAction[action] is not { } segments) return;
         foreach (int k in segments)
         {
@@ -569,7 +589,7 @@ internal sealed partial class CompiledTrainingPlan<T>
                     de?.SetCurrentScratchAction(recomputeKeyBase + a);
                     if (pool is not null) pool.HoldLeasesIn = _checkpoint.HeldRecompute[k];
                     if (de is not null)
-                        using (de.ReplayStochasticSeedsFrom(_checkpoint.SeedBeforeForwardAction[a]))
+                        using (de.ReplayStochasticSeeds(_checkpoint.SeedsDrawnByForwardAction[a]))
                             forward[a](engine);
                     else
                         forward[a](engine);

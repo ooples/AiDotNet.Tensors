@@ -135,13 +135,21 @@ public static class AiDotNetEngine
     /// <summary>Whether the module initializer's GPU detection has been requested and has not run yet.</summary>
     internal static bool IsGpuAutoDetectionDeferred => Volatile.Read(ref _deferredDetection) != 0;
 
+    // A required backend's failed detection, with the requirement it failed under: rethrown by every later read of
+    // Current without probing again, until an engine is assigned or the requirement changes.
+    private static (System.Runtime.ExceptionServices.ExceptionDispatchInfo Failure, GpuBackendType Required)? _requiredDetectionFailure;
+
     // Other threads that read Current while the detection runs wait here, so no thread starts work on the CPU
-    // engine a moment before the GPU engine is adopted. Detection must not throw into a property getter.
+    // engine a moment before the GPU engine is adopted. Detection does not throw into the property getter, except
+    // when GpuBackendOptions.RequiredBackend is set and cannot be met: then handing out the CPU engine would be the
+    // silent substitution the requirement forbids.
     private static void CompleteDeferredGpuDetection()
     {
         lock (_deferredLock)
         {
             if (Volatile.Read(ref _deferredDetection) == 0) return;
+            if (_requiredDetectionFailure is { } failed && failed.Required == global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)
+                failed.Failure.Throw();
             t_completingDeferred = true;
             try
             {
@@ -155,12 +163,14 @@ public static class AiDotNetEngine
             {
                 // AutoDetectAndConfigureGpu already falls back to CPU on its own failures; this guards the rest.
             }
-            catch (Exception)
+            catch (Exception failure)
             {
-                // A required backend failed. The detection stays owed, so every later read of Current throws the
-                // failure again instead of handing out the CPU engine the caller ruled out. Assigning an engine
-                // explicitly clears it.
+                // A required backend failed. The detection stays owed, so every later read of Current throws this
+                // failure again (without probing again) instead of handing out the CPU engine the caller ruled out.
+                // Assigning an engine explicitly clears it.
                 t_completingDeferred = false;
+                _requiredDetectionFailure = (System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure),
+                    global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend);
                 throw;
             }
             t_completingDeferred = false;
@@ -242,6 +252,7 @@ public static class AiDotNetEngine
         lock (_adoptionLock)
         {
             Volatile.Write(ref _deferredDetection, 0);
+            _requiredDetectionFailure = null;
             PublishCurrent(value);
             // Handing back the engine auto-detection adopted (a test restoring a saved engine) is not a choice.
             Volatile.Write(ref _callerAssigned, !ReferenceEquals(value, _adoptedGpu));
@@ -375,6 +386,10 @@ public static class AiDotNetEngine
         // re-adopting the GPU engine (the "GPU acceleration enabled" churn seen in CPU-only runs).
         if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable("AIDOTNET_DISABLE_GPU")))
         {
+            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var requiredWhileDisabled && requiredWhileDisabled != GpuBackendType.None)
+                throw new InvalidOperationException(
+                    $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {requiredWhileDisabled}, "
+                    + "but AIDOTNET_DISABLE_GPU disables GPU detection; unset one of them.");
             if (Current.Is<DirectGpuTensorEngine>())
             {
                 SwitchToCpuEngine();
@@ -388,6 +403,10 @@ public static class AiDotNetEngine
         // again on the dead context. Stay on CPU.
         if (_gpuCircuitBroken)
         {
+            if (global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend is var requiredWhileBroken && requiredWhileBroken != GpuBackendType.None)
+                throw new InvalidOperationException(
+                    $"{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions)}.{nameof(global::AiDotNet.Tensors.Engines.DirectGpu.GpuBackendOptions.RequiredBackend)} is {requiredWhileBroken}, "
+                    + "but the GPU circuit breaker has tripped (a sticky device fault): the GPU cannot be used again in this process.");
             SwitchToCpuEngine();
             return false;
         }
@@ -416,6 +435,7 @@ public static class AiDotNetEngine
             }
         }
 
+        DirectGpuTensorEngine? superseded = null;
         try
         {
             var gpuEngine = new DirectGpuTensorEngine();
@@ -435,10 +455,14 @@ public static class AiDotNetEngine
                         return true;
                     }
 
+                    // An engine parked earlier on a backend the requirement now rules out is superseded: released
+                    // below (after its ops drain), not left holding its context for the life of the process.
+                    superseded = _adoptedGpu is { IsDisposed: false } old && !ReferenceEquals(old, gpuEngine) ? old : null;
                     _adoptedGpu = gpuEngine;
                     PublishCurrent(gpuEngine);
                     Volatile.Write(ref _callerAssigned, false);
                 }
+                if (superseded is not null) ReleaseSupersededGpu(superseded);
                 TryRegisterGpuOffloadAllocator(gpuEngine, verbose);
                 EmitLog($"[AiDotNet] GPU acceleration enabled: {gpuEngine.Name}", verbose);
                 return true;
@@ -716,6 +740,24 @@ public static class AiDotNetEngine
         }
         EmitLog("[AiDotNet] GPU engine released", verbose: true);
         return true;
+    }
+
+    // A parked engine another adoption replaced (its backend no longer meets RequiredBackend): nothing publishes it, so
+    // it is closed once the ops that read it before the swap have drained. Ops still running after the wait keep it
+    // open, reported, and it is left to its finalizer rather than freed under them.
+    private static void ReleaseSupersededGpu(DirectGpuTensorEngine engine)
+    {
+        try
+        {
+            if (engine.TryCloseAndDispose(TimeSpan.FromSeconds(5))) return;
+            engine.ReopenAfterTimedOutClose();
+            System.Diagnostics.Trace.TraceWarning(
+                $"[AiDotNet] A superseded GPU engine ({engine.Name}) still had ops running after 5 s; it was not released.");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException or TimeoutException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"[AiDotNet] A superseded GPU engine could not be released: {ex.Message}");
+        }
     }
 
     // Puts an engine whose release did not happen back in the parked slot, unless another adoption took it meanwhile.

@@ -23,14 +23,19 @@ internal static class CudaContextScheduling
     /// environment value, when it is the one that decides, throws: a caller error, not a missing device.
     /// </summary>
     // The policy whose flag the first CUDA context was created with (-1: no context yet).
-    private static int s_contextPolicy = -1;
+    // Every distinct scheduling flag a context was created with, as a bit set (bit = the flag value), so a policy set
+    // A, then B, then A again is still reported against the contexts created under B.
+    private static int s_contextFlagsUsed;
     private static int s_policyChangeWarned;
 
     internal static uint ResolveContextFlags()
     {
-        var resolved = ResolveContextPolicy();
-        System.Threading.Interlocked.CompareExchange(ref s_contextPolicy, (int)resolved, -1);
-        return Flags(resolved);
+        uint flags = Flags(ResolveContextPolicy());
+        int bit = 1 << (int)(flags & 0x7);
+        int seen;
+        do { seen = System.Threading.Volatile.Read(ref s_contextFlagsUsed); }
+        while ((seen & bit) == 0 && System.Threading.Interlocked.CompareExchange(ref s_contextFlagsUsed, seen | bit, seen) != seen);
+        return flags;
     }
 
     /// <summary>
@@ -39,13 +44,14 @@ internal static class CudaContextScheduling
     /// </summary>
     internal static void NotePolicySet(GpuHostWaitPolicy policy)
     {
-        int created = System.Threading.Volatile.Read(ref s_contextPolicy);
-        if (created < 0 || Flags((GpuHostWaitPolicy)created) == Flags(policy)) return;
+        int used = System.Threading.Volatile.Read(ref s_contextFlagsUsed);
+        int other = used & ~(1 << (int)(Flags(policy) & 0x7));
+        if (other == 0) return;
         if (System.Threading.Interlocked.Exchange(ref s_policyChangeWarned, 1) == 0)
             System.Diagnostics.Trace.TraceWarning(
-                $"{nameof(GpuHostWaitOptions)}.{nameof(GpuHostWaitOptions.Policy)} was set to {policy} after a CUDA context was "
-                + $"created with {(GpuHostWaitPolicy)created}'s scheduling flag; existing contexts keep it. Stream waits use "
-                + "the new policy; set it before the first GPU engine to change the flag too.");
+                $"{nameof(GpuHostWaitOptions)}.{nameof(GpuHostWaitOptions.Policy)} was set to {policy} after CUDA contexts were "
+                + $"created with another scheduling flag; existing contexts keep theirs. Stream "
+                + "waits use the new policy; set it before the first GPU engine to change the flag too.");
     }
 
     private static GpuHostWaitPolicy ResolveContextPolicy()

@@ -411,14 +411,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // deterministic across runs (reproducible training) — the golden-ratio multiplier decorrelates
     // sequential counter values for Philox.
     private long _stochasticSeedCounter;
-    // A replay (see ReplayStochasticSeedsFrom) on this thread: its engine and where it is in the replayed sequence.
+    // A replay (see ReplayStochasticSeeds) on this thread: its engine, the seeds it repeats and how many it has drawn.
     [ThreadStatic] private static DirectGpuTensorEngine? t_seedReplayEngine;
-    [ThreadStatic] private static long t_seedReplayPosition;
+    [ThreadStatic] private static System.Collections.Generic.List<long>? t_seedReplay;
+    [ThreadStatic] private static int t_seedReplayIndex;
+    // A recording (see RecordStochasticSeeds) on this thread: its engine and the positions this thread drew.
+    [ThreadStatic] private static DirectGpuTensorEngine? t_seedRecordEngine;
+    [ThreadStatic] private static System.Collections.Generic.List<long>? t_seedRecord;
     private ulong NextStochasticSeed()
     {
-        long position = ReferenceEquals(t_seedReplayEngine, this)
-            ? ++t_seedReplayPosition
-            : System.Threading.Interlocked.Increment(ref _stochasticSeedCounter);
+        long position;
+        if (ReferenceEquals(t_seedReplayEngine, this) && t_seedReplay is { } replay)
+        {
+            if (t_seedReplayIndex >= replay.Count)
+                throw new InvalidOperationException(
+                    $"A replayed forward drew more stochastic seeds ({t_seedReplayIndex + 1}) than its recorded run ({replay.Count}): "
+                    + "the recompute is not the same computation as the forward it repeats.");
+            position = replay[t_seedReplayIndex++];
+        }
+        else
+        {
+            position = System.Threading.Interlocked.Increment(ref _stochasticSeedCounter);
+            if (ReferenceEquals(t_seedRecordEngine, this)) t_seedRecord?.Add(position);
+        }
         return unchecked((ulong)position * 0x9E3779B97F4A7C15UL);
     }
 
@@ -426,39 +441,75 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal ulong NextStochasticSeedForTests() => NextStochasticSeed();
 
     /// <summary>
-    /// Where the engine's stochastic ops (dropout) are in their seed sequence: the position a compiled plan records
-    /// before a forward action, so an activation-checkpoint recompute can replay it (<see cref="ReplayStochasticSeedsFrom"/>).
+    /// Where the engine's shared stochastic-op (dropout) seed sequence is (tests).
     /// </summary>
     internal long StochasticSeedPosition => System.Threading.Interlocked.Read(ref _stochasticSeedCounter);
 
     /// <summary>
-    /// Until the returned scope is disposed, the stochastic ops this thread runs on this engine draw the seeds that
-    /// followed <paramref name="position"/>, so a recomputed forward action draws what its first run drew, as
+    /// Until the returned scope is disposed, the seeds this thread's stochastic ops draw on this engine are appended to
+    /// <paramref name="into"/> (cleared first): the draws of a forward action a checkpoint recompute will repeat. Only
+    /// this thread's draws are recorded, so ops other threads run on the engine meanwhile, which advance the shared
+    /// sequence between this thread's draws, do not shift what the recompute replays.
+    /// </summary>
+    internal SeedRecordScope RecordStochasticSeeds(System.Collections.Generic.List<long> into)
+    {
+        if (into is null) throw new ArgumentNullException(nameof(into));
+        into.Clear();
+        var scope = new SeedRecordScope(t_seedRecordEngine, t_seedRecord);
+        t_seedRecordEngine = this;
+        t_seedRecord = into;
+        return scope;
+    }
+
+    /// <summary>
+    /// Until the returned scope is disposed, the stochastic ops this thread runs on this engine draw, in order, the seeds
+    /// <see cref="RecordStochasticSeeds"/> recorded, so a recomputed forward action draws what its first run drew, as
     /// <c>torch.utils.checkpoint</c> does with <c>preserve_rng_state</c>. The replay is this thread's only: the engine's
     /// own sequence is not rewound, so ops other threads run meanwhile keep drawing fresh seeds, and none of them can
-    /// draw a seed the step already used.
+    /// draw a seed the step already used. Drawing more seeds than were recorded throws.
     /// </summary>
-    internal SeedReplayScope ReplayStochasticSeedsFrom(long position)
+    internal SeedReplayScope ReplayStochasticSeeds(System.Collections.Generic.List<long> recorded)
     {
-        var scope = new SeedReplayScope(t_seedReplayEngine, t_seedReplayPosition);
+        if (recorded is null) throw new ArgumentNullException(nameof(recorded));
+        var scope = new SeedReplayScope(t_seedReplayEngine, t_seedReplay, t_seedReplayIndex);
         t_seedReplayEngine = this;
-        t_seedReplayPosition = position;
+        t_seedReplay = recorded;
+        t_seedReplayIndex = 0;
         return scope;
+    }
+
+    internal readonly struct SeedRecordScope : IDisposable
+    {
+        private readonly DirectGpuTensorEngine? _previousEngine;
+        private readonly System.Collections.Generic.List<long>? _previous;
+        internal SeedRecordScope(DirectGpuTensorEngine? previousEngine, System.Collections.Generic.List<long>? previous)
+        {
+            _previousEngine = previousEngine;
+            _previous = previous;
+        }
+        public void Dispose()
+        {
+            t_seedRecordEngine = _previousEngine;
+            t_seedRecord = _previous;
+        }
     }
 
     internal readonly struct SeedReplayScope : IDisposable
     {
         private readonly DirectGpuTensorEngine? _previousEngine;
-        private readonly long _previousPosition;
-        internal SeedReplayScope(DirectGpuTensorEngine? previousEngine, long previousPosition)
+        private readonly System.Collections.Generic.List<long>? _previous;
+        private readonly int _previousIndex;
+        internal SeedReplayScope(DirectGpuTensorEngine? previousEngine, System.Collections.Generic.List<long>? previous, int previousIndex)
         {
             _previousEngine = previousEngine;
-            _previousPosition = previousPosition;
+            _previous = previous;
+            _previousIndex = previousIndex;
         }
         public void Dispose()
         {
             t_seedReplayEngine = _previousEngine;
-            t_seedReplayPosition = _previousPosition;
+            t_seedReplay = _previous;
+            t_seedReplayIndex = _previousIndex;
         }
     }
 
@@ -1320,20 +1371,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (IsDisposed) return;
         // The new owner of a recycled array is not the registered tensor that recorded a persistent role for it.
         _pendingPersistentRoles.Remove(array);
-        if (!Helpers.HostSync.AnyExists) return;
-        if (Helpers.HostSync.IsPending(array))
-            Helpers.HostSync.Remove(array);
         // The persistent weight cache and its version maps are keyed by the array too. A new owner's version can equal
-        // the one recorded for the old owner, so a surviving entry would serve the old owner's device data.
+        // the one recorded for the old owner, so a surviving entry would serve the old owner's device data; and an array
+        // nobody owns any more (a streamed weight's dropped storage) would hold its device copy for the engine's life.
+        // Checked before the pending-download early-out below: the cache does not depend on any download existing.
         if (_persistentBufferCache.ContainsKey(array))
         {
             lock (_persistentBufferLock)
             {
-                if (_persistentBufferCache.TryRemove(array, out var pe)) pe.Dispose();
+                if (_persistentBufferCache.TryRemove(array, out var pe))
+                {
+                    // Queued kernels may still read it: freed after them.
+                    if (TryGetBackend(out var owner)) DisposeBufferAfterQueuedUse(owner, pe.Buffer);
+                    else pe.Dispose();
+                }
                 _tensorVersions.TryRemove(array, out _);
                 _persistentWeightHostVersion.TryRemove(array, out _);
             }
         }
+        if (!Helpers.HostSync.AnyExists) return;
+        if (Helpers.HostSync.IsPending(array))
+            Helpers.HostSync.Remove(array);
         if (!_activationCache.ContainsKey(array)) return;
         ActivationCacheEntry? removed = null;
         lock (_activationCacheLock)

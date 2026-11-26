@@ -1201,7 +1201,8 @@ jobs:
       with:
         name: gpu-cuda-coverage-${{ matrix.arch }}
         path: ${{ runner.temp }}/trx/**/coverage.cobertura.xml
-        if-no-files-found: error
+        # A leg whose suites never ran has no coverage; that failure is the suites' to report, not a second red step.
+        if-no-files-found: warn
         retention-days: 3
 
     - name: Upload results
@@ -1216,3 +1217,39 @@ jobs:
         if-no-files-found: ignore
         # A crash dump is the full test host (gigabytes); keep it only long enough to analyse.
         retention-days: 5
+
+  # A pull request's coverage is uploaded by ci.yml's cuda-coverage job (on a hosted runner). A scheduled or dispatched
+  # run is not called from ci.yml, so it uploads here: main's base coverage keeps its CUDA lines, as each pull request's
+  # does, and the pull request deltas compare like with like.
+  coverage:
+    name: CUDA coverage upload
+    needs: cuda
+    if: ${{ always() && github.event_name != 'pull_request' && !inputs.ratchets_only && (needs.cuda.result == 'success' || needs.cuda.result == 'failure') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: AiDotNet.Tensors
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          pattern: gpu-cuda-coverage-*
+          path: ${{ runner.temp }}/cuda-coverage
+      - name: Find the coverage files
+        id: found
+        run: echo "any=$(find '${{ runner.temp }}/cuda-coverage' -name coverage.cobertura.xml 2>/dev/null | head -1 | wc -l)" >> "$GITHUB_OUTPUT"
+      - name: Upload CUDA coverage to Codecov
+        if: ${{ steps.found.outputs.any == '1' }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml
+          disable_search: true
+          root_dir: ${{ github.workspace }}/AiDotNet.Tensors
+          flags: unittests
+          name: gpu-cuda
+          fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

@@ -32,7 +32,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             if (typeof(T) != typeof(float))
                 throw new NotSupportedException($"Loss scaling needs a float plan, not {typeof(T).Name}.");
             options.Validate();
-            if (initialState is { } resumed && (resumed.Scale < options.MinScale || resumed.Scale > options.MaxScale))
+            if (initialState is { } resumed && !(resumed.Scale >= options.MinScale && resumed.Scale <= options.MaxScale))
                 throw new ArgumentOutOfRangeException(nameof(initialState),
                     $"The loss scale state to resume from has scale {resumed.Scale}, outside the options' "
                     + $"[MinScale, MaxScale] = [{options.MinScale}, {options.MaxScale}].");
@@ -325,6 +325,11 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             }
         }
         _lossScaleHost = new LossScaleState(scale, tracker, overflows, state.Steps + 1);
+        // A captured step graph copies the device seed into the loss gradient in its prologue and nothing in it rewrites
+        // the seed when the scale is advanced here, on the host: rewrite it, or the next replay scales the gradients by
+        // the old scale while the unscale divides by the new one.
+        if (scale != state.Scale && _lossGradSeed.TryGetGpuBuffer() is { } seed && _lossGradSeed._gpuBackend is { } seedBackend)
+            seedBackend.Fill(seed, scale, _lossGradSeed.Length);
     }
 
     private void UnscaleLossScaledGradientsOnHost()

@@ -385,13 +385,15 @@ public sealed class DirectGpuEngine : IDisposable
             {
                 Trace.WriteLine("[DirectGpuEngine] CUDA is not available on this system");
                 failure = "the CUDA driver or NVRTC library could not be loaded";
-                t_cudaDriverAbsent = !CudaNativeBindings.IsAvailable;
+                // Absent only when the driver library itself is not installed; a driver that loads and then fails
+                // (cuInit errors, a version mismatch, every device hidden) is the failure the warning exists for.
+                t_cudaDriverAbsent = !CudaNativeBindings.IsDriverLibraryPresent;
             }
         }
         catch (DllNotFoundException ex)
         {
             failure = "CUDA library not found: " + ex.Message;
-            t_cudaDriverAbsent = !CudaNativeBindings.IsAvailable;
+            t_cudaDriverAbsent = !CudaNativeBindings.IsDriverLibraryPresent;
             Trace.WriteLine($"[DirectGpuEngine] CUDA library not found: {ex.Message}");
             System.Diagnostics.Debug.WriteLine($"CUDA library not found: {ex.Message}");
         }

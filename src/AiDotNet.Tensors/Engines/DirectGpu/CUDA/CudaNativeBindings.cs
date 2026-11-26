@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CUDA Driver API bindings for direct kernel execution.
 using System;
+using System.Threading;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Engines;
 
@@ -96,11 +97,22 @@ internal static class CudaNativeBindings
     /// </summary>
     public static bool IsAvailable => Availability.Value;
 
+    private static readonly Lazy<bool> DriverLibrary = new(() => { _ = Availability.Value; return Volatile.Read(ref s_driverLibraryLoaded); }, isThreadSafe: true);
+    private static bool s_driverLibraryLoaded;
+
+    /// <summary>
+    /// True when the CUDA driver library itself loads, whether or not it then initializes or finds a device: false only
+    /// on a host with no NVIDIA driver installed. A driver that loads and fails (cuInit errors, a driver/runtime
+    /// mismatch, CUDA_VISIBLE_DEVICES hiding every device) is present, and is a fault to report, not an absent driver.
+    /// </summary>
+    internal static bool IsDriverLibraryPresent => DriverLibrary.Value;
+
     private static bool CheckAvailability()
     {
         try
         {
             var result = CuBlasNative.cuInit(0);
+            Volatile.Write(ref s_driverLibraryLoaded, true);
             if (result != CudaResult.Success)
             {
                 return false;

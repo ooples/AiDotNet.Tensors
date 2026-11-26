@@ -34,7 +34,7 @@ internal static class CudaVisibleDevices
     {
         if (value is null) return null;
         // MIG instances have UUIDs of their own, which never match a Vulkan device's whole-GPU UUID: not filtered.
-        if (value.IndexOf("MIG-", StringComparison.OrdinalIgnoreCase) >= 0) return null;
+        if (value.IndexOf("MIG-", StringComparison.OrdinalIgnoreCase) >= 0) return Unresolved(value);
         if (cudaVisibleUuids() is { } fromDriver) return new HashSet<string>(fromDriver, StringComparer.Ordinal);
         var fromValue = new HashSet<string>(StringComparer.Ordinal);
         foreach (var raw in value.Split(','))

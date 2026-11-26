@@ -46,7 +46,12 @@ public static class GpuMemoryStats
         public long ActiveAllocations;
     }
 
-    /// <summary>Bytes currently held by GPU allocators.</summary>
+    /// <summary>
+    /// Bytes currently held by the labelled allocators that report through <see cref="RecordAllocation"/> (page-locked
+    /// host staging, workspaces). Device memory is not among them: every backend counts its device allocations per
+    /// device, read through <see cref="Snapshot(IDirectGpuBackend)"/> (<see cref="GpuMemorySnapshot.AllocatedBytes"/>),
+    /// or summed over devices through <see cref="Snapshot()"/>.
+    /// </summary>
     public static long CurrentBytes
     {
         get { lock (_lock) return _currentBytes; }

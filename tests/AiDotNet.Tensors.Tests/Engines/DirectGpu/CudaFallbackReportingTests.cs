@@ -114,8 +114,10 @@ public class CudaFallbackReportingTests
             try
             {
                 AiDotNetEngine.DeferGpuAutoDetection(verbose: false);
-                Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
-                Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+                var first = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+                var second = Assert.Throws<InvalidOperationException>(() => AiDotNetEngine.Current);
+                // The cached failure, rethrown: a later read does not construct an engine and probe the device again.
+                Assert.Same(first, second);
                 Assert.True(AiDotNetEngine.IsGpuAutoDetectionDeferred);
             }
             finally { GpuBackendOptions.RequiredBackend = previousRequired; }

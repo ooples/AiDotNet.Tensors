@@ -572,7 +572,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (_disposed) return;
         _disposed = true;
-        GC.SuppressFinalize(this);
         List<Exception>? failures = null;
         void Stage(Action release)
         {
@@ -610,7 +609,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Stage(() => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });
         Stage(DisposeRemainingStepState);
         TeardownCompletedForTests = true;
-        if (failures is null) return;
+        // The finalizer stays armed when a stage failed: a graph whose teardown threw is still its to destroy.
+        if (failures is null) { GC.SuppressFinalize(this); return; }
         if (failures.Count == 1) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failures[0]).Throw();
         throw new AggregateException("Several stages of releasing a compiled training plan failed.", failures);
     }
@@ -6037,7 +6037,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
             long rs = 0;
             if (resFwdUs is not null) { ProfSync(engine); rs = System.Diagnostics.Stopwatch.GetTimestamp(); }
-            fwd[i](engine);
+            RunForwardActionRecordingSeeds(i, de, fwd[i], engine);
             if (resFwdUs is not null) { ProfSync(engine); resFwdUs[i] += ProfElapsedUs(rs); }
             if (checkpointPool is not null) CheckpointAfterForwardAction(i, checkpointPool);
             if (spanLeases)

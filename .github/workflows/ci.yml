@@ -147,11 +147,18 @@ jobs:
           path: AiDotNet.Tensors
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
         with:
           pattern: gpu-cuda-coverage-*
           path: ${{ runner.temp }}/cuda-coverage
+      # A CUDA job that failed before its suites ran (a build failure) left no coverage: nothing to upload, and the
+      # failure is already the cuda job's red status.
+      - name: Find the coverage files
+        id: found
+        run: echo "any=$(find '${{ runner.temp }}/cuda-coverage' -name coverage.cobertura.xml 2>/dev/null | head -1 | wc -l)" >> "$GITHUB_OUTPUT"
       - name: Upload CUDA coverage to Codecov
         id: codecov-upload
+        if: ${{ steps.found.outputs.any == '1' }}
         continue-on-error: true
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:

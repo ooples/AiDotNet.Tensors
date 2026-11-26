@@ -4,6 +4,7 @@ using System;
 using System.IO;
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DevicePrimitives;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -227,6 +228,49 @@ public class StreamingBf16InferenceTests
             }
             // The copies made from the bf16 store are dead once it is promoted, and their device memory is released.
             Assert.Equal(0L, gpu.Bf16WeightDeviceBytes);
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
+    /// <summary>
+    /// A streamed bf16 load whose layers ran a GPU forward before their weights were streamed (a lazy layer's
+    /// materializing forward, as an MoE builder runs for every expert): each forward cached the weight's fp32 device
+    /// copy under its host array, and streaming the weight dropped the array but not the copy, so device memory grew by
+    /// every layer's full-precision weights, outside the bf16 budget. The peak must stay within the budget plus one
+    /// layer's working set.
+    /// </summary>
+    [SkippableFact]
+    public void A_streamed_load_after_gpu_forwards_stays_within_the_budget_plus_one_layer()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable || gpu.GetBackend() is not { } backend) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        const int Layers = 12, In = 256, Out = 512;
+        long layerBytes = 4L * In * Out;
+        var dir = Configure();
+        try
+        {
+            gpu.Bf16WeightDeviceBudgetBytes = 2 * 2L * In * Out;   // two layers' bf16 copies
+            var x = Filled(new[] { 1, In }, 1, v => v);
+            var warm = Filled(new[] { In, Out }, 2, v => v);
+            gpu.FusedLinear(x, warm, null, FusedActivationType.None);   // the engine's own scratch, before the baseline
+            long baseline = GpuMemoryStats.Snapshot(backend).AllocatedBytes;
+            int cachedBefore = gpu.CachedTensorCount;
+            long peak = 0;
+            var kept = new Tensor<float>[Layers];
+            for (int l = 0; l < Layers; l++)
+            {
+                var w = Filled(new[] { In, Out }, 10 + l, v => v);
+                gpu.FusedLinear(x, w, null, FusedActivationType.None);   // the materializing forward
+                kept[l] = Stream(w);
+                gpu.FusedLinear(x, w, null, FusedActivationType.None);   // inference on the streamed weight
+                peak = Math.Max(peak, GpuMemoryStats.Snapshot(backend).AllocatedBytes - baseline);
+            }
+            Assert.Equal(cachedBefore, gpu.CachedTensorCount);
+            Assert.True(peak <= gpu.Bf16WeightDeviceBudgetBytes + 2 * layerBytes,
+                $"device memory grew by {peak} bytes over {Layers} layers; budget {gpu.Bf16WeightDeviceBudgetBytes} + one layer's {layerBytes} (x2 for its output and scratch)");
+            GC.KeepAlive(kept);
         }
         finally { gpu.Dispose(); Cleanup(dir); }
     }

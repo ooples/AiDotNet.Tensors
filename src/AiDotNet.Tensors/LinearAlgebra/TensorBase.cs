@@ -839,6 +839,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _data = replacementData;
         _storage = replacementStorage;
         InvalidateGpuBindingAfterStorageReplacement();
+        // A device copy an engine cached under the dropped array (the fp32 weight buffer a GPU forward uploaded before
+        // the weight was streamed, a layer's lazy-init forward for one) belongs to that array, not to the store: release
+        // it, or every streamed weight keeps its full-precision device copy for the engine's life, outside any budget.
+        try
+        {
+            if (claimedStorage.TryGetBackingArrayIdentity(out var droppedArray, out _) && droppedArray is not null)
+                Helpers.PooledArrayRecycling.Notify(droppedArray);
+        }
+        catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming drop: releasing device copies failed: {0}", error); }
         // Reclamation must not turn a successful storage swap into a failed transaction.
         try { claimedStorage.DisposeClaimedOwners(); }
         catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming storage cleanup failed: {0}", error); }
