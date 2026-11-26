@@ -1802,6 +1802,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
         if (explicitOutput?.LazySource is ILazyNode primaryNode)
             (observableNodes ??= new HashSet<ILazyNode>()).Add(primaryNode);
+        // A tensor the forward kept or detached is read after the plan runs too; fused into a consumer, replays would
+        // stop writing it and it would keep the first execution's values.
+        if (scope.RetainedNodes is { Count: > 0 } retained)
+            (observableNodes ??= new HashSet<ILazyNode>()).UnionWith(retained);
         var compiler = new LazyGraphCompiler(observableOutputs: observableNodes);
         List<ILazyNode> optimized;
         var priorDynamic = SparseLinearFusionPattern.t_dynamicLeaves;

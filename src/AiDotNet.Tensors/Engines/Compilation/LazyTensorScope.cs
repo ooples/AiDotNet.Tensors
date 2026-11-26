@@ -746,6 +746,17 @@ internal sealed class LazyTensorScope : IDisposable
         HostEscape ??= $"the result of {operationName}";
     }
 
+    private HashSet<ILazyNode>? _retainedNodes;
+
+    /// <summary>
+    /// Traced nodes whose output the forward kept past the call (<see cref="TensorScope.Keep{T}"/>,
+    /// <see cref="TensorScope.Detach{T}"/>), or null. The caller reads them after the plan runs, so a compiled plan
+    /// must keep each one observable: fusion may not absorb it into a consumer, or replays would stop writing it.
+    /// </summary>
+    internal IReadOnlyCollection<ILazyNode>? RetainedNodes => _retainedNodes;
+
+    internal void MarkRetained(ILazyNode node) => (_retainedNodes ??= new HashSet<ILazyNode>()).Add(node);
+
     /// <summary>The engine the recorded nodes replay on.</summary>
     internal IEngine Engine => _engine;
 
