@@ -77,7 +77,10 @@ public class CudaFallbackReportingTests
     [SkippableFact]
     public void Engine_OnAHostWithoutTheCudaDriver_DoesNotWarnAboutCuda()
     {
-        Skip.If(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "The CUDA driver is installed here.");
+        // IsAvailable is false on a host whose driver loads but hides or fails every device (CUDA_VISIBLE_DEVICES=-1);
+        // that host reports the failure, so only a driver library that does not load at all is "without the driver".
+        Skip.If(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsDriverLibraryPresent,
+            "The CUDA driver is installed here.");
         DirectGpuEngine? engine = null;
         string stderr = CaptureStderr(() => engine = new DirectGpuEngine());
         using (engine)
