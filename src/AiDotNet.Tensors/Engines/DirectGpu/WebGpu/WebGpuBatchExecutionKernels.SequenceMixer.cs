@@ -67,10 +67,9 @@ internal static partial class WebGpuBatchExecutionKernels
     let c = i % channels;
     let bt = i / channels;
     let t = bt % seqLen;
-    let xv = x[i];
-    var xp: f32 = 0.0;
-    if (t > 0) { xp = x[i - channels]; }
-    y[i] = w0[c] * xv + w1[c] * xp;
+    var res: f32 = w0[c] * x[i];
+    if (t > 0) { res += w1[c] * x[i - channels]; }
+    y[i] = res;
 }");
 
     public static readonly string SmxConv2TapBackwardDx = Shader(
@@ -81,10 +80,9 @@ internal static partial class WebGpuBatchExecutionKernels
     let c = i % channels;
     let bt = i / channels;
     let t = bt % seqLen;
-    let dyv = dy[i];
-    var dyn: f32 = 0.0;
-    if (t + 1 < seqLen) { dyn = dy[i + channels]; }
-    dx[i] = w0[c] * dyv + w1[c] * dyn;
+    var res: f32 = w0[c] * dy[i];
+    if (t + 1 < seqLen) { res += w1[c] * dy[i + channels]; }
+    dx[i] = res;
 }");
 
     public static readonly string SmxConv2TapBackwardDw = Shader(

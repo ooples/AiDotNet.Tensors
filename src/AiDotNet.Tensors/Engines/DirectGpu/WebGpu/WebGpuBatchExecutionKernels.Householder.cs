@@ -36,8 +36,7 @@ internal static partial class WebGpuBatchExecutionKernels
         let uOff = j * D;
         var dot: f32 = 0.0;
         for (var c: i32 = 0; c < D; c++) { dot += y[baseOff + c] * uHat[uOff + c]; }
-        let twoDot = 2.0 * dot;
-        for (var c: i32 = 0; c < D; c++) { y[baseOff + c] -= twoDot * uHat[uOff + c]; }
+        for (var c: i32 = 0; c < D; c++) { let step = dot * uHat[uOff + c]; y[baseOff + c] = (y[baseOff + c] - step) - step; }
     }
 }");
 
@@ -55,8 +54,7 @@ internal static partial class WebGpuBatchExecutionKernels
         var pv: f32 = 0.0;
         for (var c: i32 = 0; c < D; c++) { pv += dx[baseOff + c] * uHat[uOff + c]; }
         pqBuf[pqOff + s] = pv;
-        let twoP = 2.0 * pv;
-        for (var c: i32 = 0; c < D; c++) { dx[baseOff + c] -= twoP * uHat[uOff + c]; }
+        for (var c: i32 = 0; c < D; c++) { let step = pv * uHat[uOff + c]; dx[baseOff + c] = (dx[baseOff + c] - step) - step; }
     }
     for (var c: i32 = 0; c < D; c++) { dx[baseOff + c] = dy[baseOff + c]; }
     for (var sr: i32 = 0; sr < K; sr++) {
@@ -66,8 +64,7 @@ internal static partial class WebGpuBatchExecutionKernels
         var qv: f32 = 0.0;
         for (var c: i32 = 0; c < D; c++) { qv += dx[baseOff + c] * uHat[uOff + c]; }
         pqBuf[pqOff + K + s] = qv;
-        let twoQ = 2.0 * qv;
-        for (var c: i32 = 0; c < D; c++) { dx[baseOff + c] -= twoQ * uHat[uOff + c]; }
+        for (var c: i32 = 0; c < D; c++) { let step = qv * uHat[uOff + c]; dx[baseOff + c] = (dx[baseOff + c] - step) - step; }
     }
 }");
 
@@ -82,18 +79,20 @@ internal static partial class WebGpuBatchExecutionKernels
         var xv = x[m * D + i];
         for (var s: i32 = 0; s < K; s++) {
             let j = select(s, K - 1 - s, p.trans != 0);
-            xv -= 2.0 * pqBuf[pqOff + s] * uHat[j * D + i];
-        }
-        var gv = dy[m * D + i];
-        for (var sr: i32 = 0; sr < K; sr++) {
-            let s = K - 1 - sr;
-            let j = select(s, K - 1 - s, p.trans != 0);
             let ps = pqBuf[pqOff + s];
             let qs = pqBuf[pqOff + K + s];
             let uj = uHat[j * D + i];
-            xv += 2.0 * ps * uj;
-            duHat[j * D + i] += -2.0 * (qs * xv + ps * gv);
-            gv -= 2.0 * qs * uj;
+            var gv = dy[m * D + i];
+            for (var tr: i32 = 0; tr < K - 1 - s; tr++) {
+                let t = K - 1 - tr;
+                let jt = select(t, K - 1 - t, p.trans != 0);
+                let stepQ = pqBuf[pqOff + K + t] * uHat[jt * D + i];
+                gv = (gv - stepQ) - stepQ;
+            }
+            let duTerm = qs * xv + ps * gv;
+            duHat[j * D + i] = (duHat[j * D + i] - duTerm) - duTerm;
+            let stepP = ps * uj;
+            xv = (xv - stepP) - stepP;
         }
     }
 }");

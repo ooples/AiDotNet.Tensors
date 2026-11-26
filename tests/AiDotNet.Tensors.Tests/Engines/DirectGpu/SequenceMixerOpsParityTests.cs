@@ -43,14 +43,24 @@ public sealed class SequenceMixerOpsParityTests
         for (int i = 0; i < a.Length; i++)
         {
             Assert.False(float.IsNaN(b[i]) || float.IsInfinity(b[i]), $"{label}[{i}] is non-finite: {b[i]}");
-            Assert.True(MathF.Abs(a[i] - b[i]) <= tol, $"{label}[{i}] mismatch: expected {a[i]}, got {b[i]} (tol={tol})");
+            Assert.True(Math.Abs(a[i] - b[i]) <= tol, $"{label}[{i}] mismatch: expected {a[i]}, got {b[i]} (tol={tol})");
+        }
+    }
+
+    private static void RequireOrSkipGpu(DirectGpuTensorEngine gpu)
+    {
+        if (!gpu.SupportsGpu)
+        {
+            if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU") == "1")
+                Assert.True(gpu.SupportsGpu, "AIDOTNET_REQUIRE_GPU=1 was set, but DirectGpuTensorEngine.SupportsGpu is false.");
+            Skip.If(true, "No DirectGpu backend available on this runner.");
         }
     }
 
     [Theory]
     [InlineData(17, 32)]
     [InlineData(64, 256)]
-    public void SplitHalfGivensRotation_CpuComposedAndGpuFusedAndPortable_Match(int rows, int dim)
+    public void SplitHalfGivensRotation_CpuEagerMatchesComposed(int rows, int dim)
     {
         var rng = new Random(101 + rows + dim);
         int half = dim / 2;
@@ -59,9 +69,6 @@ public sealed class SequenceMixerOpsParityTests
         var dyRaw = RandomTensor(rng, new[] { rows, dim });
 
         var cpu = new CpuEngine();
-        Tensor<float> yComp, yCpu;
-        Dictionary<Tensor<float>, Tensor<float>> compGrads, cpuGrads;
-
         var prev = AiDotNetEngine.Current;
         try
         {
@@ -69,6 +76,8 @@ public sealed class SequenceMixerOpsParityTests
             var xC0 = new Tensor<float>(xRaw.AsSpan().ToArray(), new[] { rows, dim });
             var pC0 = new Tensor<float>(phiRaw.AsSpan().ToArray(), new[] { 1, 1, half });
             var dyC0 = new Tensor<float>(dyRaw.AsSpan().ToArray(), new[] { rows, dim });
+            Tensor<float> yComp;
+            Dictionary<Tensor<float>, Tensor<float>> compGrads;
             using (var tape = new GradientTape<float>())
             {
                 yComp = CpuEngine.SplitHalfGivensRotationComposed(cpu, xC0, pC0, half);
@@ -78,6 +87,8 @@ public sealed class SequenceMixerOpsParityTests
             var xC1 = new Tensor<float>(xRaw.AsSpan().ToArray(), new[] { rows, dim });
             var pC1 = new Tensor<float>(phiRaw.AsSpan().ToArray(), new[] { 1, 1, half });
             var dyC1 = new Tensor<float>(dyRaw.AsSpan().ToArray(), new[] { rows, dim });
+            Tensor<float> yCpu;
+            Dictionary<Tensor<float>, Tensor<float>> cpuGrads;
             using (var tape = new GradientTape<float>())
             {
                 yCpu = cpu.SplitHalfGivensRotation(xC1, pC1);
@@ -92,12 +103,50 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
+    }
 
+    [SkippableTheory]
+    [InlineData(17, 32)]
+    [InlineData(64, 256)]
+    public void SplitHalfGivensRotation_GpuFusedAndPortable_Match(int rows, int dim)
+    {
         using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
+        RequireOrSkipGpu(gpu);
+
+        var rng = new Random(101 + rows + dim);
+        int half = dim / 2;
+        var xRaw = RandomTensor(rng, new[] { rows, dim });
+        var phiRaw = RandomTensor(rng, new[] { 1, 1, half });
+        var dyRaw = RandomTensor(rng, new[] { rows, dim });
+
+        var cpu = new CpuEngine();
+        Tensor<float> yComp, dxComp, dphiComp;
+        var prev = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            var xC0 = new Tensor<float>(xRaw.AsSpan().ToArray(), new[] { rows, dim });
+            var pC0 = new Tensor<float>(phiRaw.AsSpan().ToArray(), new[] { 1, 1, half });
+            var dyC0 = new Tensor<float>(dyRaw.AsSpan().ToArray(), new[] { rows, dim });
+            using var tape = new GradientTape<float>();
+            yComp = CpuEngine.SplitHalfGivensRotationComposed(cpu, xC0, pC0, half);
+            var compGrads = tape.ComputeGradients(cpu.ReduceSum(cpu.TensorMultiply(yComp, dyC0), null), new[] { xC0, pC0 });
+            dxComp = compGrads[xC0];
+            dphiComp = compGrads[pC0];
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prev;
+        }
 
         foreach (bool useFused in new[] { true, false })
         {
+            if (useFused && gpu.GetBackend() is CudaBackend cuda)
+            {
+                Assert.True(cuda.HasSequenceMixerKernel("smx_cuda_givens_fwd"), "Missing smx_cuda_givens_fwd.");
+                Assert.True(cuda.HasSequenceMixerKernel("smx_cuda_givens_bwd_dx"), "Missing smx_cuda_givens_bwd_dx.");
+                Assert.True(cuda.HasSequenceMixerKernel("smx_cuda_givens_bwd_dphi"), "Missing smx_cuda_givens_bwd_dphi.");
+            }
             bool saved = CudaBackend.UseFusedSequenceMixer;
             CudaBackend.UseFusedSequenceMixer = useFused;
             try
@@ -111,11 +160,8 @@ public sealed class SequenceMixerOpsParityTests
                 var gGrads = tape.ComputeGradients(gpu.ReduceSum(gpu.TensorMultiply(yG, dyG), null), new[] { xG, pG });
 
                 AssertClose(yComp.AsSpan(), yG.AsSpan(), 2e-5f, $"Givens.GpuFwd(fused={useFused})");
-                AssertClose(yCpu.AsSpan(), yG.AsSpan(), 2e-5f, $"Givens.GpuVsCpu(fused={useFused})");
-                AssertClose(compGrads.Values.GetEnumerator().Current is not null ? yCpu.AsSpan() : yCpu.AsSpan(), yCpu.AsSpan(), 0f, "noop");
-                var enumComp = new List<Tensor<float>>(compGrads.Values);
-                AssertClose(enumComp[0].AsSpan(), gGrads[xG].AsSpan(), 5e-5f, $"Givens.GpuDx(fused={useFused})");
-                AssertClose(enumComp[1].AsSpan(), gGrads[pG].AsSpan(), 2e-4f, $"Givens.GpuDphi(fused={useFused})");
+                AssertClose(dxComp.AsSpan(), gGrads[xG].AsSpan(), 5e-5f, $"Givens.GpuDx(fused={useFused})");
+                AssertClose(dphiComp.AsSpan(), gGrads[pG].AsSpan(), 2e-4f, $"Givens.GpuDphi(fused={useFused})");
             }
             finally
             {
@@ -125,11 +171,14 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 1, 32)]
     [InlineData(3, 19, 128)]
-    public void DepthwiseCausalConv1d2Tap_CpuComposedAndGpuFusedAndPortable_Match(int b, int s, int c)
+    public void DepthwiseCausalConv1d2Tap_GpuFusedAndPortable_Match(int b, int s, int c)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(202 + b * 11 + s * 7 + c);
         var xRaw = RandomTensor(rng, new[] { b, s, c });
         var w0Raw = RandomTensor(rng, new[] { 1, 1, c });
@@ -151,16 +200,12 @@ public sealed class SequenceMixerOpsParityTests
             var grads = tape.ComputeGradients(cpu.ReduceSum(cpu.TensorMultiply(yComp, dy0), null), new[] { x0, a0, a1 });
             dxComp = grads[x0];
             dw0Comp = grads[a0];
-            dw1Comp = grads.TryGetValue(a1, out var a1Grad) ? a1Grad : new Tensor<float>(new[] { 1, 1, c });
+            dw1Comp = s == 1 ? new Tensor<float>(new[] { 1, 1, c }) : grads[a1];
         }
         finally
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -189,12 +234,15 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 13, 4, 32, 0, 0.17677669529663687)]
     [InlineData(2, 9, 8, 64, 3, 1.0)]
-    public void RopeL2NormalizeHeads_CpuComposedAndGpuFusedAndPortable_Match(
+    public void RopeL2NormalizeHeads_GpuFusedAndPortable_Match(
         int b, int s, int nh, int dh, int startPos, double postScale)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(303 + b + s + nh + dh + startPos);
         var (cos, sin) = BuildRopeTables(startPos + s + 4, dh / 2);
         var xRaw = RandomTensor(rng, new[] { b, s, nh * dh });
@@ -216,10 +264,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -246,12 +290,15 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 11, 8, 4, 16, 0)]
     [InlineData(2, 7, 8, 6, 40, 2)]
-    public void RopeQuadraticOuterFeatures_CpuComposedAndGpuFusedAndPortable_Match(
+    public void RopeQuadraticOuterFeatures_GpuFusedAndPortable_Match(
         int b, int s, int nh, int mb, int outDim, int startPos)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(404 + b + s + nh + mb + outDim);
         var (cos, sin) = BuildRopeTables(startPos + s + 4, mb / 2);
         var xRaw = RandomTensor(rng, new[] { b, s, nh * mb });
@@ -274,10 +321,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -304,11 +347,14 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(19, 64)]
     [InlineData(64, 256)]
-    public void ProjectiveGatedResidual_CpuComposedAndGpuFusedAndPortable_Match(int rows, int dim)
+    public void ProjectiveGatedResidual_GpuFusedAndPortable_Match(int rows, int dim)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(505 + rows + dim);
         var hRaw = RandomTensor(rng, new[] { rows, dim });
         var uRaw = RandomTensor(rng, new[] { rows, dim });
@@ -336,10 +382,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -371,8 +413,36 @@ public sealed class SequenceMixerOpsParityTests
     [Theory]
     [InlineData(2, 64)]
     [InlineData(2, 256)]
-    public void SpectralCirculantMatrix_CpuComposedAndGpuFusedAndPortable_Match(int batch, int dim)
+    public void SpectralCirculantMatrix_CpuEagerMatchesComposed(int batch, int dim)
     {
+        var rng = new Random(505 + batch * 17 + dim);
+        int nf = dim / 2 + 1;
+        var dRaw = RandomTensor(rng, new[] { batch, dim });
+        var reRaw = RandomTensor(rng, new[] { batch, nf, 1 });
+        var imRaw = RandomTensor(rng, new[] { batch, nf, 1 });
+        var cpu = new CpuEngine();
+        var prev = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            var yComp = CpuEngine.SpectralCirculantMatrixComposed(cpu, dRaw, reRaw, imRaw, batch, dim);
+            var yCpu = cpu.SpectralCirculantMatrix(dRaw, reRaw, imRaw);
+            AssertClose(yComp.AsSpan(), yCpu.AsSpan(), 5e-5f, "SpecCirc.CpuFast");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prev;
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(2, 64)]
+    [InlineData(2, 256)]
+    public void SpectralCirculantMatrix_GpuFusedAndPortable_Match(int batch, int dim)
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(505 + batch * 17 + dim);
         int nf = dim / 2 + 1;
         var dRaw = RandomTensor(rng, new[] { batch, dim });
@@ -401,13 +471,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        var yCpu = cpu.SpectralCirculantMatrix(dRaw, reRaw, imRaw);
-        AssertClose(yComp.AsSpan(), yCpu.AsSpan(), 5e-5f, "SpecCirc.CpuFast");
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -436,11 +499,14 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(37, 48, 4, 6, 0.001)]
     [InlineData(19, 16, 2, 12, 0.0)]
-    public void SigmoidTopKExpertMix_CpuComposedAndGpuFusedAndPortable_Match(int rows, int experts, int topK, int channels, double biasRate)
+    public void SigmoidTopKExpertMix_GpuFusedAndPortable_Match(int rows, int experts, int topK, int channels, double biasRate)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(606 + rows * 7 + experts * 3 + topK);
         var logRaw = RandomTensor(rng, new[] { rows, experts });
         var tblRaw = RandomTensor(rng, new[] { experts, channels });
@@ -469,10 +535,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -501,10 +563,13 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(29, 64)]
-    public void DualModulatedSwiGlu_CpuComposedAndGpuFusedAndPortable_Match(int rows, int h)
+    public void DualModulatedSwiGlu_GpuFusedAndPortable_Match(int rows, int h)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(707 + rows + h);
         var guRaw = RandomTensor(rng, new[] { rows, 2 * h });
         var ggRaw = RandomTensor(rng, new[] { rows, 2 * h });
@@ -532,10 +597,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -564,14 +625,17 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 11, 8, 32, 33, false)]
     [InlineData(2, 9, 4, 16, 20, true)]
-    public void BornRatioNormalize_CpuComposedAndGpuFusedAndPortable_Match(int b, int s, int nh, int dh, int scanDim, bool withSink)
+    public void BornRatioNormalize_GpuFusedAndPortable_Match(int b, int s, int nh, int dh, int scanDim, bool withSink)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(808 + b * 3 + s * 5 + nh + (withSink ? 99 : 0));
         var scanArr = RandomTensor(rng, new[] { b, s, nh, scanDim }).AsSpan().ToArray();
-        for (int i = dh; i < scanArr.Length; i += scanDim) scanArr[i] = MathF.Abs(scanArr[i]) + 0.5f;
+        for (int i = dh; i < scanArr.Length; i += scanDim) scanArr[i] = Math.Abs(scanArr[i]) + 0.5f;
         var scanRaw = new Tensor<float>(scanArr, new[] { b, s, nh, scanDim });
         var sinkRaw = withSink ? RandomTensor(rng, new[] { 1, 1, nh, 1 }) : null;
         var dyRaw = RandomTensor(rng, new[] { b, s, nh * dh });
@@ -597,10 +661,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;
@@ -629,10 +689,13 @@ public sealed class SequenceMixerOpsParityTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(3, 17, 8, 0.5)]
-    public void BoundedSigmoidGate_CpuComposedAndGpuFusedAndPortable_Match(int b, int s, int nh, double floor)
+    public void BoundedSigmoidGate_GpuFusedAndPortable_Match(int b, int s, int nh, double floor)
     {
+        using var gpu = new DirectGpuTensorEngine();
+        RequireOrSkipGpu(gpu);
+
         var rng = new Random(909 + b + s + nh);
         var logRaw = RandomTensor(rng, new[] { b, s, nh });
         var biasRaw = RandomTensor(rng, new[] { 1, 1, nh });
@@ -657,10 +720,6 @@ public sealed class SequenceMixerOpsParityTests
         {
             AiDotNetEngine.Current = prev;
         }
-
-        using var gpu = new DirectGpuTensorEngine();
-        if (!gpu.SupportsGpu) return;
-
         foreach (bool useFused in new[] { true, false })
         {
             bool saved = CudaBackend.UseFusedSequenceMixer;

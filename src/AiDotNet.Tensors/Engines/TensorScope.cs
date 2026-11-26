@@ -65,6 +65,7 @@ public sealed class TensorScope : IDisposable
     private TensorScope? _outer;
     private readonly int _threadId;
     private readonly long _openTick;
+    private long _closeTick = long.MaxValue;
     // Keyed by storage (the vector), so a kept view keeps the result it views.
     // Value is either (DirectGpuTensorEngine, IScopedDeviceTensor) for zero-closure GPU tensor tracking
     // or (null, Action) for custom callbacks.
@@ -233,6 +234,7 @@ public sealed class TensorScope : IDisposable
     {
         if (key is IScopeTrackableStorage trackable
             && trackable.CreatedScopeTick > _openTick
+            && trackable.CreatedScopeTick <= _closeTick
             && trackable.CreatedThreadId == _threadId)
         {
             return true;
@@ -307,6 +309,7 @@ public sealed class TensorScope : IDisposable
             throw new InvalidOperationException(
                 "TensorScope disposed out of order or on another thread: dispose nested scopes innermost first, on the thread that began them.");
         _disposed = true;
+        _closeTick = s_clock;
         s_current = _outer;
         // Inside a deferred-execution scope the recorded graph still references these buffers until it executes, and not every
         // backend's buffers consult the deferral gate on disposal (HIP's do not): queue the whole release behind the graph.

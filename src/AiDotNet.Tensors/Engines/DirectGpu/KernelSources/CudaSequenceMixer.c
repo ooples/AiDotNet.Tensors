@@ -97,14 +97,14 @@ __global__ __launch_bounds__(256) void smx_cuda_conv2_fwd(
     int seqLen,
     int channels)
 {
-    int stride = (int)gridDim.x * 256;
-    for (int idx = (int)blockIdx.x * 256 + (int)threadIdx.x; idx < total; idx += stride) {
-        int c = idx % channels;
-        int bt = idx / channels;
+    long long stride = (long long)gridDim.x * 256;
+    for (long long idx = (long long)blockIdx.x * 256 + threadIdx.x; idx < total; idx += stride) {
+        int c = (int)(idx % channels);
+        int bt = (int)(idx / channels);
         int t = bt % seqLen;
-        float xv = x[idx];
-        float xp = t > 0 ? x[idx - channels] : 0.0f;
-        y[idx] = w0[c] * xv + w1[c] * xp;
+        float res = w0[c] * x[idx];
+        if (t > 0) res += w1[c] * x[idx - channels];
+        y[idx] = res;
     }
 }
 
@@ -117,14 +117,14 @@ __global__ __launch_bounds__(256) void smx_cuda_conv2_bwd_dx(
     int seqLen,
     int channels)
 {
-    int stride = (int)gridDim.x * 256;
-    for (int idx = (int)blockIdx.x * 256 + (int)threadIdx.x; idx < total; idx += stride) {
-        int c = idx % channels;
-        int bt = idx / channels;
+    long long stride = (long long)gridDim.x * 256;
+    for (long long idx = (long long)blockIdx.x * 256 + threadIdx.x; idx < total; idx += stride) {
+        int c = (int)(idx % channels);
+        int bt = (int)(idx / channels);
         int t = bt % seqLen;
-        float dyv = dy[idx];
-        float dyn = (t + 1 < seqLen) ? dy[idx + channels] : 0.0f;
-        dx[idx] = w0[c] * dyv + w1[c] * dyn;
+        float res = w0[c] * dy[idx];
+        if (t + 1 < seqLen) res += w1[c] * dy[idx + channels];
+        dx[idx] = res;
     }
 }
 
@@ -684,7 +684,7 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
     const float* __restrict__ routingBias,
     float* __restrict__ y,
     float* __restrict__ savedInfo,
-    float* __restrict__ loadCounts,
+    int* __restrict__ loadCounts,
     int rows,
     int numExperts,
     int topK,
@@ -704,8 +704,10 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
         long long infoOff = (long long)m * strideInfo;
         float regS[8];
         float regB[8];
+        unsigned char regUsed[8];
         for (int v = 0; v < nSlots; v++) {
             int j = (v << 5) + lane;
+            regUsed[v] = 0;
             if (j < numExperts) {
                 float sj = 1.0f / (1.0f + expf(-logits[logOff + j]));
                 regS[v] = sj;
@@ -725,7 +727,7 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
             float localSig = 0.0f;
             for (int v = 0; v < nSlots; v++) {
                 int j = (v << 5) + lane;
-                if (j < numExperts) {
+                if (j < numExperts && regUsed[v] == 0) {
                     float bv = regB[v];
                     if (localIdx == 2147483647 || bv > localVal || (bv == localVal && j < localIdx)) {
                         localVal = bv;
@@ -750,7 +752,7 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
             int winLane = localIdx & 31;
             int winSlot = localIdx >> 5;
             if (lane == winLane) {
-                regB[winSlot] = -3.4e38f;
+                regUsed[winSlot] = 1;
             }
         }
 
@@ -761,7 +763,7 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
             savedInfo[infoOff + lane] = (float)eIdx;
             savedInfo[infoOff + topK + lane] = chosenSig[lane] * invDenom;
             if (loadCounts != 0) {
-                atomicAdd(&loadCounts[eIdx], 1.0f);
+                atomicAdd(&loadCounts[eIdx], 1);
             }
         }
         if (lane == 0) {
@@ -780,7 +782,7 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_fwd(
 }
 
 __global__ __launch_bounds__(256) void smx_cuda_sigtopk_bias_upd(
-    const float* __restrict__ loadCounts,
+    const int* __restrict__ loadCounts,
     float* __restrict__ routingBias,
     int rows,
     int numExperts,
@@ -789,9 +791,9 @@ __global__ __launch_bounds__(256) void smx_cuda_sigtopk_bias_upd(
 {
     int e = (int)blockIdx.x * 256 + (int)threadIdx.x;
     if (e >= numExperts) return;
-    float mean = (float)((long long)rows * topK) / (float)numExperts;
-    float diff = mean - loadCounts[e];
-    float sgn = diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : 0.0f);
+    long long expectedTimesG = (long long)rows * (long long)topK;
+    long long actualTimesG = (long long)loadCounts[e] * (long long)numExperts;
+    float sgn = expectedTimesG > actualTimesG ? 1.0f : (expectedTimesG < actualTimesG ? -1.0f : 0.0f);
     routingBias[e] += rate * sgn;
 }
 
@@ -816,9 +818,6 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_bwd_dlog(
 
     for (int m = globalWarp; m < rows; m += totalWarps) {
         long long logOff = (long long)m * numExperts;
-        for (int j = lane; j < numExperts; j += 32) {
-            dLogits[logOff + j] = 0.0f;
-        }
         long long infoOff = (long long)m * strideInfo;
         long long yOff = (long long)m * channels;
         float sumSel = savedInfo[infoOff + 2 * topK];
@@ -838,12 +837,18 @@ __global__ __launch_bounds__(128) void smx_cuda_sigtopk_mix_bwd_dlog(
             dGateArr[r] = dGate;
             dotDg += dGate * gateR;
         }
-        if (lane < topK) {
-            int eIdx = idxArr[lane];
-            float dGate = dGateArr[lane];
-            float dSel = sumSel >= eps ? ((dGate - dotDg) / sumSel) : (dGate / eps);
-            float sj = 1.0f / (1.0f + expf(-logits[logOff + eIdx]));
-            dLogits[logOff + eIdx] = dSel * sj * (1.0f - sj);
+        for (int j = lane; j < numExperts; j += 32) {
+            float gradVal = 0.0f;
+            for (int r = 0; r < topK; r++) {
+                if (idxArr[r] == j) {
+                    float dGate = dGateArr[r];
+                    float dSel = sumSel >= eps ? ((dGate - dotDg) / sumSel) : (dGate / eps);
+                    float sj = 1.0f / (1.0f + expf(-logits[logOff + j]));
+                    gradVal = dSel * sj * (1.0f - sj);
+                    break;
+                }
+            }
+            dLogits[logOff + j] = gradVal;
         }
     }
 }
@@ -1079,10 +1084,10 @@ __global__ __launch_bounds__(256) void smx_cuda_boundsig_fwd(
     int cols,
     float flr)
 {
-    int stride = (int)gridDim.x * 256;
+    long long stride = (long long)gridDim.x * 256;
     float scale = 1.0f - flr;
-    for (int gid = (int)blockIdx.x * 256 + (int)threadIdx.x; gid < total; gid += stride) {
-        int c = gid % cols;
+    for (long long gid = (long long)blockIdx.x * 256 + threadIdx.x; gid < total; gid += stride) {
+        int c = (int)(gid % cols);
         float sig = 1.0f / (1.0f + expf(-(logits[gid] + bias[c])));
         y[gid] = flr + scale * sig;
     }
@@ -1097,10 +1102,10 @@ __global__ __launch_bounds__(256) void smx_cuda_boundsig_bwd_dlog(
     int cols,
     float flr)
 {
-    int stride = (int)gridDim.x * 256;
+    long long stride = (long long)gridDim.x * 256;
     float scale = 1.0f - flr;
-    for (int gid = (int)blockIdx.x * 256 + (int)threadIdx.x; gid < total; gid += stride) {
-        int c = gid % cols;
+    for (long long gid = (long long)blockIdx.x * 256 + threadIdx.x; gid < total; gid += stride) {
+        int c = (int)(gid % cols);
         float sig = 1.0f / (1.0f + expf(-(logits[gid] + bias[c])));
         dLogits[gid] = dy[gid] * scale * sig * (1.0f - sig);
     }

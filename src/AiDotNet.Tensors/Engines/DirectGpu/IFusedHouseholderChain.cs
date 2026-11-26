@@ -18,7 +18,7 @@ internal interface IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor);
+        double normFloor);
 
     void HouseholderChainBackward(
         IGpuBuffer gradOutput,
@@ -30,5 +30,5 @@ internal interface IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor);
+        double normFloor);
 }

@@ -14,13 +14,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels;
 internal static class CudaGatedDeltaNetKernels
 {
     public const int MaxHeadDim = 256;
+    internal const int ChunkBlockThreads = 256;
+    internal const int ChunkWarpSize = 32;
+    internal const int ChunkWarpsPerBlock = ChunkBlockThreads / ChunkWarpSize;
+    internal const int ChunkRowsPerWarp = 4;
+    internal const int ChunkTileRows = ChunkWarpsPerBlock * ChunkRowsPerWarp;
 
     /// <summary>The kernel-name suffix for a head size: the register entries per lane, 1, 2, 4 or 8.</summary>
     internal static string Variant(int headDim) => headDim <= 32 ? "_r1" : headDim <= 64 ? "_r2" : headDim <= 128 ? "_r4" : "_r8";
 
     public static string GetSource()
     {
-        return @"
+        return "#define GDN_CHUNK_BLOCK_THREADS " + ChunkBlockThreads + "\n"
+            + "#define GDN_CHUNK_WARP_SIZE " + ChunkWarpSize + "\n"
+            + "#define GDN_CHUNK_WARPS " + ChunkWarpsPerBlock + "\n"
+            + "#define GDN_CHUNK_ROWS_PER_WARP " + ChunkRowsPerWarp + "\n"
+            + "#define GDN_CHUNK_TILE_ROWS " + ChunkTileRows + "\n"
+            + @"
 #include <math.h>
 
 #define GDN_FULL 0xffffffffu
@@ -411,10 +421,10 @@ __device__ __forceinline__ void gdn_bwd_chunk(
     float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dA, float* __restrict__ dB,
     int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 {
-    const int W = 32 * R;
-    __shared__ float s_Sprev[(CHUNK - 1) * 32 * W];
-    __shared__ float s_red[8 * W];
-    __shared__ float s_ab[16];
+    const int W = GDN_CHUNK_WARP_SIZE * R;
+    __shared__ float s_Sprev[(CHUNK - 1) * GDN_CHUNK_TILE_ROWS * W];
+    __shared__ float s_red[GDN_CHUNK_WARPS * W];
+    __shared__ float s_ab[GDN_CHUNK_WARPS * 2];
     __shared__ float s_dQ[CHUNK * W];
     __shared__ float s_dK[CHUNK * W];
     __shared__ float s_dAB[CHUNK * 2];
@@ -436,24 +446,24 @@ __device__ __forceinline__ void gdn_bwd_chunk(
     long hh = (long)headDim * headDim;
     long ckBase = ((long)bh * nChunks + c) * hh;
 
-    for (int i = tid; i < CHUNK * W; i += 256) { s_dQ[i] = 0.0f; s_dK[i] = 0.0f; }
-    for (int i = tid; i < CHUNK * 2; i += 256) { s_dAB[i] = 0.0f; }
+    for (int i = tid; i < CHUNK * W; i += GDN_CHUNK_BLOCK_THREADS) { s_dQ[i] = 0.0f; s_dK[i] = 0.0f; }
+    for (int i = tid; i < CHUNK * 2; i += GDN_CHUNK_BLOCK_THREADS) { s_dAB[i] = 0.0f; }
     __syncthreads();
 
     for (int tile = 0; tile < TILES; tile++)
     {
-        int tileRow0 = tile * 32;
+        int tileRow0 = tile * GDN_CHUNK_TILE_ROWS;
         if (tileRow0 >= headDim) break;
 
-        float S[4][R];
+        float S[GDN_CHUNK_ROWS_PER_WARP][R];
 #pragma unroll
-        for (int r = 0; r < 4; r++)
+        for (int r = 0; r < GDN_CHUNK_ROWS_PER_WARP; r++)
         {
-            int di = tileRow0 + warpId * 4 + r;
+            int di = tileRow0 + warpId * GDN_CHUNK_ROWS_PER_WARP + r;
 #pragma unroll
             for (int j = 0; j < R; j++)
             {
-                int ki = lane + 32 * j;
+                int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                 S[r][j] = (di < headDim && ki < headDim) ? Hckpt[ckBase + (long)di * headDim + ki] : 0.0f;
             }
         }
@@ -468,7 +478,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
             for (int j = 0; j < R; j++)
             {
-                int ki = lane + 32 * j;
+                int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                 kk[j] = ki < headDim ? K[baseOff + ki] * keyScale : 0.0f;
             }
 
@@ -477,17 +487,17 @@ __device__ __forceinline__ void gdn_bwd_chunk(
             for (int j = 0; j < R; j++) dqPart[j] = 0.0f;
 
 #pragma unroll
-            for (int r = 0; r < 4; r++)
+            for (int r = 0; r < GDN_CHUNK_ROWS_PER_WARP; r++)
             {
-                int localRow = warpId * 4 + r;
+                int localRow = warpId * GDN_CHUNK_ROWS_PER_WARP + r;
                 int di = tileRow0 + localRow;
                 if (di < headDim)
                 {
                     if (lt > 0)
                     {
-                        int spBase = ((lt - 1) * 32 + localRow) * W;
+                        int spBase = ((lt - 1) * GDN_CHUNK_TILE_ROWS + localRow) * W;
 #pragma unroll
-                        for (int j = 0; j < R; j++) s_Sprev[spBase + lane + 32 * j] = S[r][j];
+                        for (int j = 0; j < R; j++) s_Sprev[spBase + lane + GDN_CHUNK_WARP_SIZE * j] = S[r][j];
                     }
                     float sK = 0.0f;
 #pragma unroll
@@ -498,7 +508,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
                     for (int j = 0; j < R; j++)
                     {
-                        int ki = lane + 32 * j;
+                        int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                         if (ki < headDim)
                         {
                             S[r][j] = a * S[r][j] + bd * kk[j];
@@ -509,32 +519,32 @@ __device__ __forceinline__ void gdn_bwd_chunk(
             }
 
 #pragma unroll
-            for (int j = 0; j < R; j++) s_red[warpId * W + lane + 32 * j] = dqPart[j];
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + GDN_CHUNK_WARP_SIZE * j] = dqPart[j];
             __syncthreads();
             if (warpId == 0)
             {
 #pragma unroll
                 for (int j = 0; j < R; j++)
                 {
-                    int col = lane + 32 * j;
+                    int col = lane + GDN_CHUNK_WARP_SIZE * j;
                     float sum = 0.0f;
 #pragma unroll
-                    for (int w = 0; w < 8; w++) sum += s_red[w * W + col];
+                    for (int w = 0; w < GDN_CHUNK_WARPS; w++) sum += s_red[w * W + col];
                     s_dQ[lt * W + col] += sum;
                 }
             }
             __syncthreads();
         }
 
-        float dS[4][R];
+        float dS[GDN_CHUNK_ROWS_PER_WARP][R];
 #pragma unroll
-        for (int r = 0; r < 4; r++)
+        for (int r = 0; r < GDN_CHUNK_ROWS_PER_WARP; r++)
         {
-            int di = tileRow0 + warpId * 4 + r;
+            int di = tileRow0 + warpId * GDN_CHUNK_ROWS_PER_WARP + r;
 #pragma unroll
             for (int j = 0; j < R; j++)
             {
-                int ki = lane + 32 * j;
+                int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                 dS[r][j] = (di < headDim && ki < headDim) ? dHckpt[ckBase + (long)di * headDim + ki] : 0.0f;
             }
         }
@@ -550,7 +560,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
             for (int j = 0; j < R; j++)
             {
-                int ki = lane + 32 * j;
+                int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                 bool in = ki < headDim;
                 kk[j] = in ? K[baseOff + ki] * keyScale : 0.0f;
                 qq[j] = in ? Q[baseOff + ki] : 0.0f;
@@ -562,19 +572,19 @@ __device__ __forceinline__ void gdn_bwd_chunk(
             float dAPart = 0.0f, dBPart = 0.0f;
 
 #pragma unroll
-            for (int r = 0; r < 4; r++)
+            for (int r = 0; r < GDN_CHUNK_ROWS_PER_WARP; r++)
             {
-                int localRow = warpId * 4 + r;
+                int localRow = warpId * GDN_CHUNK_ROWS_PER_WARP + r;
                 int di = tileRow0 + localRow;
                 if (di < headDim)
                 {
                     float sp[R];
                     float sK = 0.0f;
-                    int spBase = ((lt - 1) * 32 + localRow) * W;
+                    int spBase = ((lt - 1) * GDN_CHUNK_TILE_ROWS + localRow) * W;
 #pragma unroll
                     for (int j = 0; j < R; j++)
                     {
-                        int ki = lane + 32 * j;
+                        int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                         if (ki < headDim)
                             sp[j] = (lt > 0) ? s_Sprev[spBase + ki] : Hckpt[ckBase + (long)di * headDim + ki];
                         else
@@ -588,7 +598,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
                     for (int j = 0; j < R; j++)
                     {
-                        int ki = lane + 32 * j;
+                        int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                         if (ki < headDim) dS[r][j] += dOutVal * qq[j];
                         dAp += dS[r][j] * sp[j];
                         dBp += dS[r][j] * delta * kk[j];
@@ -607,7 +617,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
                     for (int j = 0; j < R; j++)
                     {
-                        int ki = lane + 32 * j;
+                        int ki = lane + GDN_CHUNK_WARP_SIZE * j;
                         if (ki < headDim)
                         {
                             float dKS = dS[r][j] * (bet * delta) + dSk * pa * sp[j];
@@ -619,7 +629,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
             }
 
 #pragma unroll
-            for (int j = 0; j < R; j++) s_red[warpId * W + lane + 32 * j] = dkPart[j];
+            for (int j = 0; j < R; j++) s_red[warpId * W + lane + GDN_CHUNK_WARP_SIZE * j] = dkPart[j];
             if (lane == 0) { s_ab[warpId * 2] = dAPart; s_ab[warpId * 2 + 1] = dBPart; }
             __syncthreads();
             if (warpId == 0)
@@ -627,17 +637,17 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
                 for (int j = 0; j < R; j++)
                 {
-                    int col = lane + 32 * j;
+                    int col = lane + GDN_CHUNK_WARP_SIZE * j;
                     float sum = 0.0f;
 #pragma unroll
-                    for (int w = 0; w < 8; w++) sum += s_red[w * W + col];
+                    for (int w = 0; w < GDN_CHUNK_WARPS; w++) sum += s_red[w * W + col];
                     s_dK[lt * W + col] += sum;
                 }
                 if (lane == 0)
                 {
                     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-                    for (int w = 0; w < 8; w++) { sa += s_ab[w * 2]; sb += s_ab[w * 2 + 1]; }
+                    for (int w = 0; w < GDN_CHUNK_WARPS; w++) { sa += s_ab[w * 2]; sb += s_ab[w * 2 + 1]; }
                     s_dAB[lt * 2] += sa;
                     s_dAB[lt * 2 + 1] += sb;
                 }
@@ -646,7 +656,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
         }
     }
 
-    for (int lt = warpId; lt < len; lt += 8)
+    for (int lt = warpId; lt < len; lt += GDN_CHUNK_WARPS)
     {
         int t = t0 + lt;
         int baseOff = (b * seqLen + t) * modelDim + hOff;
@@ -654,7 +664,7 @@ __device__ __forceinline__ void gdn_bwd_chunk(
 #pragma unroll
         for (int j = 0; j < R; j++)
         {
-            int ki = lane + 32 * j;
+            int ki = lane + GDN_CHUNK_WARP_SIZE * j;
             if (ki < headDim)
             {
                 dQ[baseOff + ki] = s_dQ[lt * W + ki];
@@ -669,23 +679,26 @@ __device__ __forceinline__ void gdn_bwd_chunk(
     }
 }
 
-extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_ckpt_r1(
+// Checkpointed chunk-parallel CUDA warp-shuffle specializations behind IGatedDeltaNetBackwardBackend (#1773 / #1096).
+// Peer backends already implement native GPU GatedDeltaNetScanBackward (HipBackend.FusedKernels.cs,
+// MetalBackend.Rnn.cs, OpenClBackend.cs, VulkanBackend.GpuBackend4.cs, WebGpuBackend.GpuBackend4.cs).
+extern ""C"" __global__ __launch_bounds__(GDN_CHUNK_BLOCK_THREADS) void gated_delta_scan_bwd_ckpt_r1(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
     float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 { gdn_bwd_ckpt<1, 8>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
 
-extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_chunk_r1(
+extern ""C"" __global__ __launch_bounds__(GDN_CHUNK_BLOCK_THREADS) void gated_delta_scan_bwd_chunk_r1(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
     const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dA, float* dB,
     int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 { gdn_bwd_chunk<1, 8, 1>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dQ, dK, dA, dB, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
 
-extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_ckpt_r2(
+extern ""C"" __global__ __launch_bounds__(GDN_CHUNK_BLOCK_THREADS) void gated_delta_scan_bwd_ckpt_r2(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
     float* Hckpt, float* dHckpt, float* dV, int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)
 { gdn_bwd_ckpt<2, 6>(dOut, Q, K, V, A, B, Hckpt, dHckpt, dV, batch, seqLen, modelDim, numHeads, headDim, keyScale, decayFirst); }
 
-extern ""C"" __global__ __launch_bounds__(256) void gated_delta_scan_bwd_chunk_r2(
+extern ""C"" __global__ __launch_bounds__(GDN_CHUNK_BLOCK_THREADS) void gated_delta_scan_bwd_chunk_r2(
     const float* dOut, const float* Q, const float* K, const float* V, const float* A, const float* B,
     const float* Hckpt, const float* dHckpt, float* dQ, float* dK, float* dA, float* dB,
     int batch, int seqLen, int modelDim, int numHeads, int headDim, float keyScale, int decayFirst)

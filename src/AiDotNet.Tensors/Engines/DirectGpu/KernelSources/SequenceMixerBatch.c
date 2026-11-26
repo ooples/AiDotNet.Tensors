@@ -49,9 +49,9 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_conv2_fwd(const float* x
     int c = idx % channels;
     int bt = idx / channels;
     int t = bt % seqLen;
-    float xv = x[idx];
-    float xp = t > 0 ? x[idx - channels] : 0.0f;
-    y[idx] = w0[c] * xv + w1[c] * xp;
+    float res = w0[c] * x[idx];
+    if (t > 0) res += w1[c] * x[idx - channels];
+    y[idx] = res;
 }
 
 extern "C" __global__ __launch_bounds__(256) void smx_p_conv2_bwd_dx(const float* dy, const float* w0, const float* w1, float* dx, int total, int seqLen, int channels) {
@@ -59,9 +59,9 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_conv2_bwd_dx(const float
     int c = idx % channels;
     int bt = idx / channels;
     int t = bt % seqLen;
-    float dyv = dy[idx];
-    float dyn = (t + 1 < seqLen) ? dy[idx + channels] : 0.0f;
-    dx[idx] = w0[c] * dyv + w1[c] * dyn;
+    float res = w0[c] * dy[idx];
+    if (t + 1 < seqLen) res += w1[c] * dy[idx + channels];
+    dx[idx] = res;
 }
 
 extern "C" __global__ __launch_bounds__(256) void smx_p_conv2_bwd_dw(const float* dy, const float* x, float* dw0, float* dw1, int batch, int seqLen, int channels) {
@@ -87,11 +87,11 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropel2_fwd(const float* 
     float postScale = __int_as_float(scaleBits);
     int bt = r / numHeads;
     int t = bt % seqLen;
-    int half = headDim / 2;
-    int cOff = (startPos + t) * half;
+    int halfDim = headDim / 2;
+    int cOff = (startPos + t) * halfDim;
     int xOff = r * headDim;
     float normSq = 0.0f;
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float x0 = x[xOff + 2 * p];
         float x1 = x[xOff + 2 * p + 1];
         float c = cosBuf[cOff + p];
@@ -101,7 +101,7 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropel2_fwd(const float* 
         normSq += r0 * r0 + r1 * r1;
     }
     float sc = postScale / sqrtf(normSq + eps);
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float x0 = x[xOff + 2 * p];
         float x1 = x[xOff + 2 * p + 1];
         float c = cosBuf[cOff + p];
@@ -117,11 +117,11 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropel2_bwd(const float* 
     float postScale = __int_as_float(scaleBits);
     int bt = r / numHeads;
     int t = bt % seqLen;
-    int half = headDim / 2;
-    int cOff = (startPos + t) * half;
+    int halfDim = headDim / 2;
+    int cOff = (startPos + t) * halfDim;
     int xOff = r * headDim;
     float normSq = 0.0f;
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float x0 = x[xOff + 2 * p];
         float x1 = x[xOff + 2 * p + 1];
         float c = cosBuf[cOff + p];
@@ -132,7 +132,7 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropel2_bwd(const float* 
     }
     float invNorm = 1.0f / sqrtf(normSq + eps);
     float dot = 0.0f;
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float x0 = x[xOff + 2 * p];
         float x1 = x[xOff + 2 * p + 1];
         float c = cosBuf[cOff + p];
@@ -142,7 +142,7 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropel2_bwd(const float* 
         dot += dy[xOff + 2 * p] * u0 + dy[xOff + 2 * p + 1] * u1;
     }
     float sc = postScale * invNorm;
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float x0 = x[xOff + 2 * p];
         float x1 = x[xOff + 2 * p + 1];
         float c = cosBuf[cOff + p];
@@ -160,8 +160,8 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropequad_fwd(const float
     int r = bx_gid(); if (r >= totalHeads) return;
     int bt = r / numHeads;
     int t = bt % seqLen;
-    int half = mb / 2;
-    int cOff = (startPos + t) * half;
+    int halfDim = mb / 2;
+    int cOff = (startPos + t) * halfDim;
     int xOff = r * mb;
     int yOff = r * outDim;
     int mb2 = mb * mb;
@@ -189,11 +189,11 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_ropequad_bwd(const float
     int r = bx_gid(); if (r >= totalHeads) return;
     int bt = r / numHeads;
     int t = bt % seqLen;
-    int half = mb / 2;
-    int cOff = (startPos + t) * half;
+    int halfDim = mb / 2;
+    int cOff = (startPos + t) * halfDim;
     int xOff = r * mb;
     int yOff = r * outDim;
-    for (int p = 0; p < half; p++) {
+    for (int p = 0; p < halfDim; p++) {
         float dr0 = 0.0f;
         float dr1 = 0.0f;
         int u0 = 2 * p;
@@ -278,14 +278,14 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_speccirc_h(const float* 
     int gid = bx_gid(); if (gid >= batch * dim) return;
     int b = gid / dim;
     int m = gid - b * dim;
-    int half = dim / 2;
-    int nf = half + 1;
+    int halfDim = dim / 2;
+    int nf = halfDim + 1;
     int specOff = b * nf;
     float dimF = (float)dim;
     float twoPiOverD = 6.2831853071795864769f / dimF;
     float signNyq = (m - 2 * (m / 2)) == 0 ? 1.0f : -1.0f;
-    float sum = specRe[specOff] + signNyq * specRe[specOff + half];
-    for (int f = 1; f < half; f++) {
+    float sum = specRe[specOff] + signNyq * specRe[specOff + halfDim];
+    for (int f = 1; f < halfDim; f++) {
         int fm = (f * m) % dim;
         float fmF = (float)fm;
         float ang = twoPiOverD * fmF;
@@ -324,8 +324,8 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_speccirc_bwd_dhdd(const 
 }
 
 extern "C" __global__ __launch_bounds__(256) void smx_p_speccirc_bwd_dspec(const float* dhTime, float* dRe, float* dIm, int batch, int dim) {
-    int half = dim / 2;
-    int nf = half + 1;
+    int halfDim = dim / 2;
+    int nf = halfDim + 1;
     int gid = bx_gid(); if (gid >= batch * nf) return;
     int b = gid / nf;
     int f = gid - b * nf;
@@ -337,7 +337,7 @@ extern "C" __global__ __launch_bounds__(256) void smx_p_speccirc_bwd_dspec(const
         for (int m = 0; m < dim; m++) s0 += dhTime[vecBase + m];
         dRe[gid] = s0 * invD;
         dIm[gid] = 0.0f;
-    } else if (f == half) {
+    } else if (f == halfDim) {
         float sn = 0.0f;
         for (int m = 0; m < dim; m++) {
             float sgn = (m - 2 * (m / 2)) == 0 ? 1.0f : -1.0f;

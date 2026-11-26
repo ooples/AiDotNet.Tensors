@@ -15455,7 +15455,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         IReadOnlyList<int> sizes)
     {
         if (_adamTable is { } cached && AdamTableMatches(cached, parameters, gradients, firstMoments, secondMoments, sizes))
+        {
+            if (IsStreamCapturing()) cached.CapturedByGraph = true;
             return cached;
+        }
         for (int i = 0; i < _retainedAdamTables.Count; i++)
         {
             var retained = _retainedAdamTables[i];
@@ -15463,6 +15466,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _retainedAdamTables.RemoveAt(i);
             _retainedAdamTables.Add(retained);
             _adamTable = retained;
+            if (IsStreamCapturing()) retained.CapturedByGraph = true;
             return retained;
         }
         if (IsStreamCapturing())
@@ -15472,6 +15476,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         for (int i = _retainedAdamTables.Count - 1; i >= 0; i--)
         {
             var retained = _retainedAdamTables[i];
+            if (retained.CapturedByGraph) continue;
             if (!AdamTableMatchesStaticPart(retained, parameters, firstMoments, secondMoments, sizes)) continue;
             if (!TryRefreshTablePointersInPlace(retained, n, gradients)) break;
             _retainedAdamTables.RemoveAt(i);
@@ -15482,6 +15487,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         for (int i = _retainedAdamTables.Count - 1; i >= 0; i--)
         {
             var retained = _retainedAdamTables[i];
+            if (retained.CapturedByGraph) continue;
             if (retained.Handles.Length != 4 * n || !retained.MatchesSizes(sizes)) continue;
             if (!TryRefreshTablePointersInPlace(retained, 0, parameters)
                 || !TryRefreshTablePointersInPlace(retained, n, gradients)
@@ -15500,14 +15506,23 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     }
 
     // Preserve a bounded working set of independent plans; alternating plans must not evict each other every step.
-    // Captured graphs use caller-owned tables from StepIo and are independent of this ordinary-call cache.
+    // Tables referenced by a captured CUDA graph (CapturedByGraph) are pinned for the backend's lifetime and skipped
+    // during eager in-place refresh and eviction.
     private const int MultiTensorTableCacheCapacity = 32;
     private static void RetainMultiTensorTable(List<MultiTensorTable> tables, MultiTensorTable table)
     {
-        if (tables.Count == MultiTensorTableCacheCapacity)
+        int uncaptured = 0;
+        int oldestUncaptured = -1;
+        for (int i = 0; i < tables.Count; i++)
         {
-            var retired = tables[0];
-            tables.RemoveAt(0);
+            if (tables[i].CapturedByGraph) continue;
+            if (oldestUncaptured < 0) oldestUncaptured = i;
+            uncaptured++;
+        }
+        if (uncaptured >= MultiTensorTableCacheCapacity && oldestUncaptured >= 0)
+        {
+            var retired = tables[oldestUncaptured];
+            tables.RemoveAt(oldestUncaptured);
             retired.Dispose();
         }
         tables.Add(table);
@@ -15675,7 +15690,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         public int[] Sizes = Array.Empty<int>();
         public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
         public int TotalChunks;
-
+        public bool CapturedByGraph;
         public bool Matches(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
         {
             if (Handles.Length != tensors.Count) return false;
@@ -15722,7 +15737,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (sizes.Count != tensors.Count)
             throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
         if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
+        {
+            if (IsStreamCapturing()) cached.CapturedByGraph = true;
             return cached;
+        }
         for (int i = 0; i < _retainedGradientTables.Count; i++)
         {
             var retained = _retainedGradientTables[i];
@@ -15730,6 +15748,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             _retainedGradientTables.RemoveAt(i);
             _retainedGradientTables.Add(retained);
             _gradientTable = retained;
+            if (IsStreamCapturing()) retained.CapturedByGraph = true;
             return retained;
         }
         // A miss allocates/uploads and may evict an old table: never do either during stream capture.
@@ -15739,6 +15758,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         for (int i = _retainedGradientTables.Count - 1; i >= 0; i--)
         {
             var retained = _retainedGradientTables[i];
+            if (retained.CapturedByGraph) continue;
             if (retained.Handles.Length != tensors.Count || !retained.MatchesSizes(sizes)) continue;
             for (int t = 0; t < tensors.Count; t++)
             {
@@ -19562,8 +19582,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return false;
 
         IGpuBuffer ckptPair;
-        using (DeviceMemoryReclaim.EnterScopedScratch())
-            ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        try
+        {
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+                ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        }
+        catch (GpuOutOfMemoryException)
+        {
+            return false;
+        }
         using var ckptOwner = ckptPair;
 
         IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pg = gate.Handle;
@@ -19576,14 +19603,14 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ca[0] = &pdo; ca[1] = &pq; ca[2] = &pk; ca[3] = &pv; ca[4] = &pg;
         ca[5] = &phCkpt; ca[6] = &pdhCkpt; ca[7] = &pdv;
         ca[8] = &batch; ca[9] = &seqLen; ca[10] = &modelDim; ca[11] = &numHeads; ca[12] = &headDim;
-        LaunchKernel(ckptKernel, ckptGrid, 256u, ca);
+        LaunchKernel(ckptKernel, ckptGrid, (uint)Kernels.CudaGlaKernels.ChunkBlockThreads, ca);
 
         void** ba = stackalloc void*[15];
         ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv; ba[4] = &pg;
         ba[5] = &phCkpt; ba[6] = &pdhCkpt;
         ba[7] = &pdq; ba[8] = &pdk; ba[9] = &pdg;
         ba[10] = &batch; ba[11] = &seqLen; ba[12] = &modelDim; ba[13] = &numHeads; ba[14] = &headDim;
-        LaunchKernel(chunkKernel, (uint)totalBlocksL, 256u, ba);
+        LaunchKernel(chunkKernel, (uint)totalBlocksL, (uint)Kernels.CudaGlaKernels.ChunkBlockThreads, ba);
         return true;
     }
 
@@ -19605,8 +19632,15 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return false;
 
         IGpuBuffer ckptPair;
-        using (DeviceMemoryReclaim.EnterScopedScratch())
-            ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        try
+        {
+            using (DeviceMemoryReclaim.EnterScopedScratch())
+                ckptPair = AllocateBufferUninitialized((int)(ckptElemsL * 2));
+        }
+        catch (GpuOutOfMemoryException)
+        {
+            return false;
+        }
         using var ckptOwner = ckptPair;
 
         IntPtr pdo = dOut.Handle, pq = q.Handle, pk = k.Handle, pv = v.Handle, pa = alpha.Handle, pb = beta.Handle;
@@ -19622,7 +19656,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ca[6] = &phCkpt; ca[7] = &pdhCkpt; ca[8] = &pdv;
         ca[9] = &batch; ca[10] = &seqLen; ca[11] = &modelDim; ca[12] = &numHeads; ca[13] = &headDim;
         ca[14] = &keyScale; ca[15] = &decay;
-        LaunchKernel(ckptKernel, ckptGrid, 256u, ca);
+        LaunchKernel(ckptKernel, ckptGrid, (uint)Kernels.CudaGatedDeltaNetKernels.ChunkBlockThreads, ca);
 
         void** ba = stackalloc void*[19];
         ba[0] = &pdo; ba[1] = &pq; ba[2] = &pk; ba[3] = &pv;
@@ -19630,7 +19664,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         ba[8] = &pdq; ba[9] = &pdk; ba[10] = &pda; ba[11] = &pdb;
         ba[12] = &batch; ba[13] = &seqLen; ba[14] = &modelDim; ba[15] = &numHeads; ba[16] = &headDim;
         ba[17] = &keyScale; ba[18] = &decay;
-        LaunchKernel(chunkKernel, (uint)totalBlocksL, 256u, ba);
+        LaunchKernel(chunkKernel, (uint)totalBlocksL, (uint)Kernels.CudaGatedDeltaNetKernels.ChunkBlockThreads, ba);
         return true;
     }
 

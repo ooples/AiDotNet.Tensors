@@ -72,6 +72,7 @@ __global__ __launch_bounds__(128) void householder_chain_fwd(
         if (lane == 0) s_warp[warpId] = localMax;
         __syncthreads();
         float maxAbs = fmaxf(fmaxf(s_warp[0], s_warp[1]), fmaxf(s_warp[2], s_warp[3]));
+        __syncthreads();
         float rowScale = fmaxf(maxAbs, sqrtFloor * 0.0625f);
 
         float localSq = 0.0f;
@@ -114,10 +115,12 @@ __global__ __launch_bounds__(128) void householder_chain_fwd(
                 if (col < D) dot += rx[v] * uHatJ[col];
             }
             dot = hh_warp_sum(dot);
-            float twoDot = 2.0f * dot;
             for (int v = 0; v < nVec; v++) {
                 int col = (v << 5) + lane;
-                if (col < D) rx[v] -= twoDot * uHatJ[col];
+                if (col < D) {
+                    float step = dot * uHatJ[col];
+                    rx[v] = (rx[v] - step) - step;
+                }
             }
         }
         for (int v = 0; v < nVec; v++) {
@@ -168,6 +171,7 @@ __global__ __launch_bounds__(128) void householder_chain_bwd_rows(
         if (lane == 0) s_warp[warpId] = localMax;
         __syncthreads();
         float maxAbs = fmaxf(fmaxf(s_warp[0], s_warp[1]), fmaxf(s_warp[2], s_warp[3]));
+        __syncthreads();
         float rowScale = fmaxf(maxAbs, sqrtFloor * 0.0625f);
 
         float localSq = 0.0f;
@@ -223,10 +227,12 @@ __global__ __launch_bounds__(128) void householder_chain_bwd_rows(
             }
             dot = hh_warp_sum(dot);
             p[s] = dot;
-            float twoP = 2.0f * dot;
             for (int v = 0; v < nVec; v++) {
                 int col = (v << 5) + lane;
-                if (col < D) rx[v] -= twoP * uHatJ[col];
+                if (col < D) {
+                    float step = dot * uHatJ[col];
+                    rx[v] = (rx[v] - step) - step;
+                }
             }
         }
 
@@ -235,12 +241,6 @@ __global__ __launch_bounds__(128) void householder_chain_bwd_rows(
             const float* uHatJ = s_uHat + j * D;
             float* duJ = myDu + j * D;
             float ps = p[s];
-            float twoP = 2.0f * ps;
-
-            for (int v = 0; v < nVec; v++) {
-                int col = (v << 5) + lane;
-                if (col < D) rx[v] += twoP * uHatJ[col];
-            }
 
             float q = 0.0f;
             for (int v = 0; v < nVec; v++) {
@@ -251,13 +251,24 @@ __global__ __launch_bounds__(128) void householder_chain_bwd_rows(
 
             for (int v = 0; v < nVec; v++) {
                 int col = (v << 5) + lane;
-                if (col < D) duJ[col] += -2.0f * (q * rx[v] + ps * rg[v]);
+                if (col < D) {
+                    float xStage = xm[col];
+                    for (int t = 0; t < s; t++) {
+                        int jt = trans != 0 ? (K - 1 - t) : t;
+                        float stepT = p[t] * s_uHat[jt * D + col];
+                        xStage = (xStage - stepT) - stepT;
+                    }
+                    float duTerm = q * xStage + ps * rg[v];
+                    duJ[col] = (duJ[col] - duTerm) - duTerm;
+                }
             }
 
-            float twoQ = 2.0f * q;
             for (int v = 0; v < nVec; v++) {
                 int col = (v << 5) + lane;
-                if (col < D) rg[v] -= twoQ * uHatJ[col];
+                if (col < D) {
+                    float stepQ = q * uHatJ[col];
+                    rg[v] = (rg[v] - stepQ) - stepQ;
+                }
             }
         }
 
@@ -324,7 +335,7 @@ __global__ __launch_bounds__(256) void householder_chain_bwd_reduce(
         v += __shfl_xor_sync(0xffffffffu, v, 4);
         v += __shfl_xor_sync(0xffffffffu, v, 2);
         v += __shfl_xor_sync(0xffffffffu, v, 1);
-        s_red[0] = v;
+        if (lane == 0) s_red[0] = v;
     }
     __syncthreads();
     totalDot = s_red[0];

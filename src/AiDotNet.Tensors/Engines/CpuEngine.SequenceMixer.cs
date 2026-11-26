@@ -90,7 +90,7 @@ public partial class CpuEngine
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = SplitHalfGivensRotationComposed(engine, input, angles, half);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
-            var sub = tape.ComputeGradients(loss, new[] { input, angles });
+            var sub = tape.ComputeGradients(loss, new[] { input, angles }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             if (sub.TryGetValue(angles, out var ga)) DifferentiableOps.AccumulateGrad(grads, angles, ga, engine);
             return;
@@ -276,8 +276,9 @@ public partial class CpuEngine
 
         var pad = TensorScope.Detach(new Tensor<T>(new[] { batch, 1, channels }));
         var kept = engine.TensorNarrow(x3, 1, 0, seqLen - 1);
-        var xShift = engine.TensorConcatenate(new[] { pad, kept }, axis: 1);
-        var y3 = engine.TensorAdd(term0, engine.TensorMultiply(xShift, w1));
+        var weightedPrev = engine.TensorMultiply(kept, w1);
+        var term1 = engine.TensorConcatenate(new[] { pad, weightedPrev }, axis: 1);
+        var y3 = engine.TensorAdd(term0, term1);
         return input.Rank == 3 ? y3 : engine.Reshape(y3, (int[])input._shape.Clone());
     }
 
@@ -300,7 +301,7 @@ public partial class CpuEngine
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = DepthwiseCausalConv1d2TapComposed(engine, input, weight0, weight1, batch, seqLen, channels);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
-            var sub = tape.ComputeGradients(loss, new[] { input, weight0, weight1 });
+            var sub = tape.ComputeGradients(loss, new[] { input, weight0, weight1 }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             if (sub.TryGetValue(weight0, out var gw0)) DifferentiableOps.AccumulateGrad(grads, weight0, gw0, engine);
             if (sub.TryGetValue(weight1, out var gw1)) DifferentiableOps.AccumulateGrad(grads, weight1, gw1, engine);
@@ -465,9 +466,10 @@ public partial class CpuEngine
             throw new ArgumentException($"Head dimension ({headDim}) must be even.", nameof(input));
         int half = headDim / 2;
         if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
+        long reqRows = (long)startPosition + seqLen;
         if (cos.Rank != 2 || sin.Rank != 2 || cos.Shape[1] != half || sin.Shape[1] != half
-            || cos.Shape[0] < startPosition + seqLen || sin.Shape[0] < startPosition + seqLen)
-            throw new ArgumentException($"cos/sin must have shape [>= {startPosition + seqLen}, {half}].", nameof(cos));
+            || cos.Shape[0] < reqRows || sin.Shape[0] < reqRows)
+            throw new ArgumentException($"cos/sin must have shape [>= {reqRows}, {half}].", nameof(cos));
         if (!(epsilon > 0.0)) throw new ArgumentOutOfRangeException(nameof(epsilon));
 
         if (GraphMode.IsActive || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
@@ -476,11 +478,13 @@ public partial class CpuEngine
         }
 
         var output = new Tensor<T>((int[])input._shape.Clone());
+        Tensor<T>? srcCos = null;
+        Tensor<T>? srcSin = null;
         if (input.Length > 0)
         {
             var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
+            srcCos = cos.IsContiguous ? cos : cos.Contiguous();
+            srcSin = sin.IsContiguous ? sin : sin.Contiguous();
             if (typeof(T) == typeof(float))
             {
                 RopeL2ForwardFloat(
@@ -501,13 +505,27 @@ public partial class CpuEngine
             }
         }
 
-        DifferentiableOps.RecordIfActive<T>(
-            "RopeL2NormalizeHeads",
-            output,
-            new[] { input },
-            RopeL2NormalizeHeadsBackward<T>,
-            savedState: new object[] { cos, sin, batch, seqLen, numHeads, headDim, epsilon, postScale, startPosition });
+        if (GradientTape<T>.Current is not null && !NoGradScope<T>.IsSuppressed)
+        {
+            var savedCos = SnapshotRopeWindow(srcCos ?? (cos.IsContiguous ? cos : cos.Contiguous()), startPosition, seqLen, half);
+            var savedSin = SnapshotRopeWindow(srcSin ?? (sin.IsContiguous ? sin : sin.Contiguous()), startPosition, seqLen, half);
+            DifferentiableOps.RecordIfActive<T>(
+                "RopeL2NormalizeHeads",
+                output,
+                new[] { input },
+                RopeL2NormalizeHeadsBackward<T>,
+                savedState: new object[] { savedCos, savedSin, batch, seqLen, numHeads, headDim, epsilon, postScale, 0 });
+        }
         return output;
+    }
+
+    private static Tensor<T> SnapshotRopeWindow<T>(Tensor<T> contiguousTable, int startPosition, int seqLen, int half)
+    {
+        int len = checked(seqLen * half);
+        var arr = new T[len];
+        if (len > 0)
+            contiguousTable.AsSpan().Slice(checked(startPosition * half), len).CopyTo(arr);
+        return TensorScope.Detach(new Tensor<T>(new[] { seqLen, half }, new Vector<T>(arr)));
     }
 
     internal static Tensor<T> RopeL2NormalizeHeadsComposed<T>(
@@ -549,7 +567,7 @@ public partial class CpuEngine
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = RopeL2NormalizeHeadsComposed(engine, input, cos, sin, batch, seqLen, numHeads, headDim, epsilon, postScale, startPosition);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
-            var sub = tape.ComputeGradients(loss, new[] { input });
+            var sub = tape.ComputeGradients(loss, new[] { input }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             return;
         }
@@ -755,9 +773,10 @@ public partial class CpuEngine
 
         int half = mb / 2;
         if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
+        long reqRows = (long)startPosition + seqLen;
         if (cos.Rank != 2 || sin.Rank != 2 || cos.Shape[1] != half || sin.Shape[1] != half
-            || cos.Shape[0] < startPosition + seqLen || sin.Shape[0] < startPosition + seqLen)
-            throw new ArgumentException($"cos/sin must have shape [>= {startPosition + seqLen}, {half}].", nameof(cos));
+            || cos.Shape[0] < reqRows || sin.Shape[0] < reqRows)
+            throw new ArgumentException($"cos/sin must have shape [>= {reqRows}, {half}].", nameof(cos));
 
         int[] outShape = input.Rank == 3
             ? new[] { batch, seqLen, checked(numHeads * effOutDim) }
@@ -769,11 +788,13 @@ public partial class CpuEngine
         }
 
         var output = new Tensor<T>(outShape);
+        Tensor<T>? srcCos = null;
+        Tensor<T>? srcSin = null;
         if (input.Length > 0)
         {
             var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
+            srcCos = cos.IsContiguous ? cos : cos.Contiguous();
+            srcSin = sin.IsContiguous ? sin : sin.Contiguous();
             if (typeof(T) == typeof(float))
             {
                 RopeQuadForwardFloat(
@@ -794,12 +815,17 @@ public partial class CpuEngine
             }
         }
 
-        DifferentiableOps.RecordIfActive<T>(
-            "RopeQuadraticOuterFeatures",
-            output,
-            new[] { input },
-            RopeQuadraticOuterFeaturesBackward<T>,
-            savedState: new object[] { cos, sin, batch, seqLen, numHeads, mb, effOutDim, startPosition, outShape });
+        if (GradientTape<T>.Current is not null && !NoGradScope<T>.IsSuppressed)
+        {
+            var savedCos = SnapshotRopeWindow(srcCos ?? (cos.IsContiguous ? cos : cos.Contiguous()), startPosition, seqLen, half);
+            var savedSin = SnapshotRopeWindow(srcSin ?? (sin.IsContiguous ? sin : sin.Contiguous()), startPosition, seqLen, half);
+            DifferentiableOps.RecordIfActive<T>(
+                "RopeQuadraticOuterFeatures",
+                output,
+                new[] { input },
+                RopeQuadraticOuterFeaturesBackward<T>,
+                savedState: new object[] { savedCos, savedSin, batch, seqLen, numHeads, mb, effOutDim, 0, outShape });
+        }
         return output;
     }
 
@@ -848,7 +874,7 @@ public partial class CpuEngine
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = RopeQuadraticOuterFeaturesComposed(engine, input, cos, sin, batch, seqLen, numHeads, mb, effOutDim, startPosition, outShape);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
-            var sub = tape.ComputeGradients(loss, new[] { input });
+            var sub = tape.ComputeGradients(loss, new[] { input }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             return;
         }
@@ -1097,7 +1123,7 @@ public partial class CpuEngine
         var coeff = engine.TensorDivide(dot, normSq);
         var parallel = engine.TensorMultiply(h2d, engine.TensorBroadcastTo(coeff, new[] { rows, dim }));
         var deltaPerp = engine.TensorSubtract(u2d, parallel);
-        var parGate = engine.TensorBroadcastTo(engine.Sigmoid(parallelGateLogit), new[] { rows, dim });
+        var parGate = engine.TensorBroadcastTo(engine.Reshape(engine.Sigmoid(parallelGateLogit), new[] { 1, 1 }), new[] { rows, dim });
         var sum2d = engine.TensorAdd(h2d, engine.TensorAdd(deltaPerp, engine.TensorMultiply(parallel, parGate)));
         return baseHidden.Rank == 2 ? sum2d : engine.Reshape(sum2d, (int[])baseHidden._shape.Clone());
     }
@@ -1121,7 +1147,7 @@ public partial class CpuEngine
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = ProjectiveGatedResidualComposed(engine, baseHidden, proposal, gateLogit, dim, epsilon);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
-            var sub = tape.ComputeGradients(loss, new[] { baseHidden, proposal, gateLogit });
+            var sub = tape.ComputeGradients(loss, new[] { baseHidden, proposal, gateLogit }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(baseHidden, out var gh)) DifferentiableOps.AccumulateGrad(grads, baseHidden, gh, engine);
             if (sub.TryGetValue(proposal, out var gu)) DifferentiableOps.AccumulateGrad(grads, proposal, gu, engine);
             if (sub.TryGetValue(gateLogit, out var gg)) DifferentiableOps.AccumulateGrad(grads, gateLogit, gg, engine);
@@ -1339,6 +1365,8 @@ public partial class CpuEngine
     internal static Tensor<T> SpectralCirculantMatrixComposed<T>(
         IEngine engine, Tensor<T> diagScale, Tensor<T> spectrumRe, Tensor<T> spectrumIm, int batch, int dim)
     {
+        if (batch == 0)
+            return engine.Reshape(diagScale, new[] { 0, dim, dim });
         var ops = MathHelper.GetNumericOperations<T>();
         int nf = dim / 2 + 1;
         var idArr = new T[dim * dim];
@@ -1381,7 +1409,7 @@ public partial class CpuEngine
         {
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = SpectralCirculantMatrixComposed(engine, dIn, reIn, imIn, batch, dim);
-            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { dIn, reIn, imIn });
+            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { dIn, reIn, imIn }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(dIn, out var gd)) DifferentiableOps.AccumulateGrad(grads, dIn, gd, engine);
             if (sub.TryGetValue(reIn, out var gr)) DifferentiableOps.AccumulateGrad(grads, reIn, gr, engine);
             if (sub.TryGetValue(imIn, out var gi)) DifferentiableOps.AccumulateGrad(grads, imIn, gi, engine);
@@ -1620,38 +1648,58 @@ public partial class CpuEngine
             throw new ArgumentOutOfRangeException(nameof(topK));
 
         double effRate = NoGradScope<T>.IsSuppressed ? 0.0 : biasUpdateRate;
+        if (effRate != 0.0)
+        {
+            if (ReferenceEquals(logits.DataVector, routingBias.DataVector))
+                throw new ArgumentException("routingBias cannot share storage with logits when biasUpdateRate is non-zero.", nameof(routingBias));
+            if (!routingBias.IsContiguous)
+                throw new ArgumentException("routingBias must be contiguous when biasUpdateRate is non-zero.", nameof(routingBias));
+        }
         if (GraphMode.IsActive || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
             return SigmoidTopKExpertMixComposed(this, logits, expertTable, routingBias, topK, epsilon, effRate);
         }
 
         var output = new Tensor<T>(new[] { rows, channels });
-        int strideInfo = 2 * topK + 1;
-        var savedInfo = new float[Math.Max(1, rows * strideInfo)];
-        if (rows > 0)
+        var savedIndices = new int[Math.Max(1, rows * topK)];
+        int strideGates = topK + 1;
+        object savedGatesObj;
+        if (typeof(T) == typeof(float))
         {
-            var sLog = logits.IsContiguous ? logits : logits.Contiguous();
-            var sTbl = expertTable.IsContiguous ? expertTable : expertTable.Contiguous();
-            var sBias = routingBias.IsContiguous ? routingBias : routingBias.Contiguous();
-            if (typeof(T) == typeof(float))
+            var savedGates = new float[Math.Max(1, rows * strideGates)];
+            savedGatesObj = savedGates;
+            if (rows > 0)
             {
+                var sLog = logits.IsContiguous ? logits : logits.Contiguous();
+                var sTbl = expertTable.IsContiguous ? expertTable : expertTable.Contiguous();
+                var sBias = routingBias.IsContiguous ? routingBias : routingBias.Contiguous();
                 SigmoidTopKMixForwardFloat(
                     ((Tensor<float>)(object)sLog).AsSpan(),
                     ((Tensor<float>)(object)sTbl).AsSpan(),
                     ((Tensor<float>)(object)sBias).AsSpan(),
                     ((Tensor<float>)(object)output).AsWritableSpan(),
-                    savedInfo,
+                    savedIndices,
+                    savedGates,
                     effRate != 0.0 ? ((Tensor<float>)(object)routingBias).AsWritableSpan() : Span<float>.Empty,
                     rows, numExperts, topK, channels, (float)epsilon, (float)effRate);
             }
-            else
+        }
+        else
+        {
+            var savedGates = new double[Math.Max(1, rows * strideGates)];
+            savedGatesObj = savedGates;
+            if (rows > 0)
             {
+                var sLog = logits.IsContiguous ? logits : logits.Contiguous();
+                var sTbl = expertTable.IsContiguous ? expertTable : expertTable.Contiguous();
+                var sBias = routingBias.IsContiguous ? routingBias : routingBias.Contiguous();
                 SigmoidTopKMixForwardDouble(
                     ((Tensor<double>)(object)sLog).AsSpan(),
                     ((Tensor<double>)(object)sTbl).AsSpan(),
                     ((Tensor<double>)(object)sBias).AsSpan(),
                     ((Tensor<double>)(object)output).AsWritableSpan(),
-                    savedInfo,
+                    savedIndices,
+                    savedGates,
                     effRate != 0.0 ? ((Tensor<double>)(object)routingBias).AsWritableSpan() : Span<double>.Empty,
                     rows, numExperts, topK, channels, epsilon, effRate);
             }
@@ -1662,7 +1710,7 @@ public partial class CpuEngine
             output,
             new[] { logits, expertTable },
             SigmoidTopKExpertMixBackward<T>,
-            savedState: new object[] { rows, numExperts, topK, channels, epsilon, savedInfo });
+            savedState: new object[] { rows, numExperts, topK, channels, epsilon, savedIndices, savedGatesObj });
         return output;
     }
 
@@ -1672,7 +1720,9 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         int rows = logits.Shape[0], g = logits.Shape[1];
         var s = engine.Sigmoid(logits);
-        var bias2d = routingBias.Rank == 2 ? routingBias : engine.Reshape(routingBias, new[] { 1, g });
+        var bias2d = (routingBias.Rank == 2 && routingBias.Shape[0] == 1 && routingBias.Shape[1] == g)
+            ? routingBias
+            : engine.Reshape(routingBias, new[] { 1, g });
         var biased = engine.StopGradient(engine.TensorAdd(s, bias2d));
         engine.TensorTopK(biased, topK, 1, out Tensor<int> idx);
         var sel = engine.TensorGatherRowValues(s, idx);
@@ -1695,11 +1745,34 @@ public partial class CpuEngine
     {
         int rows = (int)savedState[0], numExperts = (int)savedState[1], topK = (int)savedState[2], channels = (int)savedState[3];
         double eps = (double)savedState[4];
-        var savedInfo = savedState[5] as float[];
+        var savedIndices = savedState[5] as int[];
         var logits = inputs[0];
         var table = inputs[1];
-        if (savedInfo is null || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
+        if (savedIndices is null)
             return;
+
+        if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
+        {
+            if (rows == 0)
+            {
+                DifferentiableOps.AccumulateGrad(grads, logits, new Tensor<T>((int[])logits._shape.Clone()), engine);
+                DifferentiableOps.AccumulateGrad(grads, table, new Tensor<T>((int[])table._shape.Clone()), engine);
+                return;
+            }
+            var ops = MathHelper.GetNumericOperations<T>();
+            var idxTensor = TensorScope.Detach(new Tensor<int>(new[] { rows, topK }, new Vector<int>((int[])savedIndices.Clone())));
+            using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
+            var s = engine.Sigmoid(logits);
+            var sel = engine.TensorGatherRowValues(s, idxTensor);
+            var denom = engine.TensorClampMin(engine.ReduceSum(sel, new[] { 1 }, keepDims: true), ops.FromDouble(eps));
+            var gates = engine.TensorDivide(sel, denom);
+            var y = engine.TopKWeightedRowMix(table, idxTensor, gates);
+            var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
+            var sub = tape.ComputeGradients(loss, new[] { logits, table }, createGraph: DifferentiableOps._isBackwardCreateGraph);
+            if (sub.TryGetValue(logits, out var gl)) DifferentiableOps.AccumulateGrad(grads, logits, gl, engine);
+            if (sub.TryGetValue(table, out var gt)) DifferentiableOps.AccumulateGrad(grads, table, gt, engine);
+            return;
+        }
 
         var gLog = new Tensor<T>((int[])logits._shape.Clone());
         var gTbl = new Tensor<T>((int[])table._shape.Clone());
@@ -1710,22 +1783,26 @@ public partial class CpuEngine
             var sTbl = table.IsContiguous ? table : table.Contiguous();
             if (typeof(T) == typeof(float))
             {
+                if (savedState[6] is not float[] savedGatesF) return;
                 SigmoidTopKMixBackwardFloat(
                     ((Tensor<float>)(object)sDy).AsSpan(),
                     ((Tensor<float>)(object)sLog).AsSpan(),
                     ((Tensor<float>)(object)sTbl).AsSpan(),
-                    savedInfo,
+                    savedIndices,
+                    savedGatesF,
                     ((Tensor<float>)(object)gLog).AsWritableSpan(),
                     ((Tensor<float>)(object)gTbl).AsWritableSpan(),
                     rows, numExperts, topK, channels, (float)eps);
             }
             else
             {
+                if (savedState[6] is not double[] savedGatesD) return;
                 SigmoidTopKMixBackwardDouble(
                     ((Tensor<double>)(object)sDy).AsSpan(),
                     ((Tensor<double>)(object)sLog).AsSpan(),
                     ((Tensor<double>)(object)sTbl).AsSpan(),
-                    savedInfo,
+                    savedIndices,
+                    savedGatesD,
                     ((Tensor<double>)(object)gLog).AsWritableSpan(),
                     ((Tensor<double>)(object)gTbl).AsWritableSpan(),
                     rows, numExperts, topK, channels, eps);
@@ -1737,14 +1814,14 @@ public partial class CpuEngine
 
     private static void SigmoidTopKMixForwardFloat(
         ReadOnlySpan<float> logits, ReadOnlySpan<float> table, ReadOnlySpan<float> bias,
-        Span<float> y, float[] savedInfo, Span<float> mutableBias,
+        Span<float> y, int[] savedIndices, float[] savedGates, Span<float> mutableBias,
         int rows, int numExperts, int topK, int channels, float eps, float effRate)
     {
-        int strideInfo = 2 * topK + 1;
+        int strideGates = topK + 1;
         var counts = effRate != 0f ? new int[numExperts] : null;
         for (int m = 0; m < rows; m++)
         {
-            int lOff = m * numExperts, iOff = m * strideInfo;
+            int lOff = m * numExperts, idxOff = m * topK, gOff = m * strideGates;
             float sumSel = 0f;
             for (int r = 0; r < topK; r++)
             {
@@ -1753,52 +1830,51 @@ public partial class CpuEngine
                 for (int j = 0; j < numExperts; j++)
                 {
                     bool used = false;
-                    for (int p = 0; p < r; p++) if ((int)savedInfo[iOff + p] == j) { used = true; break; }
+                    for (int p = 0; p < r; p++) if (savedIndices[idxOff + p] == j) { used = true; break; }
                     if (used) continue;
                     float sj = 1f / (1f + MathF.Exp(-logits[lOff + j]));
                     float bj = sj + bias[j];
                     if (bestIdx < 0 || bj > bestScore) { bestIdx = j; bestScore = bj; bestSig = sj; }
                 }
-                savedInfo[iOff + r] = bestIdx;
-                savedInfo[iOff + topK + r] = bestSig;
+                savedIndices[idxOff + r] = bestIdx;
+                savedGates[gOff + r] = bestSig;
                 sumSel += bestSig;
                 if (counts is not null) counts[bestIdx]++;
             }
-            savedInfo[iOff + 2 * topK] = sumSel;
+            savedGates[gOff + topK] = sumSel;
             float denom = sumSel >= eps ? sumSel : eps;
-            for (int r = 0; r < topK; r++) savedInfo[iOff + topK + r] /= denom;
+            for (int r = 0; r < topK; r++) savedGates[gOff + r] /= denom;
             int yOff = m * channels;
             for (int c = 0; c < channels; c++)
             {
                 float acc = 0f;
                 for (int r = 0; r < topK; r++)
-                    acc += savedInfo[iOff + topK + r] * table[(int)savedInfo[iOff + r] * channels + c];
+                    acc += savedGates[gOff + r] * table[savedIndices[idxOff + r] * channels + c];
                 y[yOff + c] = acc;
             }
         }
         if (counts is not null && !mutableBias.IsEmpty)
         {
-            float mean = (float)(rows * topK) / numExperts;
+            long expectedTimesG = (long)rows * topK;
             for (int e = 0; e < numExperts; e++)
             {
-                float diff = mean - counts[e];
-                mutableBias[e] += effRate * (diff > 0f ? 1f : diff < 0f ? -1f : 0f);
+                long actualTimesG = (long)counts[e] * numExperts;
+                mutableBias[e] += effRate * (expectedTimesG > actualTimesG ? 1f : expectedTimesG < actualTimesG ? -1f : 0f);
             }
         }
     }
 
     private static void SigmoidTopKMixForwardDouble(
         ReadOnlySpan<double> logits, ReadOnlySpan<double> table, ReadOnlySpan<double> bias,
-        Span<double> y, float[] savedInfo, Span<double> mutableBias,
+        Span<double> y, int[] savedIndices, double[] savedGates, Span<double> mutableBias,
         int rows, int numExperts, int topK, int channels, double eps, double effRate)
     {
-        int strideInfo = 2 * topK + 1;
+        int strideGates = topK + 1;
         var counts = effRate != 0.0 ? new int[numExperts] : null;
         for (int m = 0; m < rows; m++)
         {
-            int lOff = m * numExperts, iOff = m * strideInfo;
+            int lOff = m * numExperts, idxOff = m * topK, gOff = m * strideGates;
             double sumSel = 0.0;
-            var selArr = new double[topK];
             for (int r = 0; r < topK; r++)
             {
                 int bestIdx = -1;
@@ -1806,56 +1882,56 @@ public partial class CpuEngine
                 for (int j = 0; j < numExperts; j++)
                 {
                     bool used = false;
-                    for (int p = 0; p < r; p++) if ((int)savedInfo[iOff + p] == j) { used = true; break; }
+                    for (int p = 0; p < r; p++) if (savedIndices[idxOff + p] == j) { used = true; break; }
                     if (used) continue;
                     double sj = 1.0 / (1.0 + Math.Exp(-logits[lOff + j]));
                     double bj = sj + bias[j];
                     if (bestIdx < 0 || bj > bestScore) { bestIdx = j; bestScore = bj; bestSig = sj; }
                 }
-                savedInfo[iOff + r] = bestIdx;
-                selArr[r] = bestSig;
+                savedIndices[idxOff + r] = bestIdx;
+                savedGates[gOff + r] = bestSig;
                 sumSel += bestSig;
                 if (counts is not null) counts[bestIdx]++;
             }
-            savedInfo[iOff + 2 * topK] = (float)sumSel;
+            savedGates[gOff + topK] = sumSel;
             double denom = sumSel >= eps ? sumSel : eps;
-            for (int r = 0; r < topK; r++) savedInfo[iOff + topK + r] = (float)(selArr[r] / denom);
+            for (int r = 0; r < topK; r++) savedGates[gOff + r] /= denom;
             int yOff = m * channels;
             for (int c = 0; c < channels; c++)
             {
                 double acc = 0.0;
                 for (int r = 0; r < topK; r++)
-                    acc += (selArr[r] / denom) * table[(int)savedInfo[iOff + r] * channels + c];
+                    acc += savedGates[gOff + r] * table[savedIndices[idxOff + r] * channels + c];
                 y[yOff + c] = acc;
             }
         }
         if (counts is not null && !mutableBias.IsEmpty)
         {
-            double mean = (double)(rows * topK) / numExperts;
+            long expectedTimesG = (long)rows * topK;
             for (int e = 0; e < numExperts; e++)
             {
-                double diff = mean - counts[e];
-                mutableBias[e] += effRate * (diff > 0.0 ? 1.0 : diff < 0.0 ? -1.0 : 0.0);
+                long actualTimesG = (long)counts[e] * numExperts;
+                mutableBias[e] += effRate * (expectedTimesG > actualTimesG ? 1.0 : expectedTimesG < actualTimesG ? -1.0 : 0.0);
             }
         }
     }
 
     private static void SigmoidTopKMixBackwardFloat(
-        ReadOnlySpan<float> dy, ReadOnlySpan<float> logits, ReadOnlySpan<float> table, float[] savedInfo,
+        ReadOnlySpan<float> dy, ReadOnlySpan<float> logits, ReadOnlySpan<float> table, int[] savedIndices, float[] savedGates,
         Span<float> dLogits, Span<float> dTable, int rows, int numExperts, int topK, int channels, float eps)
     {
         dLogits.Clear();
         dTable.Clear();
-        int strideInfo = 2 * topK + 1;
+        int strideGates = topK + 1;
         for (int m = 0; m < rows; m++)
         {
-            int lOff = m * numExperts, iOff = m * strideInfo, yOff = m * channels;
-            float sumSel = savedInfo[iOff + 2 * topK];
+            int lOff = m * numExperts, idxOff = m * topK, gOff = m * strideGates, yOff = m * channels;
+            float sumSel = savedGates[gOff + topK];
             float dotDg = 0f;
             for (int r = 0; r < topK; r++)
             {
-                int eIdx = (int)savedInfo[iOff + r];
-                float gateR = savedInfo[iOff + topK + r];
+                int eIdx = savedIndices[idxOff + r];
+                float gateR = savedGates[gOff + r];
                 float dGate = 0f;
                 for (int c = 0; c < channels; c++)
                 {
@@ -1867,7 +1943,7 @@ public partial class CpuEngine
             }
             for (int r = 0; r < topK; r++)
             {
-                int eIdx = (int)savedInfo[iOff + r];
+                int eIdx = savedIndices[idxOff + r];
                 float dGate = 0f;
                 for (int c = 0; c < channels; c++) dGate += dy[yOff + c] * table[eIdx * channels + c];
                 float dSel = sumSel >= eps ? (dGate - dotDg) / sumSel : dGate / eps;
@@ -1878,21 +1954,21 @@ public partial class CpuEngine
     }
 
     private static void SigmoidTopKMixBackwardDouble(
-        ReadOnlySpan<double> dy, ReadOnlySpan<double> logits, ReadOnlySpan<double> table, float[] savedInfo,
+        ReadOnlySpan<double> dy, ReadOnlySpan<double> logits, ReadOnlySpan<double> table, int[] savedIndices, double[] savedGates,
         Span<double> dLogits, Span<double> dTable, int rows, int numExperts, int topK, int channels, double eps)
     {
         dLogits.Clear();
         dTable.Clear();
-        int strideInfo = 2 * topK + 1;
+        int strideGates = topK + 1;
         for (int m = 0; m < rows; m++)
         {
-            int lOff = m * numExperts, iOff = m * strideInfo, yOff = m * channels;
-            double sumSel = savedInfo[iOff + 2 * topK];
+            int lOff = m * numExperts, idxOff = m * topK, gOff = m * strideGates, yOff = m * channels;
+            double sumSel = savedGates[gOff + topK];
             double dotDg = 0.0;
             for (int r = 0; r < topK; r++)
             {
-                int eIdx = (int)savedInfo[iOff + r];
-                double gateR = savedInfo[iOff + topK + r];
+                int eIdx = savedIndices[idxOff + r];
+                double gateR = savedGates[gOff + r];
                 double dGate = 0.0;
                 for (int c = 0; c < channels; c++)
                 {
@@ -1904,7 +1980,7 @@ public partial class CpuEngine
             }
             for (int r = 0; r < topK; r++)
             {
-                int eIdx = (int)savedInfo[iOff + r];
+                int eIdx = savedIndices[idxOff + r];
                 double dGate = 0.0;
                 for (int c = 0; c < channels; c++) dGate += dy[yOff + c] * table[eIdx * channels + c];
                 double dSel = sumSel >= eps ? (dGate - dotDg) / sumSel : dGate / eps;
@@ -1993,7 +2069,9 @@ public partial class CpuEngine
         var gRaw = engine.TensorNarrow(gateUpProj, 1, 0, h);
         var uRaw = engine.TensorNarrow(gateUpProj, 1, h, h);
         var gGain = engine.TensorAddScalar(engine.TensorNarrow(gateUpGainDelta, 1, 0, h), ops.One);
-        var b2 = upBase.Rank == 2 ? upBase : engine.Reshape(upBase, new[] { 1, h });
+        var b2 = (upBase.Rank == 2 && upBase.Shape[0] == 1 && upBase.Shape[1] == h)
+            ? upBase
+            : engine.Reshape(upBase, new[] { 1, h });
         var uGain = engine.TensorAdd(b2, engine.TensorNarrow(gateUpGainDelta, 1, h, h));
         var act = engine.TensorMultiply(engine.TensorSiLU(engine.TensorMultiply(gRaw, gGain)), uRaw);
         return engine.TensorMultiply(uGain, act);
@@ -2008,7 +2086,7 @@ public partial class CpuEngine
         {
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = DualModulatedSwiGluComposed(engine, guProj, guGain, upBase, h);
-            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { guProj, guGain, upBase });
+            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { guProj, guGain, upBase }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(guProj, out var g0)) DifferentiableOps.AccumulateGrad(grads, guProj, g0, engine);
             if (sub.TryGetValue(guGain, out var g1)) DifferentiableOps.AccumulateGrad(grads, guGain, g1, engine);
             if (sub.TryGetValue(upBase, out var g2)) DifferentiableOps.AccumulateGrad(grads, upBase, g2, engine);
@@ -2099,7 +2177,7 @@ public partial class CpuEngine
         if (scanOutput.Rank != 4)
             throw new ArgumentException($"Expected scanOutput rank 4 [B, S, H, scanDim], got {scanOutput.Rank}.", nameof(scanOutput));
         int b = scanOutput.Shape[0], s = scanOutput.Shape[1], nh = scanOutput.Shape[2], scanDim = scanOutput.Shape[3];
-        if (headDim <= 0 || scanDim < headDim + 1)
+        if (headDim <= 0 || headDim >= scanDim)
             throw new ArgumentOutOfRangeException(nameof(headDim));
         if (sinkLogAlpha is not null && sinkLogAlpha.Length != nh)
             throw new ArgumentException($"Expected sinkLogAlpha length {nh}, got {sinkLogAlpha.Length}.", nameof(sinkLogAlpha));
@@ -2176,7 +2254,7 @@ public partial class CpuEngine
         {
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = BornRatioNormalizeComposed(engine, scanOut, sink, b, s, nh, headDim, eps);
-            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), inputs);
+            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), inputs, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(scanOut, out var gs)) DifferentiableOps.AccumulateGrad(grads, scanOut, gs, engine);
             if (sink is not null && sub.TryGetValue(sink, out var gk)) DifferentiableOps.AccumulateGrad(grads, sink, gk, engine);
             return;
@@ -2304,7 +2382,9 @@ public partial class CpuEngine
     internal static Tensor<T> BoundedSigmoidGateComposed<T>(IEngine engine, Tensor<T> logits, Tensor<T> bias, double floor)
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        var sig = engine.Sigmoid(engine.TensorAdd(logits, bias));
+        int cols = logits.Shape[logits.Rank - 1];
+        var biasVec = bias.Rank == 1 ? bias : engine.Reshape(bias, new[] { cols });
+        var sig = engine.Sigmoid(engine.TensorAdd(logits, biasVec));
         return engine.TensorAddScalar(engine.TensorMultiplyScalar(sig, ops.FromDouble(1.0 - floor)), ops.FromDouble(floor));
     }
 
@@ -2318,7 +2398,7 @@ public partial class CpuEngine
         {
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = BoundedSigmoidGateComposed(engine, logits, bias, floor);
-            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { logits, bias });
+            var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { logits, bias }, createGraph: DifferentiableOps._isBackwardCreateGraph);
             if (sub.TryGetValue(logits, out var gl)) DifferentiableOps.AccumulateGrad(grads, logits, gl, engine);
             if (sub.TryGetValue(bias, out var gb)) DifferentiableOps.AccumulateGrad(grads, bias, gb, engine);
             return;

@@ -9817,6 +9817,7 @@ public partial class DirectGpuTensorEngine
         try
         {
             Tensor<T> cur;
+            bool fallbackToBase = false;
             using (new Autodiff.NoGradScope<T>())
             {
                 // Align to the target rank by prepending size-1 axes (a residency-preserving reshape).
@@ -9833,13 +9834,19 @@ public partial class DirectGpuTensorEngine
                 for (int d = 0; d < targetShape.Length; d++)
                 {
                     if (cur._shape[d] == targetShape[d]) continue;
-                    if (cur._shape[d] != 1) return base.TensorBroadcastTo(input, targetShape);
+                    if (cur._shape[d] != 1) { fallbackToBase = true; break; }
 
                     if (TryRepeatAxisOnDevice(cur, targetShape[d], d) is not { } expanded)
-                        return base.TensorBroadcastTo(input, targetShape);
+                    {
+                        fallbackToBase = true;
+                        break;
+                    }
                     cur = expanded;
                 }
             }
+
+            if (fallbackToBase)
+                return base.TensorBroadcastTo(input, targetShape);
 
             var originalShape = (int[])input._shape.Clone();
             Autodiff.DifferentiableOps.RecordUnary(

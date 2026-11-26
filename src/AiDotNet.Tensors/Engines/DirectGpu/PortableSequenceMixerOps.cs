@@ -11,6 +11,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// </summary>
 internal static class PortableSequenceMixerOps
 {
+#if !NETCOREAPP
+    private static unsafe int SingleToInt32Bits(float value) => *(int*)&value;
+#else
+    private static int SingleToInt32Bits(float value) => System.BitConverter.SingleToInt32Bits(value);
+#endif
+
+    // Exact contiguous integer range representable in IEEE-754 binary32 (2^24).
+    private const int MaxExactFloatExpertIndex = 16_777_216;
+
     public static void SplitHalfGivensRotationForward(
         IDirectGpuBackend backend,
         IGpuBuffer input,
@@ -114,8 +123,8 @@ internal static class PortableSequenceMixerOps
         int totalHeads = checked(batch * seqLen * numHeads);
         if (totalHeads == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
-        int scaleBits = BitConverter.SingleToInt32Bits(postScale);
+        int epsBits = SingleToInt32Bits(epsilon);
+        int scaleBits = SingleToInt32Bits(postScale);
         launch(K.SmxRopeL2Forward, totalHeads, input, cos, sin, output, totalHeads, seqLen, numHeads, headDim, startPosition, epsBits, scaleBits);
     }
 
@@ -137,8 +146,8 @@ internal static class PortableSequenceMixerOps
         int totalHeads = checked(batch * seqLen * numHeads);
         if (totalHeads == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
-        int scaleBits = BitConverter.SingleToInt32Bits(postScale);
+        int epsBits = SingleToInt32Bits(epsilon);
+        int scaleBits = SingleToInt32Bits(postScale);
         launch(K.SmxRopeL2Backward, totalHeads, gradOutput, input, cos, sin, gradInput, totalHeads, seqLen, numHeads, headDim, startPosition, epsBits, scaleBits);
     }
 
@@ -195,7 +204,7 @@ internal static class PortableSequenceMixerOps
         if (dim <= 0) throw new ArgumentOutOfRangeException(nameof(dim));
         if (rows == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         launch(K.SmxProjResForward, rows, baseHidden, proposal, gateLogit, output, rows, dim, epsBits);
     }
 
@@ -220,7 +229,7 @@ internal static class PortableSequenceMixerOps
             return;
         }
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         using var rowTerms = backend.AllocateBuffer(rows);
         launch(K.SmxProjResBackwardRows, rows, gradOutput, baseHidden, proposal, gateLogit, gradBaseHidden, gradProposal, rowTerms, rows, dim, epsBits);
         launch(K.SmxProjResBackwardDgate, 1, rowTerms, gateLogit, gradGateLogit, rows);
@@ -277,17 +286,19 @@ internal static class PortableSequenceMixerOps
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
         int nf = dim / 2 + 1;
         var hTime = backend.AllocateBuffer(checked(batch * dim));
-        var dhTime = backend.AllocateBuffer(checked(batch * dim));
+        IGpuBuffer? dhTime = null;
         try
         {
+            dhTime = backend.AllocateBuffer(checked(batch * dim));
             launch(K.SmxSpecCircH, batch * dim, spectrumRe, spectrumIm, hTime, batch, dim);
             launch(K.SmxSpecCircBackwardDhDd, batch * dim, gradOutput, diagScale, hTime, gradDiagScale, dhTime, batch, dim);
             launch(K.SmxSpecCircBackwardDspec, checked(batch * nf), dhTime, gradSpectrumRe, gradSpectrumIm, batch, dim);
         }
         finally
         {
+            if (dhTime is not null)
+                ReleaseScratch(backend, dhTime);
             ReleaseScratch(backend, hTime);
-            ReleaseScratch(backend, dhTime);
         }
     }
 
@@ -309,13 +320,15 @@ internal static class PortableSequenceMixerOps
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (topK <= 0 || topK > numExperts) throw new ArgumentOutOfRangeException(nameof(topK));
         if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels));
+        if (numExperts > MaxExactFloatExpertIndex)
+            throw new NotSupportedException($"Portable SigmoidTopKExpertMix stores expert indices in binary32 and supports at most {MaxExactFloatExpertIndex} experts.");
         if (rows == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         launch(K.SmxSigTopKMixForward, rows, logits, expertTable, routingBias, output, savedInfo, rows, numExperts, topK, channels, epsBits);
         if (biasUpdateRate != 0f)
         {
-            int rateBits = BitConverter.SingleToInt32Bits(biasUpdateRate);
+            int rateBits = SingleToInt32Bits(biasUpdateRate);
             launch(K.SmxSigTopKBiasUpdate, numExperts, savedInfo, routingBias, rows, numExperts, topK, rateBits);
         }
     }
@@ -338,13 +351,15 @@ internal static class PortableSequenceMixerOps
         if (numExperts <= 0) throw new ArgumentOutOfRangeException(nameof(numExperts));
         if (topK <= 0 || topK > numExperts) throw new ArgumentOutOfRangeException(nameof(topK));
         if (channels <= 0) throw new ArgumentOutOfRangeException(nameof(channels));
+        if (numExperts > MaxExactFloatExpertIndex)
+            throw new NotSupportedException($"Portable SigmoidTopKExpertMix stores expert indices in binary32 and supports at most {MaxExactFloatExpertIndex} experts.");
         if (rows == 0)
         {
             backend.Fill(gradExpertTable, 0f, checked(numExperts * channels));
             return;
         }
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         launch(K.SmxSigTopKMixBackwardDlogits, rows, gradOutput, logits, expertTable, savedInfo, gradLogits, rows, numExperts, topK, channels, epsBits);
         launch(K.SmxSigTopKMixBackwardDtable, checked(numExperts * channels), gradOutput, savedInfo, gradExpertTable, rows, numExperts, topK, channels);
     }
@@ -405,11 +420,11 @@ internal static class PortableSequenceMixerOps
     {
         if (totalRows < 0) throw new ArgumentOutOfRangeException(nameof(totalRows));
         if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
-        if (headDim <= 0 || scanDim < headDim + 1) throw new ArgumentOutOfRangeException(nameof(scanDim));
+        if (headDim <= 0 || headDim >= scanDim) throw new ArgumentOutOfRangeException(nameof(scanDim));
         int total = checked(totalRows * headDim);
         if (total == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         launch(K.SmxBornRatioForward, total, scanOutput, sinkLogAlphaOrDummy, output, totalRows, numHeads, headDim, scanDim, hasSink, epsBits);
     }
 
@@ -429,14 +444,14 @@ internal static class PortableSequenceMixerOps
     {
         if (totalRows < 0) throw new ArgumentOutOfRangeException(nameof(totalRows));
         if (numHeads <= 0) throw new ArgumentOutOfRangeException(nameof(numHeads));
-        if (headDim <= 0 || scanDim < headDim + 1) throw new ArgumentOutOfRangeException(nameof(scanDim));
+        if (headDim <= 0 || headDim >= scanDim) throw new ArgumentOutOfRangeException(nameof(scanDim));
         if (totalRows == 0)
         {
             if (hasSink != 0) backend.Fill(gradSinkOrDummy, 0f, numHeads);
             return;
         }
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int epsBits = BitConverter.SingleToInt32Bits(epsilon);
+        int epsBits = SingleToInt32Bits(epsilon);
         launch(K.SmxBornRatioBackwardDscan, totalRows, gradOutput, scanOutput, sinkLogAlphaOrDummy, gradScanOutput, totalRows, numHeads, headDim, scanDim, hasSink, epsBits);
         if (hasSink != 0)
             launch(K.SmxBornRatioBackwardDsink, numHeads, gradOutput, scanOutput, sinkLogAlphaOrDummy, gradSinkOrDummy, totalRows, numHeads, headDim, scanDim, epsBits);
@@ -456,7 +471,7 @@ internal static class PortableSequenceMixerOps
         int total = checked(rows * cols);
         if (total == 0) return;
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int floorBits = BitConverter.SingleToInt32Bits(floor);
+        int floorBits = SingleToInt32Bits(floor);
         launch(K.SmxBoundSigForward, total, logits, bias, output, rows, cols, floorBits);
     }
 
@@ -480,7 +495,7 @@ internal static class PortableSequenceMixerOps
             return;
         }
         var launch = ((IFusedLstmSequenceTraining)backend).StatefulLstmLauncher;
-        int floorBits = BitConverter.SingleToInt32Bits(floor);
+        int floorBits = SingleToInt32Bits(floor);
         launch(K.SmxBoundSigBackwardDlog, total, gradOutput, logits, bias, gradLogits, rows, cols, floorBits);
         launch(K.SmxBoundSigBackwardDbias, cols, gradOutput, logits, bias, gradBias, rows, cols, floorBits);
     }

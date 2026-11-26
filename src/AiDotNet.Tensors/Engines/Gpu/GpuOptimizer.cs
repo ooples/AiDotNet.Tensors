@@ -578,6 +578,14 @@ public static class GpuOptimizer
                         parameterBuffers, gradientBuffers, mBuffers, vBuffers, sizes,
                         learningRate, beta1, beta2, epsilon, weightDecay, step);
                 }
+
+                var syncLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), 3 * n);
+                for (int i = 0; i < n; i++)
+                {
+                    MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], syncLeases[3 * i]);
+                    MarkGpuUpdatedWithSync(firstMoments[i], syncLeases[3 * i + 1]);
+                    MarkGpuUpdatedWithSync(secondMoments[i], syncLeases[3 * i + 2]);
+                }
             }
             else
             {
@@ -594,15 +602,12 @@ public static class GpuOptimizer
                         backend.AdamUpdate(parameterBuffers[i], gradientBuffers[i], mBuffers[i], vBuffers[i],
                             learningRate, beta1, beta2, epsilon, weightDecay, step, sizes[i]);
                     }
-                }
-            }
 
-            var syncLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), 3 * n);
-            for (int i = 0; i < n; i++)
-            {
-                MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], syncLeases[3 * i]);
-                MarkGpuUpdatedWithSync(firstMoments[i], syncLeases[3 * i + 1]);
-                MarkGpuUpdatedWithSync(secondMoments[i], syncLeases[3 * i + 2]);
+                    var entryLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), 3);
+                    MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], entryLeases[0]);
+                    MarkGpuUpdatedWithSync(firstMoments[i], entryLeases[1]);
+                    MarkGpuUpdatedWithSync(secondMoments[i], entryLeases[2]);
+                }
             }
 
             return true;
@@ -639,13 +644,14 @@ public static class GpuOptimizer
         {
             var g = gradients[i];
             if (g is null || g.Length == 0) continue;
+            if (TryGetCurrentGpuBuffer(gpuEngine, backend, g) is null) return false;
+            g.EnsureOwnedForDeviceWrite();
             var buf = TryGetCurrentGpuBuffer(gpuEngine, backend, g);
             if (buf is null || buf.Size < g.Length) return false;
             buffers.Add(buf);
             sizes.Add(g.Length);
             owners.Add(g);
         }
-
         if (buffers.Count == 0) return true;
 
         var scaleBuf = backend.AllocateBuffer(new[] { scale });

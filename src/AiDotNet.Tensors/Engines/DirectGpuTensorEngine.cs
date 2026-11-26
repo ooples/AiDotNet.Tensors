@@ -2035,9 +2035,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
+    /// <summary>A contiguous slice (nonzero offset) or strided view of device data: materialize on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
-        => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view), out result);
+    {
+        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0))
+        {
+            result = default;
+            return false;
+        }
+        return TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view), out result);
+    }
 
     /// <summary>As above, from an explicit <paramref name="baseBuffer"/> holding the viewed STORAGE in storage order.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, out OwnedBuffer result)

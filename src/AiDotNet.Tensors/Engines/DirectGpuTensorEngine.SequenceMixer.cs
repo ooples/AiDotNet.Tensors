@@ -32,12 +32,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcAng = angles.IsContiguous ? angles : angles.Contiguous();
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var angB = GetOrAllocateBuffer(backend, srcAng);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var angB = GetOrAllocateBuffer(backend, angles);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, checked(rows * d));
-
             fused.SplitHalfGivensRotationForward(inB.Buffer, angB.Buffer, outB.Buffer, rows, half);
             var result = DeferTensorResult<T>(backend, outB.Buffer, rows * d, (int[])input._shape.Clone());
             outB.RelinquishOwnership();
@@ -72,6 +69,7 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradInput, Tensor<T> GradAngles)? TrySplitHalfGivensRotationBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> angles, int half)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int d = 2 * half;
@@ -80,12 +78,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcAng = angles.IsContiguous ? angles : angles.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, srcDy);
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var angB = GetOrAllocateBuffer(backend, srcAng);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var angB = GetOrAllocateBuffer(backend, angles);
             using var dxB = AllocateFullyWrittenOutputBuffer(backend, rows * d);
             using var daB = AllocateFullyWrittenOutputBuffer(backend, half);
 
@@ -131,12 +126,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcW0 = weight0.IsContiguous ? weight0 : weight0.Contiguous();
-            var srcW1 = weight1.IsContiguous ? weight1 : weight1.Contiguous();
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var w0B = GetOrAllocateBuffer(backend, srcW0);
-            using var w1B = GetOrAllocateBuffer(backend, srcW1);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var w0B = GetOrAllocateBuffer(backend, weight0);
+            using var w1B = GetOrAllocateBuffer(backend, weight1);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, total);
 
             fused.DepthwiseCausalConv1d2TapForward(inB.Buffer, w0B.Buffer, w1B.Buffer, outB.Buffer, batch, seqLen, channels);
@@ -176,6 +168,7 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradInput, Tensor<T> GradW0, Tensor<T> GradW1)? TryDepthwiseCausalConv1d2TapBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> weight0, Tensor<T> weight1, int batch, int seqLen, int channels)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int total = batch * seqLen * channels;
@@ -183,14 +176,10 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcW0 = weight0.IsContiguous ? weight0 : weight0.Contiguous();
-            var srcW1 = weight1.IsContiguous ? weight1 : weight1.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, srcDy);
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var w0B = GetOrAllocateBuffer(backend, srcW0);
-            using var w1B = GetOrAllocateBuffer(backend, srcW1);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var w0B = GetOrAllocateBuffer(backend, weight0);
+            using var w1B = GetOrAllocateBuffer(backend, weight1);
             using var dxB = AllocateFullyWrittenOutputBuffer(backend, total);
             using var dw0B = AllocateFullyWrittenOutputBuffer(backend, channels);
             using var dw1B = AllocateFullyWrittenOutputBuffer(backend, channels);
@@ -238,9 +227,10 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentException($"Head dimension ({headDim}) must be even.", nameof(input));
         int half = headDim / 2;
         if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
+        long reqRows = (long)startPosition + seqLen;
         if (cos.Rank != 2 || sin.Rank != 2 || cos.Shape[1] != half || sin.Shape[1] != half
-            || cos.Shape[0] < startPosition + seqLen || sin.Shape[0] < startPosition + seqLen)
-            throw new ArgumentException($"cos/sin must have shape [>= {startPosition + seqLen}, {half}].", nameof(cos));
+            || cos.Shape[0] < reqRows || sin.Shape[0] < reqRows)
+            throw new ArgumentException($"cos/sin must have shape [>= {reqRows}, {half}].", nameof(cos));
         if (!(epsilon > 0.0)) throw new ArgumentOutOfRangeException(nameof(epsilon));
 
         int total = checked(batch * seqLen * totalDim);
@@ -252,12 +242,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var cosB = GetOrAllocateBuffer(backend, srcCos);
-            using var sinB = GetOrAllocateBuffer(backend, srcSin);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var cosB = GetOrAllocateBuffer(backend, cos);
+            using var sinB = GetOrAllocateBuffer(backend, sin);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, total);
 
             fused.RopeL2NormalizeHeadsForward(
@@ -265,6 +252,19 @@ public partial class DirectGpuTensorEngine
                 batch, seqLen, numHeads, headDim, startPosition, (float)epsilon, (float)postScale);
             var result = DeferTensorResult<T>(backend, outB.Buffer, total, (int[])input._shape.Clone());
             outB.RelinquishOwnership();
+            if (!IsTapeActive<T>())
+                return result;
+
+            int winLen = checked(seqLen * half);
+            int winOff = checked(startPosition * half);
+            using var cosSnapB = AllocateFullyWrittenOutputBuffer(backend, winLen);
+            using var sinSnapB = AllocateFullyWrittenOutputBuffer(backend, winLen);
+            backend.Copy(cosB.Buffer, winOff, cosSnapB.Buffer, 0, winLen);
+            backend.Copy(sinB.Buffer, winOff, sinSnapB.Buffer, 0, winLen);
+            var savedCos = TensorScope.Detach(DeferTensorResult<T>(backend, cosSnapB.Buffer, winLen, new[] { seqLen, half }));
+            cosSnapB.RelinquishOwnership();
+            var savedSin = TensorScope.Detach(DeferTensorResult<T>(backend, sinSnapB.Buffer, winLen, new[] { seqLen, half }));
+            sinSnapB.RelinquishOwnership();
 
             DifferentiableOps.RecordIfActive<T>(
                 "RopeL2NormalizeHeads",
@@ -290,7 +290,7 @@ public partial class DirectGpuTensorEngine
                     }
                     CpuEngine.RopeL2NormalizeHeadsBackward(gradOutput, inputs, output, savedState, engine, grads);
                 },
-                savedState: new object[] { cos, sin, batch, seqLen, numHeads, headDim, epsilon, postScale, startPosition });
+                savedState: new object[] { savedCos, savedSin, batch, seqLen, numHeads, headDim, epsilon, postScale, 0 });
             return result;
         }
         catch (NotSupportedException capabilityGap)
@@ -304,6 +304,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> cos, Tensor<T> sin,
         int batch, int seqLen, int numHeads, int headDim, int startPosition, double epsilon, double postScale)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int total = batch * seqLen * numHeads * headDim;
@@ -311,14 +312,10 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, srcDy);
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var cosB = GetOrAllocateBuffer(backend, srcCos);
-            using var sinB = GetOrAllocateBuffer(backend, srcSin);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var cosB = GetOrAllocateBuffer(backend, cos);
+            using var sinB = GetOrAllocateBuffer(backend, sin);
             using var dxB = AllocateFullyWrittenOutputBuffer(backend, total);
 
             fused.RopeL2NormalizeHeadsBackward(
@@ -366,9 +363,10 @@ public partial class DirectGpuTensorEngine
 
         int half = mb / 2;
         if (startPosition < 0) throw new ArgumentOutOfRangeException(nameof(startPosition));
+        long reqRows = (long)startPosition + seqLen;
         if (cos.Rank != 2 || sin.Rank != 2 || cos.Shape[1] != half || sin.Shape[1] != half
-            || cos.Shape[0] < startPosition + seqLen || sin.Shape[0] < startPosition + seqLen)
-            throw new ArgumentException($"cos/sin must have shape [>= {startPosition + seqLen}, {half}].", nameof(cos));
+            || cos.Shape[0] < reqRows || sin.Shape[0] < reqRows)
+            throw new ArgumentException($"cos/sin must have shape [>= {reqRows}, {half}].", nameof(cos));
 
         int totalOut = checked(batch * seqLen * numHeads * effOutDim);
         if (totalOut == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
@@ -383,12 +381,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var cosB = GetOrAllocateBuffer(backend, srcCos);
-            using var sinB = GetOrAllocateBuffer(backend, srcSin);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var cosB = GetOrAllocateBuffer(backend, cos);
+            using var sinB = GetOrAllocateBuffer(backend, sin);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, totalOut);
 
             fused.RopeQuadraticOuterFeaturesForward(
@@ -396,6 +391,19 @@ public partial class DirectGpuTensorEngine
                 batch, seqLen, numHeads, mb, effOutDim, startPosition);
             var result = DeferTensorResult<T>(backend, outB.Buffer, totalOut, outShape);
             outB.RelinquishOwnership();
+            if (!IsTapeActive<T>())
+                return result;
+
+            int winLen = checked(seqLen * half);
+            int winOff = checked(startPosition * half);
+            using var cosSnapB = AllocateFullyWrittenOutputBuffer(backend, winLen);
+            using var sinSnapB = AllocateFullyWrittenOutputBuffer(backend, winLen);
+            backend.Copy(cosB.Buffer, winOff, cosSnapB.Buffer, 0, winLen);
+            backend.Copy(sinB.Buffer, winOff, sinSnapB.Buffer, 0, winLen);
+            var savedCos = TensorScope.Detach(DeferTensorResult<T>(backend, cosSnapB.Buffer, winLen, new[] { seqLen, half }));
+            cosSnapB.RelinquishOwnership();
+            var savedSin = TensorScope.Detach(DeferTensorResult<T>(backend, sinSnapB.Buffer, winLen, new[] { seqLen, half }));
+            sinSnapB.RelinquishOwnership();
 
             DifferentiableOps.RecordIfActive<T>(
                 "RopeQuadraticOuterFeatures",
@@ -420,7 +428,7 @@ public partial class DirectGpuTensorEngine
                     }
                     CpuEngine.RopeQuadraticOuterFeaturesBackward(gradOutput, inputs, output, savedState, engine, grads);
                 },
-                savedState: new object[] { cos, sin, batch, seqLen, numHeads, mb, effOutDim, startPosition, outShape });
+                savedState: new object[] { savedCos, savedSin, batch, seqLen, numHeads, mb, effOutDim, 0, outShape });
             return result;
         }
         catch (NotSupportedException capabilityGap)
@@ -434,6 +442,7 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> input, Tensor<T> cos, Tensor<T> sin,
         int batch, int seqLen, int numHeads, int mb, int effOutDim, int startPosition)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int totalIn = batch * seqLen * numHeads * mb;
@@ -442,14 +451,10 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var srcIn = input.IsContiguous ? input : input.Contiguous();
-            var srcCos = cos.IsContiguous ? cos : cos.Contiguous();
-            var srcSin = sin.IsContiguous ? sin : sin.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, srcDy);
-            using var inB = GetOrAllocateBuffer(backend, srcIn);
-            using var cosB = GetOrAllocateBuffer(backend, srcCos);
-            using var sinB = GetOrAllocateBuffer(backend, srcSin);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var inB = GetOrAllocateBuffer(backend, input);
+            using var cosB = GetOrAllocateBuffer(backend, cos);
+            using var sinB = GetOrAllocateBuffer(backend, sin);
             using var dxB = AllocateFullyWrittenOutputBuffer(backend, totalIn);
 
             fused.RopeQuadraticOuterFeaturesBackward(
@@ -498,12 +503,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcH = baseHidden.IsContiguous ? baseHidden : baseHidden.Contiguous();
-            var srcU = proposal.IsContiguous ? proposal : proposal.Contiguous();
-            var srcG = parallelGateLogit.IsContiguous ? parallelGateLogit : parallelGateLogit.Contiguous();
-            using var hB = GetOrAllocateBuffer(backend, srcH);
-            using var uB = GetOrAllocateBuffer(backend, srcU);
-            using var gB = GetOrAllocateBuffer(backend, srcG);
+            using var hB = GetOrAllocateBuffer(backend, baseHidden);
+            using var uB = GetOrAllocateBuffer(backend, proposal);
+            using var gB = GetOrAllocateBuffer(backend, parallelGateLogit);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, rows * dim);
 
             fused.ProjectiveGatedResidualForward(hB.Buffer, uB.Buffer, gB.Buffer, outB.Buffer, rows, dim, (float)epsilon);
@@ -542,6 +544,7 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradH, Tensor<T> GradU, Tensor<T> GradGate)? TryProjectiveGatedResidualBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> baseHidden, Tensor<T> proposal, Tensor<T> gateLogit, int dim, double epsilon)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int rows = baseHidden.Length / dim;
@@ -549,14 +552,10 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var srcDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var srcH = baseHidden.IsContiguous ? baseHidden : baseHidden.Contiguous();
-            var srcU = proposal.IsContiguous ? proposal : proposal.Contiguous();
-            var srcG = gateLogit.IsContiguous ? gateLogit : gateLogit.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, srcDy);
-            using var hB = GetOrAllocateBuffer(backend, srcH);
-            using var uB = GetOrAllocateBuffer(backend, srcU);
-            using var gB = GetOrAllocateBuffer(backend, srcG);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var hB = GetOrAllocateBuffer(backend, baseHidden);
+            using var uB = GetOrAllocateBuffer(backend, proposal);
+            using var gB = GetOrAllocateBuffer(backend, gateLogit);
             using var dhB = AllocateFullyWrittenOutputBuffer(backend, rows * dim);
             using var duB = AllocateFullyWrittenOutputBuffer(backend, rows * dim);
             using var dgB = AllocateFullyWrittenOutputBuffer(backend, 1);
@@ -606,12 +605,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sD = diagScale.IsContiguous ? diagScale : diagScale.Contiguous();
-            var sRe = spectrumRe.IsContiguous ? spectrumRe : spectrumRe.Contiguous();
-            var sIm = spectrumIm.IsContiguous ? spectrumIm : spectrumIm.Contiguous();
-            using var dB = GetOrAllocateBuffer(backend, sD);
-            using var reB = GetOrAllocateBuffer(backend, sRe);
-            using var imB = GetOrAllocateBuffer(backend, sIm);
+            using var dB = GetOrAllocateBuffer(backend, diagScale);
+            using var reB = GetOrAllocateBuffer(backend, spectrumRe);
+            using var imB = GetOrAllocateBuffer(backend, spectrumIm);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, totalOut);
 
             fused.SpectralCirculantMatrixForward(dB.Buffer, reB.Buffer, imB.Buffer, outB.Buffer, batch, dim);
@@ -651,6 +647,7 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradDiag, Tensor<T> GradRe, Tensor<T> GradIm)? TrySpectralCirculantMatrixBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> diagScale, Tensor<T> spectrumRe, Tensor<T> spectrumIm, int batch, int dim)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         int nf = dim / 2 + 1;
@@ -659,14 +656,10 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var sD = diagScale.IsContiguous ? diagScale : diagScale.Contiguous();
-            var sRe = spectrumRe.IsContiguous ? spectrumRe : spectrumRe.Contiguous();
-            var sIm = spectrumIm.IsContiguous ? spectrumIm : spectrumIm.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, sDy);
-            using var dB = GetOrAllocateBuffer(backend, sD);
-            using var reB = GetOrAllocateBuffer(backend, sRe);
-            using var imB = GetOrAllocateBuffer(backend, sIm);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var dB = GetOrAllocateBuffer(backend, diagScale);
+            using var reB = GetOrAllocateBuffer(backend, spectrumRe);
+            using var imB = GetOrAllocateBuffer(backend, spectrumIm);
             using var gdB = AllocateFullyWrittenOutputBuffer(backend, batch * dim);
             using var greB = AllocateFullyWrittenOutputBuffer(backend, batch * nf);
             using var gimB = AllocateFullyWrittenOutputBuffer(backend, batch * nf);
@@ -706,6 +699,13 @@ public partial class DirectGpuTensorEngine
             throw new ArgumentOutOfRangeException(nameof(topK));
 
         double effRate = NoGradScope<T>.IsSuppressed ? 0.0 : biasUpdateRate;
+        if (effRate != 0.0)
+        {
+            if (ReferenceEquals(logits.DataVector, routingBias.DataVector))
+                throw new ArgumentException("routingBias cannot share storage with logits when biasUpdateRate is non-zero.", nameof(routingBias));
+            if (!routingBias.IsContiguous)
+                throw new ArgumentException("routingBias must be contiguous when biasUpdateRate is non-zero.", nameof(routingBias));
+        }
         int totalOut = checked(rows * channels);
         if (totalOut == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
@@ -715,10 +715,8 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sLog = logits.IsContiguous ? logits : logits.Contiguous();
-            var sTbl = expertTable.IsContiguous ? expertTable : expertTable.Contiguous();
-            using var logB = GetOrAllocateBuffer(backend, sLog);
-            using var tblB = GetOrAllocateBuffer(backend, sTbl);
+            using var logB = GetOrAllocateBuffer(backend, logits);
+            using var tblB = GetOrAllocateBuffer(backend, expertTable);
 
             IGpuBuffer? persistentBiasBuf = null;
             OwnedBuffer? tempBiasLease = null;
@@ -739,8 +737,7 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                var sBias = routingBias.IsContiguous ? routingBias : routingBias.Contiguous();
-                var lease = GetOrAllocateBuffer(backend, sBias);
+                var lease = GetOrAllocateBuffer(backend, routingBias);
                 tempBiasLease = lease;
                 activeBiasBuf = lease.Buffer;
             }
@@ -785,7 +782,24 @@ public partial class DirectGpuTensorEngine
                             DifferentiableOps.AccumulateGrad(grads, inputs[1], res.GradTable, engine);
                             return;
                         }
-                        var hostState = new object[] { r, g, k, c, eps, infoTensor.AsSpan().ToArray() };
+                        var infoSpan = infoTensor.AsSpan();
+                        int strideInfo = 2 * k + 1;
+                        int strideGates = k + 1;
+                        var savedIndices = new int[Math.Max(1, r * k)];
+                        var savedGates = new float[Math.Max(1, r * strideGates)];
+                        for (int m = 0; m < r; m++)
+                        {
+                            int srcOff = m * strideInfo;
+                            int idxOff = m * k;
+                            int gateOff = m * strideGates;
+                            for (int slot = 0; slot < k; slot++)
+                            {
+                                savedIndices[idxOff + slot] = (int)infoSpan[srcOff + slot];
+                                savedGates[gateOff + slot] = infoSpan[srcOff + k + slot];
+                            }
+                            savedGates[gateOff + k] = infoSpan[srcOff + 2 * k];
+                        }
+                        var hostState = new object[] { r, g, k, c, eps, savedIndices, savedGates };
                         CpuEngine.SigmoidTopKExpertMixBackward(gradOutput, inputs, output, hostState, engine, grads);
                     },
                     savedState: new object[] { rows, numExperts, topK, channels, epsilon, savedInfoTensor });
@@ -807,20 +821,17 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> logits, Tensor<T> expertTable, Tensor<float> savedInfo,
         int rows, int numExperts, int topK, int channels, double epsilon)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         if (rows <= 0 || gradOutput.Length != rows * channels) return null;
 
         try
         {
-            var sDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var sLog = logits.IsContiguous ? logits : logits.Contiguous();
-            var sTbl = expertTable.IsContiguous ? expertTable : expertTable.Contiguous();
-            var sInfo = savedInfo.IsContiguous ? savedInfo : savedInfo.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, sDy);
-            using var logB = GetOrAllocateBuffer(backend, sLog);
-            using var tblB = GetOrAllocateBuffer(backend, sTbl);
-            using var infoB = GetOrAllocateBuffer(backend, sInfo);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var logB = GetOrAllocateBuffer(backend, logits);
+            using var tblB = GetOrAllocateBuffer(backend, expertTable);
+            using var infoB = GetOrAllocateBuffer(backend, savedInfo);
             using var dlogB = AllocateFullyWrittenOutputBuffer(backend, rows * numExperts);
             using var dtblB = AllocateFullyWrittenOutputBuffer(backend, numExperts * channels);
 
@@ -866,12 +877,9 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sGu = gateUpProj.IsContiguous ? gateUpProj : gateUpProj.Contiguous();
-            var sGg = gateUpGainDelta.IsContiguous ? gateUpGainDelta : gateUpGainDelta.Contiguous();
-            var sB = upBase.IsContiguous ? upBase : upBase.Contiguous();
-            using var guB = GetOrAllocateBuffer(backend, sGu);
-            using var ggB = GetOrAllocateBuffer(backend, sGg);
-            using var bB = GetOrAllocateBuffer(backend, sB);
+            using var guB = GetOrAllocateBuffer(backend, gateUpProj);
+            using var ggB = GetOrAllocateBuffer(backend, gateUpGainDelta);
+            using var bB = GetOrAllocateBuffer(backend, upBase);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, totalOut);
 
             fused.DualModulatedSwiGluForward(guB.Buffer, ggB.Buffer, bB.Buffer, outB.Buffer, rows, h);
@@ -909,20 +917,17 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradGu, Tensor<T> GradGg, Tensor<T> GradBase)? TryDualModulatedSwiGluBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> guProj, Tensor<T> guGain, Tensor<T> upBase, int rows, int h)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         if (rows <= 0 || gradOutput.Length != rows * h) return null;
 
         try
         {
-            var sDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var sGu = guProj.IsContiguous ? guProj : guProj.Contiguous();
-            var sGg = guGain.IsContiguous ? guGain : guGain.Contiguous();
-            var sB = upBase.IsContiguous ? upBase : upBase.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, sDy);
-            using var guB = GetOrAllocateBuffer(backend, sGu);
-            using var ggB = GetOrAllocateBuffer(backend, sGg);
-            using var bB = GetOrAllocateBuffer(backend, sB);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var guB = GetOrAllocateBuffer(backend, guProj);
+            using var ggB = GetOrAllocateBuffer(backend, guGain);
+            using var bB = GetOrAllocateBuffer(backend, upBase);
             using var dguB = AllocateFullyWrittenOutputBuffer(backend, rows * 2 * h);
             using var dggB = AllocateFullyWrittenOutputBuffer(backend, rows * 2 * h);
             using var dbB = AllocateFullyWrittenOutputBuffer(backend, h);
@@ -951,7 +956,7 @@ public partial class DirectGpuTensorEngine
         if (scanOutput.Rank != 4)
             throw new ArgumentException($"Expected scanOutput rank 4 [B, S, H, scanDim], got {scanOutput.Rank}.", nameof(scanOutput));
         int b = scanOutput.Shape[0], s = scanOutput.Shape[1], nh = scanOutput.Shape[2], scanDim = scanOutput.Shape[3];
-        if (headDim <= 0 || scanDim < headDim + 1)
+        if (headDim <= 0 || headDim >= scanDim)
             throw new ArgumentOutOfRangeException(nameof(headDim));
         if (sinkLogAlpha is not null && sinkLogAlpha.Length != nh)
             throw new ArgumentException($"Expected sinkLogAlpha length {nh}, got {sinkLogAlpha.Length}.", nameof(sinkLogAlpha));
@@ -966,17 +971,12 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sScan = scanOutput.IsContiguous ? scanOutput : scanOutput.Contiguous();
-            using var scanB = GetOrAllocateBuffer(backend, sScan);
+            using var scanB = GetOrAllocateBuffer(backend, scanOutput);
             OwnedBuffer? sinkLease = null;
-            if (sinkLogAlpha is not null)
-            {
-                var sSink = sinkLogAlpha.IsContiguous ? sinkLogAlpha : sinkLogAlpha.Contiguous();
-                sinkLease = GetOrAllocateBuffer(backend, sSink);
-            }
-
             try
             {
+                if (sinkLogAlpha is not null)
+                    sinkLease = GetOrAllocateBuffer(backend, sinkLogAlpha);
                 using var outB = AllocateFullyWrittenOutputBuffer(backend, totalOut);
                 var sinkBuf = sinkLease is { } sl ? sl.Buffer : scanB.Buffer;
                 fused.BornRatioNormalizeForward(
@@ -1027,27 +1027,24 @@ public partial class DirectGpuTensorEngine
         Tensor<T> gradOutput, Tensor<T> scanOutput, Tensor<T>? sinkLogAlpha,
         int totalRows, int nh, int headDim, int scanDim, double epsilon)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
-        if (totalRows <= 0 || gradOutput.Length != totalRows * headDim) return null;
+        if (totalRows <= 0 || headDim <= 0 || headDim >= scanDim || gradOutput.Length != totalRows * headDim) return null;
 
         try
         {
-            var sDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var sScan = scanOutput.IsContiguous ? scanOutput : scanOutput.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, sDy);
-            using var scanB = GetOrAllocateBuffer(backend, sScan);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var scanB = GetOrAllocateBuffer(backend, scanOutput);
             OwnedBuffer? sinkLease = null;
             OwnedBuffer? dSinkOut = null;
-            if (sinkLogAlpha is not null)
-            {
-                var sSink = sinkLogAlpha.IsContiguous ? sinkLogAlpha : sinkLogAlpha.Contiguous();
-                sinkLease = GetOrAllocateBuffer(backend, sSink);
-                dSinkOut = AllocateFullyWrittenOutputBuffer(backend, nh);
-            }
-
             try
             {
+                if (sinkLogAlpha is not null)
+                {
+                    sinkLease = GetOrAllocateBuffer(backend, sinkLogAlpha);
+                    dSinkOut = AllocateFullyWrittenOutputBuffer(backend, nh);
+                }
                 using var dScanB = AllocateFullyWrittenOutputBuffer(backend, totalRows * scanDim);
                 var sinkBuf = sinkLease is { } sl ? sl.Buffer : scanB.Buffer;
                 var dSinkBuf = dSinkOut is { } ds ? ds.Buffer : dScanB.Buffer;
@@ -1099,10 +1096,8 @@ public partial class DirectGpuTensorEngine
 
         try
         {
-            var sL = logits.IsContiguous ? logits : logits.Contiguous();
-            var sB = bias.IsContiguous ? bias : bias.Contiguous();
-            using var lB = GetOrAllocateBuffer(backend, sL);
-            using var bB = GetOrAllocateBuffer(backend, sB);
+            using var lB = GetOrAllocateBuffer(backend, logits);
+            using var bB = GetOrAllocateBuffer(backend, bias);
             using var outB = AllocateFullyWrittenOutputBuffer(backend, total);
 
             fused.BoundedSigmoidGateForward(lB.Buffer, bB.Buffer, outB.Buffer, rows, cols, (float)floor);
@@ -1140,18 +1135,16 @@ public partial class DirectGpuTensorEngine
     private (Tensor<T> GradLogits, Tensor<T> GradBias)? TryBoundedSigmoidGateBackwardGpu<T>(
         Tensor<T> gradOutput, Tensor<T> logits, Tensor<T> bias, int rows, int cols, double floor)
     {
+        using var __gpuOp = EnterGpuOp();
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend) || backend is not IFusedSequenceMixerOps fused)
             return null;
         if (rows <= 0 || gradOutput.Length != rows * cols) return null;
 
         try
         {
-            var sDy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var sL = logits.IsContiguous ? logits : logits.Contiguous();
-            var sB = bias.IsContiguous ? bias : bias.Contiguous();
-            using var dyB = GetOrAllocateBuffer(backend, sDy);
-            using var lB = GetOrAllocateBuffer(backend, sL);
-            using var bB = GetOrAllocateBuffer(backend, sB);
+            using var dyB = GetOrAllocateBuffer(backend, gradOutput);
+            using var lB = GetOrAllocateBuffer(backend, logits);
+            using var bB = GetOrAllocateBuffer(backend, bias);
             using var dlB = AllocateFullyWrittenOutputBuffer(backend, rows * cols);
             using var dbB = AllocateFullyWrittenOutputBuffer(backend, cols);
 

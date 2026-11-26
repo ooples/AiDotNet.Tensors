@@ -47,6 +47,8 @@ public partial class CpuEngine
             throw new ArgumentException("Reflectors shape dimensions must be positive.", nameof(reflectors));
         if (input.Rank < 1 || input.Shape[input.Rank - 1] != d)
             throw new ArgumentException($"Expected last dimension {d}, got [{string.Join(",", input._shape)}].", nameof(input));
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double) && typeof(T).Name != "Half")
+            throw new NotSupportedException($"HouseholderChain supports floating-point element types (float, double, Half); got {typeof(T).Name}.");
 
         double effFloor = normFloor > 0.0 ? normFloor : DefaultHouseholderNormFloor<T>();
         int rows = input.Length / d;
@@ -125,21 +127,23 @@ public partial class CpuEngine
         double sqrtFloor = Math.Sqrt(normFloor);
         var rowMaxAbs = engine.StopGradient(engine.ReduceMax(engine.TensorAbs(reflectors), new[] { 1 }, keepDims: true));
         var rowScale = engine.TensorMax(rowMaxAbs, numOps.FromDouble(sqrtFloor / 16.0));
-        var scaled = engine.TensorDivide(reflectors, rowScale);
+        var rowScaleFull = engine.TensorBroadcastTo(rowScale, reflectors._shape);
+        var scaled = engine.TensorDivide(reflectors, rowScaleFull);
         var scaledSq = engine.ReduceSum(engine.TensorMultiply(scaled, scaled), new[] { 1 }, keepDims: true);
         var scaledFloorRoot = engine.TensorMultiplyScalar(engine.TensorReciprocal(rowScale), numOps.FromDouble(sqrtFloor));
         var scaledFloor = engine.TensorMultiply(scaledFloorRoot, scaledFloorRoot);
         var denom = engine.TensorMax(scaledSq, scaledFloor);
-        var uHat = engine.TensorDivide(scaled, engine.TensorSqrt(denom));
+        var sqrtDenomFull = engine.TensorBroadcastTo(engine.TensorSqrt(denom), reflectors._shape);
+        var uHat = engine.TensorDivide(scaled, sqrtDenomFull);
 
-        T two = numOps.FromDouble(2.0);
         var cur = input.Rank == 2 ? input : engine.Reshape(input, new[] { rows, d });
         for (int s = 0; s < k; s++)
         {
             int j = transpose ? (k - 1 - s) : s;
             var uj = engine.TensorNarrow(uHat, 0, j, 1);
             var proj = engine.TensorMatMul(cur, engine.TensorTranspose(uj));
-            cur = engine.TensorSubtract(cur, engine.TensorMatMul(engine.TensorMultiplyScalar(proj, two), uj));
+            var step = engine.TensorMatMul(proj, uj);
+            cur = engine.TensorSubtract(engine.TensorSubtract(cur, step), step);
         }
         return input.Rank == 2 ? cur : engine.Reshape(cur, input._shape);
     }
@@ -163,6 +167,15 @@ public partial class CpuEngine
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
             HouseholderChainHigherOrderBackward(gradOutput, input, reflectors, transpose, normFloor, engine, grads);
+            return;
+        }
+
+        if (rows > 0
+            && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
+            && gpu.TryHouseholderChainBackwardGpu(gradOutput, input, reflectors, transpose, normFloor) is { } gpuGrads)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, gpuGrads.GradInput, engine);
+            DifferentiableOps.AccumulateGrad(grads, reflectors, gpuGrads.GradReflectors, engine);
             return;
         }
 
@@ -215,16 +228,17 @@ public partial class CpuEngine
 
         var rowMaxAbs = engine.StopGradient(engine.ReduceMax(engine.TensorAbs(reflectors), new[] { 1 }, keepDims: true));
         var rowScale = engine.TensorMax(rowMaxAbs, numOps.FromDouble(sqrtFloor / 16.0));
-        var scaled = engine.TensorDivide(reflectors, rowScale);
+        var rowScaleFull = engine.TensorBroadcastTo(rowScale, reflectors._shape);
+        var scaled = engine.TensorDivide(reflectors, rowScaleFull);
         var scaledSq = engine.ReduceSum(engine.TensorMultiply(scaled, scaled), new[] { 1 }, keepDims: true);
         var scaledFloorRoot = engine.TensorMultiplyScalar(engine.TensorReciprocal(rowScale), numOps.FromDouble(sqrtFloor));
         var scaledFloor = engine.TensorMultiply(scaledFloorRoot, scaledFloorRoot);
         var denom = engine.TensorMax(scaledSq, scaledFloor);
-        var uHat = engine.TensorDivide(scaled, engine.TensorSqrt(denom));
+        var sqrtDenomFull = engine.TensorBroadcastTo(engine.TensorSqrt(denom), reflectors._shape);
+        var uHat = engine.TensorDivide(scaled, sqrtDenomFull);
 
         var x2d = input.Rank == 2 ? input : engine.Reshape(input, new[] { rows, d });
         var g2d = gradOutput.Rank == 2 ? gradOutput : engine.Reshape(gradOutput, new[] { rows, d });
-        T two = numOps.FromDouble(2.0);
         T negTwo = numOps.FromDouble(-2.0);
 
         var stages = new Tensor<T>[k];
@@ -236,7 +250,8 @@ public partial class CpuEngine
             var uj = engine.TensorNarrow(uHat, 0, j, 1);
             var ujCol = engine.TensorTranspose(uj);
             var proj = engine.TensorMatMul(cur, ujCol);
-            cur = engine.TensorSubtract(cur, engine.TensorMatMul(engine.TensorMultiplyScalar(proj, two), uj));
+            var step = engine.TensorMatMul(proj, uj);
+            cur = engine.TensorSubtract(engine.TensorSubtract(cur, step), step);
         }
 
         var dUHatRows = new Tensor<T>[k];
@@ -251,8 +266,9 @@ public partial class CpuEngine
             var term1 = engine.TensorMatMul(engine.TensorTranspose(q), stages[s]);
             var term2 = engine.TensorMatMul(engine.TensorTranspose(p), gCur);
             var duRow = engine.TensorMultiplyScalar(engine.TensorAdd(term1, term2), negTwo);
-            dUHatRows[j] = dUHatRows[j] is { } prev ? engine.TensorAdd(prev, duRow) : duRow;
-            gCur = engine.TensorSubtract(gCur, engine.TensorMatMul(engine.TensorMultiplyScalar(q, two), uj));
+            dUHatRows[j] = duRow;
+            var stepQ = engine.TensorMatMul(q, uj);
+            gCur = engine.TensorSubtract(engine.TensorSubtract(gCur, stepQ), stepQ);
         }
 
         var dUHat = k == 1 ? dUHatRows[0] : engine.TensorConcatenate(dUHatRows, axis: 0);
@@ -260,10 +276,11 @@ public partial class CpuEngine
         var active = engine.StopGradient(engine.TensorMultiplyScalar(
             engine.TensorAddScalar(engine.TensorSign(engine.TensorSubtract(scaledSq, scaledFloor)), numOps.One),
             numOps.FromDouble(0.5)));
+        var activeDotFull = engine.TensorBroadcastTo(engine.TensorMultiply(active, dot), reflectors._shape);
         var dScaled = engine.TensorDivide(
-            engine.TensorSubtract(dUHat, engine.TensorMultiply(engine.TensorMultiply(active, dot), uHat)),
-            engine.TensorSqrt(denom));
-        var dRef = engine.TensorDivide(dScaled, rowScale);
+            engine.TensorSubtract(dUHat, engine.TensorMultiply(activeDotFull, uHat)),
+            sqrtDenomFull);
+        var dRef = engine.TensorDivide(dScaled, rowScaleFull);
         var gradIn = input.Rank == 2 ? gCur : engine.Reshape(gCur, input._shape);
         DifferentiableOps.AccumulateGrad(grads, input, gradIn, engine);
         DifferentiableOps.AccumulateGrad(grads, reflectors, dRef, engine);
@@ -371,8 +388,11 @@ public partial class CpuEngine
                 int uOff = j * d;
                 double dot = 0.0;
                 for (int i = 0; i < d; i++) dot += rowBuf[i] * uHat[uOff + i];
-                double twoDot = 2.0 * dot;
-                for (int i = 0; i < d; i++) rowBuf[i] -= twoDot * uHat[uOff + i];
+                for (int i = 0; i < d; i++)
+                {
+                    double step = dot * uHat[uOff + i];
+                    rowBuf[i] = (rowBuf[i] - step) - step;
+                }
             }
             for (int i = 0; i < d; i++) output[mOff + i] = (float)rowBuf[i];
         }
@@ -404,8 +424,11 @@ public partial class CpuEngine
                 int uOff = j * d;
                 double dot = 0.0;
                 for (int i = 0; i < d; i++) dot += rowBuf[i] * uHat[uOff + i];
-                double twoDot = 2.0 * dot;
-                for (int i = 0; i < d; i++) rowBuf[i] -= twoDot * uHat[uOff + i];
+                for (int i = 0; i < d; i++)
+                {
+                    double step = dot * uHat[uOff + i];
+                    rowBuf[i] = (rowBuf[i] - step) - step;
+                }
             }
             for (int i = 0; i < d; i++) output[mOff + i] = rowBuf[i];
         }
@@ -432,6 +455,7 @@ public partial class CpuEngine
         var rx = new double[d];
         var rg = new double[d];
         var p = new double[k];
+        var stages = new double[k * d];
 
         for (int m = 0; m < rows; m++)
         {
@@ -441,7 +465,7 @@ public partial class CpuEngine
                 rx[i] = input[mOff + i];
                 rg[i] = gradOutput[mOff + i];
             }
-            AccumulateRowBackwardDouble(uHat, duHat, rx, rg, p, k, d, transpose);
+            AccumulateRowBackwardDouble(uHat, duHat, rx, rg, p, stages, k, d, transpose);
             for (int i = 0; i < d; i++) gradInput[mOff + i] = (float)rg[i];
         }
 
@@ -478,6 +502,7 @@ public partial class CpuEngine
         var rx = new double[d];
         var rg = new double[d];
         var p = new double[k];
+        var stages = new double[k * d];
 
         for (int m = 0; m < rows; m++)
         {
@@ -487,7 +512,7 @@ public partial class CpuEngine
                 rx[i] = input[mOff + i];
                 rg[i] = gradOutput[mOff + i];
             }
-            AccumulateRowBackwardDouble(uHat, duHat, rx, rg, p, k, d, transpose);
+            AccumulateRowBackwardDouble(uHat, duHat, rx, rg, p, stages, k, d, transpose);
             for (int i = 0; i < d; i++) gradInput[mOff + i] = rg[i];
         }
 
@@ -509,37 +534,48 @@ public partial class CpuEngine
         double[] rx,
         double[] rg,
         double[] p,
+        double[] stages,
         int k,
         int d,
         bool transpose)
     {
         for (int s = 0; s < k; s++)
         {
+            int sOff = s * d;
+            for (int i = 0; i < d; i++) stages[sOff + i] = rx[i];
             int j = transpose ? (k - 1 - s) : s;
             int uOff = j * d;
             double dot = 0.0;
             for (int i = 0; i < d; i++) dot += rx[i] * uHat[uOff + i];
             p[s] = dot;
-            double twoP = 2.0 * dot;
-            for (int i = 0; i < d; i++) rx[i] -= twoP * uHat[uOff + i];
+            for (int i = 0; i < d; i++)
+            {
+                double step = dot * uHat[uOff + i];
+                rx[i] = (rx[i] - step) - step;
+            }
         }
 
         for (int s = k - 1; s >= 0; s--)
         {
+            int sOff = s * d;
             int j = transpose ? (k - 1 - s) : s;
             int uOff = j * d;
             double ps = p[s];
-            double twoP = 2.0 * ps;
-            for (int i = 0; i < d; i++) rx[i] += twoP * uHat[uOff + i];
 
             double q = 0.0;
             for (int i = 0; i < d; i++) q += rg[i] * uHat[uOff + i];
 
             for (int i = 0; i < d; i++)
-                duHat[uOff + i] += -2.0 * (q * rx[i] + ps * rg[i]);
+            {
+                double duTerm = q * stages[sOff + i] + ps * rg[i];
+                duHat[uOff + i] = (duHat[uOff + i] - duTerm) - duTerm;
+            }
 
-            double twoQ = 2.0 * q;
-            for (int i = 0; i < d; i++) rg[i] -= twoQ * uHat[uOff + i];
+            for (int i = 0; i < d; i++)
+            {
+                double stepQ = q * uHat[uOff + i];
+                rg[i] = (rg[i] - stepQ) - stepQ;
+            }
         }
     }
 }

@@ -70,9 +70,6 @@ int bx_gid() { return int(gl_GlobalInvocationID.x); }
             int end = k + 1 < kernels.Count ? kernels[k + 1].Index : cuda.Length;
             string body = cuda.Substring(kernel.Index + kernel.Length, end - kernel.Index - kernel.Length)
                 .Replace("__uint_as_float(", "uintBitsToFloat(");
-            body = Regex.Replace(body, @"\b(sqrt|fabs|fmax|exp|log|tanh|cos|sin)f\(",
-                m => m.Groups[1].Value == "fabs" ? "abs(" : m.Groups[1].Value == "fmax" ? "max(" : m.Groups[1].Value + "(",
-                RegexOptions.None, RegexTimeout);
             // A parameter named with a GLSL keyword (input, output, layout) is renamed in the declaration and the body.
             string parameters = kernel.Groups[2].Value;
             var reserved = Regex.Matches(parameters, @"(\w+)\s*(?:,|$)", RegexOptions.None, RegexTimeout)

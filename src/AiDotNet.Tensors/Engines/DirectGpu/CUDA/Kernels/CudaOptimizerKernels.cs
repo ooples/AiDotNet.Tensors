@@ -297,6 +297,11 @@ typedef struct {
     unsigned long long ptrs[384];
 } InlinePointerChunk384;
 
+// Updates changed 64-bit CUdeviceptr slots in CudaBackend.MultiTensorTable in place from CUDA constant
+// launch arguments without staged host-to-device uploads or CudaEvent allocations. Peer backends (HIP,
+// Metal, OpenCL, Vulkan, WebGPU) implement IMultiTensorGpuOptimizerBackend via PerTensorMultiTensorOptimizer
+// (#1142), binding native IGpuBuffer descriptors directly per kernel rather than maintaining a 64-bit
+// device-virtual-address indirection table.
 extern ""C"" __global__ __launch_bounds__(384) void refresh_pointer_table_384(
     unsigned long long* __restrict__ dst,
     int offset,

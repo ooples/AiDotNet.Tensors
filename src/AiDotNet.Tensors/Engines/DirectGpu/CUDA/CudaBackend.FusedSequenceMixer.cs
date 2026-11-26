@@ -7,6 +7,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 public sealed partial class CudaBackend : IFusedSequenceMixerOps
 {
     internal static bool UseFusedSequenceMixer = Environment.GetEnvironmentVariable("AIDOTNET_CUDA_FUSED_SEQ_MIXER") != "0";
+    internal bool HasSequenceMixerKernel(string kernelName) => _kernelCache.ContainsKey(kernelName);
 
     void IFusedSequenceMixerOps.SplitHalfGivensRotationForward(
         IGpuBuffer input, IGpuBuffer angles, IGpuBuffer output, int rows, int halfDim)
@@ -170,7 +171,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
 
         using var _ = PushContext();
         int totalHalf = checked(rows * halfDim);
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalHalf + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalHalf + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr xPtr = input.Handle, aPtr = angles.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[5];
         args[0] = &xPtr; args[1] = &aPtr; args[2] = &yPtr; args[3] = &totalHalf; args[4] = &halfDim;
@@ -186,14 +187,14 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             Fill(gradAngles, 0f, halfDim);
             return true;
         }
-        if (!UseFusedSequenceMixer || rows < 0 || halfDim <= 0 || halfDim > 65535) return false;
+        if (!UseFusedSequenceMixer || rows < 0 || halfDim <= 0 || halfDim > CudaSequenceMixerKernels.MaxSingleBlockPerChannel) return false;
         if (!_kernelCache.TryGetValue("smx_cuda_givens_bwd_dx", out var dxKernel)
             || !_kernelCache.TryGetValue("smx_cuda_givens_bwd_dphi", out var dphiKernel))
             return false;
 
         using var _ = PushContext();
         int totalHalf = checked(rows * halfDim);
-        uint dxBlocks = (uint)Math.Min(Math.Max(1, (totalHalf + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint dxBlocks = (uint)Math.Min(Math.Max(1, (totalHalf + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, xPtr = input.Handle, aPtr = angles.Handle, dxPtr = gradInput.Handle, daPtr = gradAngles.Handle;
         void** dxArgs = stackalloc void*[5];
         dxArgs[0] = &dyPtr; dxArgs[1] = &aPtr; dxArgs[2] = &dxPtr; dxArgs[3] = &totalHalf; dxArgs[4] = &halfDim;
@@ -214,7 +215,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_conv2_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr xPtr = input.Handle, w0Ptr = weight0.Handle, w1Ptr = weight1.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &xPtr; args[1] = &w0Ptr; args[2] = &w1Ptr; args[3] = &yPtr; args[4] = &total; args[5] = &seqLen; args[6] = &channels;
@@ -233,13 +234,13 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             Fill(gradWeight1, 0f, channels);
             return true;
         }
-        if (!UseFusedSequenceMixer || batch < 0 || seqLen < 0 || channels <= 0 || channels > 65535) return false;
+        if (!UseFusedSequenceMixer || batch < 0 || seqLen < 0 || channels <= 0 || channels > CudaSequenceMixerKernels.MaxSingleBlockPerChannel) return false;
         if (!_kernelCache.TryGetValue("smx_cuda_conv2_bwd_dx", out var dxKernel)
             || !_kernelCache.TryGetValue("smx_cuda_conv2_bwd_dw", out var dwKernel))
             return false;
 
         using var _ = PushContext();
-        uint dxBlocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint dxBlocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, xPtr = input.Handle, w0Ptr = weight0.Handle, w1Ptr = weight1.Handle;
         IntPtr dxPtr = gradInput.Handle, dw0Ptr = gradWeight0.Handle, dw1Ptr = gradWeight1.Handle;
         void** dxArgs = stackalloc void*[7];
@@ -263,7 +264,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_ropel2_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 4096);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.WarpHeadMaxGridBlocks);
         IntPtr xPtr = input.Handle, cPtr = cos.Handle, sPtr = sin.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[11];
         args[0] = &xPtr; args[1] = &cPtr; args[2] = &sPtr; args[3] = &yPtr;
@@ -284,7 +285,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_ropel2_bwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 4096);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.WarpHeadMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, xPtr = input.Handle, cPtr = cos.Handle, sPtr = sin.Handle, dxPtr = gradInput.Handle;
         void** args = stackalloc void*[12];
         args[0] = &dyPtr; args[1] = &xPtr; args[2] = &cPtr; args[3] = &sPtr; args[4] = &dxPtr;
@@ -305,7 +306,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_ropequad_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 4096);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.WarpHeadMaxGridBlocks);
         IntPtr xPtr = input.Handle, cPtr = cos.Handle, sPtr = sin.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[10];
         args[0] = &xPtr; args[1] = &cPtr; args[2] = &sPtr; args[3] = &yPtr;
@@ -326,7 +327,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_ropequad_bwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 4096);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalHeads + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.WarpHeadMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, xPtr = input.Handle, cPtr = cos.Handle, sPtr = sin.Handle, dxPtr = gradInput.Handle;
         void** args = stackalloc void*[11];
         args[0] = &dyPtr; args[1] = &xPtr; args[2] = &cPtr; args[3] = &sPtr; args[4] = &dxPtr;
@@ -344,7 +345,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_projres_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 1024);
+        uint blocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.ProjResForwardMaxBlocks);
         IntPtr hPtr = baseHidden.Handle, uPtr = proposal.Handle, gPtr = gateLogit.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[7];
         args[0] = &hPtr; args[1] = &uPtr; args[2] = &gPtr; args[3] = &yPtr;
@@ -368,7 +369,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             return false;
 
         using var _ = PushContext();
-        int numBlocks = Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 256);
+        int numBlocks = Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.ProjResBackwardMaxBlocks);
         using var partials = AllocateBuffer(numBlocks);
 
         IntPtr dyPtr = gradOutput.Handle, hPtr = baseHidden.Handle, uPtr = proposal.Handle, gPtr = gateLogit.Handle;
@@ -390,7 +391,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         IGpuBuffer diagScale, IGpuBuffer spectrumRe, IGpuBuffer spectrumIm, IGpuBuffer output, int batch, int dim)
     {
         if (batch == 0) return true;
-        if (!UseFusedSequenceMixer || batch < 0 || dim <= 0 || (dim & 1) != 0 || dim > CudaSequenceMixerKernels.MaxSpecCircDim || batch > 65535)
+        if (!UseFusedSequenceMixer || batch < 0 || dim <= 0 || (dim & 1) != 0 || dim > CudaSequenceMixerKernels.MaxSpecCircDim || batch > CudaSequenceMixerKernels.MaxSingleBlockPerChannel)
             return false;
         if (!_kernelCache.TryGetValue("smx_cuda_speccirc_fwd", out var kernel)) return false;
 
@@ -407,7 +408,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         IGpuBuffer gradDiagScale, IGpuBuffer gradSpectrumRe, IGpuBuffer gradSpectrumIm, int batch, int dim)
     {
         if (batch == 0) return true;
-        if (!UseFusedSequenceMixer || batch < 0 || dim <= 0 || (dim & 1) != 0 || dim > CudaSequenceMixerKernels.MaxSpecCircDim || batch > 65535)
+        if (!UseFusedSequenceMixer || batch < 0 || dim <= 0 || (dim & 1) != 0 || dim > CudaSequenceMixerKernels.MaxSpecCircDim || batch > CudaSequenceMixerKernels.MaxSingleBlockPerChannel)
             return false;
         if (!_kernelCache.TryGetValue("smx_cuda_speccirc_bwd", out var kernel)) return false;
 
@@ -444,12 +445,11 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             IntPtr countsPtr = IntPtr.Zero;
             if (biasUpdateRate != 0f)
             {
-                countsBuf = AllocateBuffer(numExperts);
-                Fill(countsBuf, 0f, numExperts);
+                countsBuf = AllocateIntBuffer(new int[numExperts]);
                 countsPtr = countsBuf.Handle;
             }
 
-            uint blocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 2048);
+            uint blocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.TopKMaxGridBlocks);
             IntPtr logPtr = logits.Handle, tblPtr = expertTable.Handle, biasPtr = routingBias.Handle;
             IntPtr yPtr = output.Handle, infoPtr = savedInfo.Handle;
             void** args = stackalloc void*[11];
@@ -495,7 +495,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             return false;
 
         using var _ = PushContext();
-        uint logBlocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 2048);
+        uint logBlocks = (uint)Math.Min(Math.Max(1, (rows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.TopKMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, logPtr = logits.Handle, tblPtr = expertTable.Handle, infoPtr = savedInfo.Handle;
         IntPtr dlogPtr = gradLogits.Handle, dtblPtr = gradExpertTable.Handle;
         void** lArgs = stackalloc void*[10];
@@ -504,7 +504,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         LaunchKernel(dlogKernel, logBlocks, CudaSequenceMixerKernels.WarpBlockThreads, lArgs);
 
         int cells = checked(numExperts * channels);
-        uint tblBlocks = (uint)Math.Min(Math.Max(1, (cells + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 2048);
+        uint tblBlocks = (uint)Math.Min(Math.Max(1, (cells + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.TopKMaxGridBlocks);
         void** tArgs = stackalloc void*[7];
         tArgs[0] = &dyPtr; tArgs[1] = &infoPtr; tArgs[2] = &dtblPtr;
         tArgs[3] = &rows; tArgs[4] = &numExperts; tArgs[5] = &topK; tArgs[6] = &channels;
@@ -521,7 +521,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_dualswiglu_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr guPtr = gateUpProj.Handle, ggPtr = gateUpGainDelta.Handle, bPtr = upBase.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[6];
         args[0] = &guPtr; args[1] = &ggPtr; args[2] = &bPtr; args[3] = &yPtr; args[4] = &total; args[5] = &hiddenDim;
@@ -539,13 +539,13 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             Fill(gradUpBase, 0f, hiddenDim);
             return true;
         }
-        if (!UseFusedSequenceMixer || rows < 0 || hiddenDim <= 0 || hiddenDim > 65535) return false;
+        if (!UseFusedSequenceMixer || rows < 0 || hiddenDim <= 0 || hiddenDim > CudaSequenceMixerKernels.MaxSingleBlockPerChannel) return false;
         if (!_kernelCache.TryGetValue("smx_cuda_dualswiglu_bwd_elem", out var elemKernel)
             || !_kernelCache.TryGetValue("smx_cuda_dualswiglu_bwd_dbase", out var dbaseKernel))
             return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, guPtr = gateUpProj.Handle, ggPtr = gateUpGainDelta.Handle, bPtr = upBase.Handle;
         IntPtr dguPtr = gradGateUpProj.Handle, dggPtr = gradGateUpGainDelta.Handle, dbPtr = gradUpBase.Handle;
         void** eArgs = stackalloc void*[8];
@@ -565,12 +565,12 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
     {
         int totalOut = checked(totalRows * headDim);
         if (totalOut == 0) return true;
-        if (!UseFusedSequenceMixer || totalRows < 0 || numHeads <= 0 || headDim <= 0 || scanDim < headDim + 1)
+        if (!UseFusedSequenceMixer || totalRows < 0 || numHeads <= 0 || headDim <= 0 || headDim >= scanDim)
             return false;
         if (!_kernelCache.TryGetValue("smx_cuda_bornratio_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (totalOut + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (totalOut + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr sPtr = scanOutput.Handle, sinkPtr = sinkLogAlphaOrDummy.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[9];
         args[0] = &sPtr; args[1] = &sinkPtr; args[2] = &yPtr;
@@ -589,7 +589,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             if (hasSink != 0) Fill(gradSinkOrDummy, 0f, numHeads);
             return true;
         }
-        if (!UseFusedSequenceMixer || totalRows < 0 || numHeads <= 0 || numHeads > 65535 || headDim <= 0 || scanDim < headDim + 1)
+        if (!UseFusedSequenceMixer || totalRows < 0 || numHeads <= 0 || numHeads > CudaSequenceMixerKernels.MaxSingleBlockPerChannel || headDim <= 0 || headDim >= scanDim)
             return false;
         if (!_kernelCache.TryGetValue("smx_cuda_bornratio_bwd_dscan", out var dscanKernel)) return false;
         IntPtr dsinkKernel = IntPtr.Zero;
@@ -597,7 +597,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             return false;
 
         using var _ = PushContext();
-        uint scanBlocks = (uint)Math.Min(Math.Max(1, (totalRows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), 4096);
+        uint scanBlocks = (uint)Math.Min(Math.Max(1, (totalRows + CudaSequenceMixerKernels.WarpsPerBlock - 1) / CudaSequenceMixerKernels.WarpsPerBlock), CudaSequenceMixerKernels.WarpHeadMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, sPtr = scanOutput.Handle, sinkPtr = sinkLogAlphaOrDummy.Handle;
         IntPtr dsPtr = gradScanOutput.Handle, dsinkPtr = gradSinkOrDummy.Handle;
         void** sArgs = stackalloc void*[10];
@@ -624,7 +624,7 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
         if (!_kernelCache.TryGetValue("smx_cuda_boundsig_fwd", out var kernel)) return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr lPtr = logits.Handle, bPtr = bias.Handle, yPtr = output.Handle;
         void** args = stackalloc void*[6];
         args[0] = &lPtr; args[1] = &bPtr; args[2] = &yPtr; args[3] = &total; args[4] = &cols; args[5] = &floor;
@@ -641,13 +641,13 @@ public sealed partial class CudaBackend : IFusedSequenceMixerOps
             Fill(gradBias, 0f, cols);
             return true;
         }
-        if (!UseFusedSequenceMixer || rows < 0 || cols <= 0 || cols > 65535) return false;
+        if (!UseFusedSequenceMixer || rows < 0 || cols <= 0 || cols > CudaSequenceMixerKernels.MaxSingleBlockPerChannel) return false;
         if (!_kernelCache.TryGetValue("smx_cuda_boundsig_bwd_dlog", out var dlogKernel)
             || !_kernelCache.TryGetValue("smx_cuda_boundsig_bwd_dbias", out var dbiasKernel))
             return false;
 
         using var _ = PushContext();
-        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), 2048);
+        uint blocks = (uint)Math.Min(Math.Max(1, (total + CudaSequenceMixerKernels.ElemBlockThreads - 1) / CudaSequenceMixerKernels.ElemBlockThreads), CudaSequenceMixerKernels.ElemMaxGridBlocks);
         IntPtr dyPtr = gradOutput.Handle, lPtr = logits.Handle, bPtr = bias.Handle, dlPtr = gradLogits.Handle, dbPtr = gradBias.Handle;
         void** lArgs = stackalloc void*[7];
         lArgs[0] = &dyPtr; lArgs[1] = &lPtr; lArgs[2] = &bPtr; lArgs[3] = &dlPtr; lArgs[4] = &total; lArgs[5] = &cols; lArgs[6] = &floor;

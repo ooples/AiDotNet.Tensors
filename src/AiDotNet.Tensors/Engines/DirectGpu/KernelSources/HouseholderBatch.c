@@ -32,8 +32,10 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_fwd(const float* x, const
         int uOff = j * D;
         float dot = 0.0f;
         for (int i = 0; i < D; i++) dot += y[baseOff + i] * uHat[uOff + i];
-        float twoDot = 2.0f * dot;
-        for (int i = 0; i < D; i++) y[baseOff + i] -= twoDot * uHat[uOff + i];
+        for (int i = 0; i < D; i++) {
+            float step = dot * uHat[uOff + i];
+            y[baseOff + i] = (y[baseOff + i] - step) - step;
+        }
     }
 }
 
@@ -48,8 +50,10 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_dx(const float* dy, c
         float p = 0.0f;
         for (int i = 0; i < D; i++) p += dx[baseOff + i] * uHat[uOff + i];
         pqBuf[pqOff + s] = p;
-        float twoP = 2.0f * p;
-        for (int i = 0; i < D; i++) dx[baseOff + i] -= twoP * uHat[uOff + i];
+        for (int i = 0; i < D; i++) {
+            float step = p * uHat[uOff + i];
+            dx[baseOff + i] = (dx[baseOff + i] - step) - step;
+        }
     }
     for (int i = 0; i < D; i++) dx[baseOff + i] = dy[baseOff + i];
     for (int s = K - 1; s >= 0; s--) {
@@ -58,8 +62,10 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_dx(const float* dy, c
         float q = 0.0f;
         for (int i = 0; i < D; i++) q += dx[baseOff + i] * uHat[uOff + i];
         pqBuf[pqOff + K + s] = q;
-        float twoQ = 2.0f * q;
-        for (int i = 0; i < D; i++) dx[baseOff + i] -= twoQ * uHat[uOff + i];
+        for (int i = 0; i < D; i++) {
+            float step = q * uHat[uOff + i];
+            dx[baseOff + i] = (dx[baseOff + i] - step) - step;
+        }
     }
 }
 
@@ -71,17 +77,19 @@ extern "C" __global__ __launch_bounds__(256) void hh_p_bwd_du_raw(const float* d
         float xv = x[m * D + col];
         for (int s = 0; s < K; s++) {
             int j = trans != 0 ? (K - 1 - s) : s;
-            xv -= 2.0f * pqBuf[pqOff + s] * uHat[j * D + col];
-        }
-        float gv = dy[m * D + col];
-        for (int s = K - 1; s >= 0; s--) {
-            int j = trans != 0 ? (K - 1 - s) : s;
             float ps = pqBuf[pqOff + s];
             float qs = pqBuf[pqOff + K + s];
             float uj = uHat[j * D + col];
-            xv += 2.0f * ps * uj;
-            duHat[j * D + col] += -2.0f * (qs * xv + ps * gv);
-            gv -= 2.0f * qs * uj;
+            float gv = dy[m * D + col];
+            for (int t = K - 1; t > s; t--) {
+                int jt = trans != 0 ? (K - 1 - t) : t;
+                float stepQ = pqBuf[pqOff + K + t] * uHat[jt * D + col];
+                gv = (gv - stepQ) - stepQ;
+            }
+            float duTerm = qs * xv + ps * gv;
+            duHat[j * D + col] = (duHat[j * D + col] - duTerm) - duTerm;
+            float stepP = ps * uj;
+            xv = (xv - stepP) - stepP;
         }
     }
 }

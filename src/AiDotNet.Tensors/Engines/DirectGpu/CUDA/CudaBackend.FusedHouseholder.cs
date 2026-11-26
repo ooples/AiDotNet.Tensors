@@ -18,7 +18,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor)
+        double normFloor)
     {
         if (!TryHouseholderChainForward(input, reflectors, output, rows, numReflectors, dim, transpose, normFloor))
             PortableHouseholderChain.Forward(this, input, reflectors, output, rows, numReflectors, dim, transpose, normFloor);
@@ -34,7 +34,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor)
+        double normFloor)
     {
         if (!TryHouseholderChainBackward(gradOutput, input, reflectors, gradInput, gradReflectors, rows, numReflectors, dim, transpose, normFloor))
             PortableHouseholderChain.Backward(this, gradOutput, input, reflectors, gradInput, gradReflectors, rows, numReflectors, dim, transpose, normFloor);
@@ -48,7 +48,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor)
+        double normFloor)
     {
         if (rows == 0) return true;
         if (!UseFusedHouseholder
@@ -56,7 +56,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
             || numReflectors < 1 || numReflectors > CudaHouseholderKernels.MaxReflectors
             || dim < 1 || dim > CudaHouseholderKernels.MaxDim
             || numReflectors * dim > CudaHouseholderKernels.MaxForwardReflectorElements
-            || !(normFloor > 0f))
+            || !(normFloor > 0.0))
         {
             return false;
         }
@@ -70,7 +70,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         IntPtr uPtr = reflectors.Handle;
         IntPtr yPtr = output.Handle;
         int trans = transpose ? 1 : 0;
-        float sqrtFloor = MathF.Sqrt(normFloor);
+        float sqrtFloor = (float)Math.Sqrt(normFloor);
         void** args = stackalloc void*[8];
         args[0] = &xPtr;
         args[1] = &uPtr;
@@ -95,7 +95,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         int numReflectors,
         int dim,
         bool transpose,
-        float normFloor)
+        double normFloor)
     {
         if (rows == 0)
         {
@@ -107,7 +107,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
             || numReflectors < 1 || numReflectors > CudaHouseholderKernels.MaxReflectors
             || dim < 1 || dim > CudaHouseholderKernels.MaxDim
             || numReflectors * dim > CudaHouseholderKernels.MaxBackwardReflectorElements
-            || !(normFloor > 0f))
+            || !(normFloor > 0.0))
         {
             return false;
         }
@@ -134,7 +134,7 @@ public sealed partial class CudaBackend : IFusedHouseholderChain
         IntPtr uHatPtr = uHatBuf.Handle;
         IntPtr metaPtr = metaBuf.Handle;
         int trans = transpose ? 1 : 0;
-        float sqrtFloor = MathF.Sqrt(normFloor);
+        float sqrtFloor = (float)Math.Sqrt(normFloor);
 
         void** rowArgs = stackalloc void*[12];
         rowArgs[0] = &dyPtr;

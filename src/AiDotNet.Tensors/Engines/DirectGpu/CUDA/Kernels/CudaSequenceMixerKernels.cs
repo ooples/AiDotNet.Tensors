@@ -16,6 +16,14 @@ internal static class CudaSequenceMixerKernels
     public const int WarpBlockThreads = 128;
     public const int WarpsPerBlock = WarpBlockThreads / 32;
     public const int ElemBlockThreads = 256;
+    // Grid-stride launch caps balancing SM occupancy against launch/atomic overhead.
+    public const int ElemMaxGridBlocks = 2048;
+    public const int WarpHeadMaxGridBlocks = 4096;
+    public const int ProjResForwardMaxBlocks = 1024;
+    public const int ProjResBackwardMaxBlocks = 256;
+    public const int TopKMaxGridBlocks = 2048;
+    // Per-column / per-channel 1-block-per-output reduction kernel launch bound.
+    public const int MaxSingleBlockPerChannel = 65535;
 
     public static string[] GetKernelNames() => new[]
     {
