@@ -201,6 +201,9 @@ public class DeviceOptimizerWeightRetentionTests
         Assert.Equal(new float[] { 2, 3, 4, 5 }, probe.ToArray());
     }
 
+    // The float device loss against the double host loss: the gaps observed were at most 2.4e-7, at losses near 1.6.
+    private static double LossTolerance(double want) => 2e-5 * Math.Max(1.0, Math.Abs(want));
+
     // (1/Rows) sum((x W1 W2 - t)^2) on the host, in double.
     private static double HostLoss(float[] xs, float[] w1, float[] w2, float[] target)
     {
@@ -267,13 +270,21 @@ public class DeviceOptimizerWeightRetentionTests
             if (step == writeAt)
             {
                 Assert.True(engine.IsDeviceOptimizerWeight(weights[0]), "the plan's device optimizer must hold its weights");
-                var w1 = weights[0].ToArray().Select(v => v * 0.5f).ToArray();
-                var w2 = weights[1].ToArray().Select(v => -v).ToArray();
+                // New weights unrelated to the current ones, large enough to move the loss well past the tolerance.
+                // A rescale of the current weights (halving W1, negating W2) moved this model's loss by less than
+                // the tolerance (7e-5 at step 9 of the late case), so a refresh that never happened passed.
+                var oldW1 = weights[0].ToArray();
+                var oldW2 = weights[1].ToArray();
+                var w1 = Values(In * Hidden, 41, 1.2f);
+                var w2 = Values(Hidden * Out, 42, 1.2f);
                 engine.InvalidateResidentWeightBuffer(weights[0]);
                 engine.InvalidateResidentWeightBuffer(weights[1]);
                 for (int i = 0; i < w1.Length; i++) weights[0][i] = w1[i];
                 for (int i = 0; i < w2.Length; i++) weights[1][i] = w2[i];
                 expected = HostLoss(xs, w1, w2, target);
+                double stale = HostLoss(xs, oldW1, oldW2, target);
+                Assert.True(Math.Abs(expected.Value - stale) > 100 * LossTolerance(expected.Value),
+                    $"the written weights must change the loss far beyond the tolerance (new {expected}, old {stale})");
             }
             plan.SetInputs(new[] { new Tensor<float>(new[] { Rows, In }, new Vector<float>(xs)) });
             long replaysBefore = compiled.PlanGraphReplayCountForTests;
@@ -283,7 +294,7 @@ public class DeviceOptimizerWeightRetentionTests
                 bool replayed = compiled.PlanGraphReplayCountForTests > replaysBefore;
                 Console.WriteLine($"scenario={scenario} writeAt={writeAt} split={compiled.HasSplitStepGraph} replayed={replayed} loss={loss} host={want}");
                 Assert.Equal(writeAt == 9, replayed);   // the case names a replay or an eager step: hold it to that
-                Assert.True(Math.Abs(loss - want) <= 1e-4 * Math.Max(1.0, Math.Abs(want)),
+                Assert.True(Math.Abs(loss - want) <= LossTolerance(want),
                     $"the step after the host write must see the new weights: loss {loss}, host loss {want}");
             }
         }
