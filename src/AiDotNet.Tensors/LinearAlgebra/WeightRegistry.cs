@@ -1362,8 +1362,16 @@ public static partial class WeightRegistry
     /// </summary>
     internal static long BeginOwnerUse<T>(Tensor<T> weight) => EnterMaterializedOwnerUse(weight);
 
-    /// <summary>Ends a use <see cref="BeginOwnerUse{T}"/> began.</summary>
-    internal static void EndOwnerUse(long handle) => ExitMaterializedOwnerUse(handle);
+    /// <summary>
+    /// Ends a use <see cref="BeginOwnerUse{T}"/> began. <paramref name="shed"/> runs the owner-budget shed pass, for a
+    /// use that paged a copy in; a use of a copy already resident added nothing to shed, and a pass per view (a bias
+    /// reshaped every forward) would retry, under the registry lock, the write-back of a cold owner a live view pins.
+    /// </summary>
+    internal static void EndOwnerUse(long handle, bool shed) => ExitMaterializedOwnerUse(handle, shed);
+
+    // Shed passes run on this thread (tests: a view of a resident weight runs none).
+    [ThreadStatic] private static long t_ownerShedPasses;
+    internal static long OwnerShedPassesOnThisThread => t_ownerShedPasses;
 
     /// <summary>
     /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry
@@ -1447,6 +1455,7 @@ public static partial class WeightRegistry
 
     private static void ShedMaterializedOwnersUnlocked(long budget, long protectedHandle)
     {
+        t_ownerShedPasses++;
         // Shed the coldest materialized owners until back under budget. Skip active
         // MaterializeMany scopes; correctness beats the soft resident-byte cap while
         // a caller is explicitly reading those tensors.
@@ -1531,7 +1540,7 @@ public static partial class WeightRegistry
         }
     }
 
-    private static void ExitMaterializedOwnerUse(long handle)
+    private static void ExitMaterializedOwnerUse(long handle, bool shed = true)
     {
         if (handle < 0) return;
 
@@ -1543,7 +1552,7 @@ public static partial class WeightRegistry
                 else _materializedActiveUses[handle] = activeUses - 1;
             }
 
-            ShedMaterializedOwnersUnlocked(MaterializedOwnerBudgetUnlocked(), protectedHandle: -1);
+            if (shed) ShedMaterializedOwnersUnlocked(MaterializedOwnerBudgetUnlocked(), protectedHandle: -1);
         }
     }
 

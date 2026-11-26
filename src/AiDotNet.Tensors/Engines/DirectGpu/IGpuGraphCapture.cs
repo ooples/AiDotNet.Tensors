@@ -47,7 +47,8 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
 
     /// <summary>
     /// True while the calling thread is capturing through this library on this backend. Managed state only (no driver
-    /// call, no context push), so a capability query without an op lease may read it.
+    /// call, no context push), so a capability query without an op lease may read it. CUDA also reports a capture this
+    /// thread runs on another CUDA backend (its capture depth is per thread): a conservative answer, never a wrong one.
     /// </summary>
     bool CaptureActiveOnThisThread { get; }
 

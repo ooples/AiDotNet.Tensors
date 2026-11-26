@@ -350,6 +350,67 @@ public class StreamingBf16InferenceTests
     }
 
     /// <summary>
+    /// A view of a streaming weight that is already resident runs no owner-budget shed pass: it paged nothing in. A pass
+    /// per view (a bias reshaped every forward) retried, under the registry lock, the write-back of a cold owner a live
+    /// view pinned. A view that pages the weight in still runs one.
+    /// </summary>
+    [Fact]
+    public void A_view_of_a_resident_streaming_weight_runs_no_shed_pass()
+    {
+        var dir = Configure();
+        try
+        {
+            var w = Stream(Filled(new[] { K, N }, 2, v => v));
+            WeightRegistry.Materialize(w);
+            Assert.True(w.DataVector.Length == w.Length);
+            long before = WeightRegistry.OwnerShedPassesOnThisThread;
+            for (int i = 0; i < 20; i++) _ = w.Reshape(K * N);
+            Assert.Equal(before, WeightRegistry.OwnerShedPassesOnThisThread);
+            // The views above share w's storage, so w cannot be dropped now; a weight registration dropped pages in.
+            var cold = Stream(Filled(new[] { K, N }, 2, v => v));
+            Assert.True(cold.DataVector.Length != cold.Length);
+            var paged = cold.Reshape(K * N);
+            Assert.True(WeightRegistry.OwnerShedPassesOnThisThread > before, "a view that paged the weight in ran no shed pass");
+            Assert.Equal(Filled(new[] { K, N }, 2, v => v).ToArray(), paged.ToArray());
+        }
+        finally { Cleanup(dir); }
+    }
+
+    /// <summary>
+    /// An in-place strided view of a no-upcast int8 weight's storage dequantizes it first, as a host read does; it built
+    /// a view over the empty fp32 storage. Re-striding a registered streaming weight itself is refused: it made the weight
+    /// a view, which the pool never writes back or sheds.
+    /// </summary>
+    [Fact]
+    public void In_place_strided_views_of_streaming_weights_page_in_or_are_refused()
+    {
+        const int r = 16, c = 32;   // the int8 store's per-output layout, as StreamingInt8NoUpcastTests uses
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-int8-inplace-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 1024L * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Int8,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var w = Filled(new[] { r, c }, 2, v => v);
+            w.Lifetime = WeightLifetime.Streaming;
+            WeightRegistry.RegisterWeight(w);
+            WeightRegistry.Materialize(w);
+            Assert.NotNull(w.StreamingInt8);
+            Assert.Equal(0, w.DataVector.Length);
+            var cpu = new CpuEngine();
+            var strided = new Tensor<float>(new[] { 1 });
+            cpu.TensorSetInPlace(strided, w, 0, new[] { r, c }, new[] { c, 1 });
+            Assert.Equal(w.ToArray(), strided.ToArray());
+            Assert.Throws<InvalidOperationException>(() => cpu.TensorAsStridedInPlace(w, new[] { c, r }, new[] { 1, c }));
+        }
+        finally { Cleanup(dir); }
+    }
+
+    /// <summary>
     /// A host copy that is resident when a forward reaches its weight on the GPU stays the owner budget's most recent
     /// use, as it is after Materialize: the next copy made resident sheds an older owner, not the one the forward is
     /// using. The forward used to leave it at the budget's oldest place.

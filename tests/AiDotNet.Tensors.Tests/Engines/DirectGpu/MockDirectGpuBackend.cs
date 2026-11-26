@@ -142,6 +142,7 @@ public class MockDirectGpuBackend : DispatchProxy
             case "get_SupportsGraphCapture": return true;
             case "get_ContextIsLive": return true;
             case "IsStreamCapturing": return _state.Capturing;
+            case "get_CaptureActiveOnThisThread": return _state.Capturing;
             case "StreamCaptureStatusRaw": return _state.Capturing ? 1 : 0;
             case "get_LastCaptureFailure":
             case "get_LastCaptureNodeCounts":

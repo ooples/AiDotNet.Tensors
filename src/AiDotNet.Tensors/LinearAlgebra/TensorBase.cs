@@ -3148,6 +3148,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// The storage half of <see cref="EnsureMaterialized"/>: creates a deferred buffer and pages a dropped
     /// streaming weight (fp32/bf16 snapshot, int8 or int4) back in. Does not realize a lazy node.
     /// </summary>
+    /// <summary>
+    /// <see cref="EnsureStorageResident"/> for engine code that reads the storage directly (a view of it): a dropped
+    /// streaming weight pages in, a no-upcast int8/int4 one dequantizes, as for any host read.
+    /// </summary>
+    internal void EnsureHostStorageResident() => EnsureStorageResident();
+
     private protected void EnsureStorageResident()
     {
         using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use

@@ -274,7 +274,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
         finally
         {
-            WeightRegistry.EndOwnerUse(ownerUse);
+            WeightRegistry.EndOwnerUse(ownerUse, shed: dropped);
         }
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
