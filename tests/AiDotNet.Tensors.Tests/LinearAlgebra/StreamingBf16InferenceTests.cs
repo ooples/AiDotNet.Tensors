@@ -149,6 +149,113 @@ public class StreamingBf16InferenceTests
         finally { gpu.Dispose(); Cleanup(dir); }
     }
 
+#if NET5_0_OR_GREATER
+    /// <summary>
+    /// Evicting and re-uploading bf16 copies under a device budget makes no host copy of the weight. Each upload used to
+    /// allocate two arrays of the weight's size (the store snapshot and a packed float[] of it); a model whose bf16
+    /// weights exceed the budget re-uploads on every pass, and its host memory grew about two bytes per byte uploaded
+    /// faster than the collector reclaimed it (a 7 GiB budget during one evaluation forward: 14 GB of host growth).
+    /// </summary>
+    /// <remarks>Both with the weights resident in the pool and paged out of it: a paged-out weight was read back into a
+    /// fresh resident array on every upload (two for a compressed store), evicting another whose array became garbage.
+    /// </remarks>
+    [SkippableTheory]
+    [InlineData(64L * 1024 * 1024, false)]
+    [InlineData(64L * 1024, false)]
+    [InlineData(64L * 1024, true)]
+    public void Gpu_bf16_evict_and_reupload_cycles_make_no_host_copy_of_the_weight(long poolResidentBytes, bool compressed)
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true }) { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies"); return; }
+        const int k = 512, n = 1024;   // 1 MiB of bf16 per weight
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-bf16-churn-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            // 64 MiB keeps both weights resident in the pool; 64 KiB pages them out, so every re-upload reads the disk.
+            StreamingPoolMaxResidentBytes = poolResidentBytes,
+            EnableCompression = compressed,
+            StreamingStoreDtype = StreamingStoreDtype.Bf16,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var x = Filled(new[] { 1, k }, 1, v => v);
+            var w = new[] { Stream(Filled(new[] { k, n }, 2, v => v)), Stream(Filled(new[] { k, n }, 3, v => v)) };
+            var b = new[] { Stream(Filled(new[] { n }, 4, v => v)), Stream(Filled(new[] { n }, 5, v => v)) };
+            long pair = 4L * ((2L * k * n + 3) / 4) + 4L * ((2L * n + 3) / 4);
+            gpu.Bf16WeightDeviceBudgetBytes = pair;   // one layer: alternating layers evict and re-upload every time
+            for (int l = 0; l < 2; l++) _ = gpu.FusedLinear(x, w[l], b[l], FusedActivationType.None).GetFlat(0);   // warm-up
+
+            const int cycles = 20;
+            long uploaded0 = gpu.Bf16WeightBytesUploaded, evictions0 = gpu.Bf16WeightEvictions;
+            long allocated0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int c = 0; c < cycles; c++) _ = gpu.FusedLinear(x, w[c % 2], b[c % 2], FusedActivationType.None);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - allocated0;
+            long uploaded = gpu.Bf16WeightBytesUploaded - uploaded0;
+
+            Assert.True(gpu.Bf16WeightEvictions - evictions0 >= 2 * (cycles - 1), "the budget did not force re-uploads");
+            Assert.True(uploaded >= (long)cycles * 2 * k * n, $"uploaded {uploaded} bytes");
+            if (poolResidentBytes < 2L * k * n)
+                Assert.True(WeightRegistry.StreamingPool.GetReport().DiskReadBytes > 0, "the weights never paged out");
+            // A few small host results and bookkeeping per call; one weight-sized array per upload would be 1 MiB each.
+            Assert.True(allocated < uploaded / 8,
+                $"{allocated} host bytes allocated for {uploaded} bf16 bytes uploaded over {cycles} re-uploads");
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+#endif
+
+    /// <summary>
+    /// Device memory over many evict and re-upload cycles stays within the bf16 budget plus one layer's working set (its
+    /// fp32 widened weight and output): the widened temporaries and evicted copies are reused or freed, not accumulated.
+    /// </summary>
+    [SkippableFact]
+    public void Gpu_bf16_evict_and_reupload_cycles_keep_device_memory_within_the_budget_plus_one_layer()
+    {
+        DirectGpuTensorEngine gpu;
+        try { gpu = new DirectGpuTensorEngine(); }
+        catch { Skip.If(true, "No GPU backend"); return; }
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+        if (gpu.GetBackend() is not IBf16WidenBackend { CanWidenBf16: true } || gpu.GetBackend() is not IDeviceMemoryPressure memory
+            || !memory.TryGetDeviceMemory(out _, out _))
+        { gpu.Dispose(); Skip.If(true, "The backend keeps no bf16 weight copies or reports no device memory"); return; }
+        const int k = 2048, n = 4096, layers = 4;   // 16 MiB of bf16, 32 MiB widened, per weight
+        var dir = Path.Combine(Path.GetTempPath(), $"aidotnet-bf16-dev-{Guid.NewGuid():N}");
+        WeightRegistry.Configure(new GpuOffloadOptions
+        {
+            StreamingBackingStorePath = dir,
+            StreamingPoolMaxResidentBytes = 256L * 1024 * 1024,
+            StreamingStoreDtype = StreamingStoreDtype.Bf16,
+        });
+        WeightRegistry.SetStreamingExecutionTraining(false);
+        try
+        {
+            var x = Filled(new[] { 8, k }, 1, v => v);
+            var w = new Tensor<float>[layers];
+            var b = new Tensor<float>[layers];
+            for (int l = 0; l < layers; l++) { w[l] = Stream(Filled(new[] { k, n }, 2 + l, v => v)); b[l] = Stream(Filled(new[] { n }, 9 + l, v => v)); }
+            long pair = 4L * ((2L * k * n + 3) / 4) + 4L * ((2L * n + 3) / 4);
+            gpu.Bf16WeightDeviceBudgetBytes = 2 * pair;
+            for (int l = 0; l < layers; l++) _ = gpu.FusedLinear(x, w[l], b[l], FusedActivationType.None).GetFlat(0);
+            memory.TryGetDeviceMemory(out ulong free0, out _);
+            long peakGrowth = 0;
+            for (int c = 0; c < 6 * layers; c++)
+            {
+                _ = gpu.FusedLinear(x, w[c % layers], b[c % layers], FusedActivationType.None).GetFlat(0);
+                memory.TryGetDeviceMemory(out ulong free, out _);
+                peakGrowth = Math.Max(peakGrowth, (long)free0 - (long)free);
+            }
+            long layerWorkingSet = 4L * k * n + 4L * n + 4L * 8 * n;
+            Assert.True(peakGrowth <= gpu.Bf16WeightDeviceBudgetBytes + layerWorkingSet,
+                $"device use grew {peakGrowth / 1048576.0:F1} MiB over the warm state; budget {gpu.Bf16WeightDeviceBudgetBytes / 1048576.0:F1} MiB, one layer {layerWorkingSet / 1048576.0:F1} MiB");
+        }
+        finally { gpu.Dispose(); Cleanup(dir); }
+    }
+
     /// <summary>
     /// A bf16 copy whose weight has been collected is released by the next upload, on an unbounded engine too. The copies
     /// are held strongly (the eviction list), so without that release a dropped model's copies stayed on the device until
