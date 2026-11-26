@@ -150,9 +150,10 @@ public partial class DirectGpuTensorEngine
         }
     }
 
-    /// <summary>Whether this engine keeps bf16 device copies of bf16-stored weights, so their ops need no fp32 host copy.</summary>
+    /// <summary>Whether this engine keeps bf16 device copies of bf16-stored weights, so their ops need no fp32 host copy.
+    /// A lease-free capability query: MaterializeForForward reads it before any operation lease is held.</summary>
     internal bool ServesBf16WeightCopies
-        => !IsDisposed && IsGpuAvailable && GetBackend() is IBf16WidenBackend { CanWidenBf16: true } backend
+        => !IsDisposed && IsGpuAvailable && QueryBackend is IBf16WidenBackend { CanWidenBf16: true } backend
             // TryBf16StreamingWeight's own refusal: a stream capture cannot record the first upload.
             && !(backend is IGpuGraphCapture capture && capture.IsStreamCapturing());
 
