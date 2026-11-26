@@ -53,7 +53,7 @@ public class LossScalingConfigurationTests
         }
     }
 
-    public static TheoryData<string> BadOptions => new() { "scale0", "scaleInf", "growth", "backoff0", "backoff2", "interval", "min0", "maxBelowMin", "maxInf" };
+    public static TheoryData<string> BadOptions => new() { "scale0", "scaleInf", "growth", "backoff0", "backoff2", "interval", "min0", "maxBelowMin", "maxInf", "initialBelowMin", "initialAboveMax" };
 
     [Theory]
     [MemberData(nameof(BadOptions))]
@@ -71,9 +71,22 @@ public class LossScalingConfigurationTests
             case "min0": options.MinScale = 0f; break;
             case "maxBelowMin": options.MinScale = 4f; options.MaxScale = 2f; break;
             case "maxInf": options.MaxScale = float.PositiveInfinity; break;
+            case "initialBelowMin": options.MinScale = 16f; options.InitialScale = 8f; break;
+            case "initialAboveMax": options.MaxScale = 1024f; options.InitialScale = 2048f; break;
         }
         using var plan = Plan<float>();
         Assert.Throws<ArgumentOutOfRangeException>(() => plan.Scaling.ConfigureLossScaling(options));
+        Assert.Null(plan.Scaling.ReadLossScaleState());
+    }
+
+    [Theory]
+    [InlineData(0.5f)]
+    [InlineData(1e9f)]
+    public void A_resumed_scale_outside_the_bounds_is_refused(float scale)
+    {
+        using var plan = Plan<float>();
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            plan.Scaling.ConfigureLossScaling(new LossScalingOptions(), new LossScaleState(scale, 0, 0, 0)));
         Assert.Null(plan.Scaling.ReadLossScaleState());
     }
 

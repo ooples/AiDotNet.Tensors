@@ -582,11 +582,6 @@ internal static partial class SimdGemm
     [ThreadStatic]
     private static WeakReference<PrePackedB>? _threadPrePackedBValue1;
 
-    /// <summary>
-    /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
-    /// full set of per-(pcIter, csIdx) packed buffers. Called on cache miss.
-    /// </summary>
-    [MethodImpl(Hot)]
     /// <summary>The bytes <see cref="BuildPrePackedB"/> allocates for this shape (its layout arithmetic, sizes only).</summary>
     internal static long PrePackedBBytes(int k, int n, int m)
     {
@@ -607,6 +602,11 @@ internal static partial class SimdGemm
         return 4L * numPcIters * numColSubBlocks * perSub;
     }
 
+    /// <summary>
+    /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
+    /// full set of per-(pcIter, csIdx) packed buffers. Called on cache miss.
+    /// </summary>
+    [MethodImpl(Hot)]
     private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
     {
         // Capture the mutation version BEFORE reading any of b's contents.

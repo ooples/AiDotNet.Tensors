@@ -21,7 +21,13 @@ public sealed partial class CudaBackend : IDeviceGradScalerFactory
             try
             {
                 using var _ = PushContext();
-                if (CudaNativeBindings.cuCtxGetDevice(out int device) != CudaResult.Success) return false;
+                var got = CudaNativeBindings.cuCtxGetDevice(out int device);
+                if (got != CudaResult.Success)
+                {
+                    System.Diagnostics.Trace.TraceWarning(
+                        $"Device loss scaling unavailable: cuCtxGetDevice failed ({got}); loss scaling runs on the host.");
+                    return false;
+                }
                 CompileKernelModule(device, Kernels.CudaGradScalerKernels.GetSource(), "grad_scaler_kernels",
                     Kernels.CudaGradScalerKernels.GetKernelNames());
                 foreach (var name in Kernels.CudaGradScalerKernels.GetKernelNames())
@@ -133,9 +139,18 @@ public sealed partial class CudaBackend : IDeviceGradScalerFactory
             var words = new float[Kernels.CudaGradScalerKernels.StateWords];
             static float Bits(uint v) => BitConverter.ToSingle(BitConverter.GetBytes(v), 0);
             words[0] = state.Scale;
-            words[1] = Bits((uint)Math.Max(0, state.GrowthTracker));
-            words[3] = Bits((uint)Math.Min(uint.MaxValue, Math.Max(0L, state.OverflowSteps)));
-            words[4] = Bits((uint)Math.Min(uint.MaxValue, Math.Max(0L, state.Steps)));
+            // The device keeps the counters in 32-bit words: a state they cannot hold is refused, not clamped.
+            if (state.GrowthTracker < 0)
+                throw new ArgumentOutOfRangeException(nameof(state), state.GrowthTracker, "The growth tracker cannot be negative.");
+            if (state.OverflowSteps < 0 || state.OverflowSteps > uint.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(state), state.OverflowSteps,
+                    $"The device loss scaler counts overflow steps in 32 bits: 0 to {uint.MaxValue}.");
+            if (state.Steps < 0 || state.Steps > uint.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(state), state.Steps,
+                    $"The device loss scaler counts steps in 32 bits: 0 to {uint.MaxValue}.");
+            words[1] = Bits((uint)state.GrowthTracker);
+            words[3] = Bits((uint)state.OverflowSteps);
+            words[4] = Bits((uint)state.Steps);
             _backend.UploadBufferInPlace(words, State);
         }
 

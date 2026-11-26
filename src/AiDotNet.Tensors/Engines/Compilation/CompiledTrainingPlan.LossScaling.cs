@@ -32,6 +32,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             if (typeof(T) != typeof(float))
                 throw new NotSupportedException($"Loss scaling needs a float plan, not {typeof(T).Name}.");
             options.Validate();
+            if (initialState is { } resumed && (resumed.Scale < options.MinScale || resumed.Scale > options.MaxScale))
+                throw new ArgumentOutOfRangeException(nameof(initialState),
+                    $"The loss scale state to resume from has scale {resumed.Scale}, outside the options' "
+                    + $"[MinScale, MaxScale] = [{options.MinScale}, {options.MaxScale}].");
             RequireDiscardingNonFinitePolicy(_nonFiniteGradientPolicy);
         }
         lock (_stepSync)
@@ -186,7 +190,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     /// <summary>
     /// Before the step graph is captured (outside the capture): the device scaler over the gradients the graph writes,
     /// holding the current state, and the seed set to its scale. Throws when the graph cannot carry the scaling, so the
-    /// capture is abandoned and the plan keeps the uncaptured steps, which scale on their own.
+    /// capture is abandoned and the plan keeps the uncaptured steps, which scale on their own. With a gradient exchange
+    /// the scaler may never enter a graph (an update that runs outside it unscales after the exchange, uncaptured), so a
+    /// scaler that cannot be prepared there does not abandon the capture: the update graph's capture refuses it if it
+    /// does record the scaler (<see cref="CaptureLossScaling"/>).
     /// </summary>
     private void PrepareLossScalingForCapture()
     {
@@ -195,9 +202,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
             || backend is not Engines.DirectGpu.IDeviceGradScalerFactory factory
             || EnsureLossScaleDevice(factory) is not { } device
             || _lossGradSeed.TryGetGpuBuffer() is not { } seed)
+        {
+            if (_gradientExchange is not null) return;
             throw new InvalidOperationException(
                 "Loss scaling needs every trained gradient and the loss-gradient seed on one CUDA device to run inside the "
                 + "step graph.");
+        }
         device.WriteSeed(seed, _lossGradSeed.Length);
         _lossScalePreparedHandles = DescribeGradientBuffers();
     }

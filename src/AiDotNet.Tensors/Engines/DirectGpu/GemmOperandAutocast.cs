@@ -80,7 +80,10 @@ internal sealed class GemmOperandAutocast
         if (backend is not IGpuNarrowFloatRounding rounding || !rounding.SupportsRoundToNarrowFloat(type))
             throw new GpuCapabilityUnavailableException(
                 $"Matmul autocast is open for {type}, and this device cannot round GEMM operands to it.");
-        if (aCount <= 0 || bCount <= 0 || aCount > int.MaxValue || bCount > int.MaxValue) return default;
+        if (aCount <= 0 || bCount <= 0) return default;
+        if (aCount > int.MaxValue || bCount > int.MaxValue)
+            throw new GpuCapabilityUnavailableException(
+                $"Matmul autocast cannot round a GEMM operand of {System.Math.Max(aCount, bCount)} elements (at most {int.MaxValue}).");
         IGpuBuffer? roundedA = null, roundedB = null;
         try
         {

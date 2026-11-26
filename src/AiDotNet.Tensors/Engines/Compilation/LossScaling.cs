@@ -45,6 +45,9 @@ public sealed class LossScalingOptions
             throw new ArgumentOutOfRangeException(nameof(GrowthInterval), GrowthInterval, "The growth interval must be positive.");
         if (!(MinScale > 0f) || !(MaxScale >= MinScale) || float.IsInfinity(MaxScale))
             throw new ArgumentOutOfRangeException(nameof(MinScale), "The scale bounds must satisfy 0 < MinScale <= MaxScale < Infinity.");
+        if (InitialScale < MinScale || InitialScale > MaxScale)
+            throw new ArgumentOutOfRangeException(nameof(InitialScale), InitialScale,
+                $"The initial scale must lie within [MinScale, MaxScale] = [{MinScale}, {MaxScale}].");
     }
 }
 

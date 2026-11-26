@@ -16,6 +16,8 @@ public partial class DirectGpuTensorEngine
     private sealed class HostMaskDeviceCopy
     {
         internal IGpuBuffer? Buffer;
+        // The backend the buffer belongs to: a copy is never read through another backend.
+        internal IDirectGpuBackend? Backend;
         internal int Capacity;
         internal object? Storage;
         internal int Version;
@@ -25,6 +27,43 @@ public partial class DirectGpuTensorEngine
     // the mask - the plan node that captured it.
     private readonly System.Runtime.CompilerServices.ConditionalWeakTable<Tensor<bool>, HostMaskDeviceCopy> _hostMaskCopies = new();
     private readonly object _hostMaskLock = new();
+    // Every copy made, weakly, so the engine's disposal frees the device memory of those still alive: the table above
+    // cannot be enumerated on every target, and the copies otherwise outlived the engine until their masks were collected.
+    private readonly List<WeakReference<HostMaskDeviceCopy>> _hostMaskCopyList = new();
+
+    /// <summary>Frees every live host-mask device copy (engine disposal).</summary>
+    private void ReleaseHostMaskDeviceCopies()
+    {
+        lock (_hostMaskLock)
+        {
+            foreach (var weak in _hostMaskCopyList)
+            {
+                if (!weak.TryGetTarget(out var copy)) continue;
+                lock (copy)
+                {
+                    copy.Buffer?.Dispose();
+                    copy.Buffer = null;
+                    copy.Backend = null;
+                }
+            }
+            _hostMaskCopyList.Clear();
+        }
+    }
+
+    /// <summary>Device copies of host masks this engine holds (tests).</summary>
+    internal int LiveHostMaskDeviceCopiesForTests
+    {
+        get
+        {
+            lock (_hostMaskLock)
+            {
+                int live = 0;
+                foreach (var weak in _hostMaskCopyList)
+                    if (weak.TryGetTarget(out var copy) && copy.Buffer is not null) live++;
+                return live;
+            }
+        }
+    }
 
     /// <summary>
     /// True for a mask that lives on the host only (no device buffer of its own): the masks whose per-call upload
@@ -49,6 +88,8 @@ public partial class DirectGpuTensorEngine
                         "A host mask's device copy cannot be made inside a graph capture: run the step uncaptured first.");
                 copy = new HostMaskDeviceCopy();
                 _hostMaskCopies.Add(mask, copy);
+                _hostMaskCopyList.RemoveAll(w => !w.TryGetTarget(out _));
+                _hostMaskCopyList.Add(new WeakReference<HostMaskDeviceCopy>(copy));
             }
         }
         RefreshHostMaskDeviceCopy(backend, copy, mask);
@@ -63,10 +104,16 @@ public partial class DirectGpuTensorEngine
         int version = mask.GpuCacheVersion;
         lock (copy)
         {
-            if (copy.Buffer is not null && copy.Capacity == n && ReferenceEquals(copy.Storage, storage)
-                && copy.Version == version) return;
+            if (copy.Buffer is not null && ReferenceEquals(copy.Backend, backend) && copy.Capacity == n
+                && ReferenceEquals(copy.Storage, storage) && copy.Version == version) return;
             if (backend is IGpuGraphCapture capture && capture.IsStreamCapturing())
                 throw new NotSupportedException("A host mask changed inside a graph capture; its device copy cannot be refreshed there.");
+            if (copy.Buffer is not null && !ReferenceEquals(copy.Backend, backend))
+            {
+                // Made on another backend: its buffer is that context's memory. A fresh copy is made on this one.
+                copy.Buffer.Dispose();
+                copy.Buffer = null;
+            }
             if (copy.Buffer is not null && copy.Capacity != n)
                 throw new InvalidOperationException("A host mask's device copy cannot be resized.");
             var values = new float[Math.Max(n, 1)];
@@ -78,6 +125,7 @@ public partial class DirectGpuTensorEngine
             if (copy.Buffer is null)
             {
                 copy.Buffer = backend.AllocateBuffer(values);
+                copy.Backend = backend;
                 copy.Capacity = n;
             }
             else backend.UploadBufferInPlace(values, copy.Buffer);

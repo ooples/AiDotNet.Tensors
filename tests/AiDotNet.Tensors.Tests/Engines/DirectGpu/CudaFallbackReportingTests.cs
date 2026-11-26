@@ -70,6 +70,20 @@ public class CudaFallbackReportingTests
         });
     }
 
+    /// <summary>
+    /// A host without the CUDA driver (AMD, Intel, no GPU) has nothing to warn about: the CUDA warning is for a CUDA
+    /// that is installed and fails. Before, every engine on such a host printed it.
+    /// </summary>
+    [SkippableFact]
+    public void Engine_OnAHostWithoutTheCudaDriver_DoesNotWarnAboutCuda()
+    {
+        Skip.If(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.IsAvailable, "The CUDA driver is installed here.");
+        DirectGpuEngine? engine = null;
+        string stderr = CaptureStderr(() => engine = new DirectGpuEngine());
+        using (engine)
+            Assert.DoesNotContain("CUDA backend unavailable", stderr);
+    }
+
     [Fact]
     public void Engine_RequiredCuda_ThrowsWithTheReason_InsteadOfFallingBack()
     {

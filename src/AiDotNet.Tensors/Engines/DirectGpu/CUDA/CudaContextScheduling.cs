@@ -22,14 +22,40 @@ internal static class CudaContextScheduling
     /// The scheduling flag a new context is created with (<see cref="EffectivePolicy"/>). A misspelled deprecated
     /// environment value, when it is the one that decides, throws: a caller error, not a missing device.
     /// </summary>
+    // The policy whose flag the first CUDA context was created with (-1: no context yet).
+    private static int s_contextPolicy = -1;
+    private static int s_policyChangeWarned;
+
     internal static uint ResolveContextFlags()
+    {
+        var resolved = ResolveContextPolicy();
+        System.Threading.Interlocked.CompareExchange(ref s_contextPolicy, (int)resolved, -1);
+        return Flags(resolved);
+    }
+
+    /// <summary>
+    /// Called when <see cref="GpuHostWaitOptions.Policy"/> is set: a context that already exists keeps the scheduling
+    /// flag it was created with, which is reported once rather than ignored silently.
+    /// </summary>
+    internal static void NotePolicySet(GpuHostWaitPolicy policy)
+    {
+        int created = System.Threading.Volatile.Read(ref s_contextPolicy);
+        if (created < 0 || Flags((GpuHostWaitPolicy)created) == Flags(policy)) return;
+        if (System.Threading.Interlocked.Exchange(ref s_policyChangeWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning(
+                $"{nameof(GpuHostWaitOptions)}.{nameof(GpuHostWaitOptions.Policy)} was set to {policy} after a CUDA context was "
+                + $"created with {(GpuHostWaitPolicy)created}'s scheduling flag; existing contexts keep it. Stream waits use "
+                + "the new policy; set it before the first GPU engine to change the flag too.");
+    }
+
+    private static GpuHostWaitPolicy ResolveContextPolicy()
     {
         if (!GpuHostWaitOptions.IsPolicySet)
         {
             string? value = Environment.GetEnvironmentVariable(EnvironmentVariable);
             if (!string.IsNullOrWhiteSpace(value)) _ = ParseLegacy(value!);   // throws on a misspelling
         }
-        return Flags(EffectivePolicy);
+        return EffectivePolicy;
     }
 
     /// <summary>The context scheduling flag a deprecated environment value names (empty: the default policy's).</summary>

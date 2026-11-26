@@ -41,12 +41,22 @@ internal static class CudaVisibleDevices
         {
             var entry = raw.Trim();
             if (entry.Length == 0) continue;
-            if (!entry.StartsWith("GPU-", StringComparison.OrdinalIgnoreCase)) return null;
+            if (!entry.StartsWith("GPU-", StringComparison.OrdinalIgnoreCase)) return Unresolved(value);
             var hex = entry.Substring(4).Replace("-", string.Empty).ToLowerInvariant();
-            if (hex.Length != 32) return null;
+            if (hex.Length != 32) return Unresolved(value);
             fromValue.Add(hex);
         }
         return fromValue;
+    }
+
+    // The CUDA driver could not say which devices the value names, and it lists ordinals (or malformed UUIDs) that only
+    // the driver can map: every NVIDIA device stays visible to the backends that filter by UUID, which is reported.
+    private static HashSet<string>? Unresolved(string value)
+    {
+        System.Diagnostics.Trace.TraceWarning(
+            $"CUDA_VISIBLE_DEVICES='{value}' could not be resolved to device UUIDs without the CUDA driver; backends that "
+            + "select NVIDIA devices by UUID (Vulkan) are not restricted by it. Set it to GPU-<uuid> entries to apply it.");
+        return null;
     }
 
     internal static string Hex(ReadOnlySpan<byte> uuid)

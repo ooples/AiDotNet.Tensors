@@ -60,6 +60,7 @@ public static class GpuHostWaitOptions
                 throw new ArgumentOutOfRangeException(nameof(value), value, "Unknown host-wait policy.");
             System.Threading.Volatile.Write(ref _policy, (int)value);
             System.Threading.Volatile.Write(ref _policySet, 1);
+            CUDA.CudaContextScheduling.NotePolicySet(value);
         }
     }
 

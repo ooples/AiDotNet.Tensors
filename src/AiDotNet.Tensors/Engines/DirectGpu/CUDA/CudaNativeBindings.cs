@@ -299,10 +299,17 @@ internal static class CudaNativeBindings
             result = cuStreamQuery(stream);
             if (result != CudaResult.NotReady) return cuStreamSynchronizeNative(stream);
         }
-        if (cuEventCreate(out IntPtr done, BlockingWaitEventFlags) != CudaResult.Success) return cuStreamSynchronizeNative(stream);
+        var created = cuEventCreate(out IntPtr done, BlockingWaitEventFlags);
+        if (created != CudaResult.Success)
+        {
+            WarnBlockingWaitUnavailable("cuEventCreate", created);
+            return cuStreamSynchronizeNative(stream);
+        }
         try
         {
-            if (cuEventRecord(done, stream) == CudaResult.Success) cuEventSynchronizeNative(done);
+            var recorded = cuEventRecord(done, stream);
+            if (recorded == CudaResult.Success) cuEventSynchronizeNative(done);
+            else WarnBlockingWaitUnavailable("cuEventRecord", recorded);
             // Finished (or failed) by now: the native wait returns at once and reports an error as it always did.
             return cuStreamSynchronizeNative(stream);
         }
@@ -310,6 +317,18 @@ internal static class CudaNativeBindings
         {
             cuEventDestroy(done);
         }
+    }
+
+    private static int s_blockingWaitWarned;
+
+    // The blocking event could not be made or recorded: this wait (and any like it) spins in cuStreamSynchronize, which
+    // the poll-then-block policy exists to avoid. Reported once.
+    private static void WarnBlockingWaitUnavailable(string call, CudaResult result)
+    {
+        if (System.Threading.Interlocked.Exchange(ref s_blockingWaitWarned, 1) == 0)
+            System.Diagnostics.Trace.TraceWarning(
+                $"A poll-then-block stream wait could not block ({call} returned {result}); it waits in cuStreamSynchronize, "
+                + "which spins a core with the context's scheduling flag.");
     }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]

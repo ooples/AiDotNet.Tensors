@@ -581,7 +581,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new ArgumentOutOfRangeException(nameof(precision), precision, "Matmul autocast supports FP16, BF16 and FP32.");
         if (mode is not (Gpu.MatMulAutocastMode.CastOperands or Gpu.MatMulAutocastMode.FastComputeType))
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown matmul autocast mode.");
-        if (GetBackend() is not DirectGpu.IGemmAutocastBackend autocast) return NoOpScope.Instance;
+        if (GetBackend() is not DirectGpu.IGemmAutocastBackend autocast)
+        {
+            // A FP32 scope asks for nothing; a 16-bit one this backend cannot honour is refused, not ignored.
+            if (precision == Gpu.PrecisionMode.Float32) return NoOpScope.Instance;
+            throw new DirectGpu.GpuCapabilityUnavailableException(
+                $"Matmul autocast to {precision} is not available on {(GetBackend()?.BackendName ?? "this engine (no GPU backend)")}.");
+        }
         var scope = new MatMulAutocastScope(this, precision, autocast.EnterGemmAutocast(precision, mode));
         lock (_matMulAutocastScopes) _matMulAutocastScopes.Add(scope);
         return scope;
@@ -32099,6 +32105,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _tensorVersions.Clear();
         _persistentWeightHostVersion.Clear();
         ReleaseBf16DeviceWeights();
+        ReleaseHostMaskDeviceCopies();
         // Reclaim buffers awaiting deferred disposal (engine teardown — no reader to race).
         foreach (var retired in _retiredWeightBuffers) retired.Dispose();
         _retiredWeightBuffers.Clear();

@@ -94,8 +94,10 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
     /// accumulates and writes FP32: with <see cref="Gpu.MatMulAutocastMode.CastOperands"/> the operands are rounded to 16
     /// bits into scratch first; with <see cref="Gpu.MatMulAutocastMode.FastComputeType"/> they stay FP32 and cuBLAS may
     /// down-convert them inside its kernel. Operands and results stay FP32 tensors, so
-    /// nothing else in a step changes. A captured graph keeps the compute type its capture ran with. Without cuBLAS the
-    /// generated FP32 GEMM runs unchanged.
+    /// nothing else in a step changes. A captured graph keeps the compute type its capture ran with. A 16-bit scope is
+    /// refused (<see cref="GpuCapabilityUnavailableException"/>) where its GEMMs could not honour it: without cuBLAS (the
+    /// generated FP32 GEMM has no 16-bit path), or for operand casting to a type the device cannot convert to (BF16 below
+    /// compute capability 8.0), as torch.autocast refuses BF16 there.
     /// </summary>
     IDisposable IGemmAutocastBackend.EnterGemmAutocast(Gpu.PrecisionMode precision, Gpu.MatMulAutocastMode mode)
     {
@@ -108,6 +110,14 @@ public sealed partial class CudaBackend : IGemmAutocastBackend
         };
         int castType = compute == 0 || mode == Gpu.MatMulAutocastMode.FastComputeType ? 0
             : precision == Gpu.PrecisionMode.BFloat16 ? CuBlasNative.CUDA_R_16BF : CuBlasNative.CUDA_R_16F;
+        if (compute != 0 && !UsesCublas)
+            throw new GpuCapabilityUnavailableException(
+                $"Matmul autocast to {precision} needs cuBLAS on CUDA; {DeviceName} runs the generated FP32 GEMM, which has no "
+                + "16-bit path.");
+        if (castType != 0
+            && !TryGetCastKernel(castType == CuBlasNative.CUDA_R_16BF ? FftElementType.BFloat16 : FftElementType.Float16, out _, out string? why))
+            throw new GpuCapabilityUnavailableException(
+                $"Matmul autocast cannot round GEMM operands to {precision} on {DeviceName}: {why}.");
         var scope = new GemmAutocastScope(this, compute == 0 ? 0 : compute | (castType << 8));
         lock (_gemmAutocastScopes)
         {

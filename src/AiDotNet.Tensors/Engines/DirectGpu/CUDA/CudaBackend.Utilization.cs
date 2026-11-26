@@ -26,9 +26,17 @@ public sealed partial class CudaBackend : IDeviceUtilization
 
     private bool HasNvmlDevice()
     {
-        if (_nvmlState == 0)
-            _nvmlState = TryDeviceUuid(out string uuid) && NvmlNative.TryGetDevice(uuid, out _nvmlDevice) ? 1 : -1;
-        return _nvmlState > 0;
+        // The state is published after the handle (a release write), and read before it (an acquire read), so a
+        // thread that sees "found" also sees the handle.
+        int state = System.Threading.Volatile.Read(ref _nvmlState);
+        if (state == 0)
+        {
+            IntPtr device = IntPtr.Zero;
+            state = TryDeviceUuid(out string uuid) && NvmlNative.TryGetDevice(uuid, out device) ? 1 : -1;
+            if (state > 0) _nvmlDevice = device;
+            System.Threading.Volatile.Write(ref _nvmlState, state);
+        }
+        return state > 0;
     }
 
     // "GPU-" and the 16 UUID bytes as 8-4-4-4-12 hex digits, the form nvidia-smi and NVML use.

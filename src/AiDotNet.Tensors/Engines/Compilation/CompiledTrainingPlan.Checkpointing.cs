@@ -577,14 +577,31 @@ internal sealed partial class CompiledTrainingPlan<T>
                     de?.EndScratchAction();
                 }
             }
+            catch (Exception failure)
+            {
+                // The live state (running statistics, router bias) holds the segment start's values now: put the step's
+                // back before the failure reaches a caller that may carry on (the eager fallback), or report both.
+                try { RestoreCurrentState(); }
+                catch (Exception restore)
+                {
+                    throw new AggregateException(
+                        $"Checkpoint segment {k}: the recompute failed, and the state it rewound could not be restored.",
+                        failure, restore);
+                }
+                throw;
+            }
             finally
             {
                 if (pool is not null) pool.HoldLeasesIn = null;
             }
-            for (int j = 0; j < state.Length; j++)
-                CopyDevice(backend,
-                    _checkpoint.Current[k][j] ?? throw new InvalidOperationException($"Checkpoint segment {k}: its current state was not saved before the recompute."),
-                    StateBuffer(state[j], k), state[j].Length);
+            RestoreCurrentState();
+            void RestoreCurrentState()
+            {
+                for (int j = 0; j < state.Length; j++)
+                    CopyDevice(backend,
+                        _checkpoint.Current[k][j] ?? throw new InvalidOperationException($"Checkpoint segment {k}: its current state was not saved before the recompute."),
+                        StateBuffer(state[j], k), state[j].Length);
+            }
             if (!capturing) _checkpoint.RecomputeRuns++;
             ScheduleRecomputeReleases(k, action, pool);
         }
