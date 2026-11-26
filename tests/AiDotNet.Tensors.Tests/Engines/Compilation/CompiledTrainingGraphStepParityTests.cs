@@ -987,7 +987,13 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     if (s > 0) Feed(s, bad: false);
                     plan.Step();
                 }
-                if (capture) AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                if (capture)
+                {
+                    AssertGraphCaptured((CompiledTrainingPlan<float>)plan);
+                    // The update runs inside the graph, so the bad label must be stopped by the captured update's gate.
+                    Assert.NotNull(TestRequire.NotNull(typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance), "the _capturedOptimizer field").GetValue(plan));
+                }
                 var beforeBad = parameters.Select(p => p.ToArray()).ToArray();
                 int acceptedBefore = ((CompiledTrainingPlan<float>)plan).OptimizerStep;
                 Feed(Steps, bad: true);
@@ -1006,6 +1012,89 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     Assert.True(!float.IsNaN(loss) && !float.IsInfinity(loss), $"step {s} loss {loss}");
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// A step whose loss is a fused cross-entropy captures its optimizer update (clip included) with the step, as any
+    /// other step does: the update reads the cross-entropy's device label-error word as a gate, so a bad label still
+    /// applies nothing (A_resident_out_of_range_label_is_caught_on_the_device_and_the_plan_recovers). It used to keep
+    /// the update out of the graph, run after every replay with a blocking label read before it.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, 0.0)]
+    [InlineData(true, 0.0)]
+    [InlineData(false, 0.5)]
+    [InlineData(true, 0.5)]
+    public void A_fused_cross_entropy_step_captures_its_update_and_trains_like_the_eager_step(bool residentLabels, double clip)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(TryCudaCapture(gpu), "Whole-step graph capture is CUDA-only.");
+            (double[] Losses, float[][] Weights, bool UpdateCaptured, int OptimizerStep) Run(bool capture)
+            {
+                const int vocab = 24;
+                var labels = new Tensor<int>([Batch]);
+                var x = Rand([Batch, Inputs], 1, 1f);
+                var w = Rand([Inputs, Inputs], 4, 0.3f);
+                var head = Rand([Inputs, vocab], 5, 0.3f);
+                var bias = Rand([vocab], 6, 0.1f);
+                var parameters = new[] { w, head, bias };
+                foreach (var t in parameters) t.Gpu();
+                void Feed(int step)
+                {
+                    var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(900 + step);
+                    for (int i = 0; i < Batch; i++) labels.SetFlat(i, rng.Next(vocab));
+                    labels.MarkModified();
+                }
+                Feed(0);
+                if (residentLabels) labels.Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(parameters))
+                {
+                    var h = gpu.TensorTanh(gpu.TensorMatMul(x, w));
+                    gpu.FusedLinearCrossEntropyWithLogits(h, head, bias, labels);
+                    plan = scope.CompileTraining(parameters);
+                }
+                using (plan)
+                {
+                    var concrete = (CompiledTrainingPlan<float>)plan;
+                    if (!capture) concrete.DisableGraphStep();
+                    plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 1e-2f, weightDecay: 0.1f);
+                    if (clip > 0) concrete.SetMaxGradNorm(clip);
+                    var losses = new double[Steps];
+                    for (int s = 0; s < Steps; s++)
+                    {
+                        if (s > 0) Feed(s);
+                        losses[s] = plan.Step().ToArray()[0];
+                    }
+                    if (capture) AssertGraphCaptured(concrete);
+                    bool updateCaptured = TestRequire.NotNull(typeof(CompiledTrainingPlan<float>)
+                        .GetField("_capturedOptimizer", BindingFlags.NonPublic | BindingFlags.Instance), "the _capturedOptimizer field").GetValue(concrete) is not null;
+                    return (losses, parameters.Select(p => p.ToArray()).ToArray(), updateCaptured, concrete.OptimizerStep);
+                }
+            }
+
+            var eager = Run(capture: false);
+            var captured = Run(capture: true);
+            double worst = 0;
+            for (int p = 0; p < eager.Weights.Length; p++)
+                for (int i = 0; i < eager.Weights[p].Length; i++)
+                    worst = Math.Max(worst, Math.Abs(eager.Weights[p][i] - captured.Weights[p][i]));
+            _output.WriteLine($"update captured {captured.UpdateCaptured}, optimizer steps {captured.OptimizerStep}/{eager.OptimizerStep}, "
+                + $"max |w_captured - w_eager| {worst:G3}, losses eager {string.Join(" ", eager.Losses.Select(l => l.ToString("G6")))}");
+            Assert.True(captured.UpdateCaptured, "the fused cross-entropy step's update was not captured into the graph");
+            Assert.Equal(Steps, captured.OptimizerStep);
+            Assert.Equal(eager.OptimizerStep, captured.OptimizerStep);
+            // The labels are redrawn every step, so the loss need not fall; the update must still move the weights.
+            Assert.True(eager.Weights[0].Zip(Rand([Inputs, Inputs], 4, 0.3f).ToArray(), (a, b) => Math.Abs(a - b)).Max() > 1e-2,
+                "the eager reference did not move the weights");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            Assert.True(worst <= 1e-5, $"captured weights differ from eager by {worst}");
         }
     }
 
@@ -2077,16 +2166,26 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                                 $"action {action}: d[{i}] {d[i]} != unpooled {expected[i]} (a shared slot was not re-zeroed?)");
                         if (action == 0) afterOne = Slots();
                     }
+                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
+                    // The claim itself, on every backend: six actions of the same op hold what one of them holds.
+                    Assert.Equal(afterOne, Slots());
                     // A pooled slot is a size class larger than the request; what an op gets is exactly its length
                     // (a dropout mask downloads its buffer into the returned vector).
                     gpu.SetCurrentScratchAction(Depth);
                     var mask = ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 7);
                     Assert.Equal(5, mask.Length);
+                    // A scratch of another length (RentTransientScratch): where views are free (CUDA, HIP) a slot is
+                    // one per local index, grown to the largest request, and the mask's 5 elements are a view of the
+                    // slot the distances used. Elsewhere a view can be refused or allocate, so a slot is keyed by
+                    // its exact length and the new length takes one slot, which later actions of that length share.
+                    // This asserted the first case alone and failed on OpenCL (12 slots for 11).
+                    bool freeViews = gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.IGpuBufferViews { ViewsAreFreeAtAnyOffset: true };
+                    int withMask = freeViews ? afterOne : afterOne + 1;
+                    Assert.Equal(withMask, Slots());
+                    gpu.SetCurrentScratchAction(Depth + 1);
+                    Assert.Equal(5, ((IEngine)gpu).GenerateDropoutMask<float>(5, 0.5f, 2f, 8).Length);
                     gpu.SetCurrentScratchAction(-1);
-                    Assert.True(afterOne > 0, "the op drew no transient scratch, so the test proves nothing");
-                    // A CUDA slot is one per local index, grown to the largest request: the mask's 5 elements are a view
-                    // of the slot the distances used, not a new size class.
-                    Assert.Equal(afterOne, Slots());
+                    Assert.Equal(withMask, Slots());
                 }
             }
             finally

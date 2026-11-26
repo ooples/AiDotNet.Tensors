@@ -294,6 +294,10 @@ public partial class DirectGpuTensorEngine
         return TryResolveAmbientAutocastConvRoute(backend, out route, operation);
     }
 
+    /// <summary>Tests: whether the autocast scope open now has a 16-bit convolution route on this backend.</summary>
+    internal static bool AutocastConvRouteAvailableForTest(IDirectGpuBackend backend)
+        => TryResolveAutocastConvRoute(backend, out _);
+
     // Floats of scratch that hold `elements` 16-bit values.
     private static int HalfStorageFloats(int elements) => checked((elements + 1) / 2);
 

@@ -52,6 +52,11 @@ public static class DirectGpuBackendFactory
             // Return cached backend if already created
             if (_cachedBackend is not null && _cachedBackend.IsAvailable)
             {
+                var required = GpuBackendOptions.RequiredBackend;
+                if (required != GpuBackendType.None && !IsBackend(_cachedBackend, required))
+                    throw new InvalidOperationException(
+                        $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is {required}, but this " +
+                        $"process's shared GPU backend is {_cachedBackend.BackendName}, created before the requirement was set.");
                 return _cachedBackend;
             }
 
@@ -147,11 +152,17 @@ public static class DirectGpuBackendFactory
         return gpus.ToArray();
     }
 
+    private static bool IsBackend(IDirectGpuBackend backend, GpuBackendType type)
+        => backend.BackendName.StartsWith(GpuBackendOptions.NameOf(type), StringComparison.OrdinalIgnoreCase);
+
     private static IDirectGpuBackend? CreateInternal(
         GpuBackendPreference preference,
         int deviceIndex,
         ILogger? logger)
     {
+        var required = GpuBackendOptions.RequiredBackend;
+        if (required != GpuBackendType.None) return CreateRequired(required, preference, deviceIndex, logger);
+
         // Detect vendor first
         _detectedVendor = DetectVendor();
 
@@ -177,6 +188,34 @@ public static class DirectGpuBackendFactory
         };
     }
 
+    // RequiredBackend set: only that backend is tried, whatever the vendor or preference, and its failure throws rather
+    // than leaving the caller on another backend or on no GPU.
+    private static IDirectGpuBackend CreateRequired(
+        GpuBackendType required, GpuBackendPreference preference, int deviceIndex, ILogger? logger)
+    {
+        string prefix = $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is {required}";
+        GpuBackendPreference matching = required switch
+        {
+            GpuBackendType.Cuda => GpuBackendPreference.CUDA,
+            GpuBackendType.Hip => GpuBackendPreference.HIP,
+            GpuBackendType.OpenCl => GpuBackendPreference.OpenCL,
+            _ => throw new NotSupportedException(
+                $"{prefix}, which this factory cannot create; create a {nameof(DirectGpuEngine)} instead."),
+        };
+        if (preference != GpuBackendPreference.Auto && preference != matching)
+            throw new ArgumentException($"{prefix}, which contradicts the requested {preference} backend.", nameof(preference));
+        string? failure = null;
+        var backend = required switch
+        {
+            GpuBackendType.Cuda => TryCreateCuda(deviceIndex, logger, out failure),
+            GpuBackendType.Hip => TryCreateHip(deviceIndex, logger),
+            _ => TryCreateOpenCl(deviceIndex, logger),
+        };
+        return backend ?? throw new InvalidOperationException(
+            $"{prefix}, and the {GpuBackendOptions.NameOf(required)} backend for device {deviceIndex} could not be " +
+            $"created: {failure ?? "no reason was reported"}.");
+    }
+
     private static IDirectGpuBackend? CreateWithPreference(
         GpuBackendPreference preference,
         int deviceIndex,
@@ -184,26 +223,34 @@ public static class DirectGpuBackendFactory
     {
         return preference switch
         {
-            GpuBackendPreference.CUDA => TryCreateCuda(deviceIndex, logger),
+            GpuBackendPreference.CUDA => TryCreateCuda(deviceIndex, logger, out _),
             GpuBackendPreference.HIP => TryCreateHip(deviceIndex, logger),
             GpuBackendPreference.OpenCL => TryCreateOpenCl(deviceIndex, logger),
             _ => null
         };
     }
 
-    private static IDirectGpuBackend? CreateNvidiaBackend(int deviceIndex, ILogger? logger)
+    internal static IDirectGpuBackend? CreateNvidiaBackend(int deviceIndex, ILogger? logger)
     {
         // Try CUDA first (better performance on NVIDIA)
-        var cuda = TryCreateCuda(deviceIndex, logger);
+        var cuda = TryCreateCuda(deviceIndex, logger, out var cudaFailure);
         if (cuda is not null)
         {
             logger?.LogInformation("Using CUDA backend for NVIDIA GPU (optimal performance).");
             return cuda;
         }
 
-        // Fall back to OpenCL
-        logger?.LogInformation("CUDA not available, falling back to OpenCL for NVIDIA GPU.");
-        return TryCreateOpenCl(deviceIndex, logger);
+        // An NVIDIA GPU whose CUDA backend failed: never a quiet switch to OpenCL.
+        string reason = cudaFailure ?? "the CUDA backend could not be created";
+        if (GpuBackendOptions.RequiredBackend == GpuBackendType.Cuda)
+            throw new InvalidOperationException(
+                $"{nameof(GpuBackendOptions)}.{nameof(GpuBackendOptions.RequiredBackend)} is Cuda, and the CUDA backend " +
+                $"for NVIDIA device {deviceIndex} could not be created: {reason}.");
+        logger?.LogWarning("CUDA backend for NVIDIA device {DeviceIndex} unavailable ({Reason}); falling back to OpenCL.",
+            deviceIndex, reason);
+        var openCl = TryCreateOpenCl(deviceIndex, logger);
+        GpuBackendOptions.WarnCudaFallback(reason, openCl is null ? "no GPU backend" : "OpenCL");
+        return openCl;
     }
 
     private static IDirectGpuBackend? CreateAmdBackend(int deviceIndex, ILogger? logger)
@@ -234,24 +281,32 @@ public static class DirectGpuBackendFactory
         return TryCreateOpenCl(deviceIndex, logger);
     }
 
-    private static IDirectGpuBackend? TryCreateCuda(int deviceIndex, ILogger? logger)
+    /// <summary>Replaces the CUDA backend construction (by device index), so a test can make CUDA initialization fail.</summary>
+    internal static Func<int, IDirectGpuBackend>? CudaBackendFactoryForTests { get; set; }
+
+    private static IDirectGpuBackend? TryCreateCuda(int deviceIndex, ILogger? logger, out string? failure)
     {
-        if (!CudaBackend.IsCudaAvailable)
+        failure = null;
+        var factory = CudaBackendFactoryForTests;
+        if (factory is null && !CudaBackend.IsCudaAvailable)
         {
+            failure = "the CUDA driver or NVRTC library could not be loaded";
             return null;
         }
 
         try
         {
-            var backend = new CudaBackend(deviceIndex);
+            var backend = factory is not null ? factory(deviceIndex) : new CudaBackend(deviceIndex);
             if (backend.IsAvailable)
             {
                 return backend;
             }
             backend.Dispose();
+            failure = $"the CUDA driver loaded but device {deviceIndex} is not usable";
         }
         catch (Exception ex)
         {
+            failure = $"{ex.GetType().Name}: {ex.Message}";
             logger?.LogWarning(ex, "Failed to initialize CUDA backend on device {DeviceIndex}.", deviceIndex);
         }
 

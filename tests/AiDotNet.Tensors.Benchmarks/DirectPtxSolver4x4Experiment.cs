@@ -730,7 +730,7 @@ internal static class DirectPtxSolver4x4Experiment
     private static void Print(IReadOnlyList<Result> results)
     {
         string contextScheduling = CudaContextScheduling.Describe(
-            CudaContextScheduling.ResolveFromEnvironment());
+            CudaContextScheduling.ResolveContextFlags());
         foreach (string fingerprint in results.Select(row => row.DeviceFingerprint).Distinct())
             Console.WriteLine(
                 $"solver_environment={fingerprint}; cuda_context_scheduling={contextScheduling}; " +

@@ -15,11 +15,16 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
         private CudaEvent? _event;
         private int _bytes;
         private bool _unread;
+        // The context lifetime the page-locked bytes belong to: they are freed only while it lasts.
+        private readonly IntPtr _context;
+        private readonly long _contextGeneration;
 
         public CudaDeviceReadback(CudaBackend backend, int byteCapacity)
         {
             if (byteCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(byteCapacity));
             _backend = backend;
+            _context = backend._cudaContext;
+            _contextGeneration = backend._contextGeneration;
             _capacity = byteCapacity;
             using var _ = backend.PushContext();
             CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAllocHost(out _pinned, (ulong)byteCapacity), "cuMemAllocHost(readback)");
@@ -61,23 +66,40 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
         public void Dispose()
         {
             if (_pinned == IntPtr.Zero) return;
-            if (!_backend.IsAvailable)
+            try
             {
-                // The backend (and its context) went first: its queue is gone, so no copy can still be writing, and a
-                // driver call now would touch a dead context. The page-locked bytes go back with the context.
+                // Not on a context the circuit breaker found corrupted: no wait and no event destroy there.
+                if (_backend.IsAvailable && !AiDotNetEngine.GpuCircuitBroken)
+                {
+                    try
+                    {
+                        using (_backend.PushContext())
+                        {
+                            // The copy may still be writing the pinned bytes; they are freed only once it is done.
+                            // The event goes even when that wait fails, except on a context the circuit breaker
+                            // found corrupted, which is not called into again.
+                            try { if (_event is { } evt && _unread) evt.Synchronize(); }
+                            finally { if (!AiDotNetEngine.GpuCircuitBroken) _event?.Dispose(); }   // a trip during the wait
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // The backend finished its teardown meanwhile: its queue is gone, so no copy is still writing.
+                    }
+                }
+            }
+            finally
+            {
+                // Also after a wait that failed (a sticky device fault stops the queue): the bytes are not left behind.
+                // The backend went first: its queue is gone, so no copy can still be writing. The bytes are freed while
+                // their context lives (another backend may hold the shared primary context); otherwise it took them.
                 _event = null;
+                var pinned = _pinned;
                 _pinned = IntPtr.Zero;
-                return;
+                var released = ReleaseHostInLiveContext(pinned, _context, _contextGeneration, unregister: false);
+                if (released is { } r && r != CudaResult.Success)
+                    System.Diagnostics.Trace.TraceWarning("Readback: cuMemFreeHost returned " + r + ".");
             }
-            using (_backend.PushContext())
-            {
-                // The copy may still be writing the pinned bytes; they are freed only once it is done.
-                if (_event is { } evt && _unread) evt.Synchronize();
-                _event?.Dispose();
-                _event = null;
-                CuBlasNative.cuMemFreeHost(_pinned);
-            }
-            _pinned = IntPtr.Zero;
         }
     }
 }

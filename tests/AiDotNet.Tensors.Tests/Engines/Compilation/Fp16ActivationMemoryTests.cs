@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// <summary>
 /// Phase-4 measurement (Tensors #555, docs/fp16-activation-storage-design.md): the resident-activation
 /// memory win. Builds an L-layer matmul stack and sums the actual activation-BUFFER bytes both ways —
-/// FP32 (default) vs FP16 activation storage (AIDOTNET_FP16_ACTIVATIONS path). The FP16 stack stores
+/// FP32 (default) vs FP16 activation storage (the MixedPrecisionCompiledPlan trace). The FP16 stack stores
 /// every layer's matmul activation as Tensor&lt;Half&gt; (2 bytes) instead of FP32 (4 bytes), so the
 /// total activation footprint is exactly halved. This guards that the emission scales across ALL layers
 /// (not just the first) — the property the ~50% resident win depends on. When run on a CUDA backend it

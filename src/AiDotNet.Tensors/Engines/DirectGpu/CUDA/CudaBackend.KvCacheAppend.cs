@@ -95,7 +95,7 @@ public sealed partial class CudaBackend : IKvCacheAppendBackend
     {
         lock (_kvFaultLock)
         {
-            if (_kvFaultHost != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_kvFaultHost);
+            ReleaseHostInLiveContext(_kvFaultHost, _cudaContext, _contextGeneration, unregister: false);
             _kvFaultHost = IntPtr.Zero;
             _kvFaultDevice = IntPtr.Zero;
         }

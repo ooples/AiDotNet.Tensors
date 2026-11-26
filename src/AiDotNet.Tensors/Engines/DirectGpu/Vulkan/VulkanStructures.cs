@@ -738,6 +738,18 @@ public unsafe struct VkPhysicalDeviceProperties2
     public VkPhysicalDeviceProperties properties;
 }
 
+/// <summary>VkPhysicalDeviceIDProperties (Vulkan 1.1): the device's UUID (NVIDIA's is the CUDA/NVML GPU UUID).</summary>
+internal unsafe struct VkPhysicalDeviceIDProperties
+{
+    public int sType;
+    public void* pNext;
+    public fixed byte deviceUUID[16];
+    public fixed byte driverUUID[16];
+    public fixed byte deviceLUID[8];
+    public uint deviceNodeMask;
+    public uint deviceLUIDValid;
+}
+
 /// <summary>VkPhysicalDeviceFloatControlsProperties (Vulkan 1.2 / VK_KHR_shader_float_controls): two
 /// VkShaderFloatControlsIndependence values, then 15 VkBool32 members (SignedZeroInfNanPreserve, DenormPreserve,
 /// DenormFlushToZero, RoundingModeRTE, RoundingModeRTZ, each for 16-, 32- and 64-bit floats).</summary>

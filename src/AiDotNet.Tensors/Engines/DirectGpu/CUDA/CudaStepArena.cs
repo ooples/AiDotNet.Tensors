@@ -28,7 +28,7 @@ internal sealed class CudaStepArena : IDisposable
     // Multi-gigabyte training steps are already served in O(1) by the stream-ordered GpuBufferPool;
     // carving a single multi-GB contiguous cuMemAlloc block risks double-buffering VRAM and WDDM
     // PCIe paging whenever a step dynamically branches or replans.
-    internal long MaxPlannedBytes = 512L * 1024 * 1024;
+    internal readonly long MaxPlannedBytes = 512L * 1024 * 1024;
 
     private readonly IntPtr _context;
     private readonly long _contextGeneration;

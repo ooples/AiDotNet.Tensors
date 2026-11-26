@@ -331,6 +331,8 @@ fn strided_dft(@builtin(global_invocation_id) gid: vec3<u32>) {
     private IGpuBuffer GemmBiasEpilogueKernel(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, int M, int N, int K,
         GemmEpilogue epilogue, float alpha)
     {
+        // Matmul autocast: under an open scope the operands are rounded to its 16-bit type first.
+        using var autocast = _gemmAutocast.Round(this, ref A, (long)M * K, ref B, (long)K * N);
         var output = AllocateBuffer(checked(M * N));
         DispatchNBufferAsync(FusedGemmFftModuleName + ".Epilogue", GemmBiasEpilogueSource, "gemm_bias_epilogue",
             new[] { A, B, bias, output }, new[] { Bits(M), Bits(N), Bits(K), Bits((int)epilogue), alpha, 0f, 0f, 0f },

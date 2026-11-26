@@ -1669,8 +1669,12 @@ internal static partial class BackwardFunctions<T>
         if (CreatesGraph && FusedConv2DBiasActivationBackwardCreateGraph(gradOutput, inputs, engine, grads, convIn, convKernel, savedState, convBias, relu))
             return;
         Tensor<T> gradPreActivation;
+        // The one-pass epilogue reads host arrays. A device-resident output or output gradient (a GPU op's result whose
+        // host copy was never read, reaching a CPU engine's backward) has none: the per-op path below reads it through
+        // the ordinary accessors, which download it.
         if (typeof(T) == typeof(float) && engine.TryGet<CpuEngine>(out var cpu) && !engine.SupportsGpu
-            && gradOutput.IsContiguous && output.IsContiguous)
+            && gradOutput.IsContiguous && output.IsContiguous
+            && gradOutput.GetCpuBackingForStridedRead(out _) is not null && output.GetCpuBackingForStridedRead(out _) is not null)
         {
             gradPreActivation = Helpers.AutoTensorCache.RentOrAllocate<T>(output._shape);
             var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
@@ -6597,9 +6601,17 @@ internal static partial class BackwardFunctions<T>
             var grad = engine.TensorMultiply(gradOutput, invMask);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
         }
-        else if (savedState[0] is Tensor<bool> boolMask)
+        else if (savedState[0] is Tensor<bool> boolMask && System.Linq.Enumerable.SequenceEqual(boolMask._shape, gradOutput._shape))
         {
-            using var boolSpanLease = boolMask.Lease();
+            // PyTorch's masked_fill backward, grad.masked_fill(mask, 0), through the engine: on the GPU it reads the
+            // mask's cached device copy, where a host-built 0/1 tensor was a fresh upload every step (which also
+            // aborted a step capture).
+            var grad = engine.TensorMaskedFill(gradOutput, boolMask, numOps.Zero);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+        }
+        else if (savedState[0] is Tensor<bool> reshapedMask)
+        {
+            using var boolSpanLease = reshapedMask.Lease();
             var boolSpan = boolSpanLease.Span;
             var maskData = new T[boolSpan.Length];
             for (int i = 0; i < boolSpan.Length; i++)

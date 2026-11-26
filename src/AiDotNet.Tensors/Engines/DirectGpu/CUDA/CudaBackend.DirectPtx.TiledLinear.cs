@@ -41,6 +41,8 @@ public sealed partial class CudaBackend
         DirectPtxLinearActivation activation,
         DirectPtxLinearWeightLayout weightLayout = DirectPtxLinearWeightLayout.OutputMajor)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!IsDirectPtxFusedLinearEnabled) return false;
         if (!PtxFusedLinearTiledKernel.IsSupportedShape(m, k, n))
         {
@@ -282,6 +284,8 @@ public sealed partial class CudaBackend
         int n,
         DirectPtxLinearActivation activation)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return null;
         if (!IsDirectPtxFusedLinearEnabled ||
             !PtxFusedLinearTiledKernel.IsSupportedShape(m, k, n) ||
             (!PtxFusedLinearTiledKernel.IsPromotedShape(m, k, n) &&
@@ -324,6 +328,8 @@ public sealed partial class CudaBackend
         DirectPtxLinearWeightLayout weightLayout,
         int batchCount = 1)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!IsDirectPtxFusedLinearEnabled) return false;
         if (!PtxFusedLinearTiledKernel.IsSupportedShape(m, k, n) ||
             batchCount <= 0 || batchCount > 64)

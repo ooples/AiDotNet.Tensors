@@ -169,6 +169,14 @@ internal static class GpuPackedCompute
         launch(GpuPackedKernelSource.Unary(operation, type), Work(type, size), (uint)size, 0u, 0u, 0u, new[] { a, output });
     }
 
+    /// <summary><c>destination[i] = (float)(type)source[i]</c> on 32-bit float buffers; they may be one buffer.</summary>
+    public static void Round(GpuPackedLaunch launch, GpuElementType type, IGpuBuffer source, IGpuBuffer destination, int count)
+    {
+        GpuNarrowFloatLayout.RequireRounding(type, source, destination, count);
+        if (count == 0) return;
+        launch(GpuPackedKernelSource.Round(type), count, (uint)count, 0u, 0u, 0u, new[] { source, destination });
+    }
+
     /// <summary><c>c = a b</c> on 16-bit floats (row-major, m x k times k x n).</summary>
     public static void MatrixMultiply(GpuPackedLaunch launch, GpuElementType type, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
         int m, int n, int k)

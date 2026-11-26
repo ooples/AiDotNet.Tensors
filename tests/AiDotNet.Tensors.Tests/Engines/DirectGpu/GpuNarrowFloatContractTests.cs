@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// buffers: each element widened to a float, computed there and rounded back as the host conversions round, for every
 /// (operation, type) pair the backend says it has.
 /// </summary>
-public abstract class GpuNarrowFloatContractTests
+public abstract partial class GpuNarrowFloatContractTests
 {
     /// <summary>The backend under test, or null when its device is absent on this host.</summary>
     protected abstract IDirectGpuBackend? Device();

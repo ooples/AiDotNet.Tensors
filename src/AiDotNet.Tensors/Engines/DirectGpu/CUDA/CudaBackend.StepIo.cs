@@ -119,6 +119,9 @@ public sealed partial class CudaBackend
         private IGpuBuffer? _copySource, _copyDestination;   // the prologue's per-replay device copy (TrySetPrologueCopy)
         private int _copyCount;
         private bool _disposed;
+        // The context lifetime the page-locked memory belongs to: it is freed only while that lifetime lasts.
+        private readonly IntPtr _hostContext;
+        private readonly long _hostContextGeneration;
 
         // The prologue's grid covers its copy in one pass up to 1024 blocks of 256 threads; past that it strides.
         private const int PrologueCopyMaxFloats = 1 << 20;
@@ -126,6 +129,8 @@ public sealed partial class CudaBackend
         public CudaGraphStepIo(CudaBackend backend, IReadOnlyList<IGpuBuffer> inputs, IReadOnlyList<int> lengths)
         {
             _backend = backend;
+            _hostContext = backend._cudaContext;
+            _hostContextGeneration = backend._contextGeneration;
             _inputs = new IGpuBuffer[inputs.Count];
             _lengths = new int[inputs.Count];
             _staging = new IntPtr[2 * inputs.Count];
@@ -387,6 +392,19 @@ public sealed partial class CudaBackend
                 _guard, _dynamicScalars!.Handle, _adamTable, _acceptedOffsets?.Handle ?? IntPtr.Zero, _state!.Handle);
         }
 
+        public IGpuBuffer? GlobalNormRecord => _clipRecord;
+
+        public void CaptureUpdateGate(IGpuBuffer flag)
+        {
+            if (_guard is null) throw new InvalidOperationException("PrepareOptimizer was not called before the capture.");
+            if (!_backend._kernelCache.TryGetValue("step_io_gate_update", out var gate))
+                throw new GpuCapabilityUnavailableException("CUDA kernel not found: step_io_gate_update");
+            IntPtr flagPtr = flag.Handle, guardPtr = _guard.Handle;
+            void** args = stackalloc void*[2];
+            args[0] = &flagPtr; args[1] = &guardPtr;
+            _backend.LaunchKernel(gate, 1, 32, args);
+        }
+
         public void PrepareGlobalNormClip()
         {
             if (_gradientTable is not { } table)
@@ -519,12 +537,17 @@ public sealed partial class CudaBackend
         {
             if (_disposed) return;
             _disposed = true;
-            if (!_backend.IsAvailable) return;   // the context took the page-locked memory with it
+            if (!_backend.IsAvailable)
+            {
+                // The backend went first (its streams, and every replay, are gone): its device tables went with it.
+                // The page-locked memory is freed while its context lives (another backend may hold the shared
+                // primary context); otherwise the context took it.
+                ReleasePageLocked();
+                return;
+            }
             using var _ = _backend.PushContext();
             // A replay may still read the staging or write the results.
             CudaNativeBindings.cuStreamSynchronize(_backend._mainStream);
-            foreach (var p in _staging) if (p != IntPtr.Zero) CuBlasNative.cuMemFreeHost(p);
-            foreach (var p in _lrTable) if (p != IntPtr.Zero) CuBlasNative.cuMemFreeHost(p);
             _dynamicScalars?.Dispose();
             _guard?.Dispose();
             _gradientTable?.Dispose();
@@ -535,12 +558,26 @@ public sealed partial class CudaBackend
             _clipPartials?.Dispose();
             _clipTicket?.Dispose();
             DisposePingPong();
-            if (_results != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_results);
-            _results = IntPtr.Zero;
-            if (_masks != IntPtr.Zero) CuBlasNative.cuMemFreeHost(_masks);
-            _masks = IntPtr.Zero;
+            ReleasePageLocked();
             _state?.Dispose();
             _state = null;
+        }
+
+        private void ReleasePageLocked()
+        {
+            IntPtr context = _hostContext;
+            for (int i = 0; i < _staging.Length; i++) { FreeHost(_staging[i], context); _staging[i] = IntPtr.Zero; }
+            for (int i = 0; i < _lrTable.Length; i++) { FreeHost(_lrTable[i], context); _lrTable[i] = IntPtr.Zero; }
+            FreeHost(_results, context);
+            _results = IntPtr.Zero;
+            FreeHost(_masks, context);
+            _masks = IntPtr.Zero;
+        }
+
+        private void FreeHost(IntPtr host, IntPtr context)
+        {
+            if (ReleaseHostInLiveContext(host, context, _hostContextGeneration, unregister: false) is { } r && r != CudaResult.Success)
+                System.Diagnostics.Trace.TraceWarning("Step I/O: cuMemFreeHost returned " + r + ".");
         }
     }
 }

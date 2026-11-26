@@ -39,6 +39,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TrySkinnyGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transB,
         float alpha, float beta, IGpuBuffer? bias = null, bool relu = false, int forceTileRows = 0)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (forceTileRows != 0 && forceTileRows != 32 && forceTileRows != 16 && forceTileRows != 8) return false;
         if (bias is not null && (bias.Size < N || (bias.Handle.ToInt64() & 15) != 0)) return false;
         if (!SmallGemmRoutesEnabled || M < 256 || M > 65535 * SkinnyTileRows || N > SkinnyMaxNarrow || K > SkinnyMaxNarrow
@@ -81,6 +83,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TryWgradTile(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta,
         IGpuBuffer? bias = null, float biasBeta = 0f)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!SmallGemmRoutesEnabled || K < WgradTileMinReduce || K >= SkinnyTnMinReduce || M <= 0 || N <= 0
             || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
             || (bias is not null && (bias.Size < N || bias.Handle == C.Handle || bias.Handle == B.Handle || bias.Handle == A.Handle))
@@ -114,6 +118,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TrySkinnyGemmTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha, float beta)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (K < SkinnyTnMinReduce) return TryWgradTile(A, B, C, M, N, K, alpha, beta);
         if (!SmallGemmRoutesEnabled || K < SkinnyTnMinReduce || M > SkinnyMaxNarrow || N > SkinnyMaxNarrow
             || (M & 3) != 0 || (N & 3) != 0 || !SkinnyAligned(A, B, C)
@@ -177,6 +183,8 @@ public sealed partial class CudaBackend : IGemmBiasActivationBackend, IWeightBia
     internal unsafe bool TrySmallGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, bool transA, bool transB,
         float alpha, float beta, IGpuBuffer? bias = null, bool relu = false)
     {
+        // FP32-only kernel: under matmul autocast the product runs where its operands are cast.
+        if (GemmAutocastActive) return false;
         if (!SmallGemmRoutesEnabled || M <= 0 || N <= 0 || K <= 0 || (bias is not null && bias.Size < N)) return false;
         bool rowReduce = M <= SmallGemmMaxRows && N <= SmallGemmMaxColumns && (long)M * N <= SmallGemmMaxOutputs
             && K >= SmallGemmMinReduce;

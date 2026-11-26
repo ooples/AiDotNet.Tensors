@@ -648,6 +648,80 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
+    /// <summary>Receives a weight's resident bytes, valid only for the duration of the call.</summary>
+    internal delegate void ResidentBytesReader(ReadOnlySpan<byte> bytes);
+
+    /// <summary>
+    /// Hands a weight's bytes to <paramref name="reader"/> straight from the pool's resident buffer, under the pool
+    /// lock, with no copy: for a caller that only streams them elsewhere (a device upload) and keeps nothing.
+    /// </summary>
+    internal void ReadResident(long handleId, ResidentBytesReader reader)
+    {
+        if (reader is null) throw new ArgumentNullException(nameof(reader));
+        lock (_lock)
+        {
+            ThrowIfDisposed();
+            if (!_entries.TryGetValue(handleId, out var entry))
+                throw new InvalidOperationException($"Streaming pool: handle {handleId} is unknown.");
+            if (entry.Data is not null)
+            {
+                // Not lent: the span does not outlive the lock, so a later write-back may still refill the buffer in place.
+                reader(RehydrateCore(handleId, isPrefetch: false, lend: false));
+                return;
+            }
+
+            // Paged out: read into the pool's reused scratch, not a resident buffer. Making it resident allocated a
+            // weight-sized array per read (two for a compressed entry) and evicted others whose arrays became
+            // garbage: a device budget smaller than the model re-reads every pass, and the host grew faster than the
+            // collector reclaimed.
+            if (entry.FileOffset < 0)
+                throw new InvalidOperationException($"Streaming pool: handle {handleId} has no backing offset (never paged out).");
+            AdvanceSchedule(handleId);
+            if (_prefetchPending.Remove(handleId)) _prefetchMissCount++;
+            int onDisk = (int)entry.PagedOutBytes;
+            var read = _readScratch = ReadFromBackingInto(entry.FileOffset, onDisk, _readScratch);
+            _diskReadCount++;
+            _diskReadBytes += onDisk;
+            if (!entry.IsCompressed)
+            {
+                reader(new ReadOnlySpan<byte>(read, 0, onDisk));
+                return;
+            }
+            int length = (int)entry.UncompressedBytes;
+            var decode = _decodeScratch is { } d && d.Length >= length ? d : _decodeScratch = new byte[length];
+            int decoded = LZ4Codec.Decode(read, 0, onDisk, decode, 0, length);
+            if (decoded != length)
+                throw new InvalidOperationException(
+                    $"Streaming pool: LZ4 decode produced {decoded} bytes, expected {length} for handle {handleId}.");
+            reader(new ReadOnlySpan<byte>(decode, 0, length));
+        }
+    }
+
+    // ReadResident's buffers for paged-out entries, reused across reads and grown to the largest one (guarded by _lock).
+    private byte[]? _readScratch;
+    private byte[]? _decodeScratch;
+
+    /// <summary>Test view: the bytes ReadResident's scratch buffers hold.</summary>
+    internal long ReadScratchBytes { get { lock (_lock) return (_readScratch?.LongLength ?? 0) + (_decodeScratch?.LongLength ?? 0); } }
+
+    private byte[] ReadFromBackingInto(long offset, int count, byte[]? reuse)
+    {
+        var buffer = reuse is not null && reuse.Length >= count ? reuse : new byte[count];
+        var fs = BackingFile();
+        fs.Seek(offset, SeekOrigin.Begin);
+        int read = 0;
+        while (read < count)
+        {
+            int r = fs.Read(buffer, read, count - read);
+            if (r <= 0) break;
+            read += r;
+        }
+        if (read != count)
+            throw new InvalidOperationException(
+                $"Streaming backing file: short read at offset {offset} ({read}/{count} bytes).");
+        return buffer;
+    }
+
     /// <summary>
     /// Reads a weight back into a freshly-allocated byte[] under the pool
     /// lock. Faster path for callers who'd otherwise call Rehydrate then
@@ -868,10 +942,11 @@ public sealed class StreamingTensorPool : IDisposable
         }
     }
 
-    /// <summary>Outstanding reservations from in-flight
-    /// <see cref="WeightRegistry.AllocateStreaming{T}"/> calls. Internal
-    /// — exposed for tests via InternalsVisibleTo, not public API.</summary>
-    internal long ReservedBytes
+    /// <summary>Bytes reserved by in-flight
+    /// <see cref="WeightRegistry.AllocateStreaming{T}"/> calls: memory
+    /// the pool has promised to tensors being streamed in but not yet
+    /// counted as resident.</summary>
+    public long ReservedBytes
     {
         get { lock (_lock) return _reservedBytes; }
     }

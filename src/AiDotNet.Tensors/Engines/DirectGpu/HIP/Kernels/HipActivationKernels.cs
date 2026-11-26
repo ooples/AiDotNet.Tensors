@@ -535,10 +535,10 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* inpu
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact on the bit patterns (ExactFloatKernels): a NaN is skipped and loads as the -inf identity (the CPU scan never
-    // takes one), and the compare no longer flushes a subnormal under fast math. Ties keep the left operand.
+    // Exact on the bit patterns (ExactFloatKernels): a NaN anywhere is the result, as for NumPy, PyTorch and the CPU kernels (it wins every
+    // merge below), and the compare no longer flushes a subnormal under fast math. Ties keep the left operand.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0xFF800000u;
-    if (xf_isnan(val)) val = 0xFF800000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
     xf_scratch[tid] = val;
     __syncthreads();
 
@@ -547,7 +547,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_max(const float* inpu
         if (tid < s)
         {
             unsigned int other = xf_scratch[tid + s];
-            if (xf_gt(other, xf_scratch[tid]))
+            if (xf_isnan(other) || xf_gt(other, xf_scratch[tid]))
                 xf_scratch[tid] = other;
         }
         __syncthreads();
@@ -562,9 +562,9 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* inpu
     extern __shared__ unsigned int xf_scratch[];
     unsigned int tid = threadIdx.x;
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Exact as reduce_max: NaN skipped, +inf identity.
+    // Exact as reduce_max: a NaN anywhere is the result, +inf identity.
     unsigned int val = (idx < (unsigned int)size) ? __float_as_uint(input[idx]) : 0x7F800000u;
-    if (xf_isnan(val)) val = 0x7F800000u;
+    if (xf_isnan(val)) val = 0xFFC00000u;
     xf_scratch[tid] = val;
     __syncthreads();
 
@@ -573,7 +573,7 @@ extern ""C"" __global__ __launch_bounds__(256) void reduce_min(const float* inpu
         if (tid < s)
         {
             unsigned int other = xf_scratch[tid + s];
-            if (xf_lt(other, xf_scratch[tid]))
+            if (xf_isnan(other) || xf_lt(other, xf_scratch[tid]))
                 xf_scratch[tid] = other;
         }
         __syncthreads();

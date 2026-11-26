@@ -20,7 +20,25 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     [DllImport("libcuda.so.1", EntryPoint = "cuMemHostAlloc")]
     private static extern CudaResult cuMemHostAllocLinux(out IntPtr pp, ulong bytesize, uint flags);
 
-    private static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
+    /// <summary>Portable page-locked memory (cuMemHostAlloc, PORTABLE), with no single-context fallback.</summary>
+    internal static CudaResult AllocatePortablePinnedHostOnly(out IntPtr ptr, ulong byteSize)
+        => RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? cuMemHostAllocWin(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE)
+            : cuMemHostAllocLinux(out ptr, byteSize, CU_MEMHOSTALLOC_PORTABLE);
+
+    // The context lifetime the pool's blocks belong to (BindContext); a block returned after the pool is disposed
+    // is freed only while that lifetime lasts.
+    private IntPtr _context;
+    private long _contextGeneration;
+
+    /// <summary>Ties the pool to its backend's context registration.</summary>
+    internal void BindContext(IntPtr context, long generation)
+    {
+        _context = context;
+        _contextGeneration = generation;
+    }
+
+    internal static CudaResult AllocatePortablePinnedHost(out IntPtr ptr, ulong byteSize)
     {
         try
         {
@@ -54,6 +72,14 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     public IntPtr Rent(int sizeInBytes)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CudaPinnedBufferPool));
+        if (sizeInBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(sizeInBytes), sizeInBytes,
+                "A pinned block needs a positive size (an int byte count that overflowed is negative).");
+        // Over 1 GiB the next power of two does not fit an int (the int rounding wrapped to int.MinValue, and the
+        // allocation then asked the driver for ~1.8e19 bytes). Such a block is not a pool bucket: refuse it here.
+        if (BucketSize(sizeInBytes) > MaxBucketBytes)
+            throw new ArgumentOutOfRangeException(nameof(sizeInBytes),
+                $"A pooled pinned block is at most {MaxBucketBytes} bytes; {sizeInBytes} bytes needs its own allocation.");
         int bucketSize = NextPowerOfTwo(sizeInBytes);
 
         if (_buckets.TryGetValue(bucketSize, out var bag) && bag.TryPop(out var ptr))
@@ -75,8 +101,18 @@ internal sealed class CudaPinnedBufferPool : IDisposable
     /// </summary>
     public void Return(IntPtr ptr, int sizeInBytes)
     {
-        if (_disposed || ptr == IntPtr.Zero)
+        if (ptr == IntPtr.Zero)
             return;
+        if (_disposed)
+        {
+            // The pool is gone: the block is freed while its context lifetime lasts (otherwise that context's
+            // destruction already took it back, and a driver call against it would be an access violation).
+            if (CudaBackend.HostReleaseReturnedMemory(
+                    CudaBackend.ReleaseHostInLiveContext(ptr, _context, _contextGeneration, unregister: false))
+                && sizeInBytes > 0 && BucketSize(sizeInBytes) <= MaxBucketBytes)
+                GpuMemoryStats.RecordFree("cuda_pinned_host", BucketSize(sizeInBytes));
+            return;
+        }
 
         int bucketSize = NextPowerOfTwo(sizeInBytes);
         var bag = _buckets.GetOrAdd(bucketSize, _ => new ConcurrentStack<IntPtr>());
@@ -91,9 +127,29 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         }
         else
         {
-            CuBlasNative.cuMemFreeHost(ptr);
-            GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
+            FreeCounted(ptr, bucketSize);
         }
+    }
+
+    /// <summary>The largest pooled block: 2^30 bytes (the largest power of two an int bucket size holds).</summary>
+    internal const long MaxBucketBytes = 1L << 30;
+
+    /// <summary>The bucket a request rounds to, in long (no wrap above 1 GiB).</summary>
+    internal static long BucketSize(int sizeInBytes)
+    {
+        if (sizeInBytes <= 1) return 1;
+        long value = sizeInBytes - 1L;
+        int shift = 0;
+        while (value > 0) { value >>= 1; shift++; }
+        return 1L << shift;
+    }
+
+    // A block freed while the pool is live (its backend's context current): counted only when the free succeeded.
+    private static void FreeCounted(IntPtr ptr, long bucketSize)
+    {
+        var freed = CuBlasNative.cuMemFreeHost(ptr);
+        if (freed == CudaResult.Success) GpuMemoryStats.RecordFree("cuda_pinned_host", bucketSize);
+        else System.Diagnostics.Trace.TraceWarning("Pinned pool: cuMemFreeHost returned " + freed + "; the block stays counted.");
     }
 
     private static int NextPowerOfTwo(int value)
@@ -116,10 +172,7 @@ internal sealed class CudaPinnedBufferPool : IDisposable
         foreach (var kvp in _buckets)
         {
             while (kvp.Value.TryPop(out var ptr))
-            {
-                CuBlasNative.cuMemFreeHost(ptr);
-                GpuMemoryStats.RecordFree("cuda_pinned_host", kvp.Key);
-            }
+                FreeCounted(ptr, kvp.Key);
         }
         _buckets.Clear();
     }

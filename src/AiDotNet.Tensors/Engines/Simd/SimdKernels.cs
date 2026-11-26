@@ -1903,40 +1903,57 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static unsafe float MaxUnsafe(float* data, int length)
         {
+            // A NaN anywhere is the result, as it is for NumPy and PyTorch, for the double kernels, for the .NET
+            // Framework build's SystemNumericsVectorBridge and for the device kernels. The accumulator alone does not
+            // give that: x86 MAXPS returns its SECOND operand when either is NaN, so a NaN element left the
+            // accumulator unchanged and the result depended on where the NaN sat. `unordered` records it instead.
             int i = 0;
             float max = float.NegativeInfinity;
+            bool sawNaN = false;
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
-                var vmax0 = Vector256.Create(float.NegativeInfinity);
-                var vmax1 = vmax0; var vmax2 = vmax0; var vmax3 = vmax0;
+                var acc0 = Vector256.Create(float.NegativeInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                var unordered = Vector256<float>.Zero;
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    vmax0 = Avx.Max(vmax0, Avx.LoadVector256(data + i));
-                    vmax1 = Avx.Max(vmax1, Avx.LoadVector256(data + i + 8));
-                    vmax2 = Avx.Max(vmax2, Avx.LoadVector256(data + i + 16));
-                    vmax3 = Avx.Max(vmax3, Avx.LoadVector256(data + i + 24));
+                    var v0 = Avx.LoadVector256(data + i);
+                    var v1 = Avx.LoadVector256(data + i + 8);
+                    var v2 = Avx.LoadVector256(data + i + 16);
+                    var v3 = Avx.LoadVector256(data + i + 24);
+                    unordered = Avx.Or(unordered, Avx.Or(Avx.CompareUnordered(v0, v1), Avx.CompareUnordered(v2, v3)));
+                    acc0 = Avx.Max(v0, acc0);
+                    acc1 = Avx.Max(v1, acc1);
+                    acc2 = Avx.Max(v2, acc2);
+                    acc3 = Avx.Max(v3, acc3);
                 }
-                vmax0 = Avx.Max(Avx.Max(vmax0, vmax1), Avx.Max(vmax2, vmax3));
-                max = HorizontalMax(vmax0);
+                sawNaN = Avx.MoveMask(unordered) != 0;
+                max = HorizontalMax(Avx.Max(Avx.Max(acc0, acc1), Avx.Max(acc2, acc3)));
             }
             if (Avx.IsSupported && length - i >= 8)
             {
-                var vmax = Vector256.Create(max);
+                var acc = Vector256.Create(max);
+                var unordered = Vector256<float>.Zero;
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    vmax = Avx.Max(vmax, Avx.LoadVector256(data + i));
+                    var v = Avx.LoadVector256(data + i);
+                    unordered = Avx.Or(unordered, Avx.CompareUnordered(v, v));
+                    acc = Avx.Max(v, acc);
                 }
-                max = HorizontalMax(vmax);
+                sawNaN |= Avx.MoveMask(unordered) != 0;
+                max = HorizontalMax(acc);
             }
 #endif
             for (; i < length; i++)
             {
-                if (data[i] > max) max = data[i];
+                float x = data[i];
+                if (x > max) max = x;
+                else if (float.IsNaN(x)) sawNaN = true;
             }
-            return max;
+            return sawNaN ? float.NaN : max;
         }
 
         /// <summary>
@@ -1998,40 +2015,57 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         public static unsafe float MinUnsafe(float* data, int length)
         {
+            // A NaN anywhere is the result, as it is for NumPy and PyTorch, for the double kernels, for the .NET
+            // Framework build's SystemNumericsVectorBridge and for the device kernels. The accumulator alone does not
+            // give that: x86 MINPS returns its SECOND operand when either is NaN, so a NaN element left the
+            // accumulator unchanged and the result depended on where the NaN sat. `unordered` records it instead.
             int i = 0;
             float min = float.PositiveInfinity;
+            bool sawNaN = false;
 #if NET5_0_OR_GREATER
             if (Avx.IsSupported && length >= 32)
             {
-                var vmin0 = Vector256.Create(float.PositiveInfinity);
-                var vmin1 = vmin0; var vmin2 = vmin0; var vmin3 = vmin0;
+                var acc0 = Vector256.Create(float.PositiveInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                var unordered = Vector256<float>.Zero;
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    vmin0 = Avx.Min(vmin0, Avx.LoadVector256(data + i));
-                    vmin1 = Avx.Min(vmin1, Avx.LoadVector256(data + i + 8));
-                    vmin2 = Avx.Min(vmin2, Avx.LoadVector256(data + i + 16));
-                    vmin3 = Avx.Min(vmin3, Avx.LoadVector256(data + i + 24));
+                    var v0 = Avx.LoadVector256(data + i);
+                    var v1 = Avx.LoadVector256(data + i + 8);
+                    var v2 = Avx.LoadVector256(data + i + 16);
+                    var v3 = Avx.LoadVector256(data + i + 24);
+                    unordered = Avx.Or(unordered, Avx.Or(Avx.CompareUnordered(v0, v1), Avx.CompareUnordered(v2, v3)));
+                    acc0 = Avx.Min(v0, acc0);
+                    acc1 = Avx.Min(v1, acc1);
+                    acc2 = Avx.Min(v2, acc2);
+                    acc3 = Avx.Min(v3, acc3);
                 }
-                vmin0 = Avx.Min(Avx.Min(vmin0, vmin1), Avx.Min(vmin2, vmin3));
-                min = HorizontalMin(vmin0);
+                sawNaN = Avx.MoveMask(unordered) != 0;
+                min = HorizontalMin(Avx.Min(Avx.Min(acc0, acc1), Avx.Min(acc2, acc3)));
             }
             if (Avx.IsSupported && length - i >= 8)
             {
-                var vmin = Vector256.Create(min);
+                var acc = Vector256.Create(min);
+                var unordered = Vector256<float>.Zero;
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
                 {
-                    vmin = Avx.Min(vmin, Avx.LoadVector256(data + i));
+                    var v = Avx.LoadVector256(data + i);
+                    unordered = Avx.Or(unordered, Avx.CompareUnordered(v, v));
+                    acc = Avx.Min(v, acc);
                 }
-                min = HorizontalMin(vmin);
+                sawNaN |= Avx.MoveMask(unordered) != 0;
+                min = HorizontalMin(acc);
             }
 #endif
             for (; i < length; i++)
             {
-                if (data[i] < min) min = data[i];
+                float x = data[i];
+                if (x < min) min = x;
+                else if (float.IsNaN(x)) sawNaN = true;
             }
-            return min;
+            return sawNaN ? float.NaN : min;
         }
 
         [MethodImpl(HotInline)]
@@ -5008,45 +5042,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
 #if NET5_0_OR_GREATER
-            int length = data.Length;
-            int i = 0;
-            float max = float.NegativeInfinity;
-
-            if (Avx.IsSupported && length >= 32)
+            unsafe
             {
-                var vmax0 = Vector256.Create(float.NegativeInfinity);
-                var vmax1 = vmax0;
-                var vmax2 = vmax0;
-                var vmax3 = vmax0;
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    vmax0 = Avx.Max(vmax0, ReadVector256(data, i));
-                    vmax1 = Avx.Max(vmax1, ReadVector256(data, i + 8));
-                    vmax2 = Avx.Max(vmax2, ReadVector256(data, i + 16));
-                    vmax3 = Avx.Max(vmax3, ReadVector256(data, i + 24));
-                }
-                vmax0 = Avx.Max(Avx.Max(vmax0, vmax1), Avx.Max(vmax2, vmax3));
-                max = HorizontalMax(vmax0);
+                fixed (float* pointer = data) return MaxUnsafe(pointer, data.Length);
             }
-
-            if (Avx.IsSupported && length - i >= 8)
-            {
-                var vmax = Vector256.Create(max);
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    vmax = Avx.Max(vmax, ReadVector256(data, i));
-                }
-                max = HorizontalMax(vmax);
-            }
-
-            for (; i < length; i++)
-            {
-                if (data[i] > max) max = data[i];
-            }
-
-            return max;
 #else
             return SystemNumericsVectorBridge.Max(data);
 #endif
@@ -5059,45 +5058,10 @@ namespace AiDotNet.Tensors.Engines.Simd
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 
 #if NET5_0_OR_GREATER
-            int length = data.Length;
-            int i = 0;
-            float min = float.PositiveInfinity;
-
-            if (Avx.IsSupported && length >= 32)
+            unsafe
             {
-                var vmin0 = Vector256.Create(float.PositiveInfinity);
-                var vmin1 = vmin0;
-                var vmin2 = vmin0;
-                var vmin3 = vmin0;
-                int simdLength = length & ~31;
-                for (; i < simdLength; i += 32)
-                {
-                    vmin0 = Avx.Min(vmin0, ReadVector256(data, i));
-                    vmin1 = Avx.Min(vmin1, ReadVector256(data, i + 8));
-                    vmin2 = Avx.Min(vmin2, ReadVector256(data, i + 16));
-                    vmin3 = Avx.Min(vmin3, ReadVector256(data, i + 24));
-                }
-                vmin0 = Avx.Min(Avx.Min(vmin0, vmin1), Avx.Min(vmin2, vmin3));
-                min = HorizontalMin(vmin0);
+                fixed (float* pointer = data) return MinUnsafe(pointer, data.Length);
             }
-
-            if (Avx.IsSupported && length - i >= 8)
-            {
-                var vmin = Vector256.Create(min);
-                int simdLength = i + ((length - i) & ~7);
-                for (; i < simdLength; i += 8)
-                {
-                    vmin = Avx.Min(vmin, ReadVector256(data, i));
-                }
-                min = HorizontalMin(vmin);
-            }
-
-            for (; i < length; i++)
-            {
-                if (data[i] < min) min = data[i];
-            }
-
-            return min;
 #else
             return SystemNumericsVectorBridge.Min(data);
 #endif

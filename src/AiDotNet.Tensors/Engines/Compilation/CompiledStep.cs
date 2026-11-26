@@ -37,6 +37,11 @@ internal sealed class CompiledStep<T>
     /// <summary>Preserves an explicit no-grad boundary when this forward is serialized and traced again.</summary>
     internal bool RecordedUnderNoGrad { get; init; }
 
+    /// <summary>
+    /// The activation-checkpoint segment the node was recorded in (GraphMode.BeginCheckpointSegment), or -1.
+    /// </summary>
+    internal int CheckpointSegment { get; init; } = -1;
+
     private int[]? _differentiableInputIndices;
 
     /// <summary>Null means every input; otherwise the sorted, distinct derivative-bearing input indices.</summary>
