@@ -125,6 +125,54 @@ public sealed class SparseRoutingTests
         AssertClose(refRun.Dv, fusedRun.Dv, "gather_dv");
     }
 
+    // Second order: both backwards record under create-graph, so differentiating the first-order gradients (here
+    // contracted with fixed weights) again matches the one-hot composition built entirely from recorded ops. The
+    // squared output makes every second derivative non-zero, including those through the upstream gradient.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void GatherRowValuesAndTopKMix_SecondOrderGradients_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+    {
+        var e = new CpuEngine();
+        var gShape = valShape.ToArray();
+        gShape[^1] = g;
+        var idxShape = valShape.ToArray();
+        idxShape[^1] = k;
+        var outShape = valShape.ToArray();
+        outShape[^1] = c;
+        var indices = RandIndices(idxShape, g, 31);
+        var values = RandFloat(gShape, 32);
+        var table = RandFloat([g, c], 33);
+        var weights = RandFloat(idxShape, 34);
+        var uGather = RandFloat(idxShape, 35);
+        var uMix = RandFloat(outShape, 36);
+        var vValues = RandFloat(gShape, 37);
+        var vTable = RandFloat([g, c], 38);
+        var vWeights = RandFloat(idxShape, 39);
+
+        float[][] Run(bool fused)
+        {
+            using var tape = new GradientTape<float>();
+            var yg = fused ? e.TensorGatherRowValues(values, indices) : DecomposedGatherRowValues(e, values, indices);
+            var ym = fused ? e.TopKWeightedRowMix(table, indices, weights) : DecomposedTopKMix(e, table, indices, weights);
+            var loss = e.TensorAdd(
+                e.ReduceSum(e.TensorMultiply(e.TensorMultiply(yg, yg), uGather), null),
+                e.ReduceSum(e.TensorMultiply(e.TensorMultiply(ym, ym), uMix), null));
+            var first = tape.ComputeGradients(loss, [values, table, weights], createGraph: true);
+            var h = e.TensorAdd(e.TensorAdd(
+                e.ReduceSum(e.TensorMultiply(first[values], vValues), null),
+                e.ReduceSum(e.TensorMultiply(first[table], vTable), null)),
+                e.ReduceSum(e.TensorMultiply(first[weights], vWeights), null));
+            var second = tape.ComputeGradients(h, [values, table, weights]);
+            return [second[values].ToArray(), second[table].ToArray(), second[weights].ToArray()];
+        }
+
+        var reference = Run(fused: false);
+        var fusedRun = Run(fused: true);
+        AssertClose(reference[0], fusedRun[0], "gather_second_dvalues", rel: 1e-4);
+        AssertClose(reference[1], fusedRun[1], "mix_second_dtable", rel: 1e-4);
+        AssertClose(reference[2], fusedRun[2], "mix_second_dweights", rel: 1e-4);
+    }
+
     [Theory]
     [MemberData(nameof(RoutingShapes))]
     public void TopKWeightedRowMix_TapeGradients_MatchOneHotMatMulComposition(int[] valShape, int g, int k, int c)
