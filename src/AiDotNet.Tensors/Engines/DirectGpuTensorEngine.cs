@@ -2037,7 +2037,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
-        => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view), out result);
+    {
+        // A contiguous offset-0 tensor is no slice the overload below copies. Resolving a base for it would upload
+        // and cache a second full buffer of a resident input (its pending persistent role) only to be declined.
+        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0))
+        {
+            result = default;
+            return false;
+        }
+        return TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view) ?? SyncedDeviceViewBase(backend, view), out result);
+    }
 
     /// <summary>As above, from an explicit <paramref name="baseBuffer"/> holding the viewed STORAGE in storage order.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, out OwnedBuffer result)
@@ -2798,6 +2807,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // correctly keyed.
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
+        // A contiguous offset-0 prefix shares the whole array too, and Contiguous() returns it unchanged: a buffer
+        // sized for the prefix cached under the array's key would be handed to a later full-tensor read, which would
+        // launch past its end. Give the prefix its own array.
+        if (IsPartialView(tensor))
+            tensor = (Tensor<T>)tensor.CloneDeepCopy();
 
         var owned = UploadTensor(backend, tensor);
         if (owned.OwnsBuffer)

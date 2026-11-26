@@ -508,8 +508,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         _bufferPool.DrainAll();
         if (_asyncMemPool != IntPtr.Zero && !IsCapturingOnThisThread && !_backendStreamCaptureActive)
         {
-            SynchronizeContextOutsideCapture(_cudaContext);
-            TrimPool(_asyncMemPool);
+            CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (arena block reclamation)");
+            var trimStatus = TrimPool(_asyncMemPool);
+            if (trimStatus != CudaResult.Success)
+                System.Diagnostics.Trace.TraceWarning($"[CudaBackend] cuMemPoolTrimTo failed during arena block reclamation: {trimStatus}.");
         }
         IntPtr block = AllocDeviceMemoryWithRetry(bytes);
         CudaAccountedMemory.Track(block, _memoryAccount, (long)bytes);
