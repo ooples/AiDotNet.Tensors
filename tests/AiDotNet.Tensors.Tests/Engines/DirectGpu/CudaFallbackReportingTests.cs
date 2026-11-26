@@ -245,6 +245,7 @@ public class CudaFallbackReportingTests
     public void The_circuit_breaker_trip_does_not_wait_for_the_adoption_lock()
     {
         var saved = AiDotNetEngine.Current;
+        bool savedAssigned = AiDotNetEngine.IsCallerAssigned;
         try
         {
             bool tripped = false;
@@ -262,6 +263,8 @@ public class CudaFallbackReportingTests
         {
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
             AiDotNetEngine.Current = saved;
+            // Restoring the engine is not a caller's choice: later tests must not inherit a caller-assigned flag.
+            if (!savedAssigned && saved.Unwrap().GetType() == typeof(CpuEngine)) AiDotNetEngine.ResetToCpu();
         }
     }
 
@@ -273,6 +276,7 @@ public class CudaFallbackReportingTests
     public void A_tripped_circuit_breaker_under_a_required_backend_makes_Current_throw()
     {
         var saved = AiDotNetEngine.Current;
+        bool savedAssigned = AiDotNetEngine.IsCallerAssigned;
         var previousRequired = GpuBackendOptions.RequiredBackend;
         try
         {
@@ -297,6 +301,8 @@ public class CudaFallbackReportingTests
             GpuBackendOptions.RequiredBackend = previousRequired;
             AiDotNetEngine.ResetGpuCircuitBreakerForTests();
             AiDotNetEngine.Current = saved;
+            // Restoring the engine is not a caller's choice: later tests must not inherit a caller-assigned flag.
+            if (!savedAssigned && saved.Unwrap().GetType() == typeof(CpuEngine)) AiDotNetEngine.ResetToCpu();
         }
     }
 

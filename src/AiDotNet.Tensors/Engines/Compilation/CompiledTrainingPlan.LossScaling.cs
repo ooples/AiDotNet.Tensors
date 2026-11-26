@@ -301,7 +301,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         ThrowIfLossScaleAdvancesInsideCapture();
         _lossScaleVerdictPending = false;
         ResolveDeferredFiniteness();
-        AdvanceHostLossScale(LastStepSkippedNonFiniteGradients);
+        AdvanceHostLossScale(LastStepSkippedNonFiniteGradients, captureChecked: true);
     }
 
     /// <summary>Advances the scale on the host as a step's verdict would and returns the new scale (tests).</summary>
@@ -323,11 +323,13 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
     // state and the seed apart.
     private void ThrowIfLossScaleAdvancesInsideCapture()
     {
+        // The query is a driver call: none on a context the circuit breaker found corrupted.
+        if (AiDotNetEngine.GpuCircuitBroken) return;
         if (_lossGradSeed._gpuBackend is Engines.DirectGpu.IGpuGraphCapture capturing && capturing.IsStreamCapturing())
             throw new InvalidOperationException("The host loss scale advanced inside a step graph capture.");
     }
 
-    private void AdvanceHostLossScale(bool nonFinite)
+    private void AdvanceHostLossScale(bool nonFinite, bool captureChecked = false)
     {
         var options = _lossScaling ?? throw new InvalidOperationException("Loss scaling is off.");
         var state = _lossScaleHost;
@@ -349,7 +351,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
                 tracker = 0;
             }
         }
-        ThrowIfLossScaleAdvancesInsideCapture();
+        if (!captureChecked) ThrowIfLossScaleAdvancesInsideCapture();
         _lossScaleHost = new LossScaleState(scale, tracker, overflows, state.Steps + 1);
         // A captured step graph copies the device seed into the loss gradient in its prologue and nothing in it rewrites
         // the seed when the scale is advanced here, on the host: rewrite it, or the next replay scales the gradients by

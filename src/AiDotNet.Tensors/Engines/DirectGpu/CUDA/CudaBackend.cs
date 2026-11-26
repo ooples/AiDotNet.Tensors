@@ -1094,8 +1094,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             if (_pushed)
             {
-                CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPopCurrent(out _), "cuCtxPopCurrent");
+                var popped = CuBlasNative.cuCtxPopCurrent(out _);
                 _threadCurrentContext = IntPtr.Zero;
+                // After a sticky device fault the pop can fail too; throwing then would replace the error that tripped
+                // the breaker with this one, from inside the cleanup of the call that hit it.
+                if (!AiDotNetEngine.GpuCircuitBroken) CuBlasNative.CheckCudaResult(popped, "cuCtxPopCurrent");
             }
             CudaCurrentStream.Restore(_previousStream);
         }
@@ -7097,6 +7100,9 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     {
         if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty
             && PendingExternalReleases.IsEmpty && PendingAbandonedBackends.IsEmpty) return false;
+        // Nothing queued is freed into a context the circuit breaker found corrupted (any native call there can fault
+        // the process): the queues keep it, and the exit of the process reclaims the memory.
+        if (AiDotNetEngine.GpuCircuitBroken) return false;
         if (IsCapturingOnThisThread || CaptureMemoryPool.Current is not null) return false;
         return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }

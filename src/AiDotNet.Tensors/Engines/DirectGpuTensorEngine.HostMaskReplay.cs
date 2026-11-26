@@ -167,15 +167,14 @@ public partial class DirectGpuTensorEngine
     // a live context itself. The fields are cleared before this runs, so a failure cannot leave a freed buffer behind.
     private static void ReleaseHostMaskBuffer(IDirectGpuBackend? owner, IGpuBuffer buffer)
     {
+        // Not on a context the circuit breaker found corrupted: the buffer is left to the exit of the process.
+        if (AiDotNetEngine.GpuCircuitBroken) return;
         if (owner is not null && owner.IsAvailable)
         {
+            // Any other failure propagates: the queued release may already own the buffer (its free waits on an event
+            // not yet complete), so disposing it here as well could free memory a kernel still reads.
             try { DisposeBufferAfterQueuedUse(owner, buffer); return; }
             catch (ObjectDisposedException) { /* closed meanwhile: dispose directly below */ }
-            catch (Exception ex) when (ex is not OutOfMemoryException)
-            {
-                // The fields no longer hold the buffer, so nothing else frees it: dispose it directly rather than leak it.
-                System.Diagnostics.Trace.TraceWarning("Host mask: a deferred buffer release failed ({0}); freeing it directly.", ex.Message);
-            }
         }
         buffer.Dispose();
     }

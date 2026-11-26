@@ -712,6 +712,13 @@ public sealed partial class CudaBackend
                 ReleaseDirectPtxGraphPins(graphExec);
                 return;
             }
+            // A context the circuit breaker found corrupted is not called into at all, not even to wait: only the
+            // tracking goes (see below), and the context's memory goes with the process.
+            if (AiDotNetEngine.GpuCircuitBroken)
+            {
+                ForgetCapturedGraph(graphExec);
+                return;
+            }
             using var _ = PushContext();
             System.Runtime.ExceptionServices.ExceptionDispatchInfo? waitFailure = null;
             try
@@ -731,8 +738,7 @@ public sealed partial class CudaBackend
             // memory goes with the process, as the breaker itself leaves it.
             if (AiDotNetEngine.GpuCircuitBroken)
             {
-                ReleaseDirectPtxGraphPins(graphExec);
-                ForgetGraphMemoryPool(graphExec);
+                ForgetCapturedGraph(graphExec);
             }
             else
             {

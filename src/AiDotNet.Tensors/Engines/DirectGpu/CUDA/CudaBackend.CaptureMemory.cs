@@ -228,11 +228,23 @@ public sealed partial class CudaBackend
         previous?.Retire();
     }
 
-    // Drops a graph's pool from the tracking without freeing its buffers, for a context the circuit breaker found
-    // corrupted: a free there can fault the process, and the exit of the process reclaims the memory.
-    private static void ForgetGraphMemoryPool(IntPtr graphExec)
+    // Pools of graphs dropped on a context the circuit breaker found corrupted. Kept reachable on purpose: their
+    // buffers' finalizers would otherwise queue frees that a later context push drains into that context.
+    private static readonly List<CaptureMemoryPool> s_forgottenGraphMemoryPools = new();
+
+    // Drops a captured graph from the tracking without any native call, for a context the circuit breaker found
+    // corrupted: a destroy or free there can fault the process, and the exit of the process reclaims the memory. Its
+    // pins are kept too (releasing one can unload a module), and its pool stays rooted (see above).
+    private void ForgetCapturedGraph(IntPtr graphExec)
     {
-        lock (s_graphMemoryLock) s_graphMemoryPools.Remove(graphExec);
+        lock (s_graphMemoryLock)
+        {
+            if (s_graphMemoryPools.TryGetValue(graphExec, out var pool))
+            {
+                s_graphMemoryPools.Remove(graphExec);
+                s_forgottenGraphMemoryPools.Add(pool);
+            }
+        }
     }
 
     private static void RetireGraphMemoryPool(IntPtr graphExec)

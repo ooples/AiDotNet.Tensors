@@ -68,7 +68,8 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
             if (_pinned == IntPtr.Zero) return;
             try
             {
-                if (_backend.IsAvailable)
+                // Not on a context the circuit breaker found corrupted: no wait and no event destroy there.
+                if (_backend.IsAvailable && !AiDotNetEngine.GpuCircuitBroken)
                 {
                     try
                     {
@@ -78,7 +79,7 @@ public sealed partial class CudaBackend : IDeviceReadbackFactory
                             // The event goes even when that wait fails, except on a context the circuit breaker
                             // found corrupted, which is not called into again.
                             try { if (_event is { } evt && _unread) evt.Synchronize(); }
-                            finally { if (!AiDotNetEngine.GpuCircuitBroken) _event?.Dispose(); }
+                            finally { if (!AiDotNetEngine.GpuCircuitBroken) _event?.Dispose(); }   // a trip during the wait
                         }
                     }
                     catch (ObjectDisposedException)

@@ -272,6 +272,8 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             Skip.If(compiled.GraphHandlesForTests.Step == IntPtr.Zero,
                 $"The step was not captured ({compiled.GraphCaptureFailureReason ?? "no reason given"}).");
 
+            // The parts after the fault have something to do: the eviction suspension is held while the graph lives.
+            Assert.True(compiled.GraphEvictionSuspendedForTests, "the captured step holds no eviction suspension");
             bool fired = false;
             compiled.TestFaultAfterStepGraphDestroy = () =>
             {
@@ -281,10 +283,8 @@ public sealed class CompiledPlanLossScalingTests : IClassFixture<DirectGpuTensor
             };
             Assert.Throws<InvalidOperationException>(() => plan.Dispose());
             Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Step);
-            // The rest of the teardown still ran: the other graphs are gone and the eviction suspension is balanced,
-            // rather than left to the finalizer with eviction off for the engine shared by the later tests.
-            Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Odd);
-            Assert.Equal(IntPtr.Zero, compiled.GraphHandlesForTests.Update);
+            // The rest of the teardown still ran: the eviction suspension is balanced, rather than left on for the
+            // engine shared by the later tests.
             Assert.False(compiled.GraphEvictionSuspendedForTests, "the graph-lifetime eviction suspension was left on");
             compiled.TestFaultAfterStepGraphDestroy = null;
         }

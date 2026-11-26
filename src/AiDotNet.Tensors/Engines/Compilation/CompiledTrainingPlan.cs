@@ -1805,20 +1805,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // The plan drives the engine's backend directly here: lease it so a concurrent Dispose waits.
         using var __gpuOp = (_engine.As<Engines.DirectGpuTensorEngine>())?.EnterGpuOp() ?? default;
-        ReclaimIdleStepMemory();   // the graph's buffers may change hands from here on
-        // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
-        // while the graphs that pin the second buffers still keep them alive.
-        ReleasePingPong();
-        bool hadGraph = _stepGraphExec != IntPtr.Zero;
-        // Every part runs even when an earlier one throws, so one failing destroy cannot leave the other graphs, the
-        // step I/O, the residency rollback or the eviction suspension behind; the first failure is rethrown at the end
-        // (all of them, as an AggregateException, when more than one part failed).
+        // Every part runs even when an earlier one throws, so one failing part cannot leave the graphs, the step I/O,
+        // the residency rollback or the eviction suspension behind; the first failure is rethrown at the end (all of
+        // them, as an AggregateException, when more than one part failed).
         List<Exception>? failures = null;
         void Part(Action part)
         {
             try { part(); }
             catch (Exception ex) { (failures ??= new List<Exception>()).Add(ex); }
         }
+        Part(ReclaimIdleStepMemory);   // the graph's buffers may change hands from here on
+        // The current weights back in the buffers the plan's other paths update (stream-ordered after every replay),
+        // while the graphs that pin the second buffers still keep them alive.
+        Part(ReleasePingPong);
+        bool hadGraph = _stepGraphExec != IntPtr.Zero;
         // Each handle is cleared before its destroy: a destroy that throws then leaves no field naming a graph that was
         // already destroyed, which the finalizer (armed while a teardown stage fails) would destroy a second time.
         if (_engine.TryGet<Engines.DirectGpuTensorEngine>(out var gte)
