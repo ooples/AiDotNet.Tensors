@@ -38,7 +38,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
     /// <param name="forTraining">True when compiling a TRAINING plan: inference-only patterns (whose fused node has
     /// no backward) are skipped, so the matched ops keep their backward steps. Measured before this: a matmul by a
     /// sparse constant selection matrix was rewritten to FusedSparseLinear inside a training plan and every gradient
-    /// upstream of it came out exactly zero (the compiled HRE attention never trained its Q/K/V projections).</param>
+    /// upstream of it came out exactly zero (a compiled attention model never trained its Q/K/V projections).</param>
     /// <param name="observableOutputs">Nodes whose outputs must remain independently observable after execution.</param>
     public CpuFusionPass(bool forTraining = false, HashSet<ILazyNode>? observableOutputs = null)
     {

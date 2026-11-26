@@ -32952,7 +32952,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // and the output of the network stayed near the compile-time random-
         // init result no matter how long training ran.
         //
-        // Consumer impact (HarmonicEngine PathB at dModel=128 / L=2 /
+        // Consumer impact (a downstream consumer at dModel=128 / L=2 /
         // ctx=64 / 10KB WikiText-2 byte-LM): top-1 0% / top-5 100% / ppl=V
         // uniform output + 3.76× slower than MHA (compile-time eager FA fired
         // every plan.Step on every layer instance).
@@ -40915,7 +40915,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Read a contiguous source in place. GetFlattenedData() copies the WHOLE source, so an embedding lookup of
         // 1024 rows from a 49K x 512 table copied all 100 MB every forward pass (PerfView main-thread stacks:
-        // TensorGather -> GetFlattenedData -> ToArray, the largest serial copy of the HRE Track B CPU step).
+        // TensorGather -> GetFlattenedData -> ToArray, the largest serial copy of a downstream CPU training step).
         T[]? srcBacking = null;
         int srcOff = 0;
         if (source.IsContiguous) srcBacking = source.GetCpuBackingForStridedRead(out srcOff);
@@ -46656,8 +46656,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
         // Compiled-training graph node. It records the SAME adjoint backward as the tape path below: with a null
-        // backward, every gradient stopped at the transform in a compiled training plan (measured: a spectral-gate
-        // FFN's parameters received no update at all, while eager training moved every one of them).
+        // backward, every gradient stopped at the transform in a compiled training plan (measured: the parameters of a
+        // model built on RFFT received no update at all, while eager training moved every one of them).
         if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RFFTAdjointBackward, new object[] { n, nFft }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
@@ -56900,8 +56900,8 @@ public partial class CpuEngine : ITensorLevelEngine
     // structs. Complex<T> carries a redundant INumericOperations<T> reference
     // field (24 bytes/element for double, 16 for float), so every butterfly
     // wrote that ref on top of the arithmetic and the hot loop touched
-    // cache-sparse memory through property accessors. Profiling the HRE spectral
-    // FFN path (SpectralHebbianLayer.ForwardBatch) showed this Complex<T>
+    // cache-sparse memory through property accessors. Profiling a downstream frequency-domain
+    // FFN path showed this Complex<T>
     // overhead — not the O(n log n) arithmetic — dominated wall time (~10x vs
     // the blittable Fft.RFft kernel on identical shapes). For the common
     // float/double element types we instead run the SAME tested SIMD radix-2

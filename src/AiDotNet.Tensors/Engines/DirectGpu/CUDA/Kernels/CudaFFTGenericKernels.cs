@@ -203,7 +203,7 @@ extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg
 // The extension is not cosmetic. Bluestein needs a LINEAR convolution; an m-point FFT computes a CYCLIC one,
 // and the two agree only when the kernel is mirrored into the upper tail. Filling just [0, n) leaves the
 // transform correct at k = 0 and wrong everywhere else - a reference implementation of this exact omission
-// measures 0.71 relative error at n = 896 (hre_port_tests/fftref.py, negative control), i.e. it is the kind of
+// measures 0.71 relative error at n = 896 (an external reference script, negative control), i.e. it is the kind of
 // bug that passes a smoke test on DC and fails on everything anyone cares about.
 extern ""C"" __global__ __launch_bounds__(AIDN_FFTG_THREADS_PER_BLOCK) void fftg_build_chirp_padded(
     float* bRe, float* bIm, int n, int m, int inverse)

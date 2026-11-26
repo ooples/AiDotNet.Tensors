@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
 /// A/B benchmark: the exact matmul shapes a DiT-XL forward pass exercises.
-/// This is the workload that led the downstream HRE/DiT consumer to report
+/// This is the workload that led a downstream DiT consumer to report
 /// CPU shards being cancelled at the 45-minute CI budget.
 ///
 /// Note on "Det=false vs Det=true" (post-MKL-removal semantics): BlasProvider

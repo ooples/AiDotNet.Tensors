@@ -114,7 +114,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // resolved: (a) the #558 stale-token-index root is fixed via the on-device captured embedding gather
     // (_graphHasEmbedding) / prefix-eager embedding; (b) grad-norm clipping no longer disables capture — it
     // runs as a fully GPU-resident clip (TryClipGradientsGlobalL2Gpu) after the captured backward, so the
-    // _maxGradNorm<=0 gate was removed. Measured: with constant-shape batching the captured d768/L6 cortex
+    // _maxGradNorm<=0 gate was removed. Measured: with constant-shape batching the captured d768/L6 model
     // reaches ~71% GPU util at the default batch (vs ~12% launch-bound without capture).
     private static readonly bool s_graphStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
@@ -4862,7 +4862,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         }
                         // Trace every device allocation that fires INSIDE the capture (AIDOTNET_GPU_CAPTURE_TRACE=1):
                         // those are the graph-purity violations that abort/spoil whole-step capture and keep the
-                        // cortex on the launch-bound eager path. The scope dumps the offending call sites on exit.
+                        // downstream model on the launch-bound eager path. The scope dumps the offending call sites on exit.
                         // From here a graph may name the pool's buffers: a transient slot that grows keeps its old one.
                         if (_scratchPool is { } capturePool) capturePool.GraphsHoldBuffers = true;
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
@@ -6121,7 +6121,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The same for state the forward updates in place (a router's selection bias nudged from its loads, a running
         // statistic). It is its own node's output, so it is not an external leaf, and nothing else gives it a buffer:
         // a host-only state took the in-place op's host path (a download inside the capture), and the next step's
-        // reader re-uploaded it there, so HreLm's moe-g never captured (CUDA 900, "weight upload"). Bound here, the
+        // reader re-uploaded it there, so a downstream MoE model never captured (CUDA 900, "weight upload"). Bound here, the
         // update runs on the device and every replay reads and writes the one buffer the graph bakes in.
         if (de is not null && !IsCapturing())
             foreach (var state in InPlaceStateTensors())
@@ -6934,7 +6934,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// tensors on every replay, and the resident step trusts a bound buffer without a liveness check, so a binding left
     /// on a released buffer made the next replay share it with whatever the pool handed it to next: a gradient allocated
     /// in the pre-pass, whose write (or zeroing) overwrote a forward value a backward then read. On OpenCL a softmax
-    /// cross-entropy divided by a supervised-row count of 0, and a Born attention by a zeroed denominator, on their
+    /// cross-entropy divided by a supervised-row count of 0, and a normalized attention by a zeroed denominator, on their
     /// second step. A detached tensor is resolved afresh when it is next written.
     /// </summary>
     private void DetachReleasedBindings(HashSet<Engines.DirectGpu.IGpuBuffer> released, HashSet<object> protectedState)
@@ -11308,7 +11308,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // CUDA-graph eligibility + GPU utilization: on a GPU engine, prefer the GENERIC engine-dispatched
         // (GPU-stream) path over the CPU-BLAS/SIMD host specializations below. Those specializations are a
         // CPU optimization (SimdGemm / BlasProvider.GemmEx on host .Data arrays); on a GPU engine they
-        // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (cortex GPU util ~7%), and
+        // (1) run the heavy GEMMs + elementwise on the CPU, starving the device (downstream-model GPU util ~7%), and
         // (2) are host-only, so the fixed kernel sequence can't be CUDA-graph captured (AIDOTNET_CUDA_GRAPH_STEP).
         // Routing to generic moves the work onto the GPU AND makes the whole step graph-eligible. Default ON
         // for GPU engines; opt out with AIDOTNET_GPU_PREFER_GENERIC=0 (preferGenericForGpu computed above).

@@ -2165,7 +2165,7 @@ public partial class CpuEngine
             return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorClampMin(tensor, min));
         // Compiled TRAINING trace: record a node that recomputes from the CURRENT input on every Step. Without it
         // the eager result below became a trace-time constant: after the parameters moved, the compiled plan kept
-        // clamping the input's old values (measured: a clamped attention normaliser froze, so the compiled HRE
+        // clamping the input's old values (measured: a clamped attention normaliser froze, so the compiled
         // model's forward drifted from the real one and training stalled).
         if (GraphMode.IsActive && GraphMode.Current is { } scope)
         {
@@ -2204,7 +2204,7 @@ public partial class CpuEngine
             return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorClampMax(tensor, max));
         // Compiled TRAINING trace: record a node that recomputes from the CURRENT input on every Step. Without it
         // the eager result below became a trace-time constant: after the parameters moved, the compiled plan kept
-        // clamping the input's old values (measured: a clamped attention normaliser froze, so the compiled HRE
+        // clamping the input's old values (measured: a clamped attention normaliser froze, so the compiled
         // model's forward drifted from the real one and training stalled).
         if (GraphMode.IsActive && GraphMode.Current is { } scope)
         {

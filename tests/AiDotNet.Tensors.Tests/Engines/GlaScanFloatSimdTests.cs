@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <summary>
 /// The float32 SIMD GLA scan (forward and BPTT backward) against the double kernel on the same inputs: output and the
 /// gradients of q, k, v and the gate, with a weighted upstream gradient, a non-unit gate, and head widths that leave
-/// SIMD tails (13) or match the HRE Born-linear scan width (100).
+/// SIMD tails (13) or match a linear-attention scan width (100).
 /// </summary>
 public class GlaScanFloatSimdTests
 {

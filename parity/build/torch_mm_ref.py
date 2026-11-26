@@ -1,5 +1,5 @@
 # GUARD_OK: PyTorch API-parity reference values for torch.nn.functional.grouped_mm / scaled_mm (fp8 GEMM operator
-# semantics). Not HRE model-weight compression: no model, no weights, only operator outputs for fixed random inputs.
+# semantics). Not model-weight compression: no model, no weights, only operator outputs for fixed random inputs.
 import torch, torch.nn.functional as F, json
 
 S = F.ScalingType

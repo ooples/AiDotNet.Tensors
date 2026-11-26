@@ -112,9 +112,9 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
                 return e.Sigmoid(e.TensorAdd(e.TensorMatMul(e.Reshape(x, [B * S, H * M]), Const([H * M, 8], 33, 2.0)), Const([1, 8], 34)));
             case "gelu":
                 return e.GELU(e.TensorMultiply(x, Const([B, H, S, M], 35, 4.0)));
-            case "spectralffn": case "sffn:spec": case "sffn:swap": case "sffn:y":
+            case "freqgate": case "fgate:spec": case "fgate:swap": case "fgate:y":
             case "g:norm": case "g:hidden": case "g:gate": case "g:cre": case "g:bcast": case "g:sign":
-                return SpectralFfn(e, x, op);
+                return FrequencyGateFfn(e, x, op);
             // Ops whose graph node used to carry no backward (now a tape-replay backward): the parameter must still
             // receive the eager gradient through them.
             // Normalisations whose replayed graph node refreshes saved statistics (mean/var) for the backward. x is
@@ -164,10 +164,10 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
             }
             case "reshape":
                 return e.Reshape(x, [B * S, H * M]);
-            case "bornattn":
-                return BornAttention(e, x, "full");
-            case "born:featq": case "born:vaug": case "born:scan": case "born:num": case "born:den": case "born:scanqk":
-                return BornAttention(e, x, op.Substring(5));
+            case "linattn":
+                return FeatureMapLinearAttention(e, x, "full");
+            case "linattn:featq": case "linattn:vaug": case "linattn:scan": case "linattn:num": case "linattn:den": case "linattn:scanqk":
+                return FeatureMapLinearAttention(e, x, op.Substring("linattn:".Length));
             case "clampmax":
                 return e.TensorClampMax(x, 0.05f);
             case "divide":
@@ -202,9 +202,9 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
     private static Tensor<float> Const(int[] shape, int seed, double scale = 0.5)
         => new(shape, new Vector<float>(Rand(shape.Aggregate(1, (p, q) => p * q), seed, scale)));
 
-    /// <summary>A Born-feature linear attention built from generic ops only (x (x) x features, a scan, a clamped
+    /// <summary>A feature-map linear attention built from generic ops only (x (x) x features, a scan, a clamped
     /// normaliser, a broadcast divide). x = [B,H,S,M] = [2,2,6,4] is read as [b*s, e] = [12, 8].</summary>
-    private static Tensor<float> BornAttention(IEngine e, Tensor<float> x, string stage)
+    private static Tensor<float> FeatureMapLinearAttention(IEngine e, Tensor<float> x, string stage)
     {
         const int b = 2, s = S, em = 8, nh = 2, mb = 2, dh = 4, d = 8;
         var x2 = e.Reshape(x, [b * s, em]);
@@ -232,7 +232,7 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
         if (stage == "vaug") return vAug;
         var gate = new Tensor<float>([b, s, nh]);
         for (int i = 0; i < gate.Length; i++) gate[i] = 1f;
-        if (stage == "scanqk")   // scan with constant values: gradient flows only through the Born features
+        if (stage == "scanqk")   // scan with constant values: gradient flows only through the feature map
         {
             var cv = Const([b, s, nh * d], 14);
             return e.GlaScanForward(phiQ, phiK, cv, gate, nh);
@@ -250,9 +250,9 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
         return e.Reshape(e.TensorDivide(num, den), [b * s, em]);
     }
 
-    /// <summary>A per-token spectral-gate FFN from generic ops: RMSNorm, gate MLP (GELU, sigmoid), RFFT, complex
-    /// multiply via a [2,2] swap matmul and a sign vector, IRFFT, residual. x = [2,2,6,4] read as [b,s,e] = [2,6,8].</summary>
-    private static Tensor<float> SpectralFfn(IEngine e, Tensor<float> x, string stage)
+    /// <summary>A per-token gate composed of generic ops: RMSNorm, a small MLP (GELU, sigmoid), RFFT, a complex
+    /// multiply via a [2,2] swap matmul and a sign vector, IRFFT and a residual. x = [2,2,6,4] read as [b,s,e] = [2,6,8].</summary>
+    private static Tensor<float> FrequencyGateFfn(IEngine e, Tensor<float> x, string stage)
     {
         if (stage.StartsWith("g:", StringComparison.Ordinal)) return GateStages(e, x, stage);
         const int b = 2, s = S, em = 8, gh = 6, nf = em / 2 + 1;
@@ -266,18 +266,18 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
         var cRe = e.TensorMultiply(gate, e.Reshape(Const([nf], 45), [1, 1, nf]));
         var cIm = e.TensorMultiply(gate, e.Reshape(Const([nf], 46), [1, 1, nf]));
         var z = e.Reshape(e.RFFT(xn), [b, s, nf, 2]);
-        if (stage == "sffn:spec") return z;
+        if (stage == "fgate:spec") return z;
         var swapM = new Tensor<float>([2, 2]); swapM[0, 1] = 1f; swapM[1, 0] = 1f;
         var sign = new Tensor<float>([2]); sign[0] = -1f; sign[1] = 1f;
         var swapped = e.Reshape(e.TensorMatMul(e.Reshape(z, [b * s * nf, 2]), swapM), [b, s, nf, 2]);
-        if (stage == "sffn:swap") return swapped;
+        if (stage == "fgate:swap") return swapped;
         var y = e.TensorAdd(e.TensorMultiply(z, e.Reshape(cRe, [b, s, nf, 1])),
             e.TensorMultiply(swapped, e.TensorMultiply(e.Reshape(cIm, [b, s, nf, 1]), sign)));
-        if (stage == "sffn:y") return y;
+        if (stage == "fgate:y") return y;
         return e.TensorAdd(a, e.IRFFT(e.Reshape(y, [b, s, 2 * nf]), em));
     }
 
-    /// <summary>Stages of the spectral FFN's gate path WITHOUT dead branches (each stage feeds the loss).</summary>
+    /// <summary>Stages of that gate's MLP path WITHOUT dead branches (each stage feeds the loss).</summary>
     private static Tensor<float> GateStages(IEngine e, Tensor<float> x, string stage)
     {
         const int b = 2, s = S, em = 8, gh = 6, nf = em / 2 + 1;
@@ -300,7 +300,7 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
 
     public static IEnumerable<object[]> Cases()
     {
-        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "batchnorm", "groupnorm", "instancenorm", "flashattn", "layernorm", "reducestd", "lerp", "addscaled", "softmaxrows", "fft", "spectralffn", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mm3fan", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "bornattn", "born:featq", "born:vaug", "born:scanqk", "born:scan", "born:num", "born:den", "sffn:spec", "sffn:swap", "sffn:y" })
+        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "batchnorm", "groupnorm", "instancenorm", "flashattn", "layernorm", "reducestd", "lerp", "addscaled", "softmaxrows", "fft", "freqgate", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mm3fan", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "linattn", "linattn:featq", "linattn:vaug", "linattn:scanqk", "linattn:scan", "linattn:num", "linattn:den", "fgate:spec", "fgate:swap", "fgate:y" })
         {
             yield return new object[] { op, false };
             yield return new object[] { op, true };

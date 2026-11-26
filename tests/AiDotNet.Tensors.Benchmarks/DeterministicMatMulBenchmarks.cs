@@ -13,7 +13,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 ///
 /// Purpose: measure how competitive the bit-exact blocked path is vs MKL.NET
 /// across matmul shapes that matter for real model training — starting with the
-/// actual HRE (Harmonic Resonance Engine) hot shapes from Issue #131, and
+/// actual downstream small-model hot shapes from Issue #131, and
 /// expanding out to common small/medium LLM shapes where the crossover likely
 /// sits. If the blocked path is within a reasonable margin at the shapes that
 /// matter, we can flip the deterministic default or remove MKL.NET entirely
@@ -60,21 +60,21 @@ public class DeterministicMatMulBenchmarks
 
     private CpuEngine _engine = null!;
 
-    // ═══ HRE baseline (Issue #131 TrainingConfig defaults) ═══
+    // ═══ Small-model baseline (Issue #131 TrainingConfig defaults) ═══
     // batch=4, seq=16, embed=32, vocab=256 → batch*seq = 64
     // Attention-like projection: [batch*seq, embed] × [embed, embed]
-    private Tensor<float> _hre_base_attn_a = null!; // [64, 32]
-    private Tensor<float> _hre_base_attn_b = null!; // [32, 32]
+    private Tensor<float> _small_base_attn_a = null!; // [64, 32]
+    private Tensor<float> _small_base_attn_b = null!; // [32, 32]
     // Output head: [batch*seq, embed] × [embed, vocab]
-    private Tensor<float> _hre_base_out_a = null!;  // [64, 32]
-    private Tensor<float> _hre_base_out_b = null!;  // [32, 256]
+    private Tensor<float> _small_base_out_a = null!;  // [64, 32]
+    private Tensor<float> _small_base_out_b = null!;  // [32, 256]
 
-    // ═══ HRE scaled-up (Issue #131 ScaledUp config) ═══
+    // ═══ Small-model scaled-up (Issue #131 ScaledUp config) ═══
     // batch=4, seq=16, embed=64, vocab=256 → batch*seq = 64
-    private Tensor<float> _hre_scaled_attn_a = null!; // [64, 64]
-    private Tensor<float> _hre_scaled_attn_b = null!; // [64, 64]
-    private Tensor<float> _hre_scaled_out_a = null!;  // [64, 64]
-    private Tensor<float> _hre_scaled_out_b = null!;  // [64, 256]
+    private Tensor<float> _small_scaled_attn_a = null!; // [64, 64]
+    private Tensor<float> _small_scaled_attn_b = null!; // [64, 64]
+    private Tensor<float> _small_scaled_out_a = null!;  // [64, 64]
+    private Tensor<float> _small_scaled_out_b = null!;  // [64, 256]
 
     // ═══ Small LLM band: where MKL overhead may still hurt ═══
     private Tensor<float> _small_128 = null!;  // [128, 128]
@@ -94,15 +94,15 @@ public class DeterministicMatMulBenchmarks
     {
         _engine = new CpuEngine();
 
-        _hre_base_attn_a = Tensor<float>.CreateRandom([64, 32]);
-        _hre_base_attn_b = Tensor<float>.CreateRandom([32, 32]);
-        _hre_base_out_a  = Tensor<float>.CreateRandom([64, 32]);
-        _hre_base_out_b  = Tensor<float>.CreateRandom([32, 256]);
+        _small_base_attn_a = Tensor<float>.CreateRandom([64, 32]);
+        _small_base_attn_b = Tensor<float>.CreateRandom([32, 32]);
+        _small_base_out_a  = Tensor<float>.CreateRandom([64, 32]);
+        _small_base_out_b  = Tensor<float>.CreateRandom([32, 256]);
 
-        _hre_scaled_attn_a = Tensor<float>.CreateRandom([64, 64]);
-        _hre_scaled_attn_b = Tensor<float>.CreateRandom([64, 64]);
-        _hre_scaled_out_a  = Tensor<float>.CreateRandom([64, 64]);
-        _hre_scaled_out_b  = Tensor<float>.CreateRandom([64, 256]);
+        _small_scaled_attn_a = Tensor<float>.CreateRandom([64, 64]);
+        _small_scaled_attn_b = Tensor<float>.CreateRandom([64, 64]);
+        _small_scaled_out_a  = Tensor<float>.CreateRandom([64, 64]);
+        _small_scaled_out_b  = Tensor<float>.CreateRandom([64, 256]);
 
         _small_128 = Tensor<float>.CreateRandom([128, 128]);
         _small_256 = Tensor<float>.CreateRandom([256, 256]);
@@ -131,25 +131,25 @@ public class DeterministicMatMulBenchmarks
         SimdGemm.UseParallelGemm = true;
     }
 
-    // ───────────── HRE baseline (Issue #131 defaults) ─────────────
+    // ───────────── Small-model baseline (Issue #131 defaults) ─────────────
 
-    [Benchmark(Description = "HRE-base attn [64,32]×[32,32]")]
-    public Tensor<float> HRE_Baseline_Attention()
-        => _engine.TensorMatMul(_hre_base_attn_a, _hre_base_attn_b);
+    [Benchmark(Description = "small attn [64,32]×[32,32]")]
+    public Tensor<float> SmallBase_Attention()
+        => _engine.TensorMatMul(_small_base_attn_a, _small_base_attn_b);
 
-    [Benchmark(Description = "HRE-base out-head [64,32]×[32,256]")]
-    public Tensor<float> HRE_Baseline_OutputHead()
-        => _engine.TensorMatMul(_hre_base_out_a, _hre_base_out_b);
+    [Benchmark(Description = "small out-head [64,32]×[32,256]")]
+    public Tensor<float> SmallBase_OutputHead()
+        => _engine.TensorMatMul(_small_base_out_a, _small_base_out_b);
 
-    // ───────────── HRE scaled-up ─────────────
+    // ───────────── Small-model scaled-up ─────────────
 
-    [Benchmark(Description = "HRE-scaled attn [64,64]×[64,64]")]
-    public Tensor<float> HRE_Scaled_Attention()
-        => _engine.TensorMatMul(_hre_scaled_attn_a, _hre_scaled_attn_b);
+    [Benchmark(Description = "small-x2 attn [64,64]×[64,64]")]
+    public Tensor<float> SmallScaled_Attention()
+        => _engine.TensorMatMul(_small_scaled_attn_a, _small_scaled_attn_b);
 
-    [Benchmark(Description = "HRE-scaled out-head [64,64]×[64,256]")]
-    public Tensor<float> HRE_Scaled_OutputHead()
-        => _engine.TensorMatMul(_hre_scaled_out_a, _hre_scaled_out_b);
+    [Benchmark(Description = "small-x2 out-head [64,64]×[64,256]")]
+    public Tensor<float> SmallScaled_OutputHead()
+        => _engine.TensorMatMul(_small_scaled_out_a, _small_scaled_out_b);
 
     // ───────────── Small LLM band ─────────────
 

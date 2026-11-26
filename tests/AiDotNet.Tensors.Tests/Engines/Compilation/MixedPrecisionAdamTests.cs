@@ -8,7 +8,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
 /// Fused-Adam path gate (Tensors #558): the compiled mixed-dtype plan trains with the ADAM optimizer —
-/// the optimizer Adam-configured models (the cortex) use, so this is what makes the fused training path
+/// the optimizer Adam-configured models (the downstream model) use, so this is what makes the fused training path
 /// eligible for the FP16 activation-storage win. Learns y = x·W toward a target via
 /// <see cref="MixedPrecisionCompiledPlan.StepAdam"/> with FP32 master moments + a GradScaler, and asserts
 /// the loss descends with zero overflow.

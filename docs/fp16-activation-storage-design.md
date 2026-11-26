@@ -16,13 +16,13 @@
 - Backward through an FP16 activation: read the FP16 save, up-convert to FP32 inside the backward kernel (gradient math in FP32), accumulate into FP32 grad buffers.
 - **Loss scaling** (`GradScaler`): scale loss before backward, unscale grads before the optimizer, skip-step + back off scale on inf/nan — prevents FP16 gradient underflow.
 
-## Phases (each gated by the gradient-check harness `LayerNormGradientCheckTests`-style finite-diff + a memory + cortex-end-to-end check; kill-on-NaN)
+## Phases (each gated by the gradient-check harness `LayerNormGradientCheckTests`-style finite-diff + a memory + downstream end-to-end check; kill-on-NaN)
 1. **Keystone — cross-type node with backward.** Add `BackwardFunction<TOut>?` to `CrossTypeLazyNode` and a `RecordCastWithBackward<TStore,TCompute>` on `LazyTensorScope`: stores `Tensor<Half>` output, but registers a backward that up-converts and accumulates FP32 grads. Unit-test forward+backward parity vs the all-FP32 node.
 2. **FP16 matmul-store op.** A `MatMulFp16Store` path: under autocast, the engine records the matmul as a cast-with-backward node whose output buffer is `Half` (via `Hgemm`); the consuming op reads FP16 directly. Gradient-check vs FP32 within FP16 tolerance.
 3. **Boundary converts.** Norm/softmax/loss inputs auto-convert FP16→FP32; their outputs convert back to FP16 for the next matmul. Reuse `AutocastScope.ShouldAutocast` for the policy.
 4. **Loss scaling.** Wire `GradScaler` into `CompiledTrainingPlan` (scale `_lossGradSeed`, unscale parameter grads before the fused optimizer, dynamic backoff). Verify no-underflow on a deep run.
 5. **Compile under autocast.** `CompiledTapeTrainingStep` opens the `AutocastScope` around `GetOrCompileTraining` so the lazy graph allocates `Half` activation buffers at trace time (the actual memory reduction), and `StepEager` keeps it open for replay (already done for compute).
-6. **Validate + measure.** d512/L6/B256: resident ~½ (target ≤12GB), loss matches FP32 to AMP tolerance, 0 NaN over a full cortex run; the gradient-check CI test extended to mixed precision.
+6. **Validate + measure.** d512/L6/B256: resident ~½ (target ≤12GB), loss matches FP32 to AMP tolerance, 0 NaN over a full downstream run; the gradient-check CI test extended to mixed precision.
 
 ## Risks / non-goals
 - FP16 underflow → handled by `GradScaler` (Phase 4); until then expect divergence on deep runs.
@@ -62,13 +62,13 @@ The mixed-dtype mechanism AND the memory win are done via the lazy-graph path. W
 - **Phase B — DONE.** `MixedPrecisionCompiledPlan.Backward()` over the captured order via the shared `MixedPrecisionGraphBackward.BackwardOverOrder` (single dispatch; works after lazy-source detachment). Gate: matches the non-compiled backward within FP16 GEMM tolerance.
 - **Phase C — DONE.** `MixedPrecisionCompiledPlan.Step(params, lr, scaler)` — forward + loss-scaled backward + SGD on FP32 masters + `GradScaler` (skip-on-overflow + backoff). Gate: compiled training descends loss >2×, 0 overflow.
 - **Phase D — DONE (correctness at scale).** Compiled plan trains the design-target stack (d512/L6/B256) on `DirectGpuTensorEngine`: loss finite + non-increasing, 0 NaN, VRAM 1229 MiB. The 0.500× activation-storage ratio is proven deterministically (`Fp16ActivationMemoryTests`). *Remaining refinement: CUDA-graph capture of the mixed-dtype step (perf), and a clean at-scale FP32-vs-FP16 in-process VRAM A/B.*
-- **Phase E — REMAINING (cross-repo deployment).** Make the plan a public Tensors API and route AiDotNet `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to it under the flag, so HarmonicEngine/opt-parity exercise it through the high-level training path on GPU.
+- **Phase E — REMAINING (cross-repo deployment).** Make the plan a public Tensors API and route AiDotNet `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to it under the flag, so downstream consumers and opt-parity exercise it through the high-level training path on GPU.
 
 Phases A–D landed (CPU + GPU verified) behind `AIDOTNET_FP16_ACTIVATIONS`; default FP32 fused path byte-identical. **Phase E** (public API + AiDotNet wiring + GPU validation through the high-level path) is the remaining cross-repo step.
 
-## ⚠️ CRITICAL FINDING (GPU validation on the real cortex) — the net memory win is NOT yet realized
+## ⚠️ CRITICAL FINDING (GPU validation on the real downstream model) — the net memory win is NOT yet realized
 
-End-to-end GPU measurement through the fused-Adam path on the cortex (d512/L6/B64) shows the mixed path **uses MORE VRAM, not less**: FP32 = 4671 MiB, FP16-activations = 5712 MiB (after the consecutive-op FP16-reuse fix; 5745 before). Training is correct (engages, descends, 0 NaN) — but the memory goal fails.
+End-to-end GPU measurement through the fused-Adam path on the downstream model (d512/L6/B64) shows the mixed path **uses MORE VRAM, not less**: FP32 = 4671 MiB, FP16-activations = 5712 MiB (after the consecutive-op FP16-reuse fix; 5745 before). Training is correct (engages, descends, 0 NaN) — but the memory goal fails.
 
 **Root cause:** the earlier "0.500×" was measured on a *pure matmul stack*, which is unrepresentative. A real transformer separates matmuls with **FP32 ops** (LayerNorm, softmax, GELU, residual add). Each matmul's output is up-cast to FP32 and consumed by the next FP32 op, which **saves that FP32 tensor for its own backward** — so the dominant saved activation stays FP32. Emitting the matmul output as Half merely adds *transient* Half buffers (down-cast inputs + Half matmul output) on top of the still-resident FP32 activation → net footprint rises. The `ToFp16Input` reuse only helps for *directly consecutive* matmuls, which transformers rarely have.
 
@@ -80,7 +80,7 @@ End-to-end GPU measurement through the fused-Adam path on the cortex (d512/L6/B6
 
 Built `SaveFp16` (the FP16 activation-storage recipe) + a full **CPU activation-paging** scheduler in `MixedPrecisionCompiledPlan` (`AIDOTNET_FP16_PAGING`): page each FP32-op activation to Half after its last forward use (`TryDropStorageForStreaming`), upcast on demand in backward (`RestoreStorageFromBytes`), refcounted free. It is **CPU-correct and transparent** (gradients match within FP16; multi-step replay works — `MixedPrecisionPagingTests`).
 
-But GPU measurement on the cortex shows it does **NOT** reduce GPU VRAM (5918 vs 4671 FP32, and ~10× slower). Root cause: on a CUDA backend the dominant activation memory lives in **DirectGpu's GPU-buffer activation cache** (`_activationCache`, evicted by VRAM cap), NOT in the `Tensor`'s CPU `_data` that `DropStorageForStreaming` frees. So CPU-storage paging frees host storage the cortex isn't bottlenecked on, while the GPU buffers stay resident — and `RestoreStorageFromBytes` adds host allocations + CPU↔GPU thrash each step.
+But GPU measurement on the downstream model shows it does **NOT** reduce GPU VRAM (5918 vs 4671 FP32, and ~10× slower). Root cause: on a CUDA backend the dominant activation memory lives in **DirectGpu's GPU-buffer activation cache** (`_activationCache`, evicted by VRAM cap), NOT in the `Tensor`'s CPU `_data` that `DropStorageForStreaming` frees. So CPU-storage paging frees host storage the downstream model isn't bottlenecked on, while the GPU buffers stay resident — and `RestoreStorageFromBytes` adds host allocations + CPU↔GPU thrash each step.
 
 **What the GPU memory win actually requires:** FP16 compression at the **GPU-buffer level**, integrated with the DirectGpu activation cache — store evicted/retained activation buffers as FP16 on-device (or Half host-offload) and upcast in the backward kernel. That is a DirectGpu-activation-cache change, distinct from both the autograd-graph dtype and the CPU saved-tensor paging. The CPU paging IS a real memory lever for **CPU** training; the GPU path needs this additional layer.
 
@@ -98,12 +98,12 @@ But GPU measurement on the cortex shows it does **NOT** reduce GPU VRAM (5918 vs
 
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
-- Resident-memory measurement via `opt-parity LEAKPROBE` (no HE rebuild).
-- End-to-end cortex: loss drops, param-L1 moves, **0 NaN**.
+- Resident-memory measurement via `opt-parity LEAKPROBE` (no downstream rebuild).
+- End-to-end downstream model: loss drops, param-L1 moves, **0 NaN**.
 
 ## ⚠️ SIXTH / BOTTOM FINDING — race-safe deferred-free defeats mid-step compression; real fix is a stream-ordered allocator
 
-Layer 5 IMPLEMENTED (on-device `CompressActivationFp16`/`UpcastActivationFp32` swap the cache entry FP32↔FP16, schedule-driven, defensive read upcast; behind `AIDOTNET_FP16_GPU_CACHE`; CPU paths 51/51 green). GPU-measured on the cortex: **7155 MiB vs 4671 FP32 — higher again**, and ~10× slower.
+Layer 5 IMPLEMENTED (on-device `CompressActivationFp16`/`UpcastActivationFp32` swap the cache entry FP32↔FP16, schedule-driven, defensive read upcast; behind `AIDOTNET_FP16_GPU_CACHE`; CPU paths 51/51 green). GPU-measured on the downstream model: **7155 MiB vs 4671 FP32 — higher again**, and ~10× slower.
 
 Root cause (bottom of the stack): compression allocates the FP16 buffer but frees the FP32 via the race-safe deferred-free (`CudaBackend.FreeBufferDeferred`, the #226 fix), which holds the FP32 until a stream event — NOT reclaimed until step-end sync. So mid-step the FP16 AND the not-yet-reclaimed FP32 coexist → peak rises. A prompt synchronous free would reclaim it but reintroduces the #226 CUDA-700 race.
 
@@ -113,7 +113,7 @@ Root cause (bottom of the stack): compression allocates the FP16 buffer but free
 
 ## ⚠️ SEVENTH / CONCLUSIVE FINDING — convert-based compression can't reduce peak at any scale; the win needs FP16-NATIVE kernels
 
-Layer 6 (stream-ordered allocator, `cuMemAllocAsync`/`cuMemFreeAsync`, race-safe + pool-reuse, pool release-threshold maxed) IMPLEMENTED + committed (`AIDOTNET_CUDA_ASYNC_ALLOC`). **Note (updated):** this allocator is now **default ON** (opt out with `AIDOTNET_CUDA_ASYNC_ALLOC=0`) — it is required for correctness, not just memory, because the legacy synchronous allocator frees device memory before queued kernels execute (sticky CUDA-700 under buffer churn). On drivers without stream-ordered mem-pool support it falls back to the sync path with a logged warning (or throws if async was explicitly requested). The memory measurements below predate that default flip and were taken with the flag toggled explicitly. Measured the full stack (ACTIVATIONS+PAGING+GPU_CACHE+ASYNC_ALLOC) at BOTH scales on the cortex:
+Layer 6 (stream-ordered allocator, `cuMemAllocAsync`/`cuMemFreeAsync`, race-safe + pool-reuse, pool release-threshold maxed) IMPLEMENTED + committed (`AIDOTNET_CUDA_ASYNC_ALLOC`). **Note (updated):** this allocator is now **default ON** (opt out with `AIDOTNET_CUDA_ASYNC_ALLOC=0`) — it is required for correctness, not just memory, because the legacy synchronous allocator frees device memory before queued kernels execute (sticky CUDA-700 under buffer churn). On drivers without stream-ordered mem-pool support it falls back to the sync path with a logged warning (or throws if async was explicitly requested). The memory measurements below predate that default flip and were taken with the flag toggled explicitly. Measured the full stack (ACTIVATIONS+PAGING+GPU_CACHE+ASYNC_ALLOC) at BOTH scales on the downstream model:
 - d512/L6/**B64**: FP32 4671 → FP16-all **7087** MiB (higher)
 - d512/L6/**B256**: FP32 8071 → FP16-all **11937** MiB (higher)
 

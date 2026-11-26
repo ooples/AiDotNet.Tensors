@@ -1,4 +1,4 @@
-# PR #638 — Whole-step CUDA-graph capture for the cortex: completion plan
+# PR #638 — Whole-step CUDA-graph capture for the downstream model: completion plan
 
 **Branch:** `feat/fp16-capture-residency-claude` → base `feat/fp16-in-capture` (PR #633)
 **Owner anchor:** this doc is the single source of "what "done" means." We do NOT declare completion until the **Acceptance Test (§1)** passes. No "one more piece" framing — every remaining item is a checkbox below, and we work the list to the bottom.
@@ -17,7 +17,7 @@ For several sessions the work was reported as "almost done — one last op" beca
 
 PR #638 is COMPLETE when **all** of these hold in one clean run:
 
-1. **Capture engages:** `scripts/capture_health.sh` on the cortex (d128/L1, N≥8000) prints **`VERDICT: CAPTURE FULLY ENGAGED`** — i.e. `eagerFallback=False`, `CUDA-700 none`, **0 THREW**, and `_stepGraphExec != Zero` (the graph instantiates and replays).
+1. **Capture engages:** `scripts/capture_health.sh` on the downstream model (d128/L1, N≥8000) prints **`VERDICT: CAPTURE FULLY ENGAGED`** — i.e. `eagerFallback=False`, `CUDA-700 none`, **0 THREW**, and `_stepGraphExec != Zero` (the graph instantiates and replays).
 2. **Correctness gate:** held-out **CAND-RANK from the captured run == the eager run at the same seed+config** (within ±0.15pp). This compares *captured-vs-eager at identical config* — NOT against the historical 2.81% (which was a different N). A dedicated `HE_CAPTURE_PARITY` harness produces both numbers.
 3. **Performance gate (the actual point):** captured **s/step < eager s/step by a meaningful margin** (target ≥1.5× at d128/L1; the real prize is the larger config). Measured from wall/steps, plus `GpuMemoryTracker` showing **no per-op host transfers** in the steady-state captured step (only the scalar loss downloads).
 4. **Tests:** full `AiDotNet.Tensors` suite green + a new **resident-backward parity test** (GPU captured grads == CPU grads on a small net).
@@ -33,7 +33,7 @@ If any of 1–5 fails, #638 is **not** done. We do not stop on "frontier advance
 
 - `capture_health.sh` → `eagerFallback=True`, **CUDA-700 FIRED**, `[CAPTURE-INVALIDATED-BY] forwardAction#0` (embedding) with `EmbFloat-resident FELLBACK … CUDA 901` — a *cascade*, not the root.
 - The real error (from `train_loss`): **`cuCtxSynchronize (async-pool OOM reclamation) failed: CUDA-700`**. At d128/L1 (<1 GB expected on a 10 GB card) an OOM = a **per-step GPU memory leak**.
-- **NOT a correctness regression:** the cortex `C=2.86%` (≈ ref 2.81%) — the model trains correctly on the **eager** fallback; only capture-engagement is blocked. (`capture_health`'s "CAND drift" warning misparses *hybrid* 1.79% vs the *C* number.)
+- **NOT a correctness regression:** the downstream model `C=2.86%` (≈ ref 2.81%) — the model trains correctly on the **eager** fallback; only capture-engagement is blocked. (`capture_health`'s "CAND drift" warning misparses *hybrid* 1.79% vs the *C* number.)
 
 **Leak localized via `GpuMemoryTracker` peak-dump (`AIDOTNET_GPU_MEMTRACK=1`, N=600 → 278 MB live, 2284 live allocs):** the dominant retention-by-COUNT is **`MultiHeadAttentionForward` (`DirectGpuTensorEngine.MissingKernels.cs:2481`, via `MultiHeadAttentionLayer.TryFusedAttentionInference`)** — **x540** `TensorMatMul`, **x536** `TensorMatMulTransposed`, **x536** `TensorMultiplyScalar`, **x536** `SoftmaxLastAxisGpu`. It builds a long chain of fresh intermediate tensors per step (Q/K/V projections + per-head `scores`/`attn`/`headOuts` + concat/permute/out-proj); each `TensorMatMul`/`Softmax` records backward so they're tape-live within the step, but they are **not released after the step** → accumulate ~0.46 MB/step at d128/L1 → cross 10 GB by ~N8000 → async-pool OOM → sticky CUDA-700 → capture aborts → eager. This is the SAME leak the sibling branch `gpu-stream-event-safety` WIP `3ff3aea` ("fused-mode ~500MB/step accumulation not yet cracked") was chasing.
 
@@ -57,7 +57,7 @@ The "intermittent CUDA-700 / async-pool OOM" was a **misdiagnosis** (GPU only ev
 
 **Capture frontier progression** (each fix = "work the list" advancing it): `forwardAction#0` (embedding, fixed) → **`forwardAction#25` op=Softmax** (now). Next THREW = the attention **BMM** + Softmax-area matmuls falling to host `CpuEngine.TensorMatMulFloatInto` (CUDA-900) — make them GPU-resident-into. The 700 had been masking ALL of this; with it gone, capture cleanly runs the embedding + 24 forward ops and the path forward is straightforward iterative resident-into work (Phase A, now unblocked).
 
-**UPDATE — generalization attempt + N=8000 (commit `d8b4341`):** A STEP-LEVEL generalized release does NOT help (made opt-in `AIDOTNET_STEP_TRANSIENT_RELEASE=1`): the cortex leak is in the model's `ForwardForTraining` BEFORE `StepEager`'s snapshot, so a step-level sweep can't see it — the effective fix is PER-OP. N=8000 memtrack: the MHA-forward fix is ~94% (intermediates x480-483 vs ~x7000 unfixed), but NOT 100% — ~6% of MHA calls are TAPE-ACTIVE so `!IsTapeActive` correctly skips them, yet the tape-dispose release isn't freeing them either (both filter by caller `ThreadId`; tape lifecycle lives in AiDotNet). And the N=8000 OOM-700 is intertwined with an async illegal-access: it fires at `cuCtxSynchronize (async-pool OOM reclamation)` BEFORE the already-wired `cuMemPoolTrimTo` — a sticky 700 from an earlier async use-after-free (vanishes under per-op sync); live ~1.1GB, ONE 700, test still passes. **Remaining: (a) free tape-active MHA intermediates (AiDotNet tape lifecycle), (b) the async-700 — the sibling `eval-oom` WIP territory.**
+**UPDATE — generalization attempt + N=8000 (commit `d8b4341`):** A STEP-LEVEL generalized release does NOT help (made opt-in `AIDOTNET_STEP_TRANSIENT_RELEASE=1`): the downstream model leak is in the model's `ForwardForTraining` BEFORE `StepEager`'s snapshot, so a step-level sweep can't see it — the effective fix is PER-OP. N=8000 memtrack: the MHA-forward fix is ~94% (intermediates x480-483 vs ~x7000 unfixed), but NOT 100% — ~6% of MHA calls are TAPE-ACTIVE so `!IsTapeActive` correctly skips them, yet the tape-dispose release isn't freeing them either (both filter by caller `ThreadId`; tape lifecycle lives in AiDotNet). And the N=8000 OOM-700 is intertwined with an async illegal-access: it fires at `cuCtxSynchronize (async-pool OOM reclamation)` BEFORE the already-wired `cuMemPoolTrimTo` — a sticky 700 from an earlier async use-after-free (vanishes under per-op sync); live ~1.1GB, ONE 700, test still passes. **Remaining: (a) free tape-active MHA intermediates (AiDotNet tape lifecycle), (b) the async-700 — the sibling `eval-oom` WIP territory.**
 
 ---
 
@@ -96,7 +96,7 @@ The **entire forward + loss is capture-resident** (commits `88ba2db`…`ef7e3b5`
   - 26 copies / 104 MB: `GetDataArray → DeferredArrayMaterializer.TryMaterialize` (backward ops pulling forward activations to host) → A1.
   - 6: `LayerNormBackward`; 2: `SoftmaxBackward`; 1 ea: `ReluBackward`, `ReduceGradToShape→ReduceSum` (engine methods download internally) → A1.
 
-  Trace at `HarmonicEngine/logs/dl_trace.txt`. NB: the eager trace is a valid *work-list* (same backward ops run) but `ResidentStepActive` is false in eager mode, so fixes are verified on the CAPTURE path (`capture_health.sh`, GRAPH_STEP=1).
+  Trace from a downstream run. NB: the eager trace is a valid *work-list* (same backward ops run) but `ResidentStepActive` is false in eager mode, so fixes are verified on the CAPTURE path (`capture_health.sh`, GRAPH_STEP=1).
 - [ ] **A1 — Resident intermediates for the autodiff ops.** For each `engine.Tensor*` in the hot backward ops, ensure the DirectGpu eager op **keeps its result resident** during `ResidentStepActive` (bind `_gpuBuffer`, no download). Candidates from the eligibility/trace list: `TensorMultiply`, `TensorMatMul` (incl. transposed + the rank-4 batched backward), `Softmax` backward, `TensorBroadcastAdd`/reduce, `ReduceGradToShape`, `Negate`, `Log` backward, `FusedLinearWithActivationBackward`, `EmbeddingBackward`. Pattern per op: replace `AllocateOutputBuffer` + `DownloadBuffer` + `new Tensor(host)` with `GetOrCreateResidentBuffer` + `BindResidentBuffer`; gate on resident inputs (`TryGetGpuBuffer()`) to avoid the A2 owned-upload async-free trap.
 
   ⚠️ **A1 KEY CHALLENGE (why this is the multi-session phase): stable buffers for DYNAMIC intermediates.** The generic backward calls `engine.ReluBackward(...)` etc. which return a **freshly-allocated `Tensor` every step**. A naïve "bind resident" would `cuMemAlloc` a NEW device buffer each captured step → a graph-purity violation (the capture pass needs the SAME device pointers the pre-pass instantiated). So A1 isn't just "don't download" — each backward op needs a **stable per-op scratch buffer reused across steps** (like the forward's `_lnStatsScratch` keyed by the output backing array). Likely approaches: (a) key a scratch pool by (op-identity, gradOut stable array) so the same buffer returns each step; or (b) pre-allocate per-backward-step scratch in `CompiledTrainingPlan` (alongside `_preAllocatedGrads`) and have the generic backward write into it. (b) is the more invasive but more robust fix. The dynamic-allocation problem — not the download per se — is the real Phase-A work.
@@ -333,7 +333,7 @@ the batched GEMM matches base exactly. (capture_health's "1.79% DRIFT" is its hy
   the table-grad by index → needs a resident scatter-add kernel.
 
 **Net for #638:** the entire forward pass plus 73/78 of the backward run capture-resident,
-test green and cortex correctness (C 2.86%) intact at every increment. Capture still ABORTS
+test green and downstream-model correctness (C 2.86%) intact at every increment. Capture still ABORTS
 only because the whole-graph capture is invalidated by ANY single remaining download — so
 engagement is the last-5-kernels away. The reusable primitives (`EnsureResidentBuffer`,
 `ResolveResidentBufferNoUpload`, `TryBinaryResidentOutOfPlace`, `TryMatMulResident`, the
@@ -344,9 +344,9 @@ once the broadcast + scatter-add kernels land.
 
 ## 14. ★ 2026-06-19 — PHASE A COMPLETE: WHOLE-STEP CUDA-GRAPH CAPTURE ENGAGES ★
 
-`CAPTURE ✓ ENGAGED (0 in-capture violations)`, CUDA-700 none, test Passed, cortex
+`CAPTURE ✓ ENGAGED (0 in-capture violations)`, CUDA-700 none, test Passed, downstream model
 correctness `C 2.86%` byte-identical. **All 78 backward grad sites are resident; the
-entire forward + backward of the cortex training step is now CUDA-graph-capture-pure.**
+entire forward + backward of the downstream model training step is now CUDA-graph-capture-pure.**
 This is the §1 frontier (capture engages) — done. The work went 7→78 resident grads by
 reusing existing backend kernels + clearing every residual download / non-capturable op.
 
@@ -374,7 +374,7 @@ probe and only fails when the capture frontier actually reaches it.
 
 **REMAINING = PHASE B (replayability), a distinct frontier:** capture BUILDS the graph purely
 but `cuGraphLaunch` on a later step throws `Invalid value` (CudaBackend.Graph.cs:95) → the
-cortex recovers to eager (test passes, no acceleration yet). Likely the per-call async-pool
+downstream model recovers to eager (test passes, no acceleration yet). Likely the per-call async-pool
 allocations the resident-into ops make DURING capture leave the graph's captured device
 pointers invalid on replay → resident-into outputs may need STABLE (pre-allocated, reused)
 buffers. Then Phase C (perf gate: captured vs eager wall-clock), D, E. See plan task Phase B.
@@ -391,7 +391,7 @@ at each launch start and replays every step (the stable gradMap accumulators are
 allocated OUTSIDE the graph, so they survive). `VERDICT ✓ CAPTURE FULLY ENGAGED — launch-
 overhead path live`, full eval ran, test Passed.
 
-**Phase C (perf gate) DONE** — cortex training at d128/L1/8000:
+**Phase C (perf gate) DONE** — downstream-model training at d128/L1/8000:
 - **captured graph: 11s**
 - **eager: 20s**
 - **→ ~1.8× faster**, correctness IDENTICAL (`C 2.86%` both).

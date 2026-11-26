@@ -127,7 +127,7 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
 
     public static IEnumerable<object[]> IrfftCases() =>
     [
-        [new[] { 8, 16 }, 257, 512],   // the LM spectral-FFN shape family: E = 512
+        [new[] { 8, 16 }, 257, 512],   // an LM frequency-domain FFN shape family: E = 512
         [new[] { 3 }, 9, 16],          // small, full length
         [new[] { 2, 5 }, 9, 13],       // trimmed output length
     ];
