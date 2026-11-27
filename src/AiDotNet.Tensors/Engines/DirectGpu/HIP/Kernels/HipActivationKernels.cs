@@ -1074,6 +1074,14 @@ extern ""C"" __global__ __launch_bounds__(256) void threshold_forward(const floa
     output[idx] = input[idx] > thresh ? input[idx] : val;
 }
 
+// Soft shrink: x - clamp(x, -lambda, lambda)
+extern ""C"" __global__ __launch_bounds__(256) void soft_shrink_forward(const float* input, float* output, float lam, int size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx]; float c = -lam > x ? -lam : x; output[idx] = x - (lam < c ? lam : c);
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void threshold_backward(const float* gradOutput, const float* input, float* gradInput, float thresh, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1485,7 +1493,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
             "relu6", "relu6_backward",
             "prelu", "prelu_backward_input", "prelu_backward_alpha", "prelu_backward_alpha_deterministic",
             "rrelu", "rrelu_backward",
-            "threshold_forward", "threshold_backward",
+            "threshold_forward", "threshold_backward", "soft_shrink_forward",
             "reciprocal_backward",
             "var_backward", "std_backward", "masked_fill_backward",
             "where_backward", "norm_backward", "logsumexp_backward",

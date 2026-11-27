@@ -1575,6 +1575,8 @@ public interface IDirectGpuBackend : IGpuDevice
     void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size);
     void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size);
     void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size);
+    /// <summary>Soft shrinkage: <c>output = input - clamp(input, -lambda, lambda)</c> (0 where |input| &lt;= lambda).</summary>
+    void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size);
     void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size);
     /// <summary>
     /// Backward of the reciprocal: gradInput = -gradOutput * y * y, where <paramref name="input"/> holds the forward

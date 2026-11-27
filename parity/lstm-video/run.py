@@ -70,7 +70,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=1,
                         help="Run the pair this many times, alternating which framework goes first, and report the median")
     parser.add_argument("--torch-compile-mode", choices=["default", "reduce-overhead"], default="default",
-                        help="torch.compile mode for the PyTorch trainer. The recording used default; reduce-overhead adds CUDA graphs.")
+                        help="torch.compile mode for the PyTorch trainer. The recording used default; reduce-overhead adds CUDA graphs "
+                             "to whatever Dynamo compiles.")
+    parser.add_argument("--torch-compile-rnn", action="store_true",
+                        help="Let torch.compile trace the trainer's nn.LSTM (torch._dynamo.config.allow_rnn). Without it Dynamo "
+                             "skips the model and PyTorch trains with eager cuDNN, as in the recording.")
     parser.add_argument("--allow-battery", action="store_true", help="Run even when the machine is on battery power")
     args = parser.parse_args()
     if args.repeats < 1 or (args.record and args.repeats != 1):
@@ -142,12 +146,19 @@ def main():
     env.setdefault("TRITON_CACHE_DIR", str(work / "triton-cache"))
     py_models = tree / "AiDotNet/benchmarks/AiDotNet.PyTorchParity/pytorch"
     # Preload the pinned model before the historical trainer adds its author's checkout to sys.path. A non-default
-    # compile mode is applied by binding torch.compile's mode here, so the original trainer still runs byte-for-byte.
-    bootstrap = ("import sys,os,runpy,functools; sys.path.insert(0,os.getcwd()); import benchmark, torch; "
+    # compile mode and allow_rnn are applied here, so the original trainer still runs byte-for-byte. At exit the
+    # bootstrap records how many graphs Dynamo compiled: zero means torch.compile ran the LSTM eagerly.
+    bootstrap = ("import sys,os,runpy,functools,atexit,json; sys.path.insert(0,os.getcwd()); import benchmark, torch; "
+                 "import torch._dynamo.config as dc; from torch._dynamo.utils import counters; "
+                 "dc.allow_rnn=os.environ.get('PARITY_TORCH_ALLOW_RNN')=='1'; "
                  "mode=os.environ.get('PARITY_TORCH_COMPILE_MODE'); "
                  "torch.compile=functools.partial(torch.compile, mode=mode) if mode and mode!='default' else torch.compile; "
-                 "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')")
+                 "sys.argv=sys.argv[1:]; out=os.path.join(sys.argv[1],'compiled_graphs.json'); "
+                 "atexit.register(lambda: open(out,'w').write(json.dumps(dict(graphs=counters['stats']['unique_graphs'], "
+                 "allow_rnn=dc.allow_rnn, mode=mode)))); "
+                 "runpy.run_path(sys.argv[0],run_name='__main__')")
     env["PARITY_TORCH_COMPILE_MODE"] = args.torch_compile_mode
+    env["PARITY_TORCH_ALLOW_RNN"] = "1" if args.torch_compile_rnn else "0"
     takes = []
     for repeat in range(1, args.repeats + 1):
         take = output / ("measurements" if args.repeats == 1 else f"measurements-{repeat}")
@@ -183,12 +194,14 @@ def main():
         if a["initial"] != b["initial"] or abs(a["firstLoss"] - b["firstLoss"]) >= .002:
             raise ValueError("Starting predictions or first loss differ between frameworks")
         result["torch_over_aidotnet"] = result["PyTorch"]["seconds"] / result["AiDotNet"]["seconds"]
+        result["torchCompiledGraphs"] = json.loads((pt / "compiled_graphs.json").read_text())["graphs"]
         takes.append(result)
         print(f"Take {repeat}: AiDotNet {result['AiDotNet']['seconds']:.3f} s, PyTorch {result['PyTorch']['seconds']:.3f} s, "
-              f"{result['torch_over_aidotnet']:.2f}x", flush=True)
+              f"{result['torch_over_aidotnet']:.2f}x, PyTorch compiled {result['torchCompiledGraphs']} graph(s)", flush=True)
     seconds = {name: [t[name]["seconds"] for t in takes] for name in ("AiDotNet", "PyTorch")}
     ratios = [t["torch_over_aidotnet"] for t in takes]
-    summary = dict(torchCompileMode=args.torch_compile_mode, repeats=args.repeats, takes=takes,
+    summary = dict(torchCompileMode=args.torch_compile_mode, torchCompileRnn=args.torch_compile_rnn, repeats=args.repeats,
+                   takes=takes,
                    median_seconds={name: statistics.median(v) for name, v in seconds.items()},
                    torch_over_aidotnet_median=statistics.median(ratios),
                    torch_over_aidotnet_range=[min(ratios), max(ratios)])

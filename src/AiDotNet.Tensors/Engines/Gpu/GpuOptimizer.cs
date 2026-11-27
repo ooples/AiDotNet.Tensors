@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 /// argument fails the GPU-residency contract — caller should fall back
 /// to CPU optimizer.
 /// </remarks>
-public static class GpuOptimizer
+public static partial class GpuOptimizer
 {
     private static GpuSyncPoint CreateWriteSyncPoint(IDirectGpuBackend backend)
         => backend is IAsyncGpuBackend asyncBackend

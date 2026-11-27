@@ -20,7 +20,7 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.HouseholderSource + K.SequenceMixerSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource)
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.HouseholderSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource)
         .Replace(TranslateSolvers(K.ChannelBiasLeakySource), GetChannelBiasLeakySource());
 
     // Keep the shared CUDA constant intact so all backends deduplicate the common module in CLR metadata.
@@ -283,17 +283,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             K.GruWeightHhGrad, K.GruBiasGrad, K.GruRbResetHidden, K.GruRbCandidateProjection, K.GruRbCell, K.GruRbCellBackward,
             K.GruRbResetBackward, K.GruRbHiddenBackward, K.GruRbWeightHhGrad,
             K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw,
-            K.HouseholderNorm, K.HouseholderForward, K.HouseholderBackwardInput, K.HouseholderBackwardReflectorsRaw, K.HouseholderBackwardReflectorsNorm,
-            K.SmxGivensForward, K.SmxGivensBackwardDx, K.SmxGivensBackwardDphi,
-            K.SmxConv2TapForward, K.SmxConv2TapBackwardDx, K.SmxConv2TapBackwardDw,
-            K.SmxRopeL2Forward, K.SmxRopeL2Backward,
-            K.SmxRopeQuadForward, K.SmxRopeQuadBackward,
-            K.SmxProjResForward, K.SmxProjResBackwardRows, K.SmxProjResBackwardDgate,
-            K.SmxSpecCircH, K.SmxSpecCircW, K.SmxSpecCircBackwardDhDd, K.SmxSpecCircBackwardDspec,
-            K.SmxSigTopKMixForward, K.SmxSigTopKBiasUpdate, K.SmxSigTopKMixBackwardDlogits, K.SmxSigTopKMixBackwardDtable,
-            K.SmxDualSwiGluForward, K.SmxDualSwiGluBackwardElem, K.SmxDualSwiGluBackwardDbase,
-            K.SmxBornRatioForward, K.SmxBornRatioBackwardDscan, K.SmxBornRatioBackwardDsink,
-            K.SmxBoundSigForward, K.SmxBoundSigBackwardDlog, K.SmxBoundSigBackwardDbias
+            K.HouseholderNorm, K.HouseholderForward, K.HouseholderBackwardInput, K.HouseholderBackwardReflectorsRaw, K.HouseholderBackwardReflectorsNorm
         };
     }
 }

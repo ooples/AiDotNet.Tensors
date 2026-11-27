@@ -5,3 +5,4 @@ evidence/torch/* -text
 *.mp4 binary
 *.webm binary
 *.bundle binary
+evidence/rerun-2026-11-20/** -text

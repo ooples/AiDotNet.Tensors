@@ -43,15 +43,13 @@ public partial class CpuEngine
 
         int k = reflectors.Shape[0];
         int d = reflectors.Shape[1];
-        if (k <= 0 || d <= 0)
-            throw new ArgumentException("Reflectors shape dimensions must be positive.", nameof(reflectors));
         if (input.Rank < 1 || input.Shape[input.Rank - 1] != d)
             throw new ArgumentException($"Expected last dimension {d}, got [{string.Join(",", input._shape)}].", nameof(input));
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double) && typeof(T).Name != "Half")
             throw new NotSupportedException($"HouseholderChain supports floating-point element types (float, double, Half); got {typeof(T).Name}.");
 
         double effFloor = normFloor > 0.0 ? normFloor : DefaultHouseholderNormFloor<T>();
-        int rows = input.Length / d;
+        int rows = d == 0 ? 0 : input.Length / d; // [..., 0] holds no rows
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
@@ -120,8 +118,9 @@ public partial class CpuEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int k = reflectors.Shape[0];
         int d = reflectors.Shape[1];
-        int rows = input.Length / d;
-        if (rows == 0)
+        int rows = d == 0 ? 0 : input.Length / d; // [..., 0] holds no rows
+        // No rows, or no reflectors (the empty product of reflections is the identity): y = x.
+        if (rows == 0 || k == 0)
             return engine.TensorMultiplyScalar(input, numOps.One);
 
         double sqrtFloor = Math.Sqrt(normFloor);
@@ -162,7 +161,7 @@ public partial class CpuEngine
         var reflectors = inputs[1];
         int k = reflectors.Shape[0];
         int d = reflectors.Shape[1];
-        int rows = input.Length / d;
+        int rows = d == 0 ? 0 : input.Length / d; // [..., 0] holds no rows
 
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
@@ -170,7 +169,7 @@ public partial class CpuEngine
             return;
         }
 
-        if (rows > 0
+        if (rows > 0 && k > 0
             && engine.TryGet<DirectGpuTensorEngine>(out var gpu)
             && gpu.TryHouseholderChainBackwardGpu(gradOutput, input, reflectors, transpose, normFloor) is { } gpuGrads)
         {
@@ -223,8 +222,17 @@ public partial class CpuEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         int k = reflectors.Shape[0];
         int d = reflectors.Shape[1];
-        int rows = input.Length / d;
+        int rows = d == 0 ? 0 : input.Length / d; // [..., 0] holds no rows
         double sqrtFloor = Math.Sqrt(normFloor);
+
+        // No rows or no reflectors: y = x, so dL/dx = dL/dy and nothing reaches the reflectors. Kept on the tape so a
+        // higher-order pass still differentiates through it.
+        if (rows == 0 || k == 0)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, engine.TensorMultiplyScalar(gradOutput, numOps.One), engine);
+            DifferentiableOps.AccumulateGrad(grads, reflectors, engine.TensorMultiplyScalar(reflectors, numOps.Zero), engine);
+            return;
+        }
 
         var rowMaxAbs = engine.StopGradient(engine.ReduceMax(engine.TensorAbs(reflectors), new[] { 1 }, keepDims: true));
         var rowScale = engine.TensorMax(rowMaxAbs, numOps.FromDouble(sqrtFloor / 16.0));

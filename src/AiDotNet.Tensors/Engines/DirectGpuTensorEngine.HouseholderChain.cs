@@ -24,15 +24,13 @@ public partial class DirectGpuTensorEngine
 
         int k = reflectors.Shape[0];
         int d = reflectors.Shape[1];
-        if (k <= 0 || d <= 0)
-            throw new ArgumentException("Reflectors shape dimensions must be positive.", nameof(reflectors));
         if (input.Rank < 1 || input.Shape[input.Rank - 1] != d)
             throw new ArgumentException($"Expected last dimension {d}, got [{string.Join(",", input._shape)}].", nameof(input));
 
         double effFloor = normFloor > 0.0 ? normFloor : DefaultHouseholderNormFloor<T>();
         double sqrtFloor = Math.Sqrt(effFloor);
-        int rows = input.Length / d;
-        if (rows == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
+        int rows = d == 0 ? 0 : input.Length / d; // [..., 0] holds no rows
+        if (rows == 0 || k == 0 || GraphMode.IsActive || typeof(T) != typeof(float)
             || !(sqrtFloor >= 1.1754943508222875e-38 && sqrtFloor <= float.MaxValue)
             || !TryGetBackend(out var backend) || backend is not IFusedHouseholderChain fused)
         {

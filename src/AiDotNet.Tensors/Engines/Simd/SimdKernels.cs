@@ -980,6 +980,63 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// Soft shrinkage in one pass: <c>x - clamp(x, -lambda, lambda)</c>, which is <c>x - lambda</c> above
+        /// <c>lambda</c>, <c>x + lambda</c> below <c>-lambda</c> and exactly +0 between (PyTorch's softshrink). NaN stays NaN.
+        /// </summary>
+        public static unsafe void SoftShrinkUnsafe(float* input, float* output, int length, float lambda)
+        {
+            float lo = -lambda, hi = lambda;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 8)
+            {
+                var vLo = Vector256.Create(lo);
+                var vHi = Vector256.Create(hi);
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    Avx.Store(output + i, Avx.Subtract(x, Avx.Min(vHi, Avx.Max(vLo, x))));
+                }
+            }
+#endif
+            // The tail computes what the vector body does (MAXPS(lo, x) is lo > x ? lo : x, MINPS(hi, c) is hi < c ? hi : c),
+            // so an element's result never depends on its position.
+            for (; i < length; i++)
+            {
+                float x = input[i];
+                float c = lo > x ? lo : x;
+                output[i] = x - (hi < c ? hi : c);
+            }
+        }
+
+        /// <summary>Soft shrinkage in one pass for doubles; see the float overload.</summary>
+        public static unsafe void SoftShrinkUnsafe(double* input, double* output, int length, double lambda)
+        {
+            double lo = -lambda, hi = lambda;
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && length >= 4)
+            {
+                var vLo = Vector256.Create(lo);
+                var vHi = Vector256.Create(hi);
+                int simdLength = length & ~3;
+                for (; i < simdLength; i += 4)
+                {
+                    var x = Avx.LoadVector256(input + i);
+                    Avx.Store(output + i, Avx.Subtract(x, Avx.Min(vHi, Avx.Max(vLo, x))));
+                }
+            }
+#endif
+            for (; i < length; i++)
+            {
+                double x = input[i];
+                double c = lo > x ? lo : x;
+                output[i] = x - (hi < c ? hi : c);
+            }
+        }
+
+        /// <summary>
         /// SIMD Round using AVX RoundToNearestInteger.
         /// </summary>
         [MethodImpl(HotInline)]
