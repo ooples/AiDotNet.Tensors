@@ -91,6 +91,13 @@ internal sealed class PersistentParallelExecutor
     /// found nothing to do), so a test can wait for a held worker to finish instead of sleeping.</summary>
     internal static Action<int>? TestWorkerAttemptDone;
 
+    /// <summary>Tests only: runs on the dispatching thread before it signals worker <c>slot</c>, after the dispatch is
+    /// published; a test can block or be interrupted here as in a contended wake.</summary>
+    internal static Action<int>? TestBeforeWake;
+
+    /// <summary>Tests only: the Job published for the dispatch in flight, if any.</summary>
+    internal object? PublishedJob => _job;
+
     /// <summary>Tests only: whether the latest plain dispatch let the caller steal unstarted chunks without a grace period.</summary>
     internal bool LastDispatchStoleEagerly => Volatile.Read(ref _lastStoleEagerly);
     private bool _lastStoleEagerly;
@@ -303,6 +310,32 @@ internal sealed class PersistentParallelExecutor
         }
         if (interrupted is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(interrupted).Throw();
+    }
+
+    /// <summary>
+    /// Wakes the first <paramref name="count"/> workers of a dispatch already published in <see cref="_job"/>. Set takes
+    /// the event's monitor when a worker waits on it, and a contended monitor entry throws on
+    /// <see cref="Thread.Interrupt"/>; leaving then would skip the drain while woken or warm workers run the
+    /// dispatch's chunks, and their late completions would count against the next dispatch. So every worker is still
+    /// woken, and the interrupt is returned for the caller to report once the dispatch has drained.
+    /// </summary>
+    private ThreadInterruptedException? WakeWorkers(int count)
+    {
+        ThreadInterruptedException? interrupted = null;
+        for (int i = 0; i < count; i++)
+        {
+            try
+            {
+                TestBeforeWake?.Invoke(i);
+                _workReady[i].Set();
+            }
+            catch (ThreadInterruptedException ex)
+            {
+                interrupted ??= ex;
+                i--; // this worker is not signalled yet: signal it again
+            }
+        }
+        return interrupted;
     }
 
     // Serialize concurrent Execute calls
@@ -1162,11 +1195,9 @@ internal sealed class PersistentParallelExecutor
                     _cursors = new long[(_numWorkers + 1) * CursorStride];
                 _job = job; // publish BEFORE waking any worker (the volatile write also publishes the cursors)
 
-                // Wake workers (they're already spinning/blocked on ManualResetEventSlim)
-                for (int i = 0; i < workersNeeded; i++)
-                {
-                    _workReady[i].Set();
-                }
+                // Wake workers (they're already spinning/blocked on ManualResetEventSlim). The Job is published, so an
+                // interrupt here must not leave before the dispatch drains (see WakeWorkers).
+                var wakeInterrupt = WakeWorkers(workersNeeded);
 
                 // The calling thread runs its own set (participant 0), gives the workers a short grace period, then
                 // runs any chunk still unstarted and waits for the ones running elsewhere -- not for every woken
@@ -1189,6 +1220,9 @@ internal sealed class PersistentParallelExecutor
                     _job = null; // release the body's captured references for GC between dispatches
                     job.Clear();
                 }
+
+                if (wakeInterrupt is not null)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(wakeInterrupt).Throw();
 
                 // Re-throw first captured exception (worker or main thread)
                 var workerEx = _workerException;
@@ -1301,8 +1335,7 @@ internal sealed class PersistentParallelExecutor
                     stride: stride);
                 var job = _job;
 
-                for (int i = 0; i < workersNeeded; i++)
-                    _workReady[i].Set();
+                var wakeInterrupt = WakeWorkers(workersNeeded);
 
                 Exception? mainException;
                 try
@@ -1316,6 +1349,9 @@ internal sealed class PersistentParallelExecutor
                 {
                     _job = null; // release the body's captured references for GC between dispatches
                 }
+
+                if (wakeInterrupt is not null)
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(wakeInterrupt).Throw();
 
                 var workerEx = _workerException;
                 if (mainException is not null) throw mainException;

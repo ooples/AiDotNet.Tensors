@@ -89,6 +89,7 @@ public sealed class PersistentExecutorJobReuseTests
             PersistentParallelExecutor.TestWorkerStartDelay = null;
             PersistentParallelExecutor.TestWorkerViewDelay = null;
             PersistentParallelExecutor.TestWorkerAttemptDone = null;
+            PersistentParallelExecutor.TestBeforeWake = null;
             CpuParallelSettings.MaxDegreeOfParallelism = priorDop;
             CpuParallelSettings.UseCooperativePool = priorPool;
         }
@@ -108,14 +109,17 @@ public sealed class PersistentExecutorJobReuseTests
         }) { IsBackground = true };
         thread.Start();
         if (!thread.Join(deadline))
-        {
-            string reason = $"{nameof(PersistentExecutorJobReuseTests)}: the dispatches did not finish within " +
-                $"{deadline.TotalSeconds:F0} s: a dispatch never completed and still holds the executor.";
-            Console.Error.WriteLine(reason);
-            Environment.FailFast(reason);
-        }
+            FailStuck($"the dispatches did not finish within {deadline.TotalSeconds:F0} s");
         if (failure is not null)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    private static void FailStuck(string what)
+    {
+        string reason = $"{nameof(PersistentExecutorJobReuseTests)}: {what}: a dispatch never completed and still " +
+            "holds the executor.";
+        Console.Error.WriteLine(reason);
+        Environment.FailFast(reason);
     }
 
     // Deterministic per-thread noise: mostly nothing, sometimes a spin, rarely a sleep that outlasts many dispatches.
@@ -197,6 +201,7 @@ public sealed class PersistentExecutorJobReuseTests
             var release = new ManualResetEventSlim();
             var heldDone = new ManualResetEventSlim();
             var isHeld = new ThreadLocal<bool>();
+            int holdExpired = 0;
             PersistentParallelExecutor.TestWorkerViewDelay = (slot, published) =>
             {
                 inFlight.Enter();
@@ -204,7 +209,8 @@ public sealed class PersistentExecutorJobReuseTests
                 if (slot != 0 || !published || Interlocked.CompareExchange(ref arm, 0, 1) != 1) return;
                 isHeld.Value = true;
                 holding.Set();
-                release.Wait(Bound);
+                // Asserted on the test thread: a hold that expired early did not span the re-arms.
+                if (!release.Wait(Bound)) Interlocked.Exchange(ref holdExpired, 1);
             };
             PersistentParallelExecutor.TestWorkerAttemptDone = _ =>
             {
@@ -264,6 +270,8 @@ public sealed class PersistentExecutorJobReuseTests
 
                     release.Set();
                     Assert.True(heldDone.Wait(Bound), "the held worker did not finish its attempt");
+                    Assert.True(Volatile.Read(ref holdExpired) == 0,
+                        "the held worker's hold expired before the test released it");
                 }
             }
             finally
@@ -280,9 +288,12 @@ public sealed class PersistentExecutorJobReuseTests
         });
     }
 
-    [Fact]
+    [SkippableFact]
     public void AWorkerHeldFromAWiderDispatch_DoesNotJoinANarrowerOne()
     {
+        // The schedule needs worker slot 1, which a host with fewer than three hardware threads does not have.
+        Skip.If(PersistentParallelExecutor.Instance.WorkerCount < 2,
+            "needs at least two pool workers (three hardware threads)");
         // Slot 1 is woken for A (three participants) and held after reading the plain Job. A finishes; B re-arms the
         // Job with a cap of two participants (the caller and slot 0) and eager stealing. Released while B is live,
         // slot 1 views B; it is outside B's team, so it must neither run nor steal B's chunks.
@@ -294,6 +305,7 @@ public sealed class PersistentExecutorJobReuseTests
             var release = new ManualResetEventSlim();
             var heldDone = new ManualResetEventSlim();
             var isHeld = new ThreadLocal<bool>();
+            int holdExpired = 0;
             try
             {
                 // Parked workers: every dispatch steals eagerly, as the reported schedule needs.
@@ -305,7 +317,8 @@ public sealed class PersistentExecutorJobReuseTests
                     isHeld.Value = true;
                     Volatile.Write(ref heldThread, Environment.CurrentManagedThreadId);
                     holding.Set();
-                    release.Wait(Bound);
+                    // Asserted on the test thread: a hold that expired could view the cleared Job instead of B.
+                    if (!release.Wait(Bound)) Interlocked.Exchange(ref holdExpired, 1);
                 };
                 PersistentParallelExecutor.TestWorkerAttemptDone = _ =>
                 {
@@ -349,6 +362,7 @@ public sealed class PersistentExecutorJobReuseTests
                     b.Run(c);
                 });
                 b.Returned = true;
+                Assert.True(Volatile.Read(ref holdExpired) == 0, "slot 1's hold expired before B released it");
                 Assert.All(b.Hits, h => Assert.Equal(1, h));
                 Assert.True(ranOnHeldWorker == 0,
                     $"{ranOnHeldWorker} chunk(s) of the two-participant dispatch ran on a worker outside its team");
@@ -436,7 +450,8 @@ public sealed class PersistentExecutorJobReuseTests
             {
                 releaseChunk1.Set();
             }
-            Assert.True(dispatcher.Join(Bound), "Execute did not return after its last chunk finished");
+            if (!dispatcher.Join(Bound))
+                FailStuck("Execute did not return after its last chunk finished");
             Assert.IsType<ThreadInterruptedException>(caught);
             Assert.True(chunk1FinishedWhenThrown, "the interrupt was reported before the dispatch drained");
 
@@ -501,21 +516,81 @@ public sealed class PersistentExecutorJobReuseTests
         });
     }
 
-#if NETCOREAPP
     [Fact]
-    public void APlainDispatch_AllocatesNothingOnTheDispatchingThread()
+    public void PlainDispatches_ReuseOneJob_AndAllocateNothingOnTheDispatchingThread()
     {
         WithPool(Math.Max(2, Math.Min(16, Environment.ProcessorCount)), _ =>
         {
+            var executor = PersistentParallelExecutor.Instance;
             var hits = new int[32];
             Action<int> body = c => Interlocked.Increment(ref hits[c]);
-            for (int i = 0; i < 200; i++) PersistentParallelExecutor.Instance.Execute(32, body); // warm up
+            for (int i = 0; i < 200; i++) executor.Execute(32, body); // warm up
+
+            // Every plain dispatch publishes the same Job. Portable: needs no per-thread allocation counter.
+            object? firstJob = null;
+            int otherJobs = 0;
+            Action<int> probe = c =>
+            {
+                if (c != 0) return;
+                var published = executor.PublishedJob;
+                if (published is null || !ReferenceEquals(published, firstJob ??= published))
+                    Interlocked.Increment(ref otherJobs);
+            };
+            for (int i = 0; i < 100; i++) executor.Execute(32, probe);
+            Assert.NotNull(firstJob);
+            Assert.Equal(0, otherJobs);
+            Assert.Null(executor.PublishedJob);
+
+#if NETCOREAPP
             long before = GC.GetAllocatedBytesForCurrentThread();
-            for (int i = 0; i < 1000; i++) PersistentParallelExecutor.Instance.Execute(32, body);
+#endif
+            for (int i = 0; i < 1000; i++) executor.Execute(32, body);
+#if NETCOREAPP
             long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
             Assert.Equal(0, allocated);
+#endif
             Assert.All(hits, h => Assert.Equal(1200, h));
         });
     }
-#endif
+
+    [Fact]
+    public void AnInterruptWhileWakingWorkers_IsReportedOnlyOnceTheDispatchHasDrained()
+    {
+        // Signalling a waiting worker takes the event's monitor, and a contended monitor entry throws when the thread
+        // is interrupted. The hook throws there as that entry does, once, before the first worker is signalled.
+        WithPool(Math.Max(2, Math.Min(8, Environment.ProcessorCount)), _ =>
+        {
+            int thrown = 0;
+            PersistentParallelExecutor.TestBeforeWake = slot =>
+            {
+                if (slot == 0 && Interlocked.Exchange(ref thrown, 1) == 0)
+                    throw new ThreadInterruptedException();
+            };
+            var record = new Dispatch(16);
+            try
+            {
+                Assert.Throws<ThreadInterruptedException>(() =>
+                    PersistentParallelExecutor.Instance.Execute(16, record.Run));
+            }
+            finally
+            {
+                PersistentParallelExecutor.TestBeforeWake = null;
+            }
+            record.Returned = true;
+            Assert.Equal(1, thrown);
+            // The interrupted dispatch still ran every chunk once and was cleared before Execute left.
+            Assert.All(record.Hits, h => Assert.Equal(1, h));
+            Assert.Null(PersistentParallelExecutor.Instance.PublishedJob);
+
+            for (int i = 0; i < 50; i++)
+            {
+                var next = new Dispatch(16);
+                PersistentParallelExecutor.Instance.Execute(16, next.Run);
+                next.Returned = true;
+                Assert.All(next.Hits, h => Assert.Equal(1, h));
+                Assert.Equal(0, next.LateRuns);
+            }
+            Assert.Equal(0, record.LateRuns);
+        });
+    }
 }
