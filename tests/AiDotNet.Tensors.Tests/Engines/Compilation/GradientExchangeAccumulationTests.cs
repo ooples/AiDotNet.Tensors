@@ -403,7 +403,7 @@ public class GradientExchangeAccumulationTests
                 var tokens = Enumerable.Range(0, TailMicro + 1).Select(m => Tokens(w, m)).ToArray();
                 var eager = EagerCombined(run.Raw[w], tokens);
                 for (int i = 0; i < eager.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(eager[i]) == BitConverter.SingleToInt32Bits(run.Combined[w][i]),
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(eager[i]) == TestHelpers.MathCompat.SingleToInt32Bits(run.Combined[w][i]),
                         $"window {w} element {i}: combined {run.Combined[w][i]:R}, eager accumulation {eager[i]:R}");
             }
             // The update ran on the combined gradient (a one-step-per-window plan given it follows the same weights), and
