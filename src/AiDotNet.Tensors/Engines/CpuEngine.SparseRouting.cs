@@ -323,9 +323,21 @@ public partial class CpuEngine
         var savedIndices = (Tensor<int>)savedState[0];
         int numCols = (int)savedState[1];
         var sr = engine.As<CpuEngine>() ?? new CpuEngine();
-        DifferentiableOps.AccumulateGrad(
-            grads, inputs[0], sr.TensorGatherRowValuesBackward(gradOutput, savedIndices, numCols), engine);
+        // The gradient is a fixed linear map of the upstream gradient (a scatter-add at the saved positions). Under
+        // create-graph it is recorded with that map's adjoint, the gather itself, so a second-order gradient that
+        // flows back through it (a top-k mix's routing logits, differentiated against its table) is not lost.
+        var gradValues = BackwardFunctions<T>.CreatesGraph
+            ? GatherRowValuesGradRecorded(sr, gradOutput, savedIndices, numCols)
+            : sr.TensorGatherRowValuesBackward(gradOutput, savedIndices, numCols);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradValues, engine);
     }
+
+    // The create-graph gradient, in its own method so its lambdas (which capture the saved indices) are allocated only
+    // when a graph is being created, never on a first-order call.
+    private static Tensor<T> GatherRowValuesGradRecorded<T>(CpuEngine sr, Tensor<T> gradOutput, Tensor<int> savedIndices, int numCols)
+        => BackwardFunctions<T>.LinearGrad("TensorGatherRowValuesBackward", gradOutput,
+            () => sr.TensorGatherRowValuesBackward(gradOutput, savedIndices, numCols),
+            (eng, cotangent) => eng.TensorGatherRowValues(cotangent, savedIndices));
 
     internal static void TopKWeightedRowMixAutoBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -334,6 +346,12 @@ public partial class CpuEngine
         var table = inputs[0];
         var weights = inputs[1];
         var savedIndices = (Tensor<int>)savedState[0];
+        // Under create-graph the gradients are themselves differentiated, so they have to come from recorded ops: the
+        // kernels below record nothing, and a second-order gradient through the mix (with respect to the table, or
+        // the table and the weights jointly) came back zero.
+        // CreatesGraph first: the range scan reads the indices on the host, which a plain backward must not pay for.
+        if (BackwardFunctions<T>.CreatesGraph && TryTopKWeightedRowMixCompositeBackward(gradOutput, inputs, engine, grads, savedIndices))
+            return;
         var sr = engine.As<CpuEngine>() ?? new CpuEngine();
         if (DifferentiableOps.IsGradientRequired(table))
         {
@@ -345,6 +363,70 @@ public partial class CpuEngine
             DifferentiableOps.AccumulateGrad(
                 grads, weights, sr.TopKWeightedRowMixBackwardWeights(gradOutput, table, savedIndices), engine);
         }
+    }
+
+    // Its own method, entered only under CreatesGraph: the composite's lambda captures the backward's tensors, which in
+    // the backward itself would allocate a closure on every first-order call.
+    private static bool TryTopKWeightedRowMixCompositeBackward<T>(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<int> savedIndices)
+    {
+        var table = inputs[0];
+        var weights = inputs[1];
+        // With no index there is nothing to select: the output is a constant zero and the kernels' zero gradients are exact.
+        if (savedIndices.Length == 0 || savedIndices._shape[savedIndices.Rank - 1] == 0) return false;
+        // Both sources: a create-graph pass installs no gradient-relevance filter (every gradient stays required, as a
+        // higher-order pass may still differentiate through either), so there is nothing to prune here.
+        var sources = new[] { table, weights };
+        var (indices, mask) = TopKInRangeIndicesAndMask<T>(savedIndices, table._shape[0]);
+        var outShape = (int[])gradOutput._shape.Clone();
+        return BackwardFunctions<T>.TryCompositeBackward(gradOutput, sources, engine, grads,
+            eng => TopKWeightedRowMixComposed(eng, table, indices, weights, mask, outShape));
+    }
+
+    // The mix as recorded engine ops: gather the K selected rows of the [G, C] table per output row, scale each by its
+    // weight, sum over K. The gather needs every index in [0, G), while the kernel lets an out-of-range index contribute
+    // zero; so such an index selects row 0 here and a constant 0/1 mask zeroes its weight, which keeps the composition
+    // equal to the kernel and its gradients (to the table and to the weights) zero for that slot.
+    private static Tensor<T> TopKWeightedRowMixComposed<T>(
+        IEngine engine, Tensor<T> table, Tensor<int> indices, Tensor<T> weights, Tensor<T>? mask, int[] outShape)
+    {
+        int k = indices._shape[indices.Rank - 1];
+        int rows = indices.Length / k;
+        int channels = table._shape[1];
+        var flat = indices.Rank == 1 ? indices : indices.Reshape(new[] { indices.Length });
+        var picked = engine.Reshape(engine.TensorIndexSelect(table, flat, 0), new[] { rows, k, channels });
+        var w = engine.Reshape(weights, new[] { rows, k, 1 });
+        if (mask is not null) w = engine.TensorMultiply(w, mask);
+        w = engine.TensorBroadcastTo(w, new[] { rows, k, channels });
+        var mixed = engine.ReduceSum(engine.TensorMultiply(picked, w), new[] { 1 }, keepDims: false);
+        return engine.Reshape(mixed, outShape);
+    }
+
+    // The indices with every out-of-range entry replaced by 0, and a [rows, K, 1] 0/1 mask marking the in-range entries
+    // (null when all are in range).
+    private static (Tensor<int> Indices, Tensor<T>? Mask) TopKInRangeIndicesAndMask<T>(Tensor<int> indices, int numEntries)
+    {
+        var arr = HostArray(indices, out int off);
+        int n = indices.Length;
+        bool allInRange = true;
+        for (int i = 0; i < n && allInRange; i++)
+        {
+            int v = arr[off + i];
+            allInRange = v >= 0 && v < numEntries;
+        }
+        if (allInRange) return (indices, null);
+        var ops = MathHelper.GetNumericOperations<T>();
+        var clamped = new int[n];
+        var mask = new T[n];
+        for (int i = 0; i < n; i++)
+        {
+            int v = arr[off + i];
+            bool ok = v >= 0 && v < numEntries;
+            clamped[i] = ok ? v : 0;
+            mask[i] = ok ? ops.One : ops.Zero;
+        }
+        int k = indices._shape[indices.Rank - 1];
+        return (new Tensor<int>(clamped, (int[])indices._shape.Clone()), new Tensor<T>(mask, new[] { n / k, k, 1 }));
     }
 
     private static Tensor<int> CloneIndicesHost(Tensor<int> indices)

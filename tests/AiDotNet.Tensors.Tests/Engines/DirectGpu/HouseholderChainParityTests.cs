@@ -187,6 +187,59 @@ public sealed class HouseholderChainParityTests
         }
     }
 
+    // An empty chain (K = 0) is the empty product of reflections: the identity, so y = x, dL/dx = dL/dy, and the
+    // [0, D] reflectors get an empty gradient. An empty row length (D = 0) leaves nothing to reflect: every result is
+    // empty and keeps its shape. Neither may throw or divide by D.
+    [Theory]
+    [InlineData(3, 0, 4)]
+    [InlineData(5, 0, 1)]
+    [InlineData(3, 2, 0)]
+    [InlineData(0, 2, 4)]
+    public void CpuHouseholderChain_EmptyChainOrRows_IsTheIdentityWithMatchingGradients(int rows, int k, int dim)
+    {
+        var rng = new Random(77 + rows * 13 + k * 5 + dim);
+        var cpu = new CpuEngine();
+        foreach (bool transpose in new[] { false, true })
+        {
+            var x = RandomTensor(rng, new[] { rows, dim });
+            var u = RandomTensor(rng, new[] { k, dim });
+            var dy = RandomTensor(rng, new[] { rows, dim });
+
+            Tensor<float> y;
+            Dictionary<Tensor<float>, Tensor<float>> grads;
+            var prev = AiDotNetEngine.Current;
+            try
+            {
+                AiDotNetEngine.Current = cpu;
+                using var tape = new GradientTape<float>();
+                y = cpu.HouseholderChain(x, u, transpose);
+                grads = tape.ComputeGradients(cpu.ReduceSum(cpu.TensorMultiply(y, dy), null), new[] { x, u });
+            }
+            finally
+            {
+                AiDotNetEngine.Current = prev;
+            }
+
+            Assert.Equal(new[] { rows, dim }, y.Shape.ToArray());
+            Assert.Equal(x.AsSpan().ToArray(), y.AsSpan().ToArray());
+            Assert.Equal(new[] { k, dim }, grads[u].Shape.ToArray());
+            Assert.All(grads[u].AsSpan().ToArray(), g => Assert.Equal(0f, g));
+            if (grads.TryGetValue(x, out var gx))
+            {
+                Assert.Equal(new[] { rows, dim }, gx.Shape.ToArray());
+                Assert.Equal(dy.AsSpan().ToArray(), gx.AsSpan().ToArray());
+            }
+            else
+            {
+                Assert.Equal(0, x.Length); // only an empty input may have no gradient entry
+            }
+
+            var xd = new Tensor<double>(new double[rows * dim], new[] { rows, dim });
+            var ud = new Tensor<double>(new double[k * dim], new[] { k, dim });
+            Assert.Equal(new[] { rows, dim }, cpu.HouseholderChain(xd, ud, transpose).Shape.ToArray());
+        }
+    }
+
     [Fact]
     public void CpuExtremeReflectorsAndTypeGuards_ProduceExactFiniteResults()
     {

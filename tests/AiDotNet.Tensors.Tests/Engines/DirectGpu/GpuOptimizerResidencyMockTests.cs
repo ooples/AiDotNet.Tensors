@@ -170,6 +170,106 @@ public sealed class GpuOptimizerResidencyMockTests
         Assert.Empty(ctx.State.OptimizerCalls);
     }
 
+    private delegate bool ListStep(Tensor<float>[] ps, Tensor<float>[] gs, Tensor<float>[][] states);
+
+    private static IEnumerable<(string Kernel, int States, ListStep Run)> ListSteps()
+    {
+        yield return ("SgdMomentumUpdate", 1, (p, g, s) => GpuOptimizer.TrySgdMomentumStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0f));
+        yield return ("NagUpdate", 1, (p, g, s) => GpuOptimizer.TryNagStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0f));
+        yield return ("RmspropUpdate", 1, (p, g, s) => GpuOptimizer.TryRmspropStepMultiTensor(p, g, s[0], 0.01f, 0.99f, 1e-8f, 0f));
+        yield return ("AdagradUpdate", 1, (p, g, s) => GpuOptimizer.TryAdagradStepMultiTensor(p, g, s[0], 0.01f, 1e-8f, 0f));
+        yield return ("AdadeltaUpdate", 2, (p, g, s) => GpuOptimizer.TryAdadeltaStepMultiTensor(p, g, s[0], s[1], 0.95f, 1e-6f, 0f));
+        yield return ("AmsgradUpdate", 3, (p, g, s) => GpuOptimizer.TryAmsgradStepMultiTensor(p, g, s[0], s[1], s[2], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+        yield return ("AdamaxUpdate", 2, (p, g, s) => GpuOptimizer.TryAdamaxStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+        yield return ("LionUpdate", 1, (p, g, s) => GpuOptimizer.TryLionStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0.99f, 0f));
+        yield return ("NadamUpdate", 2, (p, g, s) => GpuOptimizer.TryNadamStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+        yield return ("FtrlUpdate", 2, (p, g, s) => GpuOptimizer.TryFtrlStepMultiTensor(p, g, s[0], s[1], 0.01f, 0f, 0f, 0f));
+        yield return ("LambUpdate", 2, (p, g, s) => GpuOptimizer.TryLambStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+        yield return ("LarsUpdate", 1, (p, g, s) => GpuOptimizer.TryLarsStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0f, 0.001f));
+        yield return ("ProximalL1Update", 0, (p, g, s) => GpuOptimizer.TryProximalL1StepMultiTensor(p, g, 0.01f, 0.1f));
+    }
+
+    private static Tensor<float>[] GpuList(IDirectGpuBackend backend, params int[] lengths)
+        => Array.ConvertAll(lengths, len => GpuFloat(backend, len));
+
+    private static Tensor<float>[][] GpuStates(IDirectGpuBackend backend, int count, params int[] lengths)
+    {
+        var states = new Tensor<float>[count][];
+        for (int s = 0; s < count; s++) states[s] = GpuList(backend, lengths);
+        return states;
+    }
+
+    [Fact]
+    public void EveryListOptimizerStep_RunsItsKernelPerTensor_AndMarksParametersAndStateCurrent()
+    {
+        foreach (var (kernel, stateCount, run) in ListSteps())
+        {
+            using var ctx = new MockGpuEngineScope();
+            var ps = GpuList(ctx.Backend, 4, 9, 1);
+            var gs = GpuList(ctx.Backend, 4, 9, 1);
+            var states = GpuStates(ctx.Backend, stateCount, 4, 9, 1);
+            var pBefore = Array.ConvertAll(ps, p => p.Version);
+            var sBefore = Array.ConvertAll(states, list => Array.ConvertAll(list, x => x.Version));
+            var gBefore = Array.ConvertAll(gs, g => g.Version);
+
+            Assert.True(run(ps, gs, states), kernel);
+
+            Assert.Equal(new[] { kernel, kernel, kernel }, ctx.State.OptimizerCalls);
+            for (int i = 0; i < ps.Length; i++)
+            {
+                AssertGpuMarkedCurrent(ps[i], pBefore[i], $"{kernel} parameter {i}");
+                for (int s = 0; s < stateCount; s++)
+                    AssertGpuMarkedCurrent(states[s][i], sBefore[s][i], $"{kernel} state {s} of parameter {i}");
+                Assert.Equal(gBefore[i], gs[i].Version);
+            }
+        }
+    }
+
+    [Fact]
+    public void EveryListOptimizerStep_RefusesTheWholeListBeforeAnyLaunch_WhenOneTensorIsHostOnly()
+    {
+        foreach (var (kernel, stateCount, run) in ListSteps())
+        {
+            // The host-only tensor is the LAST entry, so a per-tensor loop would already have stepped the others.
+            int variants = stateCount > 0 ? 3 : 2;
+            for (int variant = 0; variant < variants; variant++)
+            {
+                using var ctx = new MockGpuEngineScope();
+                var ps = GpuList(ctx.Backend, 4, 9, 1);
+                var gs = GpuList(ctx.Backend, 4, 9, 1);
+                var states = GpuStates(ctx.Backend, stateCount, 4, 9, 1);
+                var host = new Tensor<float>(new float[1], new[] { 1 });
+                if (variant == 0) gs[2] = host;
+                else if (variant == 1) ps[2] = host;
+                else states[stateCount - 1][2] = host;
+                var pBefore = Array.ConvertAll(ps, p => p.Version);
+
+                Assert.False(run(ps, gs, states), $"{kernel} variant {variant}");
+                Assert.Empty(ctx.State.OptimizerCalls);
+                Assert.Equal(pBefore, Array.ConvertAll(ps, p => p.Version));
+            }
+        }
+    }
+
+    [Fact]
+    public void ListOptimizerSteps_SkipEmptyTensors_AndRejectMalformedLists()
+    {
+        using var ctx = new MockGpuEngineScope();
+        var ps = GpuList(ctx.Backend, 4, 0, 2);
+        var gs = GpuList(ctx.Backend, 4, 0, 2);
+        var v = GpuList(ctx.Backend, 4, 0, 2);
+        Assert.True(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, v, 0.01f, 0.9f, 0f));
+        Assert.Equal(new[] { "SgdMomentumUpdate", "SgdMomentumUpdate" }, ctx.State.OptimizerCalls);
+
+        var four = GpuList(ctx.Backend, 4);
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(null, four, four, 0.01f, 0.9f, 0f));
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(four, four, null, 0.01f, 0.9f, 0f));
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(four, GpuList(ctx.Backend, 4, 4), four, 0.01f, 0.9f, 0f));
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(four, four, GpuList(ctx.Backend, 3), 0.01f, 0.9f, 0f));
+        Assert.Throws<ArgumentException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(four, GpuList(ctx.Backend, 3), four, 0.01f, 0.9f, 0f));
+        Assert.Throws<ArgumentNullException>(() => GpuOptimizer.TrySgdMomentumStepMultiTensor(four, four, new Tensor<float>[] { null }, 0.01f, 0.9f, 0f));
+    }
+
     [Fact]
     public void SgdStepMultiTensor_RefusesOnACpuEngine()
     {

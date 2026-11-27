@@ -1242,6 +1242,7 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend, 
     public virtual void RRelu(IGpuBuffer input, IGpuBuffer noise, IGpuBuffer output, int size) => Inner.RRelu(input, noise, output, size);
     public virtual void RReluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer noise, IGpuBuffer gradInput, int size) => Inner.RReluBackward(gradOutput, input, noise, gradInput, size);
     public virtual void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size) => Inner.Threshold(input, output, threshold, value, size);
+    public virtual void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size) => Inner.SoftShrink(input, output, lambda, size);
     public virtual void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size) => Inner.ThresholdBackward(gradOutput, input, gradInput, threshold, size);
     public virtual void ReciprocalBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int size) => Inner.ReciprocalBackward(gradOutput, input, gradInput, size);
     public virtual void VarBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer mean, IGpuBuffer gradInput, int outerSize, int reduceSize) => Inner.VarBackward(gradOutput, input, mean, gradInput, outerSize, reduceSize);

@@ -1141,20 +1141,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BornRatioNormalize``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BoundedSigmoidGate``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.CausalConv1dStep``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean)</Target>
     <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
@@ -1162,21 +1148,7 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseCausalConv1d2Tap``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseConv2DBatchNorm``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32[],System.Int32[],AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double,AiDotNet.Tensors.Engines.FusedActivationType)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DualModulatedSwiGlu``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1226,48 +1198,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32,System.Double,System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.HashGridAlignment)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.ProjectiveGatedResidual``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeL2NormalizeHeads``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double,System.Int32)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeQuadraticOuterFeatures``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Int32,System.Int32)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SigmoidTopKExpertMix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SpectralCirculantMatrix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SplitHalfGivensRotation``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1533,20 +1463,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BornRatioNormalize``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BoundedSigmoidGate``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.CausalConv1dStep``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean)</Target>
     <Left>lib/net462/AiDotNet.Tensors.dll</Left>
     <Right>lib/net462/AiDotNet.Tensors.dll</Right>
@@ -1554,21 +1470,7 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseCausalConv1d2Tap``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseConv2DBatchNorm``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32[],System.Int32[],AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double,AiDotNet.Tensors.Engines.FusedActivationType)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DualModulatedSwiGlu``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net462/AiDotNet.Tensors.dll</Left>
     <Right>lib/net462/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1618,48 +1520,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32,System.Double,System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.HashGridAlignment)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.ProjectiveGatedResidual``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeL2NormalizeHeads``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double,System.Int32)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeQuadraticOuterFeatures``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Int32,System.Int32)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SigmoidTopKExpertMix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SpectralCirculantMatrix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SplitHalfGivensRotation``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net462/AiDotNet.Tensors.dll</Left>
     <Right>lib/net462/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1925,20 +1785,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BornRatioNormalize``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BoundedSigmoidGate``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.CausalConv1dStep``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean)</Target>
     <Left>lib/net471/AiDotNet.Tensors.dll</Left>
     <Right>lib/net471/AiDotNet.Tensors.dll</Right>
@@ -1946,21 +1792,7 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseCausalConv1d2Tap``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseConv2DBatchNorm``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32[],System.Int32[],AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double,AiDotNet.Tensors.Engines.FusedActivationType)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DualModulatedSwiGlu``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net471/AiDotNet.Tensors.dll</Left>
     <Right>lib/net471/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2010,48 +1842,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32,System.Double,System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.HashGridAlignment)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.ProjectiveGatedResidual``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeL2NormalizeHeads``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double,System.Int32)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeQuadraticOuterFeatures``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Int32,System.Int32)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SigmoidTopKExpertMix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SpectralCirculantMatrix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SplitHalfGivensRotation``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net471/AiDotNet.Tensors.dll</Left>
     <Right>lib/net471/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2317,20 +2107,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BornRatioNormalize``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BoundedSigmoidGate``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.CausalConv1dStep``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean)</Target>
     <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
@@ -2338,21 +2114,7 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseCausalConv1d2Tap``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseConv2DBatchNorm``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32[],System.Int32[],AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double,AiDotNet.Tensors.Engines.FusedActivationType)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DualModulatedSwiGlu``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2402,48 +2164,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32,System.Double,System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.HashGridAlignment)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.ProjectiveGatedResidual``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeL2NormalizeHeads``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double,System.Int32)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeQuadraticOuterFeatures``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Int32,System.Int32)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SigmoidTopKExpertMix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SpectralCirculantMatrix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SplitHalfGivensRotation``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2745,20 +2465,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BornRatioNormalize``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.BoundedSigmoidGate``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.CausalConv1dStep``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean)</Target>
     <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
@@ -2766,21 +2472,7 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseCausalConv1d2Tap``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.DepthwiseConv2DBatchNorm``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32[],System.Int32[],AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double,AiDotNet.Tensors.Engines.FusedActivationType)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.DualModulatedSwiGlu``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2830,48 +2522,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.MultiresolutionHashEncodingBackward``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0}[],System.Int32,System.Double,System.Int32,AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.HashGridAlignment)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.ProjectiveGatedResidual``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Double)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeL2NormalizeHeads``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double,System.Int32)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.RopeQuadraticOuterFeatures``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Int32,System.Int32)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SigmoidTopKExpertMix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Int32,System.Double,System.Double)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SpectralCirculantMatrix``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.SplitHalfGivensRotation``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>

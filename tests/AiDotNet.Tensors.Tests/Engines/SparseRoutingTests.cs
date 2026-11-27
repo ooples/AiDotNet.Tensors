@@ -36,7 +36,9 @@ public sealed class SparseRoutingTests
         var t = new Tensor<int>(shape);
         for (int i = 0; i < t.Length; i++)
         {
-            if (includeOutOfBounds && i % 11 == 0)
+            if (includeOutOfBounds && i == t.Length - 1 && i % 11 != 0)
+                t[i] = numBins + 3; // an index past the end in every shape, not only the long ones
+            else if (includeOutOfBounds && i % 11 == 0)
                 t[i] = (i % 2 == 0) ? -1 : numBins + 3;
             else
                 t[i] = rng.Next(0, numBins);
@@ -123,6 +125,104 @@ public sealed class SparseRoutingTests
         var fusedRun = Run(fused: true);
         AssertClose(refRun.Y, fusedRun.Y, "gather_y");
         AssertClose(refRun.Dv, fusedRun.Dv, "gather_dv");
+    }
+
+    // Second order: both backwards record under create-graph, so differentiating the first-order gradients (here
+    // contracted with fixed weights) again matches the one-hot composition built entirely from recorded ops. The
+    // squared output makes every second derivative non-zero, including those through the upstream gradient.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void GatherRowValuesAndTopKMix_SecondOrderGradients_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+        => AssertSecondOrderMatchesOneHotComposition(valShape, g, k, c, includeOutOfBounds: false);
+
+    // An out-of-range index contributes zero; under create-graph its slot must still differentiate to zero rather than
+    // dropping the whole op's second-order gradients.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void GatherRowValuesAndTopKMix_SecondOrderGradients_WithOutOfRangeIndices_MatchOneHotComposition(
+        int[] valShape, int g, int k, int c)
+        => AssertSecondOrderMatchesOneHotComposition(valShape, g, k, c, includeOutOfBounds: true);
+
+    private static void AssertSecondOrderMatchesOneHotComposition(
+        int[] valShape, int g, int k, int c, bool includeOutOfBounds)
+    {
+        var e = new CpuEngine();
+        var gShape = valShape.ToArray();
+        gShape[^1] = g;
+        var idxShape = valShape.ToArray();
+        idxShape[^1] = k;
+        var outShape = valShape.ToArray();
+        outShape[^1] = c;
+        var indices = RandIndices(idxShape, g, 31, includeOutOfBounds);
+        var values = RandFloat(gShape, 32);
+        var table = RandFloat([g, c], 33);
+        var weights = RandFloat(idxShape, 34);
+        var uGather = RandFloat(idxShape, 35);
+        var uMix = RandFloat(outShape, 36);
+        var vValues = RandFloat(gShape, 37);
+        var vTable = RandFloat([g, c], 38);
+        var vWeights = RandFloat(idxShape, 39);
+
+        float[][] Run(bool fused)
+        {
+            using var tape = new GradientTape<float>();
+            var yg = fused ? e.TensorGatherRowValues(values, indices) : DecomposedGatherRowValues(e, values, indices);
+            var ym = fused ? e.TopKWeightedRowMix(table, indices, weights) : DecomposedTopKMix(e, table, indices, weights);
+            var loss = e.TensorAdd(
+                e.ReduceSum(e.TensorMultiply(e.TensorMultiply(yg, yg), uGather), null),
+                e.ReduceSum(e.TensorMultiply(e.TensorMultiply(ym, ym), uMix), null));
+            var first = tape.ComputeGradients(loss, [values, table, weights], createGraph: true);
+            var h = e.TensorAdd(e.TensorAdd(
+                e.ReduceSum(e.TensorMultiply(first[values], vValues), null),
+                e.ReduceSum(e.TensorMultiply(first[table], vTable), null)),
+                e.ReduceSum(e.TensorMultiply(first[weights], vWeights), null));
+            var second = tape.ComputeGradients(h, [values, table, weights]);
+            return [second[values].ToArray(), second[table].ToArray(), second[weights].ToArray()];
+        }
+
+        var reference = Run(fused: false);
+        var fusedRun = Run(fused: true);
+        AssertClose(reference[0], fusedRun[0], "gather_second_dvalues", rel: 1e-4);
+        AssertClose(reference[1], fusedRun[1], "mix_second_dtable", rel: 1e-4);
+        AssertClose(reference[2], fusedRun[2], "mix_second_dweights", rel: 1e-4);
+    }
+
+    // Third order through the mix, with out-of-range indices in the routing: the first gradient is for the table, the
+    // second for the weights, and the third for both.
+    [Theory]
+    [MemberData(nameof(RoutingShapes))]
+    public void TopKMix_ThirdOrderGradients_WithOutOfRangeIndices_MatchOneHotComposition(int[] valShape, int g, int k, int c)
+    {
+        var e = new CpuEngine();
+        var idxShape = valShape.ToArray();
+        idxShape[^1] = k;
+        var outShape = valShape.ToArray();
+        outShape[^1] = c;
+        var indices = RandIndices(idxShape, g, 61, includeOutOfBounds: true);
+        var table = RandFloat([g, c], 62);
+        var weights = RandFloat(idxShape, 63);
+        var u = RandFloat(outShape, 64);
+        var vTable = RandFloat([g, c], 65);
+        var vWeights = RandFloat(idxShape, 66);
+
+        float[][] Run(bool fused)
+        {
+            using var tape = new GradientTape<float>();
+            var y = fused ? e.TopKWeightedRowMix(table, indices, weights) : DecomposedTopKMix(e, table, indices, weights);
+            var loss = e.ReduceSum(e.TensorMultiply(e.TensorMultiply(y, y), u), null);
+            var first = tape.ComputeGradients(loss, [table], createGraph: true);
+            var h = e.ReduceSum(e.TensorMultiply(first[table], vTable), null);
+            var second = tape.ComputeGradients(h, [weights], createGraph: true);
+            var h2 = e.ReduceSum(e.TensorMultiply(second[weights], vWeights), null);
+            var third = tape.ComputeGradients(h2, [table, weights]);
+            return [second[weights].ToArray(), third[table].ToArray(), third[weights].ToArray()];
+        }
+
+        var reference = Run(fused: false);
+        var fusedRun = Run(fused: true);
+        AssertClose(reference[0], fusedRun[0], "mix_second_dweights", rel: 1e-4);
+        AssertClose(reference[1], fusedRun[1], "mix_third_dtable", rel: 1e-4);
+        AssertClose(reference[2], fusedRun[2], "mix_third_dweights", rel: 1e-4);
     }
 
     [Theory]

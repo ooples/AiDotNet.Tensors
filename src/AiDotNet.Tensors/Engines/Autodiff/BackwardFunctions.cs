@@ -4498,6 +4498,22 @@ internal static partial class BackwardFunctions<T>
             double threshold)
         => DiagonalLinearGrad("ThresholdBackward", gradOutput, engine, (e, w) => e.ThresholdBackward(w, x, threshold));
 
+    /// <summary>Soft-shrink backward: the gradient passes through where |x| > lambda and is 0 elsewhere.</summary>
+    internal static void SoftShrinkBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T lambda = numOps.FromDouble((double)savedState[0]);
+        var x = inputs[0];
+        // 1 where |x| > lambda, else 0: the derivative of x - clamp(x, -lambda, lambda), which is a constant mask.
+        var pass = engine.TensorGreaterThan(engine.TensorAbs(x), lambda);
+        var grad = CreatesGraph
+            ? DiagonalLinearGrad("SoftShrinkBackward", gradOutput, engine, (e, w) => e.TensorMultiply(w, pass))
+            : engine.TensorMultiply(gradOutput, pass);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>Flatten backward: reshape gradient back to input shape</summary>
     internal static void FlattenBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

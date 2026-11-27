@@ -512,6 +512,7 @@ fn tanh_op(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct Params {
     size: u32,
     alpha: f32,
+    beta: f32,
 }
 @group(0) @binding(2) var<uniform> params: Params;
 
@@ -626,8 +627,19 @@ fn relu6(@builtin(global_invocation_id) gid: vec3<u32>) {
 fn threshold_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        // params.alpha = threshold value, params.beta (unused) could be fill value but we use 0
-        B[idx] = select(0.0, A[idx], A[idx] > params.alpha);
+        // params.alpha = threshold, params.beta = the value written where x <= threshold
+        B[idx] = select(params.beta, A[idx], A[idx] > params.alpha);
+    }
+}
+
+@compute @workgroup_size(256)
+fn soft_shrink(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx < params.size) {
+        // x - clamp(x, -lambda, lambda), params.alpha = lambda, with the CPU kernel's selects
+        let x = A[idx];
+        let c = select(x, -params.alpha, -params.alpha > x);
+        B[idx] = x - select(c, params.alpha, params.alpha < c);
     }
 }
 ";

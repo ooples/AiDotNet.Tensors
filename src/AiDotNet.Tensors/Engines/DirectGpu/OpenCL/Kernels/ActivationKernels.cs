@@ -1114,6 +1114,12 @@ __kernel void threshold_forward(__global const float* input, __global float* out
     const int idx = get_global_id(0); if (idx >= size) return;
     output[idx] = input[idx] > thresh ? input[idx] : val;
 }
+// Soft shrink: x - clamp(x, -lambda, lambda)
+__kernel void soft_shrink_forward(__global const float* input, __global float* output, const float lam, const int size)
+{
+    const int idx = get_global_id(0); if (idx >= size) return;
+    float x = input[idx]; float c = -lam > x ? -lam : x; output[idx] = x - (lam < c ? lam : c);
+}
 __kernel void threshold_backward(__global const float* gradOutput, __global const float* input, __global float* gradInput, const float thresh, const int size)
 {
     const int idx = get_global_id(0); if (idx >= size) return;
@@ -1538,7 +1544,7 @@ __kernel void clip_by_norm_from_squared_sum(
                 "relu6", "relu6_backward",
                 "prelu", "prelu_backward_input", "prelu_backward_alpha",
                 "rrelu", "rrelu_backward",
-                "threshold_forward", "threshold_backward",
+                "threshold_forward", "threshold_backward", "soft_shrink_forward",
                 "reciprocal_backward",
                 "var_backward", "std_backward", "masked_fill_backward",
                 "where_backward", "norm_backward", "logsumexp_backward",
