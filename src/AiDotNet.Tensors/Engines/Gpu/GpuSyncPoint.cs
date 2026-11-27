@@ -94,6 +94,22 @@ public abstract class GpuSyncPoint : IDisposable
         return new CombinedSyncPoint(syncPoints);
     }
 
+    /// <summary>
+    /// Splits one sync point into <paramref name="count"/> leases that each wait on it, for a single device event that
+    /// several independent owners (for example the tensors of one multi-output op) each hold and release on their own.
+    /// </summary>
+    /// <param name="inner">The sync point the leases share. The group takes ownership of it.</param>
+    /// <param name="count">How many owners hold a lease.</param>
+    /// <returns>
+    /// The leases. For a count of 1 this is <paramref name="inner"/> itself; for a count of 0 or less it is empty and
+    /// <paramref name="inner"/> has already been disposed.
+    /// </returns>
+    /// <remarks>
+    /// For a positive count the caller hands <paramref name="inner"/> to the group: do not dispose it or use it
+    /// directly while any lease is live. Dispose every returned lease; <paramref name="inner"/> is disposed when the
+    /// last one is, so a lease that is never disposed keeps it alive.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="inner"/> is null.</exception>
     public static GpuSyncPoint[] CreateSharedLeaseGroup(GpuSyncPoint inner, int count)
     {
         if (inner is null)
