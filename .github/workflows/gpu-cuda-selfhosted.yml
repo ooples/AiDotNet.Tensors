@@ -391,8 +391,9 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         repository: ooples/AiDotNet
-        # AiDotNet #2524: fractional hash-grid API migration and build-contract repairs.
-        ref: 4e8028853fb311660849f0101bf592574b520c67
+        # AiDotNet #2524 (fractional hash-grid API migration and build-contract repairs) plus one commit on
+        # ci/tensors-cuda-lane-pin passing the LARS epsilon that #1844 added to IDirectGpuBackend.LarsUpdate.
+        ref: d5c13288b5a2bba948f6bcec03759a0304e42321
         path: aidn
         persist-credentials: false
 
