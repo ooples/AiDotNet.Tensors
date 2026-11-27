@@ -3083,6 +3083,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
     }
 
+    public unsafe void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+    {
+        if (!_kernelCache.TryGetValue("soft_shrink_forward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: soft_shrink_forward");
+        IntPtr _p0 = input.Handle; IntPtr _p1 = output.Handle;
+        void** args = stackalloc void*[4]; args[0] = &_p0; args[1] = &_p1; args[2] = &lambda; args[3] = &size;
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        LaunchKernel(krnl, grid, DefaultBlockSize, args); Synchronize();
+    }
+
     public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("threshold_backward", out var krnl)) throw new GpuCapabilityUnavailableException("HIP kernel not found: threshold_backward");

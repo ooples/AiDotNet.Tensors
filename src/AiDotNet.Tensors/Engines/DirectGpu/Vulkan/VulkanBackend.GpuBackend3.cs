@@ -305,6 +305,12 @@ public sealed unsafe partial class VulkanBackend
         GlslUnaryOp(VulkanGlslKernels.Threshold, input, output, size, pushData, (uint)(3 * sizeof(uint)));
     }
 
+    public void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+    {
+        var pushData = new uint[] { (uint)size, FloatToUInt32(lambda) };
+        GlslUnaryOp(VulkanGlslKernels.SoftShrink, input, output, size, pushData, (uint)(2 * sizeof(uint)));
+    }
+
     public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         var pushData = new uint[] { (uint)size, FloatToUInt32(threshold) };

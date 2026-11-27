@@ -2278,6 +2278,16 @@ void main() {
     b[idx] = a[idx] > thresh ? a[idx] : val;
 }";
 
+    public static string SoftShrink => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint size; float lam; };
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= size) return;
+    float x = a[idx];
+    float c = -lam > x ? -lam : x;
+    b[idx] = x - (lam < c ? lam : c);
+}";
+
     public static string ThresholdBackward => Header + ThreeBufferLayout + @"
 layout(push_constant) uniform Params { uint size; float thresh; };
 void main() {

@@ -348,7 +348,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IntPtr _fftModule;
     private IntPtr _spectralPerfModule;
     private IntPtr _householderModule;
-    private IntPtr _sequenceMixerModule;
     private IntPtr _spatialTransformerModule;
     private IntPtr _sparseModule;
     private IntPtr _dotProductModule;
@@ -1644,7 +1643,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         _spectralPerfModule = CompileKernelModule(device, Kernels.CudaSpectralPerfKernels.GetSource(), "spectral_perf_kernels", Kernels.CudaSpectralPerfKernels.GetKernelNames());
         _householderModule = CompileKernelModule(device, Kernels.CudaHouseholderKernels.GetSource(), "householder_kernels", Kernels.CudaHouseholderKernels.GetKernelNames());
-        _sequenceMixerModule = CompileKernelModule(device, Kernels.CudaSequenceMixerKernels.GetSource(), "sequence_mixer_kernels", Kernels.CudaSequenceMixerKernels.GetKernelNames());
         _sparseModule = CompileKernelModule(device, CudaSparseKernels.GetSource(), "sparse_kernels", CudaSparseKernels.GetKernelNames());
         _spatialTransformerModule = CompileKernelModule(device, CudaSpatialTransformerKernels.GetSource(), "spatial_transformer_kernels", CudaSpatialTransformerKernels.GetKernelNames());
 
@@ -12382,6 +12380,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+    {
+        if (!_kernelCache.TryGetValue("soft_shrink_forward", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: soft_shrink_forward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr oPtr = output.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &iPtr; args[1] = &oPtr; args[2] = &lambda; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("threshold_backward", out var kernel))
@@ -20980,12 +20989,6 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         {
             UnloadModule(_householderModule);
             _householderModule = IntPtr.Zero;
-        }
-
-        if (_sequenceMixerModule != IntPtr.Zero)
-        {
-            UnloadModule(_sequenceMixerModule);
-            _sequenceMixerModule = IntPtr.Zero;
         }
 
         if (_spatialTransformerModule != IntPtr.Zero)

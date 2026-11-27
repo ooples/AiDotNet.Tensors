@@ -51875,6 +51875,78 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> TensorSoftShrink<T>(Tensor<T> tensor, T lambda)
+    {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        var numOps = MathHelper.GetNumericOperations<T>();
+        double lambdaD = numOps.ToDouble(lambda);
+        if (!(lambdaD >= 0))
+            throw new ArgumentOutOfRangeException(nameof(lambda), "The shrinkage must be at least 0.");
+
+        if (GraphMode.IsActive)
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("SoftShrink", tensor._shape); if (ac is not null) return ac.Execute(); }
+
+        {
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            if (scope != null)
+            {
+                var captured = tensor;
+                T capLambda = lambda;
+                return scope.RecordUnary(LazyNodeType.Custom, "SoftShrink", captured, captured._shape,
+                    (eng, output) => { var r = eng.TensorSoftShrink(captured, capLambda); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    BackwardFunctions<T>.SoftShrinkBackward, new object[] { lambdaD });
+            }
+        }
+
+        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
+
+        if (typeof(T) == typeof(float))
+        {
+            unsafe
+            {
+                using var srcKeep = new KeepAliveScope(tensor);
+                var srcMem = AsFloatReadOnlyMemory(tensor.ReadOnlyDataUnmarked);
+                using var dstKeep = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SoftShrinkUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)lambdaD);
+            }
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            unsafe
+            {
+                using var srcKeep = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleReadOnlyMemory(tensor.ReadOnlyDataUnmarked);
+                using var dstKeep = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
+                using var pinSrc = srcMem.Pin();
+                using var pinDst = dstMem.Pin();
+                SimdKernels.SoftShrinkUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length, lambdaD);
+            }
+        }
+        else
+        {
+            // Any other T in its own arithmetic (no round trip through double): x - clamp(x, -lambda, lambda), with the
+            // type's span kernels.
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
+            numOps.Clip(src, numOps.Negate(lambda), lambda, dst);
+            numOps.Subtract(src, dst, dst);
+        }
+
+        DifferentiableOps.RecordUnary("SoftShrink", result, tensorOrig, BackwardFunctions<T>.SoftShrinkBackward,
+            savedState: new object[] { lambdaD });
+        AutoTracer.RecordOp("SoftShrink", result, eng => eng.TensorSoftShrink(tensorOrig, lambda));
+        return result;
+    }
+
     /// <summary>Element-wise reciprocal: 1/x</summary>
     public Tensor<T> TensorReciprocal<T>(Tensor<T> tensor)
     {

@@ -1,23 +1,5 @@
 # Changelog
 
-## [0.154.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.153.0...v0.154.0) (2026-11-26)
-
-
-### Features
-
-* checkpointed deterministic gated deltanet backward on every non-cuda backend ([97293ce](https://github.com/ooples/AiDotNet.Tensors/commit/97293ce7fdc924cf8c42ed0e6806d727d95aba96))
-
-
-### Bug Fixes
-
-* rename GLSL/WGSL reserved Householder identifiers, guard net471 module-init test, and sync 0.153.0 suppressions ([dc78072](https://github.com/ooples/AiDotNet.Tensors/commit/dc7807225acbbe4ff22f1c7ae5bc0b60097d7a15))
-
-
-### Performance
-
-* **gpu:** fused Householder/sequence-mixer ops, multi-tensor checkpoint flush, and in-place pointer refresh (2.66x faster than Compiled PyTorch + Triton) ([4cf0768](https://github.com/ooples/AiDotNet.Tensors/commit/4cf076818ea6312d1ad0b465bc5bb59507735a0b))
-* **gpu:** GPU-resident tape broadcast/slice views, O(n) CudaStepArena planner, and warp-register GLA kernels ([0963db6](https://github.com/ooples/AiDotNet.Tensors/commit/0963db6016d71ddf84cafc1399e8718fa7b2b9c8))
-
 ## [0.153.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.152.1...v0.153.0) (2026-11-26)
 
 
