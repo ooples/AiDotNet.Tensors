@@ -241,31 +241,27 @@ public sealed class CudaStepArenaPlanTests
     {
         // Correctness at full size: every one of the 20,000 replayed claims hits a planned slot and none falls back to
         // the pool, which proves the plan has no two overlapping live intervals sharing storage.
-        ReplayLifetimes(segments: 8, perSegment: 2500, out long hits, out long fallbacks);
+        long largeTicks = ReplayLifetimes(segments: 8, perSegment: 2500, out long hits, out long fallbacks, out long largeWork);
         Assert.Equal(8L * 2500, hits);
         Assert.Equal(0L, fallbacks);
 
-        // Speed, as a scaling law rather than a wall-clock constant (a fixed "< 500 ms" fails whenever the host is busy):
-        // planning and replaying 8x the lifetimes must cost well under the 64x a quadratic plan would. Near-linear
-        // packing costs ~8-10x. Each size takes the fastest of several runs, the run least disturbed by other load,
-        // and both sizes run interleaved so load affects them alike.
-        ReplayLifetimes(segments: 1, perSegment: 2500, out _, out _); // JIT warmup
-        long small = long.MaxValue, large = long.MaxValue;
-        for (int rep = 0; rep < 5; rep++)
-        {
-            small = Math.Min(small, ReplayLifetimes(segments: 1, perSegment: 2500, out _, out _));
-            large = Math.Min(large, ReplayLifetimes(segments: 8, perSegment: 2500, out _, out _));
-        }
-        double ratio = (double)large / Math.Max(1, small);
-        _out.WriteLine($"8x lifetimes: {large} vs {small} ticks = {ratio:F2}x");
-        Assert.True(ratio < 24.0,
-            $"8x the lifetimes cost {ratio:F1}x the time ({large} vs {small} ticks); near-linear packing is ~8-10x, quadratic 64x.");
+        // Scaling, counted in the planner's own steps rather than timed: wall-clock ratios measured the host's load (other
+        // tests' GC pauses and CPU contention land far more often in the longer run), not the packing. Planning 8x the
+        // lifetimes must take well under the 64x steps a quadratic plan would; near-linear packing takes ~8x.
+        long smallTicks = ReplayLifetimes(segments: 1, perSegment: 2500, out _, out _, out long smallWork);
+        double workRatio = (double)largeWork / Math.Max(1, smallWork);
+        // Diagnostic only: the time ratio depends on what else the host is running.
+        _out.WriteLine($"8x lifetimes: {largeWork} vs {smallWork} plan steps = {workRatio:F2}x; "
+            + $"{largeTicks} vs {smallTicks} ticks = {(double)largeTicks / Math.Max(1, smallTicks):F2}x");
+        Assert.True(smallWork > 0, "the plan recorded no work");
+        Assert.True(workRatio < 24.0,
+            $"8x the lifetimes took {workRatio:F1}x the plan steps ({largeWork} vs {smallWork}); near-linear packing is ~8x, quadratic 64x.");
     }
 
     // Records one step of checkpoint-like lifetimes (each segment keeps one boundary tensor until backward while its
     // internal buffers overlap within a sliding window of 16 live buffers), then replays the same lifetimes. Returns
-    // the Stopwatch ticks of BuildPlan + replay and reports the replay's slot hits and pool fallbacks.
-    private static long ReplayLifetimes(int segments, int perSegment, out long slotHits, out long poolFallbacks)
+    // the Stopwatch ticks of BuildPlan + replay and reports the replay's slot hits, pool fallbacks and plan steps.
+    private static long ReplayLifetimes(int segments, int perSegment, out long slotHits, out long poolFallbacks, out long planWork)
     {
         int totalCount = segments * perSegment;
         var rng = new Random(20261125);
@@ -323,6 +319,7 @@ public sealed class CudaStepArenaPlanTests
 
         slotHits = arena.SlotHits;
         poolFallbacks = arena.PoolFallbacks;
+        planWork = arena.PlanWorkSteps;
         return sw.ElapsedTicks;
     }
 }

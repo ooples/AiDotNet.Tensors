@@ -64,6 +64,13 @@ internal sealed class CudaStepArena : IDisposable
 
     /// <summary>Slots handed out, pool fallbacks and replans, for tests and diagnostics.</summary>
     internal long SlotHits, PoolFallbacks;
+
+    /// <summary>
+    /// Steps the last <see cref="BuildPlan"/> took: one per lifetime event, per free gap examined and per gap-list
+    /// element shifted by an insert or remove. A count of the planner's work rather than its time, so a test can check
+    /// that it scales near-linearly with the number of lifetimes whatever else the host is doing.
+    /// </summary>
+    internal long PlanWorkSteps;
     internal int Replans => _replans;
     internal long PlannedBytes => _plan?.TotalBytes ?? 0;
 
@@ -395,10 +402,12 @@ internal sealed class CudaStepArena : IDisposable
         var freeGaps = new List<(long Start, long End)>(32);
         long frontier = 0;
         long total = 0;
+        long work = 0;
         for (int t = 0; t < events.Length; t++)
         {
             int ev = events[t];
             if (ev == 0) continue;
+            work++;
             if (ev > 0)
             {
                 int slot = ev - 1;
@@ -407,6 +416,7 @@ internal sealed class CudaStepArena : IDisposable
                 long bestLen = long.MaxValue;
                 for (int g = 0; g < freeGaps.Count; g++)
                 {
+                    work++;
                     long len = freeGaps[g].End - freeGaps[g].Start;
                     if (len >= need && len < bestLen)
                     {
@@ -419,7 +429,7 @@ internal sealed class CudaStepArena : IDisposable
                 {
                     var gap = freeGaps[bestIdx];
                     offset[slot] = gap.Start;
-                    if (bestLen == need) freeGaps.RemoveAt(bestIdx);
+                    if (bestLen == need) { work += freeGaps.Count - bestIdx; freeGaps.RemoveAt(bestIdx); }
                     else freeGaps[bestIdx] = (gap.Start + need, gap.End);
                 }
                 else
@@ -440,6 +450,7 @@ internal sealed class CudaStepArena : IDisposable
                 if (leftAdj && rightAdj)
                 {
                     freeGaps[idx - 1] = (freeGaps[idx - 1].Start, freeGaps[idx].End);
+                    work += freeGaps.Count - idx;
                     freeGaps.RemoveAt(idx);
                 }
                 else if (leftAdj)
@@ -456,6 +467,7 @@ internal sealed class CudaStepArena : IDisposable
                 }
                 else
                 {
+                    work += freeGaps.Count - idx;
                     freeGaps.Insert(idx, (start, end));
                 }
 
@@ -463,9 +475,11 @@ internal sealed class CudaStepArena : IDisposable
                 {
                     frontier = freeGaps[freeGaps.Count - 1].Start;
                     freeGaps.RemoveAt(freeGaps.Count - 1);
+                    work++;
                 }
             }
         }
+        PlanWorkSteps = work;
         if (total == 0) total = Alignment;
         if (total > MaxPlannedBytes) { _mode = Mode.Off; return; }
 
