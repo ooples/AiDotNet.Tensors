@@ -60,6 +60,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         var engine = TestRequire.NotNull(_fixture.Engine, "the fixture's engine");
         Skip.If(engine.GetBackend() is not AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend,
             "The backend has no matmul autocast.");
+        Skip.If(engine.GetBackend() is CudaBackend { SupportsBFloat16GemmFanout: false }, "BFloat16 operand rounding needs compute capability 8.0 or later.");
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
         try
@@ -147,6 +148,9 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         Skip.If(engine.GetBackend() is not CudaBackend, "Matmul autocast is CUDA's.");
         var cuda = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
         Skip.If(!cuda.IsCublasAvailable, "The cast-operands GEMM is cuBLAS's.");
+        // Below compute capability 8.0 the device has no BF16 conversion, and entering BF16 autocast refuses by design.
+        Skip.If(precision == PrecisionMode.BFloat16 && !cuda.SupportsBFloat16GemmFanout,
+            "BFloat16 operand rounding needs compute capability 8.0 or later.");
         using var scheduler = engine.GetStreamScheduler();
         Skip.If(scheduler is null, "The backend has no stream scheduler.");
         // Alpha 0.5 keeps the whole-batch direct-PTX path (alpha 1, beta 0) out of the way.
@@ -227,9 +231,10 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             var b = new Tensor<float>(bShape, new Vector<float>(hostB)).Gpu();
             foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
             {
+                var cuda = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
+                if (precision == PrecisionMode.BFloat16 && !cuda.SupportsBFloat16GemmFanout) continue;   // no BF16 conversion
                 Func<float, float> round = precision == PrecisionMode.Float16 ? RoundToHalf : RoundToBFloat16;
                 float[] mixed;
-                var cuda = (CudaBackend)TestRequire.NotNull(engine.GetBackend(), "the engine's backend");
                 long declines = cuda.AutocastCastDeclinesForTest;
                 using (engine.EnterMatMulAutocast(precision)) mixed = engine.TensorMatMul(a, b).ToArray();
                 Assert.Equal(declines, cuda.AutocastCastDeclinesForTest);   // cast, not the fast fallback
@@ -279,10 +284,13 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
             Assert.Equal((int)CublasComputeType.Float32Fast16F, cuda.GemmAutocastComputeTypeForTest);
             Assert.Equal(0, cuda.GemmAutocastCastTypeForTest);
         }
-        using (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").EnterMatMulAutocast(PrecisionMode.BFloat16))
+        if (cuda.SupportsBFloat16GemmFanout)   // below compute capability 8.0, BF16 autocast refuses by design
         {
-            Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
-            Assert.Equal(CuBlasNative.CUDA_R_16BF, cuda.GemmAutocastCastTypeForTest);
+            using (TestRequire.NotNull(_fixture.Engine, "the fixture's engine").EnterMatMulAutocast(PrecisionMode.BFloat16))
+            {
+                Assert.Equal((int)CublasComputeType.Float32FastBF16, cuda.GemmAutocastComputeTypeForTest);
+                Assert.Equal(CuBlasNative.CUDA_R_16BF, cuda.GemmAutocastCastTypeForTest);
+            }
         }
         Assert.Equal(0, cuda.GemmAutocastCastTypeForTest);
     }
@@ -295,6 +303,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         Skip.If(!_fixture.IsAvailable, "No GPU device.");
         Skip.IfNot(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "CUDA only.");
         var cuda = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)TestRequire.NotNull(TestRequire.NotNull(_fixture.Engine, "the fixture's engine").GetBackend(), "the engine's backend");
+        Skip.IfNot(cuda.SupportsBFloat16GemmFanout, "BFloat16 operand rounding needs compute capability 8.0 or later.");
         var autocast = (AiDotNet.Tensors.Engines.DirectGpu.IGemmAutocastBackend)cuda;
         Assert.Equal(0, cuda.GemmAutocastComputeTypeForTest);
         var a = autocast.EnterGemmAutocast(PrecisionMode.Float16);
@@ -343,6 +352,7 @@ public sealed class CublasComputeTypeTests : IClassFixture<DirectGpuTensorEngine
         using var db = backend.AllocateBuffer(hb);
         foreach (var precision in new[] { PrecisionMode.Float16, PrecisionMode.BFloat16 })
         {
+            if (precision == PrecisionMode.BFloat16 && !backend.SupportsBFloat16GemmFanout) continue;   // no BF16 conversion
             double u = precision == PrecisionMode.Float16 ? Math.Pow(2, -11) : Math.Pow(2, -8);
             double factor = 2 * u + u * u + 2.0 * k * Math.Pow(2, -24);
             float[]? first = null;
