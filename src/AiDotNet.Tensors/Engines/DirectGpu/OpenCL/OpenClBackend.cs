@@ -10402,11 +10402,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (!_kernelCache.TryGetValue("soft_shrink_forward", out var k))
                 throw new GpuCapabilityUnavailableException("OpenCL kernel not found: soft_shrink_forward");
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k.SetArg(arg++, lambda);
-            k.SetArg(arg++, size);
+            k.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(2, lambda);
+            k.SetArg(3, size);
             k.Execute1D(size, Math.Min(256, size));
         }
 
