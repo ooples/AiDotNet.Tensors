@@ -217,6 +217,29 @@ public class WeightRegistryStreamingTests : IDisposable
         Assert.Equal(4, t.Length);
     }
 
+    // A second restore of a streaming weight that another restore already made resident (two Materialize calls that
+    // both saw it dropped) is discarded under the transition gate: the weight keeps the storage a view may already
+    // hold, and the values it published, instead of swapping in a second decode.
+    [Fact]
+    public void RestoreStorageFromBytes_OfAResidentStreamingWeight_KeepsItsStorage()
+    {
+        float[] expected = { 1.5f, -2.25f, 3.125f, 4f };
+        var t = new Tensor<float>(expected, new[] { expected.Length });
+        t.Lifetime = WeightLifetime.Streaming;
+        WeightRegistry.RegisterWeight(t);
+        WeightRegistry.Materialize(t);
+        var storage = t._storage;
+        var data = t.DataVector;
+
+        float[] other = { 9f, 9f, 9f, 9f };
+        t.RestoreStorageFromBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(other.AsSpan()));
+
+        Assert.Same(storage, t._storage);
+        Assert.Same(data, t.DataVector);
+        Assert.Equal(1, t._storage.RefCount);
+        Assert.Equal(expected, t.DataVector.AsSpan().ToArray());
+    }
+
     [Fact]
     public void Materialize_AfterRegister_RestoresExactBytes_Float()
     {

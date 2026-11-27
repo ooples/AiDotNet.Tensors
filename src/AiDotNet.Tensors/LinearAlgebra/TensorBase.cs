@@ -1155,17 +1155,46 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             }
         }
 
-        // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
-        // release the mapping before swapping in the owned bytes.
-        DisposeStreamingMmapOwner();
-        var oldStorage = _storage;
-        _data = fresh;
-        // A restore-pool array shares its array's GPU-cache epoch, as other wrappers of a caller-owned array do: the
-        // GPU engine keys persistent buffers by the backing array, so a recycled array's storage with a fresh local
-        // version would match an upload made for the weight it held before, and the epoch bump below would not reach it.
-        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: restoredArray is not null);
-        InvalidateGpuBindingAfterStorageReplacement();
-        oldStorage.Release();
+        // The decode above runs outside the transition gate; the publication runs under it. BuildViewOfResidentStorage
+        // reads _data and _storage under the gate, so without it a view built while two restores of one dropped weight
+        // overlap (Materialize tests residency without a lock and leaves the registry lock before decoding) could pair
+        // the first restore's vector with the second's storage, and keep a storage whose array was then released.
+        // Nothing below takes the weight registry's lock or an engine lock: the registry may hold its own while it
+        // waits for this gate.
+        bool discarded = false;
+        TensorStorage<T>? replaced = null;
+        lock (StreamingTransitionGate)
+        {
+            // A second decode of a streaming weight that another restore has already made resident is discarded, so
+            // the weight keeps the storage views may already hold.
+            if (Lifetime == WeightLifetime.Streaming && _data.Length == Length)
+            {
+                discarded = true;
+            }
+            else
+            {
+                // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
+                // release the mapping before swapping in the owned bytes.
+                DisposeStreamingMmapOwner();
+                replaced = _storage;
+                _data = fresh;
+                // A restore-pool array shares its array's GPU-cache epoch, as other wrappers of a caller-owned array do:
+                // the GPU engine keys persistent buffers by the backing array, so a recycled array's storage with a fresh
+                // local version would match an upload made for the weight it held before, and the epoch bump below would
+                // not reach it.
+                _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: restoredArray is not null);
+                InvalidateGpuBindingAfterStorageReplacement();
+            }
+        }
+        // Outside the gate: releasing the last reference disposes the storage's GPU-buffer owner (a backend call), and
+        // parking reads the registry's pool cap. A view built under the gate holds its own reference to the storage it
+        // took, so releasing the replaced one here cannot free an array a view still uses.
+        replaced?.Release();
+        if (discarded)
+        {
+            if (restoredArray is not null) ParkUnpublishedRestoreArray(restoredArray);
+            return;
+        }
 
         // A recycled array (#2322) keeps the identity of the weight it last held, so every cache keyed by array
         // identity sees the refill as an in-place mutation: the CPU derived-weight caches and any GPU upload epoch.
@@ -1174,6 +1203,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             Engines.InferenceWeightCache.Invalidate(restoredArray);
             TensorStorage<T>.InvalidateExternalArrayEpoch(restoredArray);
         }
+    }
+
+    // Returns a restore-pool array that a discarded decode filled but never published: nothing else references it.
+    private static void ParkUnpublishedRestoreArray(T[] array)
+    {
+        if (typeof(T) == typeof(float)) StreamingRestoreBuffers<float>.Park((float[])(object)array);
+        else if (typeof(T) == typeof(double)) StreamingRestoreBuffers<double>.Park((double[])(object)array);
     }
 
     private static int ElementSizeForStreaming()
