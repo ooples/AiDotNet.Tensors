@@ -7,6 +7,37 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.AvxCs;
 // Invalid graphs decline before compilation; invalid buffers fail before writes.
 internal static class CpuKernelContract
 {
+    /// <summary>
+    /// Elements per chunk when a pointwise kernel is split across the CPU pool: the elementwise grain every CPU
+    /// elementwise op uses, in whole vectors of <paramref name="width"/> so only the last chunk has a scalar tail.
+    /// </summary>
+    internal static int ChunkElements(int width)
+        => Math.Max(width, Helpers.CpuParallelSettings.ElementwiseGrain / width * width);
+
+    /// <summary>
+    /// Runs a pointwise <paramref name="kernel"/>(inputs, outputs, start, end) over [0, <paramref name="count"/>) in
+    /// fixed chunks of <paramref name="chunk"/> elements across the CPU pool; serially on the calling thread when that
+    /// is one chunk. Each element is computed alone, so the split (fixed by the grain, not the thread count) cannot
+    /// change a result. The degree of parallelism is read once, by ParallelForOrSerial, which also runs serially inside
+    /// another parallel region.
+    /// </summary>
+    internal static void RunChunked<TElement>(TElement[][] inputs, TElement[][] outputs, int count, int chunk,
+        Action<TElement[][], TElement[][], int, int> kernel)
+    {
+        int chunks = count <= 0 ? 0 : (count + chunk - 1) / chunk;
+        if (chunks < 2)
+        {
+            kernel(inputs, outputs, 0, count);
+            return;
+        }
+        long work = (long)count * (inputs.Length + outputs.Length);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, work, c =>
+        {
+            int from = c * chunk;
+            kernel(inputs, outputs, from, Math.Min(count, from + chunk));
+        }, deterministicSafe: true);
+    }
+
     internal static bool TryValidateGraph(CodegenGraph graph, CodegenElementType dtype,
         out int elementCount, out string reason)
     {

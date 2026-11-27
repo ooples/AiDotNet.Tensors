@@ -1,10 +1,10 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 // CPU reference emitter: lowers a CodegenGraph into a .NET
 // Expression tree, compiles it via LambdaExpression.Compile(), and
-// wraps the result in a CodegenKernel. The JIT then applies its own
-// vectorization + inlining on top of the element-wise code we emit,
-// so "AVX-512 CPU" performance is recovered from the baseline JIT
-// without us hand-rolling Vector512 IL.
+// wraps the result in a CodegenKernel. The body runs on
+// System.Numerics.Vector<T> lanes where every op has a lane-exact
+// vector form, and CompiledCpuKernel splits large inputs across the
+// CPU pool in elementwise-grain chunks.
 
 using System;
 using System.Collections.Generic;
@@ -18,8 +18,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.AvxCs;
 /// Emits a CPU kernel by lowering a <see cref="CodegenGraph"/> to a
 /// <see cref="LambdaExpression"/> and compiling it with the
 /// standard .NET JIT. Produces real native code (not interpreted
-/// tree-walking); the JIT auto-vectorizes the element loop on
-/// platforms that support it.
+/// tree-walking); the element loop runs on Vector&lt;T&gt; lanes where
+/// the hardware accelerates them and every op has a lane-exact vector
+/// form, and large inputs are split across the CPU pool.
 /// </summary>
 /// <remarks>
 /// <para><b>Why Expression trees and not Roslyn / IL emit:</b></para>
@@ -114,7 +115,10 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
 
         var inputsParam = Expression.Parameter(typeof(T[][]), "inputs");
         var outputsParam = Expression.Parameter(typeof(T[][]), "outputs");
-        var countParam = Expression.Parameter(typeof(int), "count");
+        // The kernel runs over [start, end): CompiledCpuKernel splits the elements across the CPU pool and hands each
+        // chunk its own range.
+        var startParam = Expression.Parameter(typeof(int), "start");
+        var endParam = Expression.Parameter(typeof(int), "end");
         var iVar = Expression.Variable(typeof(int), "i");
         var body = new List<Expression>();
 
@@ -197,16 +201,24 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
             }
         }
 
-        // Wrap the loop: for (int i = 0; i < count; i++) { ... }
+        // The vector body: Vector<T>.Count elements at a time, the same IEEE operation per lane as the scalar loop (so
+        // the result is bit-identical to it); the scalar loop then finishes the tail from where it stopped. Graphs
+        // with an op Vector<T> cannot compute lane-for-lane identically (transcendentals, rounding, and Max/Min, whose
+        // NaN rule differs) keep the scalar loop alone.
+        var vectorLoop = System.Numerics.Vector.IsHardwareAccelerated
+            ? TryBuildVectorLoop<T>(graph, inputArrays, outputArrays, iVar, startParam, endParam)
+            : null;
+
+        // Wrap the loop: for (i = start, or where the vector body stopped; i < end; i++) { ... }
         var breakLabel = Expression.Label("break");
         var loop = Expression.Block(
             variables: CollectLocalVars(loopBody),
             expressions: new Expression[]
             {
-                Expression.Assign(iVar, Expression.Constant(0)),
+                vectorLoop is null ? Expression.Assign(iVar, startParam) : (Expression)Expression.Empty(),
                 Expression.Loop(
                     Expression.IfThenElse(
-                        Expression.LessThan(iVar, countParam),
+                        Expression.LessThan(iVar, endParam),
                         Expression.Block(
                             Expression.Block(loopBody),
                             Expression.PostIncrementAssign(iVar)),
@@ -214,13 +226,14 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
                     breakLabel),
             });
 
+        if (vectorLoop is not null) body.Add(vectorLoop);
         body.Add(loop);
 
         var outerBlock = Expression.Block(
             variables: CollectOuterVars(inputArrays, outputArrays, iVar),
             expressions: body);
 
-        var lambda = Expression.Lambda<KernelDelegate<T>>(outerBlock, inputsParam, outputsParam, countParam);
+        var lambda = Expression.Lambda<RangeKernelDelegate<T>>(outerBlock, inputsParam, outputsParam, startParam, endParam);
         var compiled = lambda.Compile();
 
         // ─── 3. Produce the source dump ──────────────────────────────
@@ -228,8 +241,110 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
         var source = DumpSource(graph, dtype);
 
         return CodegenEmitResult.Succeeded(
-            new CompiledCpuKernel<T>(graph, dtype, compiled, elementCount),
+            new CompiledCpuKernel<T>(graph, dtype, compiled, elementCount, vectorized: vectorLoop is not null),
             source);
+    }
+
+    private static readonly HashSet<CodegenOpKind> VectorOps = new()
+    {
+        CodegenOpKind.LoadInput, CodegenOpKind.StoreOutput,
+        CodegenOpKind.Add, CodegenOpKind.Sub, CodegenOpKind.Mul, CodegenOpKind.Div,
+        CodegenOpKind.Negate, CodegenOpKind.Abs, CodegenOpKind.Sqrt, CodegenOpKind.ReLU,
+    };
+
+    // for (i = start; i <= end - W; i += W) { the graph on Vector<T> lanes }, leaving i at the first element the
+    // scalar loop still has to compute. Null when an op in the graph has no lane-exact Vector<T> form.
+    private static Expression? TryBuildVectorLoop<T>(CodegenGraph graph, ParameterExpression[] inputArrays,
+        ParameterExpression[] outputArrays, ParameterExpression iVar, ParameterExpression startParam,
+        ParameterExpression endParam) where T : unmanaged
+    {
+        foreach (var node in graph.Nodes)
+            if (!VectorOps.Contains(node.Op)) return null;
+
+        var vecType = typeof(System.Numerics.Vector<T>);
+        var load = vecType.GetConstructor(new[] { typeof(T[]), typeof(int) });
+        var store = vecType.GetMethod(nameof(System.Numerics.Vector<T>.CopyTo), new[] { typeof(T[]), typeof(int) });
+        if (load is null || store is null) return null;
+        int width = System.Numerics.Vector<T>.Count;
+        var zero = Expression.Constant(System.Numerics.Vector<T>.Zero);
+
+        var values = new Expression[graph.Count];
+        var locals = new List<ParameterExpression>();
+        var steps = new List<Expression>();
+        int inputPort = 0, outputPort = 0;
+        for (int n = 0; n < graph.Count; n++)
+        {
+            var node = graph[n];
+            if (node.Op == CodegenOpKind.StoreOutput)
+            {
+                steps.Add(Expression.Call(values[node.Inputs[0]], store, outputArrays[outputPort++], iVar));
+                values[n] = values[node.Inputs[0]];
+                continue;
+            }
+            var v = Expression.Variable(vecType, $"w{n}");
+            locals.Add(v);
+            Expression value = node.Op switch
+            {
+                CodegenOpKind.LoadInput => Expression.New(load, inputArrays[inputPort++], iVar),
+                CodegenOpKind.Add => Expression.Add(values[node.Inputs[0]], values[node.Inputs[1]]),
+                CodegenOpKind.Sub => Expression.Subtract(values[node.Inputs[0]], values[node.Inputs[1]]),
+                CodegenOpKind.Mul => Expression.Multiply(values[node.Inputs[0]], values[node.Inputs[1]]),
+                CodegenOpKind.Div => Expression.Divide(values[node.Inputs[0]], values[node.Inputs[1]]),
+                // Floating lanes flip the sign bit (as scalar -x does); Vector negation on .NET Framework
+                // computes 0 - x, which turns -0 into +0.
+                CodegenOpKind.Negate => FloatingSignMask<T>() is { } signMask
+                    ? CallVector<T>(nameof(System.Numerics.Vector.Xor), values[node.Inputs[0]], signMask)
+                    : Expression.Negate(values[node.Inputs[0]]),
+                CodegenOpKind.Abs => CallVector<T>(nameof(System.Numerics.Vector.Abs), values[node.Inputs[0]]),
+                CodegenOpKind.Sqrt => CallVector<T>(nameof(System.Numerics.Vector.SquareRoot), values[node.Inputs[0]]),
+                // x < 0 ? 0 : x per lane, as the scalar body: NaN and -0 pass through.
+                CodegenOpKind.ReLU => CallVector<T>(nameof(System.Numerics.Vector.ConditionalSelect),
+                    CallVector<T>(nameof(System.Numerics.Vector.LessThan), values[node.Inputs[0]], zero),
+                    zero, values[node.Inputs[0]]),
+                _ => throw new NotSupportedException($"{node.Op} has no vector form."),
+            };
+            steps.Add(Expression.Assign(v, value));
+            values[n] = v;
+        }
+        steps.Add(Expression.AddAssign(iVar, Expression.Constant(width)));
+
+        var lastStart = Expression.Variable(typeof(int), "lastVectorStart");
+        var breakLabel = Expression.Label("vectorBreak");
+        return Expression.Block(
+            new[] { lastStart },
+            Expression.Assign(iVar, startParam),
+            Expression.Assign(lastStart, Expression.Subtract(endParam, Expression.Constant(width))),
+            Expression.Loop(
+                Expression.IfThenElse(
+                    Expression.LessThanOrEqual(iVar, lastStart),
+                    Expression.Block(locals, steps),
+                    Expression.Break(breakLabel)),
+                breakLabel));
+    }
+
+    // A Vector<T> with only the sign bit of each float/double lane set (built from integer bits, because
+    // new Vector<float>(-0f) yields +0 on .NET Framework); null for other element types.
+    private static Expression? FloatingSignMask<T>() where T : unmanaged
+    {
+        if (typeof(T) == typeof(float)) return Expression.Constant(System.Numerics.Vector.AsVectorSingle(new System.Numerics.Vector<int>(int.MinValue)));
+        if (typeof(T) == typeof(double)) return Expression.Constant(System.Numerics.Vector.AsVectorDouble(new System.Numerics.Vector<long>(long.MinValue)));
+        return null;
+    }
+
+    // The generic static of that name on System.Numerics.Vector whose operands and result are all Vector<T>.
+    private static Expression CallVector<T>(string name, params Expression[] args) where T : unmanaged
+    {
+        var vecType = typeof(System.Numerics.Vector<T>);
+        foreach (var method in typeof(System.Numerics.Vector).GetMethods())
+        {
+            if (method.Name != name || !method.IsGenericMethodDefinition) continue;
+            if (method.GetParameters().Length != args.Length) continue;
+            var closed = method.MakeGenericMethod(typeof(T));
+            bool matches = closed.ReturnType == vecType;
+            foreach (var parameter in closed.GetParameters()) matches &= parameter.ParameterType == vecType;
+            if (matches) return Expression.Call(closed, args);
+        }
+        throw new NotSupportedException($"Vector.{name}<{typeof(T).Name}> was not found.");
     }
 
     // Collects variables declared as the first element of each
@@ -427,9 +542,8 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
 }
 
 /// <summary>
-/// The compiled-delegate signature produced by
-/// <see cref="CpuDotNetJitEmitter"/>. Fixed shape so all emitted
-/// kernels share the same callable form. Uses jagged
+/// The whole-buffer kernel signature <see cref="CpuDotNetJitEmitter"/> used to compile to; it now compiles a range form
+/// (start, end) so a call can cover one chunk. Kept as the public whole-buffer callable form. Uses jagged
 /// <c>T[][]</c> rather than <c>Memory&lt;T&gt;[]</c> because Span-
 /// based types are ref structs and cannot be stored in Expression-
 /// tree locals.
@@ -437,25 +551,49 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
 public delegate void KernelDelegate<T>(T[][] inputs, T[][] outputs, int count)
     where T : unmanaged;
 
+/// <summary>The emitted kernel over the element range [start, end), so one call can cover one chunk.</summary>
+internal delegate void RangeKernelDelegate<T>(T[][] inputs, T[][] outputs, int start, int end)
+    where T : unmanaged;
+
 /// <summary>
-/// A kernel backed by a compiled <see cref="KernelDelegate{T}"/>.
+/// A kernel backed by a compiled <see cref="RangeKernelDelegate{T}"/>: vectorized where the graph allows, and split
+/// across the CPU pool in fixed chunks of the elementwise grain, so a large input uses every thread the process allows.
 /// </summary>
+/// <remarks>
+/// Each element is computed alone from its own inputs, so the chunking cannot change a result: the split is fixed by
+/// the grain (not the thread count) and the output is bit-identical to one serial pass. Inputs of fewer than two grains
+/// run serially on the calling thread.
+/// </remarks>
 internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
     where TElement : unmanaged
 {
-    private readonly KernelDelegate<TElement> _delegate;
+    private readonly RangeKernelDelegate<TElement> _delegate;
     private readonly int _elementCount;
+    private readonly int _chunk;
+    private readonly Action<TElement[][], TElement[][], int, int> _run;
 
     public CompiledCpuKernel(
         CodegenGraph graph,
         CodegenElementType dtype,
-        KernelDelegate<TElement> compiled,
-        int elementCount)
+        RangeKernelDelegate<TElement> compiled,
+        int elementCount,
+        bool vectorized)
         : base(dtype, graph, CodegenTarget.CpuDotNetJit)
     {
         _delegate = compiled;
         _elementCount = elementCount;
+        IsVectorized = vectorized;
+        // Whole vectors per chunk, so only the last chunk has a scalar tail.
+        int width = System.Numerics.Vector<TElement>.Count;
+        _chunk = CpuKernelContract.ChunkElements(width);
+        _run = (i, o, from, to) => _delegate(i, o, from, to);
     }
+
+    /// <summary>Whether the emitted body runs on <see cref="System.Numerics.Vector{T}"/> lanes.</summary>
+    internal bool IsVectorized { get; }
+
+    /// <summary>Number of chunks <see cref="Execute{T}"/> splits the elements into (1: one serial pass).</summary>
+    internal int ChunkCount => _elementCount <= 0 ? 0 : (_elementCount + _chunk - 1) / _chunk;
 
     /// <inheritdoc/>
     public override void Execute<T>(T[][] inputs, T[][] outputs)
@@ -468,6 +606,13 @@ internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
 
         var typedInputs = (TElement[][])(object)inputs;
         var typedOutputs = (TElement[][])(object)outputs;
-        _delegate(typedInputs, typedOutputs, _elementCount);
+        CpuKernelContract.RunChunked(typedInputs, typedOutputs, _elementCount, _chunk, _run);
+    }
+
+    /// <summary>One serial pass over every element on the calling thread: the reference a split run must equal.</summary>
+    internal void ExecuteSerial(TElement[][] inputs, TElement[][] outputs)
+    {
+        CpuKernelContract.ValidateBuffers(inputs, outputs, InputCount, OutputCount, _elementCount);
+        _delegate(inputs, outputs, 0, _elementCount);
     }
 }
