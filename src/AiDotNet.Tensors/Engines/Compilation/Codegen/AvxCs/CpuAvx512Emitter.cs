@@ -53,6 +53,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.AvxCs;
 /// </remarks>
 public sealed class CpuAvx512Emitter : IKernelEmitter
 {
+    // Node count up to which a kernel keeps its per-node registers on the stack (64 B each for Vector512).
+    private const int MaxStackNodes = 64;
+
     /// <inheritdoc/>
     public CodegenTarget Target => CodegenTarget.CpuAvx512;
 
@@ -156,7 +159,8 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
             if (inputs.Length != inputCount || outputs.Length != outputCount)
                 throw new ArgumentException("input/output buffer count mismatch.");
 
-            var v = new Vector512<float>[n];
+            // On the stack for any graph of ordinary size: this runs once per chunk.
+            Span<Vector512<float>> v = n <= MaxStackNodes ? stackalloc Vector512<float>[n] : new Vector512<float>[n];
 
             int simdEnd = start + ((end - start) & ~15);
             for (int i = start; i < simdEnd; i += 16)
@@ -199,7 +203,7 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
             }
 
             // Scalar tail for the trailing < 16 elements.
-            var s = new float[n];
+            Span<float> s = n <= MaxStackNodes ? stackalloc float[n] : new float[n];
             for (int i = simdEnd; i < end; i++)
             {
                 for (int k = 0; k < n; k++)
@@ -257,7 +261,8 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
             if (inputs.Length != inputCount || outputs.Length != outputCount)
                 throw new ArgumentException("input/output buffer count mismatch.");
 
-            var v = new Vector512<double>[n];
+            // On the stack for any graph of ordinary size: this runs once per chunk.
+            Span<Vector512<double>> v = n <= MaxStackNodes ? stackalloc Vector512<double>[n] : new Vector512<double>[n];
             int simdEnd = start + ((end - start) & ~7);
             for (int i = start; i < simdEnd; i += 8)
             {
@@ -285,7 +290,7 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
                     }
                 }
             }
-            var s = new double[n];
+            Span<double> s = n <= MaxStackNodes ? stackalloc double[n] : new double[n];
             for (int i = simdEnd; i < end; i++)
             {
                 for (int k = 0; k < n; k++)
@@ -336,7 +341,7 @@ internal sealed class CompiledAvx512Kernel<TElement> : CodegenKernel
 {
     private readonly Action<TElement[][], TElement[][], int, int> _kernel;
     private readonly int _count;
-    private readonly int _chunk;
+    private readonly ChunkedPointwiseRunner<TElement> _runner;
 
     public CompiledAvx512Kernel(
         CodegenGraph graph,
@@ -348,7 +353,18 @@ internal sealed class CompiledAvx512Kernel<TElement> : CodegenKernel
         _kernel = kernel;
         _count = count;
         // 16 floats or 8 doubles per 512-bit vector.
-        _chunk = CpuKernelContract.ChunkElements(64 / System.Runtime.CompilerServices.Unsafe.SizeOf<TElement>());
+        _runner = new ChunkedPointwiseRunner<TElement>(
+            kernel, count, 64 / System.Runtime.CompilerServices.Unsafe.SizeOf<TElement>());
+    }
+
+    /// <summary>Fixed chunks the elements split into (1: one serial pass).</summary>
+    internal int ChunkCount => _runner.ChunkCount;
+
+    /// <summary>One serial pass over every element on the calling thread: the reference a split run must equal.</summary>
+    internal void ExecuteSerial(TElement[][] inputs, TElement[][] outputs)
+    {
+        CpuKernelContract.ValidateBuffers(inputs, outputs, InputCount, OutputCount, _count);
+        _kernel(inputs, outputs, 0, _count);
     }
 
     public override void Execute<T>(T[][] inputs, T[][] outputs)
@@ -361,7 +377,7 @@ internal sealed class CompiledAvx512Kernel<TElement> : CodegenKernel
 
         var typedInputs = (TElement[][])(object)inputs;
         var typedOutputs = (TElement[][])(object)outputs;
-        CpuKernelContract.RunChunked(typedInputs, typedOutputs, _count, _chunk, _kernel);
+        _runner.Run(typedInputs, typedOutputs);
     }
 }
 #endif

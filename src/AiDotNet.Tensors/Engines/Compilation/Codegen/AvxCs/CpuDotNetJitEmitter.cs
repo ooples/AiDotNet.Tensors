@@ -569,8 +569,7 @@ internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
 {
     private readonly RangeKernelDelegate<TElement> _delegate;
     private readonly int _elementCount;
-    private readonly int _chunk;
-    private readonly Action<TElement[][], TElement[][], int, int> _run;
+    private readonly ChunkedPointwiseRunner<TElement> _runner;
 
     public CompiledCpuKernel(
         CodegenGraph graph,
@@ -584,16 +583,15 @@ internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
         _elementCount = elementCount;
         IsVectorized = vectorized;
         // Whole vectors per chunk, so only the last chunk has a scalar tail.
-        int width = System.Numerics.Vector<TElement>.Count;
-        _chunk = CpuKernelContract.ChunkElements(width);
-        _run = (i, o, from, to) => _delegate(i, o, from, to);
+        _runner = new ChunkedPointwiseRunner<TElement>(
+            (i, o, from, to) => compiled(i, o, from, to), elementCount, System.Numerics.Vector<TElement>.Count);
     }
 
     /// <summary>Whether the emitted body runs on <see cref="System.Numerics.Vector{T}"/> lanes.</summary>
     internal bool IsVectorized { get; }
 
     /// <summary>Number of chunks <see cref="Execute{T}"/> splits the elements into (1: one serial pass).</summary>
-    internal int ChunkCount => _elementCount <= 0 ? 0 : (_elementCount + _chunk - 1) / _chunk;
+    internal int ChunkCount => _runner.ChunkCount;
 
     /// <inheritdoc/>
     public override void Execute<T>(T[][] inputs, T[][] outputs)
@@ -606,7 +604,7 @@ internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
 
         var typedInputs = (TElement[][])(object)inputs;
         var typedOutputs = (TElement[][])(object)outputs;
-        CpuKernelContract.RunChunked(typedInputs, typedOutputs, _elementCount, _chunk, _run);
+        _runner.Run(typedInputs, typedOutputs);
     }
 
     /// <summary>One serial pass over every element on the calling thread: the reference a split run must equal.</summary>
