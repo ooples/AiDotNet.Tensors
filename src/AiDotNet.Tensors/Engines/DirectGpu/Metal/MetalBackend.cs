@@ -1925,26 +1925,13 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <summary>
     /// ArgMin along axis for batched data using GPU kernel.
     /// </summary>
+    /// <remarks>
+    /// Shares <see cref="ArgMin"/> for the same reason <see cref="ArgMaxAxis"/> shares ArgMax: the Reduction library's
+    /// argmin_axis wrote int bits into the float index buffer and compared with a native less-than, so a NaN never won
+    /// and a row of +inf or NaN reported index 0 for the wrong reason.
+    /// </remarks>
     public void ArgMinAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
-    {
-        ThrowIfDisposed();
-
-        if (A is not MetalGpuBuffer aBuffer || indices is not MetalGpuBuffer idxBuffer)
-        {
-            throw new ArgumentException("Buffers must be MetalGpuBuffer");
-        }
-
-        var pipeline = GetPipeline("Reduction", _reductionLibrary, "argmin_axis");
-        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(outerSize);
-
-        using var encoder = _commandQueue.CreateScopedComputeEncoder();
-        encoder.SetPipelineState(pipeline.Handle);
-        encoder.SetBuffer(aBuffer, 0);
-        encoder.SetBuffer(idxBuffer, 1);
-        encoder.SetBytes((uint)outerSize, 2);
-        encoder.SetBytes((uint)reduceSize, 3);
-        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
-    }
+        => ArgMin(A, indices, outerSize, reduceSize);
 
     #endregion
 
