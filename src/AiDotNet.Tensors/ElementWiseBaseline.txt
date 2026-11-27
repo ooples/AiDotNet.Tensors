@@ -1051,7 +1051,6 @@
 3	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.GLUFamily<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, AiDotNet.Tensors.NN.Activations.Activations.GLUKind)
 1	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.Hardshrink<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, double)
 2	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.QuickGelu<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
-2	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.Softshrink<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, double)
 2	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.Tanhshrink<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>)
 1	TENS0011|AiDotNet.Tensors.NN.Activations.Activations.Threshold<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>, double, double)
 3	TENS0011|AiDotNet.Tensors.NN.Functional.Functional.Embedding<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<int>, AiDotNet.Tensors.LinearAlgebra.Tensor<T>, int?, double?, double, bool)

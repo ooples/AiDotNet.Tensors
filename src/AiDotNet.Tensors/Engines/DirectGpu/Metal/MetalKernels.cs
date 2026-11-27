@@ -1035,6 +1035,19 @@ kernel void rrelu_backward(
     }
 }
 
+// Soft shrink: x - clamp(x, -lambda, lambda)
+kernel void soft_shrink_forward(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant float& lam [[buffer(2)]],
+    constant uint& size [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < size) {
+        float x = input[gid]; float c = -lam > x ? -lam : x; output[gid] = x - (lam < c ? lam : c);
+    }
+}
+
 // Threshold: x > threshold ? x : value
 kernel void threshold_forward(
     device const float* input [[buffer(0)]],

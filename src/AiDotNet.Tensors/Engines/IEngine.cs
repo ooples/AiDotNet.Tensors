@@ -4672,62 +4672,6 @@ public partial interface IEngine
         bool transpose = false,
         double normFloor = 0.0);
 
-    Tensor<T> SplitHalfGivensRotation<T>(Tensor<T> input, Tensor<T> angles);
-
-    Tensor<T> DepthwiseCausalConv1d2Tap<T>(Tensor<T> input, Tensor<T> weight0, Tensor<T> weight1);
-
-    Tensor<T> RopeL2NormalizeHeads<T>(
-        Tensor<T> input,
-        Tensor<T> cos,
-        Tensor<T> sin,
-        int numHeads,
-        double epsilon = 1e-6,
-        double postScale = 1.0,
-        int startPosition = 0);
-
-    Tensor<T> RopeQuadraticOuterFeatures<T>(
-        Tensor<T> input,
-        Tensor<T> cos,
-        Tensor<T> sin,
-        int numHeads,
-        int outputHeadDim = 0,
-        int startPosition = 0);
-
-    Tensor<T> ProjectiveGatedResidual<T>(
-        Tensor<T> baseHidden,
-        Tensor<T> proposal,
-        Tensor<T> parallelGateLogit,
-        double epsilon = 1e-6);
-
-    Tensor<T> SpectralCirculantMatrix<T>(
-        Tensor<T> diagScale,
-        Tensor<T> spectrumRe,
-        Tensor<T> spectrumIm);
-
-    Tensor<T> SigmoidTopKExpertMix<T>(
-        Tensor<T> logits,
-        Tensor<T> expertTable,
-        Tensor<T> routingBias,
-        int topK,
-        double epsilon = 1e-12,
-        double biasUpdateRate = 0.0);
-
-    Tensor<T> DualModulatedSwiGlu<T>(
-        Tensor<T> gateUpProj,
-        Tensor<T> gateUpGainDelta,
-        Tensor<T> upBase);
-
-    Tensor<T> BornRatioNormalize<T>(
-        Tensor<T> scanOutput,
-        Tensor<T>? sinkLogAlpha,
-        int headDim,
-        double epsilon = 1e-4);
-
-    Tensor<T> BoundedSigmoidGate<T>(
-        Tensor<T> logits,
-        Tensor<T> bias,
-        double floor);
-
     /// <summary>
     /// Fused ABC (Attention with Bounded-memory Control) slot recurrence over a whole sequence as one
     /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.AbcScan.cs</c> (#1464).
@@ -9301,6 +9245,20 @@ public partial interface IEngine
     /// <summary>Threshold: x > threshold ? x : value.</summary>
     Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value);
 
+    /// <summary>
+    /// Soft shrinkage (PyTorch <c>softshrink</c>), the proximal operator of <c>lambda * |x|</c>: <c>x - lambda</c> where
+    /// <c>x &gt; lambda</c>, <c>x + lambda</c> where <c>x &lt; -lambda</c>, and 0 in between, in one fused pass.
+    /// </summary>
+    /// <param name="tensor">The input.</param>
+    /// <param name="lambda">The shrinkage, at least 0.</param>
+    /// <returns>A new tensor of the input's shape.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="lambda"/> is negative or NaN.</exception>
+    /// <remarks>
+    /// The gradient passes through where <c>|x| &gt; lambda</c> and is 0 elsewhere. This is the soft-threshold step of
+    /// L1-regularized (lasso, elastic-net) proximal gradient descent and of ISTA.
+    /// </remarks>
+    Tensor<T> TensorSoftShrink<T>(Tensor<T> tensor, T lambda);
+
     /// <summary>Element-wise reciprocal: 1/x.</summary>
     Tensor<T> TensorReciprocal<T>(Tensor<T> tensor);
 
@@ -9550,7 +9508,7 @@ public partial interface IEngine
 
     // --- Native Complex<T> Tensor Operations ---
     // These operate on Tensor<Complex<T>> directly, avoiding interleaved format conversion overhead.
-    // For maximum performance in spectral processing (FFT, filtering, HRE).
+    // For maximum performance in frequency-domain processing (FFT, filtering).
     //
     // CPU path: Operates on Tensor<Complex<T>> directly with no conversion.
     // GPU path: DirectGpuTensorEngine decomposes Tensor<Complex<T>> to split
@@ -9644,7 +9602,7 @@ public partial interface IEngine
     /// <b>Non-differentiable:</b> this op is registered as non-differentiable in the autograd
     /// <c>OpRegistry</c> and does not record a backward. Use the differentiable equivalent
     /// <c>Tanh&lt;T&gt;</c> in training graphs; use <c>NativeTanh</c> only for inference or
-    /// post-training pipelines (e.g. HRE spectral/audio ops) that need SIMD throughput.
+    /// post-training pipelines (e.g. frequency-domain/audio ops) that need SIMD throughput.
     /// </remarks>
     Tensor<T> NativeTanh<T>(Tensor<T> input);
 
@@ -9864,8 +9822,8 @@ public partial interface IEngine
     // ─── HRR binding primitives (issue #248) ─────────────────────────
     //
     // These five methods replace the hand-rolled stitching of 6+
-    // TensorPrimitives calls per HRR bind/unbind that blocked scaling in
-    // the HRE research campaign's cycle 12 build.
+    // TensorPrimitives calls per HRR bind/unbind that blocked scaling to
+    // larger workloads.
     //
     // Type-support matrix:
     //   - NativeComplexPointwiseMultiply<T>       : any numeric T (CPU
@@ -10046,7 +10004,7 @@ public partial interface IEngine
     /// Fused HRR bind + accumulate across N training pairs:
     /// <c>memory += Σ_n keyCode[keyIds[n]] · valPermCode[valIds[n]]</c>
     /// where <c>·</c> is pointwise complex multiplication. Replaces
-    /// N × 6 TensorPrimitives calls; the single hottest loop in HRE's
+    /// N × 6 TensorPrimitives calls; the hottest loop in a typical
     /// memory-build phase. The caller passes
     /// <paramref name="valPermCodeRe"/> / <paramref name="valPermCodeIm"/>
     /// pre-permuted so the gather + permute + multiply + accumulate
