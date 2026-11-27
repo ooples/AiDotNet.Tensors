@@ -744,8 +744,9 @@ public class GradientExchangeAccumulationTests
         }
     }
 
-    // Plans sharing one accumulator step one at a time: a step while another holds it is refused before anything is
-    // touched, and a disposed accumulator refuses every step.
+    // Plans sharing one accumulator step one at a time: a step while another holds it is refused before its exchange
+    // touches the accumulator (and its update), a disposed accumulator refuses every step, and neither an accumulator in
+    // use nor one without an exchange is accepted.
     [SkippableTheory]
     [InlineData("cpu")]
     [InlineData("device")]
@@ -765,11 +766,83 @@ public class GradientExchangeAccumulationTests
             var busy = Assert.Throws<InvalidOperationException>(() => plan.Step());
             Assert.Contains("in use by another step", busy.Message);
             Assert.Equal(1, accumulation.Steps);
+            var disposeBusy = Assert.Throws<InvalidOperationException>(() => accumulation.Dispose());
+            Assert.Contains("while a step is using it", disposeBusy.Message);
             accumulation.ExitStep();
+            Assert.Throws<ArgumentException>(() => compiled.SetGradientExchange(null, accumulation));
             plan.Step();
             Assert.Equal(2, accumulation.Steps);
             accumulation.Dispose();
             Assert.Throws<ObjectDisposedException>(() => plan.Step());
+            Assert.Equal(0, compiled.OptimizerStep);
+        }
+    }
+
+    // A shared accumulator forgets, at a window's end, the parameters no step of that window used: a loop that builds
+    // new plans (new parameters) does not keep the old ones' slots alive.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void ASharedAccumulator_DropsTheSlotsOfParametersAWindowDidNotUse(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        {
+            using var accumulation = new GradientAccumulation<float>();
+            int step = 0;
+            Action<GradientExchange<float>> callback = exchange =>
+            {
+                if (step % 2 == 0) exchange.DeferUpdate(1.0);
+                else exchange.CombineAccumulated(0.5, 0.5);
+            };
+            using (var first = CompileSmall(engine, out _))
+            {
+                first.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+                ((CompiledTrainingPlan<float>)first).SetGradientExchange(callback, accumulation);
+                for (step = 0; step < 2; step++) first.Step();
+            }
+            Assert.Equal(1, accumulation.SlotCountForTests);
+            using var second = CompileSmall(engine, out _);
+            var compiled = (CompiledTrainingPlan<float>)second;
+            second.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            compiled.SetGradientExchange(callback, accumulation);
+            step = 0;
+            second.Step();
+            Assert.Equal(2, accumulation.SlotCountForTests);   // the old plan's slot stays until the window ends
+            step = 1;
+            second.Step();
+            Assert.Equal(1, accumulation.SlotCountForTests);
+            Assert.Equal(1, compiled.OptimizerStep);
+        }
+    }
+
+    // Gradients another plan deferred into a shared accumulator are not combined by a loss-scaled plan: its update
+    // would unscale them by its own scale.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void ALossScaledPlan_RefusesToCombineASharedWindow(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        {
+            using var accumulation = new GradientAccumulation<float>();
+            using var deferring = CompileSmall(engine, out _);
+            deferring.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            ((CompiledTrainingPlan<float>)deferring).SetGradientExchange(e => e.DeferUpdate(1.0), accumulation);
+            deferring.Step();
+            Assert.Equal(1, accumulation.Steps);
+            using var scaled = CompileSmall(engine, out _);
+            var compiled = (CompiledTrainingPlan<float>)scaled;
+            scaled.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            ((ICompiledTrainingPlanLossScaling)scaled).ConfigureLossScaling(new LossScalingOptions { InitialScale = 8f });
+            Exception? combineFailure = null;
+            compiled.SetGradientExchange(e => combineFailure = Record.Exception(() => e.CombineAccumulated(0.5, 0.5)),
+                accumulation);
+            Assert.Throws<InvalidOperationException>(() => scaled.Step());   // neither deferred nor combined: refused
+            var refusal = Assert.IsType<InvalidOperationException>(combineFailure);
+            Assert.Contains("cannot combine", refusal.Message);
+            Assert.Contains("loss scaling", refusal.Message);
             Assert.Equal(0, compiled.OptimizerStep);
         }
     }

@@ -168,6 +168,10 @@ internal sealed class GradientExchange<T>
                 + "after, the local accumulator would be added to the reduced gradient.");
         if (_accumulation is not { Steps: > 0 } acc)
             throw new InvalidOperationException("There are no accumulated gradients to combine.");
+        // Another plan sharing the accumulator deferred them: this plan's update would treat them as it treats its own
+        // step (unscaled by its loss scale, or applied at Schedule-Free's transformed parameters).
+        if (_deferRefusal is { } why)
+            throw new InvalidOperationException("This step cannot combine accumulated gradients: " + why + ".");
         if (UpdateDeferred || _combined)
             throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
         if (AccumulationFaulted)
@@ -526,8 +530,9 @@ internal sealed class GradientExchange<T>
 
 /// <summary>
 /// A compiled plan's gradient accumulator across steps whose update was deferred (<see
-/// cref="GradientExchange{T}.DeferUpdate"/>): one buffer per exchanged gradient, on the device where the gradient is a
-/// device buffer and on the host otherwise, owned by the plan and kept across accumulation windows.
+/// cref="GradientExchange{T}.DeferUpdate"/>): one buffer per parameter, on the device where its gradient is a device
+/// buffer and on the host otherwise, kept across accumulation windows. Either a plan's own, or the caller's, shared by
+/// every plan a window's micro-batches run through.
 /// </summary>
 internal sealed class GradientAccumulation<T> : IDisposable
 {
@@ -540,6 +545,9 @@ internal sealed class GradientAccumulation<T> : IDisposable
         // Whether the slot holds a deferred step's gradient in this window (false: its contents are stale, and the next
         // deferral sets it instead of adding to it, as PyTorch accumulates into a parameter whose grad was None).
         internal bool Holds;
+        // Whether a step of the current window prepared the slot. One that no step of a window used is dropped at its
+        // end, so a shared accumulator does not keep the parameters (and buffers) of plans that are gone.
+        internal bool Used;
         internal Slot(int length) { Length = length; }
     }
 
@@ -549,7 +557,7 @@ internal sealed class GradientAccumulation<T> : IDisposable
     private readonly Dictionary<Tensor<T>, Slot> _slots =
         new(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
     private Engines.DirectGpu.IDirectGpuBackend? _backend;
-    private bool _disposed;
+    private volatile bool _disposed;
     // 1 while a step is using the accumulator (EnterStep .. ExitStep). Plans that share it serialize their steps on
     // their own locks only, so two steps on two threads would both mutate it: the second is refused instead (torch's
     // no_sync is not thread-safe either).
@@ -587,6 +595,7 @@ internal sealed class GradientAccumulation<T> : IDisposable
     internal Slot[] Prepare(Tensor<T>[] parameters, Tensor<T>[] gradients, Engines.DirectGpu.IGpuBuffer?[] device,
         Engines.DirectGpu.IDirectGpuBackend? backend)
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientAccumulation<T>));
         if (_backend is not null && !ReferenceEquals(backend, _backend))
         {
             // Another backend cannot read these buffers: the held values go to the host first.
@@ -618,6 +627,7 @@ internal sealed class GradientAccumulation<T> : IDisposable
                 slot = null;
             }
             if (slot is null) _slots[parameter] = slot = new Slot(length);
+            slot.Used = true;
             result[i] = slot;
             if (length == 0) continue;
             if (typeof(T) == typeof(float) && device[i] is not null && backend is not null)
@@ -673,12 +683,30 @@ internal sealed class GradientAccumulation<T> : IDisposable
         }
     }
 
-    /// <summary>Ends the window: every slot's contents become stale (the buffers are kept for the next window).</summary>
+    /// <summary>
+    /// Ends the window: every slot's contents become stale. The buffers of the parameters the window used are kept for
+    /// the next window; the others are freed and their parameters forgotten.
+    /// </summary>
     internal void EndWindow()
     {
-        foreach (var slot in _slots.Values) slot.Holds = false;
+        List<Tensor<T>>? unused = null;
+        foreach (var pair in _slots)
+        {
+            if (!pair.Value.Used) (unused ??= new List<Tensor<T>>()).Add(pair.Key);
+            pair.Value.Holds = false;
+            pair.Value.Used = false;
+        }
+        if (unused is not null)
+            foreach (var parameter in unused)
+            {
+                _slots[parameter].Device?.Dispose();
+                _slots.Remove(parameter);
+            }
         Steps = 0;
     }
+
+    /// <summary>The parameters the accumulator keeps a slot for, for tests.</summary>
+    internal int SlotCountForTests => _slots.Count;
 
     private void MoveToHost(Slot slot)
     {
@@ -761,12 +789,19 @@ internal sealed class GradientAccumulation<T> : IDisposable
 
     /// <summary>
     /// Frees the device slots; afterwards the accumulator refuses every step. Dispose it before the engine whose backend
-    /// allocated its slots.
+    /// allocated its slots, and not while a step is using it (that throws).
     /// </summary>
     public void Dispose()
     {
-        _disposed = true;
-        ReleaseSlots();
+        if (_disposed) return;
+        if (System.Threading.Interlocked.CompareExchange(ref _inUse, 1, 0) != 0)
+            throw new InvalidOperationException("The gradient accumulator cannot be disposed while a step is using it.");
+        try
+        {
+            _disposed = true;
+            ReleaseSlots();
+        }
+        finally { System.Threading.Volatile.Write(ref _inUse, 0); }
     }
 
     private void ReleaseSlots()
@@ -851,6 +886,8 @@ internal sealed partial class CompiledTrainingPlan<T>
     internal void SetGradientExchange(Action<GradientExchange<T>>? exchange, GradientAccumulation<T>? accumulation = null)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (exchange is null && accumulation is not null)
+            throw new ArgumentException("An accumulator needs an exchange to defer through.", nameof(accumulation));
         lock (_stepSync)
         {
             // The running callback still holds its step's exchange, whose accumulator the replacement would clear and
@@ -919,41 +956,46 @@ internal sealed partial class CompiledTrainingPlan<T>
             _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray),
             _gradientAccumulation, deferRefusal);
         var accumulation = _gradientAccumulation;
+        // Held from before the callback until the window checks are done: another plan sharing the accumulator must not
+        // step in between, or this step's checks would drop (or misjudge) that step's window.
         accumulation.EnterStep();
         try
         {
-            _exchangeCallbackRunning = true;
-            try { exchange(step); }
-            finally { _exchangeCallbackRunning = false; }
-        }
-        catch when (step.AccumulatorTouched)
-        {
-            // The accumulator took (some of) this step's gradients, or was (partly) folded into them: a retried step
-            // would count twice, and a combined window lives only in this step's gradients. The window is dropped.
-            _gradientAccumulation.Release();
-            throw;
+            try
+            {
+                _exchangeCallbackRunning = true;
+                try { exchange(step); }
+                finally { _exchangeCallbackRunning = false; }
+            }
+            catch when (step.AccumulatorTouched)
+            {
+                // The accumulator took (some of) this step's gradients, or was (partly) folded into them: a retried step
+                // would count twice, and a combined window lives only in this step's gradients. The window is dropped.
+                accumulation.Release();
+                throw;
+            }
+            if (step.AccumulationFaulted)
+            {
+                // An accumulation write threw part-way and the callback returned anyway: the gradients are part-scaled,
+                // so the update must not run on them, and the part-written window is dropped.
+                accumulation.Release();
+                throw new InvalidOperationException(
+                    "An accumulation write failed part-way inside the gradient exchange; the step was refused and the "
+                    + "accumulation window was dropped.");
+            }
+            if (!step.UpdateDeferred && !step.CombinedAccumulation && accumulation.Steps > 0)
+            {
+                // An update would run with the window still open, and the next combine would mix gradients from before
+                // and after it. The window is dropped and the step refused before its update.
+                accumulation.Release();
+                throw new InvalidOperationException(
+                    "The exchange neither deferred this step's update nor combined the accumulated gradients, with "
+                    + "accumulated steps pending; the accumulation window was dropped.");
+            }
         }
         finally
         {
             accumulation.ExitStep();
-        }
-        if (step.AccumulationFaulted)
-        {
-            // An accumulation write threw part-way and the callback returned anyway: the gradients are part-scaled, so
-            // the update must not run on them, and the part-written window is dropped.
-            _gradientAccumulation.Release();
-            throw new InvalidOperationException(
-                "An accumulation write failed part-way inside the gradient exchange; the step was refused and the "
-                + "accumulation window was dropped.");
-        }
-        if (!step.UpdateDeferred && !step.CombinedAccumulation && _gradientAccumulation.Steps > 0)
-        {
-            // An update would run with the window still open, and the next combine would mix gradients from before and
-            // after it. The window is dropped and the step refused before its update.
-            _gradientAccumulation.Release();
-            throw new InvalidOperationException(
-                "The exchange neither deferred this step's update nor combined the accumulated gradients, with "
-                + "accumulated steps pending; the accumulation window was dropped.");
         }
         GradientExchangeCount++;
         if (step.UpdateDeferred)
