@@ -142,6 +142,9 @@ internal sealed class PersistentParallelExecutor
 
         private static long s_ids;
 
+        // Dispatch ids are process-wide (cursors compare them across Jobs), so they come from one static counter.
+        private static long NextId() => Interlocked.Increment(ref s_ids);
+
         public Job(Action<int>? action, Func<object?>? localInit, Action<int, object?>? localBody,
             Action<object?>? localFinally, int numChunks, int stride, bool stealEagerly = false)
         {
@@ -151,7 +154,7 @@ internal sealed class PersistentParallelExecutor
             LocalFinally = localFinally;
             NumChunks = numChunks;
             Stride = stride;
-            Id = Interlocked.Increment(ref s_ids);
+            Id = NextId();
             Pending = numChunks;
             StealEagerly = stealEagerly;
         }
@@ -166,7 +169,7 @@ internal sealed class PersistentParallelExecutor
             Action = action;
             NumChunks = numChunks;
             Stride = stride;
-            Id = Interlocked.Increment(ref s_ids);
+            Id = NextId();
             Pending = numChunks;
             StealEagerly = stealEagerly;
             EndWrite();
