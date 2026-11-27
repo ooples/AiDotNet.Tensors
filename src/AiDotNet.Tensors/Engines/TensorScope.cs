@@ -27,6 +27,15 @@ internal interface IScopedDeviceTensor
 }
 
 /// <summary>
+/// Implemented by <see cref="Tensor{T}"/> so <see cref="TensorScope"/> can hand a host result's pooled array back for
+/// reuse when it ends, without a collection.
+/// </summary>
+internal interface IScopedHostTensor
+{
+    void ReleaseHostFromScope();
+}
+
+/// <summary>
 /// Frees the GPU memory of the results created inside it when it ends, except the ones passed to
 /// <see cref="Keep{T}"/>, as TorchSharp's <c>DisposeScope</c> does.
 /// </summary>
@@ -48,7 +57,15 @@ internal interface IScopedDeviceTensor
 /// the scope writes it (a destination handed to an *Into op). Reading a freed result after the scope ends throws an
 /// <see cref="InvalidOperationException"/>; it never returns stale data. Keep what outlives the scope, and do not run
 /// a backward pass across a scope's end. Scopes nest: <see cref="Keep{T}"/> inside a nested scope hands the result to
-/// the enclosing one, which frees it when it ends unless it is kept there too. Results on the CPU are unaffected.
+/// the enclosing one, which frees it when it ends unless it is kept there too.
+/// </para>
+/// <para>
+/// Large CPU results (the ones big enough to be pooled, 85 KB and up) are recycled the same way: when the scope ends,
+/// the array of each one created inside it and not kept goes straight to the next result of its size, with no garbage
+/// collection, and reading the old result throws an <see cref="InvalidOperationException"/>. A CPU result something
+/// else can still reach is left alone: one whose span, <c>Memory</c> or array was handed out, or that another vector
+/// or matrix wraps. Smaller CPU results are left to the garbage collector, whose gen-0 allocator already serves them
+/// within a fraction of a microsecond.
 /// </para>
 /// </remarks>
 public sealed class TensorScope : IDisposable
@@ -263,6 +280,24 @@ public sealed class TensorScope : IDisposable
         scope._results[storage] = (null, release);
     }
 
+    /// <summary>Message a read of a CPU result recycled when its scope ended throws.</summary>
+    internal const string ReleasedHostResultMessage =
+        "This tensor is a CPU result created inside a TensorScope that has ended: its buffer was recycled for a later " +
+        "result. Keep it (TensorScope.Keep) or detach it (TensorScope.Detach) to use it after the scope, or read it " +
+        "before the scope ends.";
+
+    /// <summary>
+    /// Records a pooled host result created on this thread with the innermost open scope: its array is recycled when
+    /// the scope ends, unless kept.
+    /// </summary>
+    internal static void TrackHost(object storage, IScopedHostTensor tensor)
+    {
+        var scope = s_current;
+        // A result created while a graph is captured belongs to the compiled plan, which outlives any scope.
+        if (scope is null || scope._threadId != Environment.CurrentManagedThreadId || Compilation.GraphMode.IsActive) return;
+        scope._results[storage] = (null, tensor);
+    }
+
     /// <summary>
     /// Records a device-resident tensor result on the innermost open scope without allocating a closure or delegate.
     /// </summary>
@@ -348,6 +383,10 @@ public sealed class TensorScope : IDisposable
                 if (entry.Engine is { } engine && entry.Target is IScopedDeviceTensor scopedTensor)
                 {
                     scopedTensor.ReleaseFromScope(engine);
+                }
+                else if (entry.Target is IScopedHostTensor hostTensor)
+                {
+                    hostTensor.ReleaseHostFromScope();
                 }
                 else if (entry.Target is Action release)
                 {
