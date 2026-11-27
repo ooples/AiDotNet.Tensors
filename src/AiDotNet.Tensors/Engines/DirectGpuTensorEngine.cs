@@ -28567,7 +28567,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         double lambdaD = MathHelper.GetNumericOperations<T>().ToDouble(lambda);
         // The kernels compute in float32; other types keep their own precision on the CPU engine (which also validates
         // lambda and handles the empty tensor).
-        if (!(lambdaD >= 0) || tensor.Length == 0 || DirectGpuEngine.ShouldFallbackForPrecision<T>()
+        if (double.IsNaN(lambdaD) || lambdaD < 0 || tensor.Length == 0 || DirectGpuEngine.ShouldFallbackForPrecision<T>()
             || !TryGetBackend(out var backend))
             return base.TensorSoftShrink(tensor, lambda);
 

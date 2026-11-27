@@ -58,6 +58,17 @@ public static partial class GpuOptimizer
         if (backend is null) return false;
         if (n == 0) return true;
 
+        // The list form is the all-resident fast path: one tensor with no device copy refuses the whole list before
+        // anything is uploaded, promoted or launched, so the caller's per-tensor path (which does move host tensors
+        // onto the device) takes the step with nothing half-done. Same contract as TrySgdStepMultiTensor.
+        for (int i = 0; i < n; i++)
+        {
+            if (parameters[i].Length == 0) continue;
+            if (IsHostOnly(gpuEngine, backend, parameters[i]) || IsHostOnly(gpuEngine, backend, gradients[i])) return false;
+            for (int s = 0; s < states.Length; s++)
+                if (IsHostOnly(gpuEngine, backend, states[s][i])) return false;
+        }
+
         var parameterBuffers = new IGpuBuffer[n];
         var gradientBuffers = new IGpuBuffer[n];
         var stateBuffers = new IGpuBuffer[n][];
@@ -134,6 +145,13 @@ public static partial class GpuOptimizer
     }
 
     /// <summary>SGD with momentum over a parameter list; equals <see cref="TrySgdMomentumStep"/> per tensor.</summary>
+    // No current device copy: not on this backend, not pinned offload memory, and not a view of a flat parameter
+    // buffer (whose device copy belongs to the flat array).
+    private static bool IsHostOnly(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> tensor)
+        => TryGetCurrentGpuBuffer(engine, backend, tensor) is null
+            && tensor.OffloadDevicePointer == IntPtr.Zero
+            && !DirectGpuTensorEngine.IsFlatParameterView(tensor);
+
     public static bool TrySgdMomentumStepMultiTensor(
         IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients,
         IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay)

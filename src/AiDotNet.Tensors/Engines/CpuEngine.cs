@@ -51881,7 +51881,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var numOps = MathHelper.GetNumericOperations<T>();
         double lambdaD = numOps.ToDouble(lambda);
-        if (!(lambdaD >= 0))
+        if (double.IsNaN(lambdaD) || lambdaD < 0)
             throw new ArgumentOutOfRangeException(nameof(lambda), "The shrinkage must be at least 0.");
 
         if (GraphMode.IsActive)
