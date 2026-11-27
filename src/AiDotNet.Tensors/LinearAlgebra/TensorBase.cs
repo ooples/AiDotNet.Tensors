@@ -1208,8 +1208,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     // Returns a restore-pool array that a discarded decode filled but never published: nothing else references it.
     private static void ParkUnpublishedRestoreArray(T[] array)
     {
-        if (typeof(T) == typeof(float)) StreamingRestoreBuffers<float>.Park((float[])(object)array);
-        else if (typeof(T) == typeof(double)) StreamingRestoreBuffers<double>.Park((double[])(object)array);
+        if (array is float[] floats) StreamingRestoreBuffers<float>.Park(floats);
+        else if (array is double[] doubles) StreamingRestoreBuffers<double>.Park(doubles);
     }
 
     private static int ElementSizeForStreaming()
