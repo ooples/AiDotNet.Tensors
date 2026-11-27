@@ -20,7 +20,7 @@
 //   * Re-entrant Dispose() is a no-op (idempotent).
 //
 // We DO NOT assert performance here (parallel speedup is a downstream
-// concern measured by the HE PathB Pareto sweep); we DO assert there is no
+// concern measured by a downstream Pareto sweep); we DO assert there is no
 // crash, no deadlock, and no leaked queue handles under stress (≥ 8 threads).
 
 using System;
