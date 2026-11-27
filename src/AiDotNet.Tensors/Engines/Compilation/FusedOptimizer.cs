@@ -2072,9 +2072,11 @@ internal static class FusedOptimizer
         paramNorm = MathF.Sqrt(paramNorm);
         gradNorm = MathF.Sqrt(gradNorm);
 
-        // Trust ratio. A layer with a numerically zero weight or gradient norm keeps the base rate.
+        // Trust ratio. A layer with a numerically zero weight or gradient norm keeps the base rate. The > 0 tests keep
+        // that true at eps = 0, where 0 >= 0 would take the ratio 0 / 0 (as the reference LARS applies it only to
+        // positive norms).
         float localLr = lr;
-        if (paramNorm >= eps && gradNorm >= eps)
+        if (paramNorm >= eps && gradNorm >= eps && paramNorm > 0f && gradNorm > 0f)
             localLr = lr * trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm + eps);
 
         // v = momentum*v + local_lr*(g + wd*w);  w -= v
@@ -2659,7 +2661,7 @@ internal static class FusedOptimizer
 
         // Same trust ratio and eps floor as the dense kernel, so a parameter does not change algorithm
         // depending on whether its gradient happened to arrive sparse.
-        float localLr = (pNorm >= eps && gNorm >= eps)
+        float localLr = (pNorm >= eps && gNorm >= eps && pNorm > 0f && gNorm > 0f)
             ? (lr * trustCoeff * pNorm / (gNorm + wd * pNorm + eps))
             : lr;
 

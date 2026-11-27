@@ -37,7 +37,8 @@ internal static class GpuLars
 
         float paramNorm = backend.L2Norm(param, size);
         float gradNorm = backend.L2Norm(gradient, size);
-        float localRate = paramNorm < epsilon || gradNorm < epsilon
+        // Same rule as the CPU optimizer: a zero norm keeps the learning rate even at epsilon 0, where the ratio is 0 / 0.
+        float localRate = paramNorm < epsilon || gradNorm < epsilon || !(paramNorm > 0f) || !(gradNorm > 0f)
             ? learningRate
             : learningRate * (trustCoeff * paramNorm / (gradNorm + weightDecay * paramNorm + epsilon));
 
