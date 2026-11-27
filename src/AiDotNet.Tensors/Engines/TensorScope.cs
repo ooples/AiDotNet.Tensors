@@ -113,7 +113,10 @@ public sealed class TensorScope : IDisposable
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         ThrowIfDisposed();
-        object storage = tensor.DataVector;
+        // The storage's identity, not DataVector: that getter realizes a traced value (and, in an inference trace,
+        // records a host escape), while keeping or detaching a tensor reads none of its values.
+        object storage = tensor.GraphVectorIdentity;
+        MarkRetainedIfTraced(tensor);
         _kept.Add(storage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) _kept.Add(array);
         if (_results.TryGetValue(storage, out var entry))
@@ -122,6 +125,13 @@ public sealed class TensorScope : IDisposable
             _outer?.AdoptEntry(storage, entry);
         }
         return tensor;
+    }
+
+    // A traced tensor kept or detached during a trace is read after the compiled plan runs: the trace records it so
+    // the plan keeps it observable (LazyTensorScope.RetainedNodes).
+    private static void MarkRetainedIfTraced<T>(Tensor<T> tensor)
+    {
+        if (tensor.LazySource is Compilation.ILazyNode node && Compilation.GraphMode.Current is { } trace) trace.MarkRetained<T>(node);
     }
 
     /// <summary>
@@ -133,7 +143,9 @@ public sealed class TensorScope : IDisposable
     public static Tensor<T> Detach<T>(Tensor<T> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        object storage = tensor.DataVector;
+        object storage = tensor.GraphVectorIdentity;   // reads no value: a traced tensor stays in the graph (see Keep)
+        MarkRetainedIfTraced(tensor);
+        // Unrealized, a lazily allocated host array is not there yet; nothing registered it with a scope either.
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
         // A result kept in a nested scope was adopted by the enclosing one, and each scope's activation release spares
         for (var scope = s_current; scope is not null; scope = scope._outer)
