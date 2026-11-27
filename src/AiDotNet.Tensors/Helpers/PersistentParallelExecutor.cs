@@ -83,8 +83,13 @@ internal sealed class PersistentParallelExecutor
     internal static Action<int>? TestWorkerStartDelay;
 
     /// <summary>Tests only: runs on a worker between reading the published Job and taking its view, to hold a worker
-    /// with the reusable plain Job while the dispatcher re-arms it for later dispatches.</summary>
-    internal static Action<int>? TestWorkerViewDelay;
+    /// with the reusable plain Job while the dispatcher re-arms it for later dispatches. The second argument is whether
+    /// the worker read a published Job (false: the dispatch it woke for had already ended).</summary>
+    internal static Action<int, bool>? TestWorkerViewDelay;
+
+    /// <summary>Tests only: runs on a worker once it is done with the dispatch it woke for (joined, ran its part, or
+    /// found nothing to do), so a test can wait for a held worker to finish instead of sleeping.</summary>
+    internal static Action<int>? TestWorkerAttemptDone;
 
     /// <summary>Tests only: whether the latest plain dispatch let the caller steal unstarted chunks without a grace period.</summary>
     internal bool LastDispatchStoleEagerly => Volatile.Read(ref _lastStoleEagerly);
@@ -276,11 +281,25 @@ internal sealed class PersistentParallelExecutor
                     break;
             }
         }
+        // An interrupt (Thread.Interrupt) must not end the wait early: the counter belongs to a dispatch whose
+        // chunks are still running elsewhere, and the plain Job is re-armed by the next dispatch -- a straggler's
+        // late decrement would then land on that dispatch's count. Keep waiting, then report the interrupt.
+        ThreadInterruptedException? interrupted = null;
         while (Volatile.Read(ref counter) != 0)
         {
-            _allDone.Wait();
+            try
+            {
+                _allDone.Wait();
+            }
+            catch (ThreadInterruptedException ex)
+            {
+                interrupted ??= ex;
+                continue;
+            }
             _allDone.Reset();
         }
+        if (interrupted is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(interrupted).Throw();
     }
 
     // Serialize concurrent Execute calls
@@ -876,12 +895,15 @@ internal sealed class PersistentParallelExecutor
             // Set, and the sequence-checked view below is one dispatch's complete field set or nothing — no
             // half-updated body/stride/chunk-count from a concurrent or prior dispatch.
             var published = _job;
-            TestWorkerViewDelay?.Invoke(slot);
+            TestWorkerViewDelay?.Invoke(slot, published is not null);
             // A plain dispatch can complete without a woken worker (others claimed its chunks), so a worker can
             // wake late: after its dispatch ended (job null), into the next dispatch, or twice into the same one.
             // It joins each dispatch at most once, and a thread-local one only as a slot that dispatch woke.
             if (published is null || !JoinDispatch(published, slot, ref lastJobId))
+            {
+                TestWorkerAttemptDone?.Invoke(slot);
                 continue;
+            }
 
             // Thread-local mode: this worker's strided chunk set. Capture the first exception, re-thrown on the
             // caller thread. A thread-local Job is never re-armed, so its fields are read directly.
@@ -894,6 +916,7 @@ internal sealed class PersistentParallelExecutor
             {
                 _allDone.Set();
             }
+            TestWorkerAttemptDone?.Invoke(slot);
         }
     }
 
@@ -914,6 +937,11 @@ internal sealed class PersistentParallelExecutor
             if (job.Action is null)
                 return false;
             lastJobId = job.Id;
+            // Only a slot inside this dispatch's team joins it. A worker woken for an earlier, wider dispatch and held
+            // before its view can read the re-armed Job of a narrower one; running or stealing its chunks would put
+            // more threads on it than its cap allows.
+            if (slot >= job.Stride - 1)
+                return false;
             // Plain mode: its own set (none if this dispatch did not wake it). A chunk's exception is published
             // before the chunk counts as finished.
             TestWorkerStartDelay?.Invoke(slot);
@@ -1010,6 +1038,10 @@ internal sealed class PersistentParallelExecutor
     {
         if (numChunks <= 0)
             return;
+        // Before anything is armed: a null body on the reusable plain Job reads as a cleared Job, so no participant
+        // would claim a chunk and the dispatch would wait for ever while holding the executor lock.
+        if (action is null)
+            throw new ArgumentNullException(nameof(action));
         if (numChunks == 1)
         {
             action(0);
@@ -1137,16 +1169,23 @@ internal sealed class PersistentParallelExecutor
                 // runs any chunk still unstarted and waits for the ones running elsewhere -- not for every woken
                 // worker: one that has not started holds no chunk and is not waited on.
                 var view = job.View();
-                Exception? mainException = RunSet(in view, 0, publish: false);
-                // Always finish the dispatch, also when one of the caller's own chunks threw: `mainException ??=
-                // FinishPlainDispatch(job)` skipped it then, so Execute rethrew without waiting for the workers or running
-                // the chunks they had not started -- a sibling chunk could be skipped, or still be running after Execute
-                // returned (seen once the caller owned the throwing chunk, at a smaller team on a 4-core CI runner).
-                Exception? finishException = FinishPlainDispatch(job);
-                mainException ??= finishException;
-
-                _job = null; // release the body's captured references for GC between dispatches
-                job.Clear();
+                Exception? mainException;
+                try
+                {
+                    mainException = RunSet(in view, 0, publish: false);
+                    // Always finish the dispatch, also when one of the caller's own chunks threw: `mainException ??=
+                    // FinishPlainDispatch(job)` skipped it then, so Execute rethrew without waiting for the workers or
+                    // running the chunks they had not started -- a sibling chunk could be skipped, or still be running
+                    // after Execute returned (seen once the caller owned the throwing chunk, at a smaller team on a
+                    // 4-core CI runner). An interrupt is reported only once the dispatch has drained (WaitForZero).
+                    Exception? finishException = FinishPlainDispatch(job);
+                    mainException ??= finishException;
+                }
+                finally
+                {
+                    _job = null; // release the body's captured references for GC between dispatches
+                    job.Clear();
+                }
 
                 // Re-throw first captured exception (worker or main thread)
                 var workerEx = _workerException;
@@ -1262,12 +1301,18 @@ internal sealed class PersistentParallelExecutor
                 for (int i = 0; i < workersNeeded; i++)
                     _workReady[i].Set();
 
-                Exception? mainException = RunParticipantChunks(job, 0);
+                Exception? mainException;
+                try
+                {
+                    mainException = RunParticipantChunks(job, 0);
 
-                if (workersNeeded > 0)
-                    WaitForWorkers();
-
-                _job = null; // release the body's captured references for GC between dispatches
+                    if (workersNeeded > 0)
+                        WaitForWorkers();
+                }
+                finally
+                {
+                    _job = null; // release the body's captured references for GC between dispatches
+                }
 
                 var workerEx = _workerException;
                 if (mainException is not null) throw mainException;
