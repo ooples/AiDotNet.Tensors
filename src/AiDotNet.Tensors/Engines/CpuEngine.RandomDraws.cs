@@ -54,6 +54,13 @@ public partial class CpuEngine
         return branch == BoxMullerBranch.Sine ? r * Math.Sin(2.0 * Math.PI * u2) : r * Math.Cos(2.0 * Math.PI * u2);
     }
 
+    /// <summary><c>(stdDev * sqrt(-2 ln u1)) * cos(2 pi u2)</c> (or sin): the radius scaled before the angle term.</summary>
+    internal static double ScaledFirstBoxMullerNormal(double u1, double u2, BoxMullerBranch branch, double stdDev)
+    {
+        double r = stdDev * Math.Sqrt(-2.0 * Math.Log(u1));
+        return branch == BoxMullerBranch.Sine ? r * Math.Sin(2.0 * Math.PI * u2) : r * Math.Cos(2.0 * Math.PI * u2);
+    }
+
     /// <summary>Every rule of <paramref name="variant"/> is a defined value: checked before the first draw, so an invalid
     /// convention throws with the caller's Random untouched (and even when there is nothing to draw).</summary>
     internal static void ValidateVariant(BoxMullerVariant variant)
@@ -64,6 +71,8 @@ public partial class CpuEngine
             throw new ArgumentOutOfRangeException(nameof(variant), variant.SecondUniform, "Unknown Box-Muller second-uniform rule.");
         if (variant.Branch != BoxMullerBranch.Cosine && variant.Branch != BoxMullerBranch.Sine)
             throw new ArgumentOutOfRangeException(nameof(variant), variant.Branch, "Unknown Box-Muller branch.");
+        if (variant.ScaleOrder != BoxMullerScaleOrder.ScaleLast && variant.ScaleOrder != BoxMullerScaleOrder.ScaleFirst)
+            throw new ArgumentOutOfRangeException(nameof(variant), variant.ScaleOrder, "Unknown Box-Muller scale order.");
         // The constructor already rejects this; default(BoxMullerVariant) cannot reach it, but a radius of
         // sqrt(-2 ln u1) with u1 > 1 is NaN and would spin the gamma sampler's rejection loop forever.
         if (double.IsNaN(variant.FirstUniformFloor) || variant.FirstUniformFloor < 0.0 || variant.FirstUniformFloor > 1.0)
@@ -150,13 +159,15 @@ public partial class CpuEngine
         var result = new Tensor<T>((int[])shape.Clone());
         if (count == 0) return result;
         var pairs = DrawBoxMullerUniforms(generator, variant, count);
-        StoreDoubles(TransformBoxMullerPairs(pairs, variant.Branch, mean, stdDev, low, high), result.GetDataArray());
+        StoreDoubles(TransformBoxMullerPairs(pairs, variant.Branch, variant.ScaleOrder, mean, stdDev, low, high),
+            result.GetDataArray());
         return result;
     }
 
-    /// <summary><c>clamp(mean + stdDev * z, low, high)</c> for each drawn pair (interleaved u1, u2), in parallel.</summary>
-    internal static double[] TransformBoxMullerPairs(double[] pairs, BoxMullerBranch branch, double mean, double stdDev,
-        double low, double high)
+    /// <summary><c>clamp(mean + stdDev * z, low, high)</c> for each drawn pair (interleaved u1, u2), in parallel; under
+    /// <see cref="BoxMullerScaleOrder.ScaleFirst"/>, <c>clamp(mean + (stdDev * r) * trig, low, high)</c>.</summary>
+    internal static double[] TransformBoxMullerPairs(double[] pairs, BoxMullerBranch branch, BoxMullerScaleOrder scaleOrder,
+        double mean, double stdDev, double low, double high)
     {
         int count = pairs.Length / 2;
         var values = new double[count];
@@ -164,7 +175,12 @@ public partial class CpuEngine
         {
             int from = chunk * DataOpChunk, to = Math.Min(count, from + DataOpChunk);
             for (int i = from; i < to; i++)
-                values[i] = ClampNormal(mean + stdDev * BoxMullerNormal(pairs[2 * i], pairs[2 * i + 1], branch), low, high);
+            {
+                double scaled = scaleOrder == BoxMullerScaleOrder.ScaleFirst
+                    ? ScaledFirstBoxMullerNormal(pairs[2 * i], pairs[2 * i + 1], branch, stdDev)
+                    : stdDev * BoxMullerNormal(pairs[2 * i], pairs[2 * i + 1], branch);
+                values[i] = ClampNormal(mean + scaled, low, high);
+            }
         }, deterministicSafe: true);
         return values;
     }
