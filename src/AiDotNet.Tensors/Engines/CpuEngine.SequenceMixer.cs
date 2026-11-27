@@ -87,15 +87,10 @@ public partial class CpuEngine
         var angles = inputs[1];
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = SplitHalfGivensRotationComposed(engine, input, angles, half);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { input, angles }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             if (sub.TryGetValue(angles, out var ga)) DifferentiableOps.AccumulateGrad(grads, angles, ga, engine);
             return;
@@ -303,15 +298,10 @@ public partial class CpuEngine
         var weight1 = inputs[2];
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = DepthwiseCausalConv1d2TapComposed(engine, input, weight0, weight1, batch, seqLen, channels);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { input, weight0, weight1 }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             if (sub.TryGetValue(weight0, out var gw0)) DifferentiableOps.AccumulateGrad(grads, weight0, gw0, engine);
             if (sub.TryGetValue(weight1, out var gw1)) DifferentiableOps.AccumulateGrad(grads, weight1, gw1, engine);
@@ -574,15 +564,10 @@ public partial class CpuEngine
 
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = RopeL2NormalizeHeadsComposed(engine, input, cos, sin, batch, seqLen, numHeads, headDim, epsilon, postScale, startPosition);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { input }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             return;
         }
@@ -886,15 +871,10 @@ public partial class CpuEngine
 
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = RopeQuadraticOuterFeaturesComposed(engine, input, cos, sin, batch, seqLen, numHeads, mb, effOutDim, startPosition, outShape);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { input }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(input, out var gi)) DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
             return;
         }
@@ -1164,15 +1144,10 @@ public partial class CpuEngine
 
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = ProjectiveGatedResidualComposed(engine, baseHidden, proposal, gateLogit, dim, epsilon);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { baseHidden, proposal, gateLogit }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(baseHidden, out var gh)) DifferentiableOps.AccumulateGrad(grads, baseHidden, gh, engine);
             if (sub.TryGetValue(proposal, out var gu)) DifferentiableOps.AccumulateGrad(grads, proposal, gu, engine);
             if (sub.TryGetValue(gateLogit, out var gg)) DifferentiableOps.AccumulateGrad(grads, gateLogit, gg, engine);
@@ -1432,14 +1407,9 @@ public partial class CpuEngine
         var imIn = inputs[2];
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = SpectralCirculantMatrixComposed(engine, dIn, reIn, imIn, batch, dim);
             var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { dIn, reIn, imIn }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(dIn, out var gd)) DifferentiableOps.AccumulateGrad(grads, dIn, gd, engine);
             if (sub.TryGetValue(reIn, out var gr)) DifferentiableOps.AccumulateGrad(grads, reIn, gr, engine);
             if (sub.TryGetValue(imIn, out var gi)) DifferentiableOps.AccumulateGrad(grads, imIn, gi, engine);
@@ -1791,9 +1761,6 @@ public partial class CpuEngine
             }
             var ops = MathHelper.GetNumericOperations<T>();
             var idxTensor = TensorScope.Detach(new Tensor<int>(new[] { rows, topK }, new Vector<int>((int[])savedIndices.Clone())));
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var s = engine.Sigmoid(logits);
             var sel = engine.TensorGatherRowValues(s, idxTensor);
@@ -1802,8 +1769,6 @@ public partial class CpuEngine
             var y = engine.TopKWeightedRowMix(table, idxTensor, gates);
             var loss = engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null);
             var sub = tape.ComputeGradients(loss, new[] { logits, table }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(logits, out var gl)) DifferentiableOps.AccumulateGrad(grads, logits, gl, engine);
             if (sub.TryGetValue(table, out var gt)) DifferentiableOps.AccumulateGrad(grads, table, gt, engine);
             return;
@@ -2119,14 +2084,9 @@ public partial class CpuEngine
         var guProj = inputs[0]; var guGain = inputs[1]; var upBase = inputs[2];
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = DualModulatedSwiGluComposed(engine, guProj, guGain, upBase, h);
             var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { guProj, guGain, upBase }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(guProj, out var g0)) DifferentiableOps.AccumulateGrad(grads, guProj, g0, engine);
             if (sub.TryGetValue(guGain, out var g1)) DifferentiableOps.AccumulateGrad(grads, guGain, g1, engine);
             if (sub.TryGetValue(upBase, out var g2)) DifferentiableOps.AccumulateGrad(grads, upBase, g2, engine);
@@ -2292,14 +2252,9 @@ public partial class CpuEngine
         Tensor<T>? sink = hasSink ? inputs[1] : null;
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = BornRatioNormalizeComposed(engine, scanOut, sink, b, s, nh, headDim, eps);
             var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), inputs, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(scanOut, out var gs)) DifferentiableOps.AccumulateGrad(grads, scanOut, gs, engine);
             if (sink is not null && sub.TryGetValue(sink, out var gk)) DifferentiableOps.AccumulateGrad(grads, sink, gk, engine);
             return;
@@ -2441,14 +2396,9 @@ public partial class CpuEngine
         var logits = inputs[0]; var bias = inputs[1];
         if (DifferentiableOps._isBackwardCreateGraph || (typeof(T) != typeof(float) && typeof(T) != typeof(double)))
         {
-            // The tape this create-graph backward records on. The nested tape below is disposed on return, so its
-            // entries move to this one and the gradients accumulate on it; otherwise a higher order sees no graph.
-            var outerTape = GradientTape<T>.Current;
             using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
             var y = BoundedSigmoidGateComposed(engine, logits, bias, floor);
             var sub = tape.ComputeGradients(engine.ReduceSum(engine.TensorMultiply(y, gradOutput), null), new[] { logits, bias }, createGraph: DifferentiableOps._isBackwardCreateGraph);
-            if (DifferentiableOps._isBackwardCreateGraph && outerTape is not null) tape.TransferEntriesTo(outerTape);
-            using var recordOnOuter = GradientTape<T>.RecordOn(outerTape);
             if (sub.TryGetValue(logits, out var gl)) DifferentiableOps.AccumulateGrad(grads, logits, gl, engine);
             if (sub.TryGetValue(bias, out var gb)) DifferentiableOps.AccumulateGrad(grads, bias, gb, engine);
             return;

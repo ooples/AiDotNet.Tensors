@@ -650,15 +650,6 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "GatedDeltaNetStep(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,GatedDeltaRule)",
         "CausalConv1dStep(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Boolean)",
         "KvCacheAppend(Tensor<T>,Tensor<T>,Tensor<T>)",
-        // Fused sequence-mixer ops with per-op shape contracts (even head widths, [B, S, H, scanDim] scans, a scalar
-        // gate): SequenceMixerOpsParityTests checks each GPU forward and backward, fused and portable, against the
-        // CPU engine's composed reference.
-        "BornRatioNormalize(Tensor<T>,Tensor<T>,Int32,Double)",
-        "DepthwiseCausalConv1d2Tap(Tensor<T>,Tensor<T>,Tensor<T>)",
-        "DualModulatedSwiGlu(Tensor<T>,Tensor<T>,Tensor<T>)",
-        "ProjectiveGatedResidual(Tensor<T>,Tensor<T>,Tensor<T>,Double)",
-        "RopeL2NormalizeHeads(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Double,Double,Int32)",
-        "RopeQuadraticOuterFeatures(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
         // Sparse CSR graph attention (a CsrGraph operand and a stochastic dropout generator):
         // GraphAttentionCsrTests.Gpu_MatchesCpu_ForwardAndBackward, GPU vs CPU forward and backward.
         "GraphAttentionCsr(Tensor<T>,Tensor<T>,CsrGraph,Double,Double,Random)",

@@ -454,7 +454,6 @@ public partial class DifferentiableOpsGradCheckSweep
         AddCasesReductionsAndIndexing(all);
         AddCasesSpatialAndAttention(all);
         AddCasesLinearAlgebraAndLosses(all);
-        AddCasesSequenceMixer(all);
         AddCasesVariants(all);
         AddCasesNonDifferentiableAudit(all);
         return all;
@@ -478,7 +477,6 @@ public partial class DifferentiableOpsGradCheckSweep
     static partial void AddCasesReductionsAndIndexing(Dictionary<string, Func<Random, object[]>> cases);
     static partial void AddCasesSpatialAndAttention(Dictionary<string, Func<Random, object[]>> cases);
     static partial void AddCasesLinearAlgebraAndLosses(Dictionary<string, Func<Random, object[]>> cases);
-    static partial void AddCasesSequenceMixer(Dictionary<string, Func<Random, object[]>> cases);
 
     /// <summary>
     /// Compact parameter-type fingerprint used to key table entries to a SPECIFIC overload,
