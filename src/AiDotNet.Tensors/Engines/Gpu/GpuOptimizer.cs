@@ -504,6 +504,29 @@ public static partial class GpuOptimizer
         if (backend is null) return false;
         if (n == 0) return true;
 
+        // The same all-or-nothing residency contract as the other list steps (see GpuOptimizer.MultiTensor): copy-on-write
+        // tensors detach first, then a host-only gradient or moment refuses the whole list before any kernel runs, and
+        // parameters resolve without an upload.
+        for (int i = 0; i < n; i++)
+        {
+            var p = parameters[i];
+            if (p is null || gradients[i] is null || firstMoments[i] is null || secondMoments[i] is null) return false;
+            int len = p.Length;
+            if (len <= 0 || gradients[i].Length != len || firstMoments[i].Length != len || secondMoments[i].Length != len)
+                return false;
+            p.EnsureOwnedForDeviceWrite();
+            firstMoments[i].EnsureOwnedForDeviceWrite();
+            secondMoments[i].EnsureOwnedForDeviceWrite();
+        }
+        for (int i = 0; i < n; i++)
+        {
+            int len = parameters[i].Length;
+            if (!IsListTensorDeviceResident(gpuEngine, backend, gradients[i], len)
+                || !IsListTensorDeviceResident(gpuEngine, backend, firstMoments[i], len)
+                || !IsListTensorDeviceResident(gpuEngine, backend, secondMoments[i], len))
+                return false;
+        }
+
         var parameterBuffers = new IGpuBuffer[n];
         var gradientBuffers = new IGpuBuffer[n];
         var mBuffers = new IGpuBuffer[n];
@@ -536,20 +559,7 @@ public static partial class GpuOptimizer
                 }
                 (slices ??= new List<DirectGpuTensorEngine.TransientDeviceSlice>(n)).Add(gradIn.Slice);
 
-                param.EnsureOwnedForDeviceWrite();
-                IGpuBuffer? pBuf;
-                if (DirectGpuTensorEngine.IsFlatParameterView(param))
-                {
-                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _);
-                }
-                else if (param._gpuBuffer is null && param.OffloadDevicePointer != IntPtr.Zero)
-                {
-                    pBuf = param.TryGetGpuBuffer();
-                }
-                else
-                {
-                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _) ?? TryGetCurrentGpuBuffer(gpuEngine, backend, param);
-                }
+                var pBuf = TryResolveListParameterBuffer(gpuEngine, backend, param);
 
                 if (pBuf is null || pBuf.Size < len)
                 {

@@ -9,10 +9,12 @@ namespace AiDotNet.Tensors.Engines.Gpu;
 
 /// <summary>
 /// Whole-parameter-list ("foreach", as <c>torch.optim</c>'s <c>foreach=True</c>) forms of every dense GPU optimizer
-/// step. Each one equals calling its per-tensor step (<see cref="GpuOptimizer.TryRmspropStep"/> and so on) on every
-/// parameter in order, under one GPU operation lease, and is all-or-nothing: every parameter, gradient and state
-/// buffer is resolved on the device before any kernel runs, so <c>false</c> leaves the whole list unchanged for the
-/// caller's CPU path (a caller can never double-apply the step to the tensors before the one that failed). As with
+/// step. On device-resident lists each one equals calling its per-tensor step (<see cref="GpuOptimizer.TryRmspropStep"/>
+/// and so on) on every parameter in order, under one GPU operation lease. It is all-or-nothing: every parameter,
+/// gradient and state tensor must already hold its current value on the device (a list step never uploads, as a
+/// per-tensor step may), and all of them are resolved before any kernel runs, so <c>false</c> leaves every value in the
+/// list unchanged for the caller's CPU path (a caller can never double-apply the step to the tensors before the one
+/// that failed). As with
 /// <see cref="GpuOptimizer.TrySgdStepMultiTensor"/>, null lists or entries and length mismatches are caller errors and
 /// throw; <c>false</c> means only that the list is not device-resident.
 /// </summary>
@@ -58,15 +60,24 @@ public static partial class GpuOptimizer
         if (backend is null) return false;
         if (n == 0) return true;
 
-        // The list form is the all-resident fast path: one tensor with no device copy refuses the whole list before
-        // anything is uploaded, promoted or launched, so the caller's per-tensor path (which does move host tensors
-        // onto the device) takes the step with nothing half-done. Same contract as TrySgdStepMultiTensor.
+        // The list form is the all-resident fast path: one tensor with no current device copy refuses the whole list
+        // before any kernel runs, so the caller's per-tensor path (which does move host tensors onto the device) takes
+        // the step with nothing half-done. Same contract as TrySgdStepMultiTensor. Copy-on-write tensors detach first,
+        // as the step writes them; a detached one is on the host and refuses the list. Gradients and states are
+        // checked here, parameters as they resolve (TryResolveListParameterBuffer never uploads).
         for (int i = 0; i < n; i++)
         {
             if (parameters[i].Length == 0) continue;
-            if (IsHostOnly(gpuEngine, backend, parameters[i]) || IsHostOnly(gpuEngine, backend, gradients[i])) return false;
+            parameters[i].EnsureOwnedForDeviceWrite();
+            for (int s = 0; s < states.Length; s++) states[s][i].EnsureOwnedForDeviceWrite();
+        }
+        for (int i = 0; i < n; i++)
+        {
+            int len = parameters[i].Length;
+            if (len == 0) continue;
+            if (!IsListTensorDeviceResident(gpuEngine, backend, gradients[i], len)) return false;
             for (int s = 0; s < states.Length; s++)
-                if (IsHostOnly(gpuEngine, backend, states[s][i])) return false;
+                if (!IsListTensorDeviceResident(gpuEngine, backend, states[s][i], len)) return false;
         }
 
         var parameterBuffers = new IGpuBuffer[n];
@@ -80,7 +91,7 @@ public static partial class GpuOptimizer
             int len = param.Length;
             if (len == 0) continue; // nothing to update; sizes[i] stays 0 and the dispatch skips it
 
-            var pBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, param);
+            var pBuf = TryResolveListParameterBuffer(gpuEngine, backend, param);
             var gBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, grad);
             if (pBuf is null || pBuf.Size < len || gBuf is null || gBuf.Size < len)
                 return false;
@@ -102,27 +113,7 @@ public static partial class GpuOptimizer
 
         int active = 0;
         for (int i = 0; i < n; i++)
-        {
-            int len = sizes[i];
-            if (len == 0) continue;
-            var param = parameters[i];
-            param.EnsureOwnedForDeviceWrite();
-            var pBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, param);
-            if (pBuf is null || pBuf.Size < len)
-                return false;
-            parameterBuffers[i] = pBuf;
-
-            for (int s = 0; s < states.Length; s++)
-            {
-                var state = states[s][i];
-                state.EnsureOwnedForDeviceWrite();
-                var sBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, state);
-                if (sBuf is null || sBuf.Size < len)
-                    return false;
-                stateBuffers[i][s] = sBuf;
-            }
-            active++;
-        }
+            if (sizes[i] != 0) active++;
         if (active == 0) return true;
 
         for (int i = 0; i < n; i++)
@@ -144,14 +135,35 @@ public static partial class GpuOptimizer
         return true;
     }
 
-    /// <summary>SGD with momentum over a parameter list; equals <see cref="TrySgdMomentumStep"/> per tensor.</summary>
-    // No current device copy: not on this backend, not pinned offload memory, and not a view of a flat parameter
-    // buffer (whose device copy belongs to the flat array).
-    private static bool IsHostOnly(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> tensor)
-        => TryGetCurrentGpuBuffer(engine, backend, tensor) is null
-            && tensor.OffloadDevicePointer == IntPtr.Zero
-            && !DirectGpuTensorEngine.IsFlatParameterView(tensor);
+    // A gradient or optimizer state already on this backend's device, checked read-only: an offload buffer large enough,
+    // or a current device buffer. This is the first branch of TryResolveStateBuffer and TryAcquireReadOnlyFloatBuffer,
+    // so a tensor that passes is resolved there without an upload. Call it after EnsureOwnedForDeviceWrite: detaching a
+    // copy-on-write tensor rebinds it to host storage.
+    internal static bool IsListTensorDeviceResident(
+        DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> tensor, int length)
+    {
+        if (tensor._gpuBuffer is null && tensor.OffloadDevicePointer != IntPtr.Zero)
+            return tensor.TryGetGpuBuffer() is { } offload && offload.Handle != IntPtr.Zero && offload.Size >= length;
+        var current = TryGetCurrentGpuBuffer(engine, backend, tensor);
+        return current is not null && current.Size >= length;
+    }
 
+    // A list step's parameter buffer, never uploaded: a flat ParameterBuffer view from its flat array's device buffer, an
+    // offload buffer, or what AcquireParameterBuffer serves without an upload. A parameter AcquireParameterBuffer cannot
+    // take (strided, or offset into its storage) uses its current bound buffer. Null when its value is only on the host.
+    internal static IGpuBuffer? TryResolveListParameterBuffer(
+        DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param)
+    {
+        if (DirectGpuTensorEngine.IsFlatParameterView(param))
+            return engine.AcquireParameterBuffer(param, out _, allowUpload: false);
+        if (param._gpuBuffer is null && param.OffloadDevicePointer != IntPtr.Zero)
+            return param.TryGetGpuBuffer();
+        if (param.IsContiguous && param._storageOffset == 0)
+            return engine.AcquireParameterBuffer(param, out _, allowUpload: false);
+        return TryGetCurrentGpuBuffer(engine, backend, param);
+    }
+
+    /// <summary>SGD with momentum over a parameter list; equals <see cref="TrySgdMomentumStep"/> per tensor.</summary>
     public static bool TrySgdMomentumStepMultiTensor(
         IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients,
         IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay)
