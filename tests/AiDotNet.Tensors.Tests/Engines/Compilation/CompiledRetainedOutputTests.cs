@@ -14,6 +14,60 @@ public sealed class CompiledRetainedOutputTests : IDisposable
     private readonly IEngine _prior = AiDotNetEngine.Current;
     public void Dispose() => AiDotNetEngine.Current = _prior;
 
+    // TensorScope.Keep/Detach of a traced activation declares it retained: the training plan must not lease its
+    // buffer to a later step or release its value, or the caller reads another tensor's values after Step().
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Detached_or_kept_activation_survives_later_forward_and_backward_work(bool gpu, bool detach)
+    {
+        DirectGpuTensorEngine? device = null;
+        if (gpu)
+        {
+            try { device = new DirectGpuTensorEngine(); }
+            catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
+            Skip.If(device is null || !device.IsGpuAvailable, "No direct GPU backend available.");
+        }
+        using (device)
+        {
+            IEngine engine = device is null ? new CpuEngine() : device;
+            AiDotNetEngine.Current = engine;
+            const int length = 65536;   // past the CPU forward-pooling and GPU span-lease thresholds
+            var input = new Tensor<float>([256, 256]);
+            var parameter = new Tensor<float>([256, 256]);
+            parameter.AsWritableSpan().Fill(0.25f);
+            if (gpu) parameter.Gpu();
+            Tensor<float> retained;
+            ICompiledTrainingPlan<float> plan;
+            using (var tensorScope = TensorScope.Begin())
+            using (var scope = GraphMode.EnableTraining(new[] { parameter }))
+            {
+                var added = engine.TensorAdd(input, parameter);
+                retained = detach ? TensorScope.Detach(added) : tensorScope.Keep(added);
+                var doubled = engine.TensorAdd(retained, retained);
+                var quadrupled = engine.TensorAdd(doubled, doubled);
+                engine.ReduceSum(engine.TensorAdd(quadrupled, quadrupled), null);
+                plan = scope.CompileTraining(new[] { parameter });
+            }
+            using (plan)
+            {
+                for (int step = 0; step < 6; step++)
+                {
+                    input.AsWritableSpan().Fill(step + 1);
+                    input.IncrementVersion();
+                    float expected = step + 1.25f;
+                    Assert.Equal(8f * length * expected, plan.Step().ToArray()[0]);
+                    var values = retained.ToArray();
+                    Assert.Equal(length, values.Length);
+                    foreach (float value in values) Assert.Equal(expected, value);
+                    foreach (float gradient in plan.Gradients[0].ToArray()) Assert.Equal(8f, gradient);
+                }
+            }
+        }
+    }
+
     [SkippableTheory]
     [InlineData(false, false)]
     [InlineData(true, false)]

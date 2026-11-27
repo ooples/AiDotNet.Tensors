@@ -58,76 +58,100 @@ public static partial class GpuOptimizer
         if (backend is null) return false;
         if (n == 0) return true;
 
+        // The list form is the all-resident fast path: one tensor with no device copy refuses the whole list before
+        // anything is uploaded, promoted or launched, so the caller's per-tensor path (which does move host tensors
+        // onto the device) takes the step with nothing half-done. Same contract as TrySgdStepMultiTensor.
+        for (int i = 0; i < n; i++)
+        {
+            if (parameters[i].Length == 0) continue;
+            if (IsHostOnly(gpuEngine, backend, parameters[i]) || IsHostOnly(gpuEngine, backend, gradients[i])) return false;
+            for (int s = 0; s < states.Length; s++)
+                if (IsHostOnly(gpuEngine, backend, states[s][i])) return false;
+        }
+
         var parameterBuffers = new IGpuBuffer[n];
         var gradientBuffers = new IGpuBuffer[n];
         var stateBuffers = new IGpuBuffer[n][];
         var sizes = new int[n];
-        List<DirectGpuTensorEngine.TransientDeviceSlice>? slices = null;
-        try
+        for (int i = 0; i < n; i++)
         {
-            for (int i = 0; i < n; i++)
+            var param = parameters[i];
+            var grad = gradients[i];
+            int len = param.Length;
+            if (len == 0) continue; // nothing to update; sizes[i] stays 0 and the dispatch skips it
+
+            var pBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, param);
+            var gBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, grad);
+            if (pBuf is null || pBuf.Size < len || gBuf is null || gBuf.Size < len)
+                return false;
+
+            var perTensorStates = new IGpuBuffer[states.Length];
+            for (int s = 0; s < states.Length; s++)
             {
-                var param = parameters[i];
-                var grad = gradients[i];
-                int len = param.Length;
-                if (len == 0) continue; // nothing to update; sizes[i] stays 0 and the dispatch skips it
-
-                var perTensorStates = new IGpuBuffer[states.Length];
-                for (int s = 0; s < states.Length; s++)
-                {
-                    var state = states[s][i];
-                    if (TryResolveStateBuffer(gpuEngine, backend, state, len) is not { } stateBuffer) return false;
-                    perTensorStates[s] = stateBuffer;
-                }
-
-                if (TryAcquireReadOnlyFloatBuffer(gpuEngine, backend, grad, len) is not { } gradIn) return false;
-                (slices ??= new List<DirectGpuTensorEngine.TransientDeviceSlice>(n)).Add(gradIn.Slice);
-
-                param.EnsureOwnedForDeviceWrite();
-                IGpuBuffer? pBuf;
-                if (DirectGpuTensorEngine.IsFlatParameterView(param))
-                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _);
-                else if (param._gpuBuffer is null && param.OffloadDevicePointer != IntPtr.Zero)
-                    pBuf = param.TryGetGpuBuffer();
-                else
-                    pBuf = gpuEngine.AcquireParameterBuffer(param, out _) ?? TryGetCurrentGpuBuffer(gpuEngine, backend, param);
-                if (pBuf is null || pBuf.Size < len) return false;
-
-                parameterBuffers[i] = pBuf;
-                gradientBuffers[i] = gradIn.Buffer;
-                stateBuffers[i] = perTensorStates;
-                sizes[i] = len;
+                var sBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, states[s][i]);
+                if (sBuf is null || sBuf.Size < len)
+                    return false;
+                perTensorStates[s] = sBuf;
             }
 
-            int active = 0;
-            for (int i = 0; i < n; i++)
-            {
-                if (sizes[i] == 0) continue;
-                kernel(backend, parameterBuffers[i], gradientBuffers[i], stateBuffers[i], sizes[i]);
-                active++;
-            }
-            if (active == 0) return true;
-
-            int marks = 1 + states.Length;
-            var syncLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), marks * active);
-            int lease = 0;
-            for (int i = 0; i < n; i++)
-            {
-                if (sizes[i] == 0) continue;
-                MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], syncLeases[lease++]);
-                for (int s = 0; s < states.Length; s++)
-                    MarkGpuUpdatedWithSync(states[s][i], syncLeases[lease++]);
-            }
-            return true;
+            parameterBuffers[i] = pBuf;
+            gradientBuffers[i] = gBuf;
+            stateBuffers[i] = perTensorStates;
+            sizes[i] = len;
         }
-        finally
+
+        int active = 0;
+        for (int i = 0; i < n; i++)
         {
-            if (slices is not null)
-                for (int i = 0; i < slices.Count; i++) slices[i].Dispose();
+            int len = sizes[i];
+            if (len == 0) continue;
+            var param = parameters[i];
+            param.EnsureOwnedForDeviceWrite();
+            var pBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, param);
+            if (pBuf is null || pBuf.Size < len)
+                return false;
+            parameterBuffers[i] = pBuf;
+
+            for (int s = 0; s < states.Length; s++)
+            {
+                var state = states[s][i];
+                state.EnsureOwnedForDeviceWrite();
+                var sBuf = TryGetCurrentGpuBuffer(gpuEngine, backend, state);
+                if (sBuf is null || sBuf.Size < len)
+                    return false;
+                stateBuffers[i][s] = sBuf;
+            }
+            active++;
         }
+        if (active == 0) return true;
+
+        for (int i = 0; i < n; i++)
+        {
+            if (sizes[i] == 0) continue;
+            kernel(backend, parameterBuffers[i], gradientBuffers[i], stateBuffers[i], sizes[i]);
+        }
+
+        int marks = 1 + states.Length;
+        var syncLeases = GpuSyncPoint.CreateSharedLeaseGroup(CreateWriteSyncPoint(backend), marks * active);
+        int lease = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (sizes[i] == 0) continue;
+            MarkParameterUpdatedWithSync(gpuEngine, backend, parameters[i], parameterBuffers[i], syncLeases[lease++]);
+            for (int s = 0; s < states.Length; s++)
+                MarkGpuUpdatedWithSync(states[s][i], syncLeases[lease++]);
+        }
+        return true;
     }
 
     /// <summary>SGD with momentum over a parameter list; equals <see cref="TrySgdMomentumStep"/> per tensor.</summary>
+    // No current device copy: not on this backend, not pinned offload memory, and not a view of a flat parameter
+    // buffer (whose device copy belongs to the flat array).
+    private static bool IsHostOnly(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> tensor)
+        => TryGetCurrentGpuBuffer(engine, backend, tensor) is null
+            && tensor.OffloadDevicePointer == IntPtr.Zero
+            && !DirectGpuTensorEngine.IsFlatParameterView(tensor);
+
     public static bool TrySgdMomentumStepMultiTensor(
         IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients,
         IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay)
@@ -228,9 +252,9 @@ public static partial class GpuOptimizer
     /// </summary>
     public static bool TryLarsStepMultiTensor(
         IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients,
-        IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay, float trustCoeff)
+        IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay, float trustCoeff, float epsilon)
         => TryStepMultiTensor(nameof(TryLarsStepMultiTensor), parameters, gradients, new[] { velocities },
-            (b, p, g, s, len) => b.LarsUpdate(p, g, s[0], lr, momentum, weightDecay, trustCoeff, len));
+            (b, p, g, s, len) => b.LarsUpdate(p, g, s[0], lr, momentum, weightDecay, trustCoeff, epsilon, len));
 
     /// <summary>Proximal gradient (L1) over a parameter list; equals <see cref="TryProximalL1Step"/> per tensor.</summary>
     public static bool TryProximalL1StepMultiTensor(

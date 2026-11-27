@@ -1004,9 +1004,10 @@ __kernel void hardswish_backward(
     } else if (x > 3.0f) {
         grad = 1.0f;
     } else {
-        grad = (2.0f * x + 3.0f) / 6.0f;
+        // Divided on the bits: fast math divides by a reciprocal, and -0.5 at the kink came out -0.49999997.
+        grad = as_float(pk_fdiv(as_uint(2.0f * x + 3.0f), 0x40C00000u));
     }
-    gradInput[idx] = gradOutput[idx] * grad;
+    gradInput[idx] = pk_mul_keep(gradOutput[idx], grad);
 }
 
 // SELU backward

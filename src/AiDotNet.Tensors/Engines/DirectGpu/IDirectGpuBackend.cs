@@ -2229,10 +2229,15 @@ public interface IDirectGpuBackend : IGpuDevice
     /// <param name="learningRate">Global learning rate.</param>
     /// <param name="momentum">Momentum coefficient.</param>
     /// <param name="weightDecay">L2 regularization coefficient.</param>
-    /// <param name="trustCoeff">Trust coefficient for scaling.</param>
+    /// <param name="trustCoeff">Trust coefficient (eta): the local rate is
+    /// <c>learningRate * eta * ||w|| / (||g|| + weightDecay * ||w|| + epsilon)</c>.</param>
+    /// <param name="epsilon">Added to the local rate's denominator; below it either norm counts as zero and the
+    /// learning rate is used unscaled.</param>
     /// <param name="size">Number of parameters.</param>
+    /// <remarks>The velocity holds the rate-scaled step: <c>v = momentum v + localRate (g + weightDecay w)</c>,
+    /// <c>w = w - v</c>.</remarks>
     void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size);
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size);
 
     /// <summary>
     /// LAMB (Layer-wise Adaptive Moments) optimizer update.

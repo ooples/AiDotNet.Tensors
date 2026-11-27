@@ -13,6 +13,14 @@ public sealed class CudaMultiPlanTableCacheTests
     private static object Field(object owner, string name) => owner.GetType()
         .GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!.GetValue(owner)!;
 
+    private static int CacheCapacity()
+    {
+        var field = typeof(CudaBackend).GetField("MultiTensorTableCacheCapacity", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("CudaBackend.MultiTensorTableCacheCapacity was not found.");
+        return field.GetRawConstantValue() is int value ? value
+            : throw new InvalidOperationException("CudaBackend.MultiTensorTableCacheCapacity is not an int constant.");
+    }
+
     private sealed class Buffers : IDisposable
     {
         public readonly int[] Sizes;
@@ -100,7 +108,10 @@ public sealed class CudaMultiPlanTableCacheTests
         Skip.IfNot(engine.IsGpuAvailable && engine.GetBackend() is CudaBackend, "Actual CUDA backend required.");
         var backend = engine.GetBackend()!;
         using var sum = backend.AllocateBuffer(new float[AiDotNet.Tensors.Engines.Gpu.DeterministicGradientNorm.RecordWords]);
-        var sets = Enumerable.Range(0, 10).Select(i => new Buffers(backend, i + 1, 2)).ToArray();
+        // The bound is the backend's working-set size (raised from 8 to 32 in a3562ce03); two plans past it evict the
+        // first, so the test follows the constant rather than a copy of its old value.
+        int capacity = CacheCapacity();
+        var sets = Enumerable.Range(0, capacity + 2).Select(i => new Buffers(backend, i + 1, 2)).ToArray();
         try
         {
             IGpuBuffer? firstAdam = null, firstGradient = null;
@@ -113,8 +124,8 @@ public sealed class CudaMultiPlanTableCacheTests
                     firstAdam = (IGpuBuffer)Field(Field(backend, "_adamTable"), "Pointers");
                     firstGradient = (IGpuBuffer)Field(Field(backend, "_gradientTable"), "Pointers");
                 }
-                Assert.InRange(((ICollection)Field(backend, "_retainedAdamTables")).Count, 1, 8);
-                Assert.InRange(((ICollection)Field(backend, "_retainedGradientTables")).Count, 1, 8);
+                Assert.InRange(((ICollection)Field(backend, "_retainedAdamTables")).Count, 1, capacity);
+                Assert.InRange(((ICollection)Field(backend, "_retainedGradientTables")).Count, 1, capacity);
                 sets[i].Check();
             }
             Assert.Equal(IntPtr.Zero, firstAdam!.Handle);

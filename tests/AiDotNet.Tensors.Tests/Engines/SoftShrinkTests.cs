@@ -2,6 +2,7 @@ using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -37,7 +38,7 @@ public class SoftShrinkTests
         for (int i = 0; i < Inputs.Length; i++)
         {
             float expected = (float)Reference((float)Inputs[i], 0.5);
-            Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(y[i]));
+            Assert.Equal(MathCompat.SingleToInt32Bits(expected), MathCompat.SingleToInt32Bits(y[i]));
         }
     }
 
@@ -75,7 +76,7 @@ public class SoftShrinkTests
 
         var y = _engine.TensorSoftShrink(x, 0.5f);
 
-        for (int i = 0; i < 3; i++) Assert.Equal(0, BitConverter.SingleToInt32Bits(y[i]));
+        for (int i = 0; i < 3; i++) Assert.Equal(0, MathCompat.SingleToInt32Bits(y[i]));
     }
 
     [Fact]

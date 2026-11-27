@@ -209,6 +209,27 @@ public class LarsFusedTests
     }
 
     /// <summary>
+    /// With eps = 0 the zero-norm floor is <c>norm &gt;= 0</c>, which a zero norm passes: the ratio became 0 / 0 and
+    /// the step NaN. A zero weight or gradient norm keeps the base rate at any eps, as the reference LARS applies the
+    /// trust ratio only to positive norms.
+    /// </summary>
+    [Fact]
+    public void ZeroNorms_WithZeroEps_KeepTheBaseLearningRate()
+    {
+        const float lr = 0.1f, momentum = 0f, wd = 0f, trust = 1e-3f, eps = 0f;
+        var zeroWeights = new float[9];
+        var grad = new float[9];
+        for (int i = 0; i < grad.Length; i++) grad[i] = 0.5f;
+        RunKernel(zeroWeights, grad, new float[9], lr, momentum, wd, trust, eps);
+        Assert.All(zeroWeights, v => Assert.Equal(-lr * 0.5f, v, 6));
+
+        var weights = new float[9];
+        for (int i = 0; i < weights.Length; i++) weights[i] = 2f;
+        RunKernel(weights, new float[9], new float[9], lr, momentum, wd, trust, eps);   // zero gradient
+        Assert.All(weights, v => Assert.Equal(2f, v));
+    }
+
+    /// <summary>
     /// The sparse and dense kernels are the same optimizer and must produce the same numbers when the
     /// sparse gradient happens to touch every index.
     /// </summary>

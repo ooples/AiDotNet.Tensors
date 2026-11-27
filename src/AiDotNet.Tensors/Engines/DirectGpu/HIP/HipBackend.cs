@@ -9280,14 +9280,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     // Rows at least this wide reduce with one block per row (arg_extreme_axis_rows, the CUDA kernel); narrower rows
     // keep one thread per row.
-    internal const int ArgExtremeRowKernelMinWidth = 512;
     private long _argExtremeRowLaunches;
-    internal long ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+    long IArgExtremeRowLaunchCounter.ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
 
 
     private unsafe bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
     {
-        if (reduceSize < ArgExtremeRowKernelMinWidth || outerSize <= 0
+        if (reduceSize < ArgExtremeRows.MinWidth || outerSize <= 0
             || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var kernel))
             return false;
         IntPtr inputPtr = A.Handle;
@@ -12473,32 +12472,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     }
 
     /// <inheritdoc/>
-    public unsafe void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        if (!_kernelCache.TryGetValue("lars_update", out var krnl))
-            throw new GpuCapabilityUnavailableException("HIP kernel not found: lars_update");
-
-            {
-            IntPtr _p0 = ((HipGpuBuffer)param).Handle;
-            IntPtr _p1 = ((HipGpuBuffer)gradient).Handle;
-            IntPtr _p2 = ((HipGpuBuffer)velocity).Handle;
-            void** args = stackalloc void*[8];
-            args[0] = &_p0;
-            args[1] = &_p1;
-            args[2] = &_p2;
-            args[3] = &learningRate;
-            args[4] = &momentum;
-            args[5] = &weightDecay;
-            args[6] = &trustCoeff;
-            args[7] = &size;
-
-
-            uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-            LaunchKernel(krnl, grid, DefaultBlockSize, args);
-            Synchronize();
-            }
-    }
+    public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     /// <inheritdoc/>
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

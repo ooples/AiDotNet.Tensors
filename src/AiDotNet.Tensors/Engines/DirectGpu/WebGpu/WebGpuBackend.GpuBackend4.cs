@@ -144,26 +144,10 @@ public sealed partial class WebGpuBackend : IGatedDeltaNetBackwardBackend, IGate
     }
 
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        // Two-pass: compute norms on GPU, then dispatch update with pre-computed local_lr
-        using var squared = (WebGpuBuffer)AllocateBuffer(size);
-        // Compute param norm
-        SquareAsync(param, squared, size).GetAwaiter().GetResult();
-        float pNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
-        float pNorm = MathF.Sqrt(pNormSq);
-        // Compute gradient norm
-        SquareAsync(gradient, squared, size).GetAwaiter().GetResult();
-        float gNormSq = SumAsync(squared, size).GetAwaiter().GetResult();
-        float gNorm = MathF.Sqrt(gNormSq);
-        float localLr = pNorm > 0 && gNorm > 0 ? trustCoeff * pNorm / (gNorm + weightDecay * pNorm) : 1f;
-        // LarsLambFtrlSource lars_update: extra = pre-computed local_lr, beta1 = momentum
-        var uniforms = MakeOptimizerUniforms(size, learningRate, momentum, 0, 0, weightDecay, 0);
-        // Replace the last uniform (extra) with localLr
-        uniforms[7] = localLr;
-        Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lars_update",
-            param, gradient, velocity, SharedDummyBuffer, uniforms, size).GetAwaiter().GetResult();
-    }
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,

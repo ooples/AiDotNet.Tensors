@@ -38,12 +38,6 @@ layout(push_constant) uniform Params { uint size; uint step; float learningRate;
 void main(){uint i=gl_GlobalInvocationID.x;if(i>=size)return;float g=gradient[i]+weightDecay*param[i];m[i]=beta1*m[i]+(1.0-beta1)*g;v[i]=beta2*v[i]+(1.0-beta2)*g*g;vmax[i]=max(vmax[i],v[i]);float mh=m[i]/(vk_bias_correction(beta1,float(step)));param[i]-=learningRate*mh/(sqrt(vmax[i]/(vk_bias_correction(beta2,float(step))))+epsilon);}
 ";
 
-    public static string Lars => Header + @"
-layout(set=0,binding=0) buffer Param { float param[]; };layout(set=0,binding=1) readonly buffer Gradient { float gradient[]; };layout(set=0,binding=2) buffer Velocity { float velocity[]; };
-layout(push_constant) uniform Params { uint size; float learningRate; float momentum; float weightDecay; float trustCoefficient; };
-void main(){if(gl_GlobalInvocationID.x!=0u)return;float pn=0.0,gn=0.0;for(uint i=0u;i<size;++i){pn+=param[i]*param[i];gn+=gradient[i]*gradient[i];}pn=sqrt(pn);gn=sqrt(gn);float local=pn>0.0&&gn>0.0?trustCoefficient*pn/(gn+weightDecay*pn):1.0;for(uint i=0u;i<size;++i){velocity[i]=momentum*velocity[i]+local*(gradient[i]+weightDecay*param[i]);param[i]-=learningRate*velocity[i];}}
-";
-
     public static string Lamb => Header + @"
 layout(set=0,binding=0) buffer Param { float param[]; };layout(set=0,binding=1) readonly buffer Gradient { float gradient[]; };layout(set=0,binding=2) buffer M { float m[]; };layout(set=0,binding=3) buffer V { float v[]; };
 layout(push_constant) uniform Params { uint size; uint step; float learningRate; float beta1; float beta2; float epsilon; float weightDecay; };

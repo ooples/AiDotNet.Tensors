@@ -40,6 +40,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlanLos
         }
         lock (_stepSync)
         {
+            // A pending window holds gradients at the old scale; combined with a step at the new one, the whole sum would
+            // be unscaled by one factor. Finish (combine) the window before changing the loss scaling.
+            if (AccumulatedGradientSteps > 0)
+                throw new InvalidOperationException(
+                    $"Loss scaling cannot change while {AccumulatedGradientSteps} deferred gradient step(s) are pending; "
+                    + "combine the accumulated gradients first.");
             DisposeLossScaleDevice();
             _lossScaling = options is null ? null : new LossScalingOptions
             {

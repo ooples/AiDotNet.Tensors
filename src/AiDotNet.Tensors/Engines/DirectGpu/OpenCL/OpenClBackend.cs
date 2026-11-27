@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IAdam8BitWeightDecayBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor, IDeviceMemoryAccounted, IGatedDeltaNetBackwardBackend, IGatedDeltaRuleForwardBackend, IArgExtremeRowLaunchCounter
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -355,6 +355,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             {
                 InitializationException = new AggregateException(
                     "OpenCL backend initialization and cleanup both failed.", exception, cleanupException);
+            }
+        }
+
+        // An optional kernel module (#1464): compiled and registered on its own, so a driver that rejects it loses only
+        // its kernels. Out of memory is fatal and propagates.
+        private void CompileOptionalModule(string source, IEnumerable<string> kernelNames, string buildOptions, string label)
+        {
+            var context = _context
+                ?? throw new InvalidOperationException("The OpenCL context must exist before kernel modules compile.");
+            try
+            {
+                var program = CompileOrLoadCached(source, buildOptions, label);
+                _programs.Add(program);
+                foreach (var name in kernelNames)
+                    _kernelCache[name] = new DirectOpenClKernel(context, program, name);
+            }
+            catch (OutOfMemoryException)
+            {
+                throw; // Fatal: never silently downgrade.
+            }
+            catch (Exception ex)
+            {
+                WriteDiag($"[OpenClBackend] {label} (#1464) unavailable: {ex.Message}");
             }
         }
 
@@ -785,85 +808,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     _kernelCache[name] = new DirectOpenClKernel(_context, lstmProgram, name);
                 }
 
-                // Fused recurrence / LM-head kernels (#1464) are an OPTIONAL capability: a
-                // driver that rejects one of these sources must not abort the whole backend
-                // init (which would lose every core kernel). Compile them in their own
-                // try/catch — methods that need a missing kernel already throw "kernel not
-                // found" at call time, so a partial compile degrades gracefully.
-                try
-                {
-                    // Compile fused GLA (Gated Linear Attention) scan kernels (#1464)
-                    var glaProgram = CompileOrLoadCached(GlaKernels.GetSource(), optimizationFlags, "GLA scan kernels");
-                    _programs.Add(glaProgram);
-                    foreach (var name in GlaKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, glaProgram, name);
-                    }
-
-                    // Compile fused xLSTM (mLSTM) scan kernels (#1464)
-                    var xlstmProgram = CompileOrLoadCached(XLstmKernels.GetSource(), optimizationFlags, "xLSTM scan kernels");
-                    _programs.Add(xlstmProgram);
-                    foreach (var name in XLstmKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, xlstmProgram, name);
-                    }
-
-                    // Compile fused Gated DeltaNet scan kernels (#1464)
-                    var gdnProgram = CompileOrLoadCached(GatedDeltaNetKernels.GetSource(), optimizationFlags, "Gated DeltaNet scan kernels");
-                    _programs.Add(gdnProgram);
-                    foreach (var name in GatedDeltaNetKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, gdnProgram, name);
-                    }
-
-                    // Compile fused RG-LRU scan kernels (#1464)
-                    var rglruProgram = CompileOrLoadCached(RgLruKernels.GetSource(), optimizationFlags, "RG-LRU scan kernels");
-                    _programs.Add(rglruProgram);
-                    foreach (var name in RgLruKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, rglruProgram, name);
-                    }
-
-                    // Compile fused RWKV-4 WKV scan kernels (#1464)
-                    var rwkv4Program = CompileOrLoadCached(Rwkv4Kernels.GetSource(), optimizationFlags, "RWKV-4 WKV scan kernels");
-                    _programs.Add(rwkv4Program);
-                    foreach (var name in Rwkv4Kernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, rwkv4Program, name);
-                    }
-
-                    // Compile fused Mamba selective scan kernels (#1464)
-                    var mambaProgram = CompileOrLoadCached(MambaKernels.GetSource(), optimizationFlags, "Mamba selective scan kernels");
-                    _programs.Add(mambaProgram);
-                    foreach (var name in MambaKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, mambaProgram, name);
-                    }
-
-                    // Compile fused Mamba-2 SSD scan kernels (#1464)
-                    var mamba2Program = CompileOrLoadCached(Mamba2Kernels.GetSource(), optimizationFlags, "Mamba-2 SSD scan kernels");
-                    _programs.Add(mamba2Program);
-                    foreach (var name in Mamba2Kernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, mamba2Program, name);
-                    }
-
-                    // Compile fused linear + cross-entropy kernels (#1464)
-                    var fusedCeProgram = CompileOrLoadCached(FusedLinearCeKernels.GetSource(), optimizationFlags, "Fused linear cross-entropy kernels");
-                    _programs.Add(fusedCeProgram);
-                    foreach (var name in FusedLinearCeKernels.GetKernelNames())
-                    {
-                        _kernelCache[name] = new DirectOpenClKernel(_context, fusedCeProgram, name);
-                    }
-                }
-                catch (OutOfMemoryException)
-                {
-                    throw; // Fatal — never silently downgrade.
-                }
-                catch (Exception fex)
-                {
-                    WriteDiag($"[OpenClBackend] fused recurrence/LM-head kernels (#1464) unavailable: {fex.Message}");
-                }
+                // Fused recurrence / LM-head kernels (#1464) are an OPTIONAL capability: a driver that rejects one of these
+                // sources must not abort the whole backend init (which would lose every core kernel), and must not take
+                // the other modules with it either. One shared try/catch did: on NVIDIA's OpenCL a Gated DeltaNet source
+                // error left Mamba, Mamba-2, RG-LRU, RWKV-4 and the fused cross-entropy unregistered too ("kernel not
+                // found" for nine kernels). Each module now compiles on its own; one a driver rejects is reported and
+                // its methods throw "kernel not found" at call time.
+                CompileOptionalModule(GlaKernels.GetSource(), GlaKernels.GetKernelNames(), optimizationFlags, "GLA scan kernels");
+                CompileOptionalModule(XLstmKernels.GetSource(), XLstmKernels.GetKernelNames(), optimizationFlags, "xLSTM scan kernels");
+                CompileOptionalModule(GatedDeltaNetKernels.GetSource(), GatedDeltaNetKernels.GetKernelNames(), optimizationFlags, "Gated DeltaNet scan kernels");
+                CompileOptionalModule(RgLruKernels.GetSource(), RgLruKernels.GetKernelNames(), optimizationFlags, "RG-LRU scan kernels");
+                CompileOptionalModule(Rwkv4Kernels.GetSource(), Rwkv4Kernels.GetKernelNames(), optimizationFlags, "RWKV-4 WKV scan kernels");
+                CompileOptionalModule(MambaKernels.GetSource(), MambaKernels.GetKernelNames(), optimizationFlags, "Mamba selective scan kernels");
+                CompileOptionalModule(Mamba2Kernels.GetSource(), Mamba2Kernels.GetKernelNames(), optimizationFlags, "Mamba-2 SSD scan kernels");
+                CompileOptionalModule(FusedLinearCeKernels.GetSource(), FusedLinearCeKernels.GetKernelNames(), optimizationFlags, "Fused linear cross-entropy kernels");
 
                 // Compile GRU sequence kernels (forward/backward for BPTT training)
                 var gruProgram = CompileOrLoadCached(GruKernels.GetSource(), optimizationFlags, "GRU sequence kernels");
@@ -10402,11 +10360,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (!_kernelCache.TryGetValue("soft_shrink_forward", out var k))
                 throw new GpuCapabilityUnavailableException("OpenCL kernel not found: soft_shrink_forward");
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-            k.SetArg(arg++, lambda);
-            k.SetArg(arg++, size);
+            k.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
+            k.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(2, lambda);
+            k.SetArg(3, size);
             k.Execute1D(size, Math.Min(256, size));
         }
 
@@ -11908,8 +11865,28 @@ KERNEL VARIANTS (A/B testing):
             k.Execute1D(outerSize, Math.Min(64, outerSize));
         }
 
+        private long _argExtremeRowLaunches;
+        long IArgExtremeRowLaunchCounter.ArgExtremeRowLaunches => System.Threading.Interlocked.Read(ref _argExtremeRowLaunches);
+
+        // A row at least ArgExtremeRows.MinWidth wide: one 256-item work group per row.
+        private bool TryLaunchArgExtremeRows(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize, int findMin)
+        {
+            if (reduceSize < ArgExtremeRows.MinWidth || outerSize <= 0 || (long)outerSize * 256 > int.MaxValue
+                || !_kernelCache.TryGetValue("arg_extreme_axis_rows", out var k) || k.MaxWorkGroupSize < 256)
+                return false;
+            k.SetArg(0, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
+            k.SetArg(1, ((DirectOpenClGpuBuffer)indices).Buffer.Handle);
+            k.SetArg(2, outerSize);
+            k.SetArg(3, reduceSize);
+            k.SetArg(4, findMin);
+            k.Execute1D(outerSize * 256, 256);
+            System.Threading.Interlocked.Increment(ref _argExtremeRowLaunches);
+            return true;
+        }
+
         public void ArgMax(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
             var k = _kernelCache["argmax_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -11922,6 +11899,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void ArgMin(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 1)) return;
             var k = _kernelCache["argmin_axis"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
@@ -11958,6 +11936,7 @@ KERNEL VARIANTS (A/B testing):
         public void ArgMaxAxis(IGpuBuffer A, IGpuBuffer indices, int outerSize, int reduceSize)
         {
             if (_context == null) throw new GpuCapabilityUnavailableException("OpenCL context not available");
+            if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, findMin: 0)) return;
 
             var aBuf = ((DirectOpenClGpuBuffer)A).Buffer;
             var idxBuf = ((DirectOpenClGpuBuffer)indices).Buffer;
@@ -12229,21 +12208,10 @@ KERNEL VARIANTS (A/B testing):
 
         /// <inheritdoc/>
         public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-            float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-        {
-            var k = _kernelCache["lars_update"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)velocity).Buffer.Handle);
-            k.SetArg(arg++, learningRate);
-            k.SetArg(arg++, momentum);
-            k.SetArg(arg++, weightDecay);
-            k.SetArg(arg++, trustCoeff);
-            k.SetArg(arg++, size);
-
-            k.Execute1D(size, Math.Min(256, size));
-        }
+            float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+            // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+            // algorithm on every backend.
+            => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
         /// <inheritdoc/>
         public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

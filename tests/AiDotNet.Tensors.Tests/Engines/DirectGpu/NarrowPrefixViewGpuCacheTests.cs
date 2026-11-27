@@ -79,4 +79,32 @@ public class NarrowPrefixViewGpuCacheTests
         Assert.Equal(firstRow, gpu.TensorBroadcastTo(cloned, new[] { 2, 6 }).ToArray());
         Assert.Equal(rowSums, gpu.TensorMatMul(source, ones).ToArray());
     }
+
+    [SkippableFact]
+    public void A_prefix_view_reads_the_buffer_the_source_was_last_bound_to()
+    {
+        // The source's upload is cached under its backing array; a device result then rebinds the source to a buffer
+        // the cache does not know. A prefix view resolving the pending array through the cache read the upload's
+        // superseded values instead of the bound buffer's.
+        using var gpu = new DirectGpuTensorEngine();
+        Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend available");
+        var backend = gpu.GetBackend();
+        Skip.If(backend is null, "No DirectGpu backend available");
+        if (backend is null) return;
+        var data = new float[12];
+        for (int i = 0; i < data.Length; i++) data[i] = i + 1;
+        var source = new Tensor<float>(new[] { 3, 4 }, new Vector<float>(data));
+        _ = gpu.TensorAddScalar(source, 0f).ToArray();                          // the upload is cached under the array
+
+        var rebound = new float[12];
+        for (int i = 0; i < rebound.Length; i++) rebound[i] = 100f + i;
+        var buffer = backend.AllocateBuffer(rebound);
+        gpu.BindResidentBuffer(source, buffer, backend);                        // a device write: the bound buffer is current
+
+        var rows = gpu.TensorNarrow(source, 0, 0, 2);                           // first two rows: a prefix view
+        var doubled = gpu.TensorMultiplyScalar(rows, 2f).ToArray();
+
+        Assert.Equal(new[] { 200f, 202f, 204f, 206f, 208f, 210f, 212f, 214f }, doubled);
+        Assert.Equal(rebound, source.ToArray());
+    }
 }
