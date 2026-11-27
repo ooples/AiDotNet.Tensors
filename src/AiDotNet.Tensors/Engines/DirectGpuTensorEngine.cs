@@ -2264,7 +2264,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // A contiguous offset-0 tensor is no slice the overload below copies. Resolving a base for it would upload
         // and cache a second full buffer of a resident input (its pending persistent role) only to be declined.
-        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0))
+        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0 && !view.IsPrefixView))
         {
             result = default;
             return false;
@@ -7367,6 +7367,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     }
 
+    /// <summary>
+    /// A bind of a whole tensor to a buffer the cache does not know (a resident result, an optimizer's output) makes
+    /// that buffer the array's only current value. An array-keyed entry for an older buffer would otherwise survive:
+    /// the array is pending again (for the new buffer), and a device read that resolves the pending array through the
+    /// cache (a prefix or slice view) would copy the superseded values. Called under the activation-cache lock.
+    /// </summary>
+    /// <returns>The superseded entry, removed from the cache, for the caller to release once the obsolete download is
+    /// detached; null when nothing is superseded.</returns>
+    /// <remarks>
+    /// Only a bind that covers the whole backing array supersedes it: a view bound to its own buffer leaves the rest of
+    /// the array in the cached buffer, which the resident mirror keeps per view. A buffer a compiled plan holds as its
+    /// bound input is never released here.
+    /// </remarks>
+    private ActivationCacheEntry? DisplaceSupersededArrayOwner<T>(Tensor<T> tensor, object arrayKey, IGpuBuffer buffer)
+    {
+        if (tensor.IsView || !tensor.CoversWholeVector || arrayKey is not Array array || array.Length != tensor.Length)
+            return null;
+        if (!_activationCache.TryGetValue(arrayKey, out var stale) || ReferenceEquals(stale.Buffer, buffer))
+            return null;
+        if (_residentInputBindings.TryGetValue(tensor, out var binding) && ReferenceEquals(binding.Buffer, stale.Buffer))
+            return null;
+        return _activationCache.TryRemove(arrayKey, out var displaced) ? displaced : null;
+    }
+
     private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
         Tensor<T> tensor,
         object arrayKey,
@@ -7404,7 +7428,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!_activationCache.TryGetValue(vectorKey, out var vectorEntry)
                 || !ReferenceEquals(vectorEntry.Buffer, buffer)
                 || !ReferenceEquals(vectorEntry.Backend, backend))
-                return null;
+                return DisplaceSupersededArrayOwner(tensor, arrayKey, buffer);
 
             // A second entry can have been cached under the newly materialized array between the
             // vector-keyed result's host read and this bind. The bind makes `buffer` authoritative,

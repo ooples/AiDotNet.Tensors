@@ -22,7 +22,7 @@ internal static partial class BatchExecutionCudaKernels
     public const int BroadcastAdd = 0, BroadcastMul = 1;
     public const int GateGlu = 0, GateGeGlu = 1, GateReGlu = 2, GateSwiGlu = 3;
 
-    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + HouseholderSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource + ChannelBiasResidualSource;
+    public static string GetSource() => CoreSource + SolverSource + AttentionSource + LstmSource + GruSource + DecodeLinearSource + DirectConvSource + WeightNormSource + RfftMagnitudeSource + ChannelBiasLeakySource + GroupedConv2DSource + ChannelBiasResidualSource;
 
     private static string CoreSource => KernelSourceResources.Read("BatchExecution.core.c");
 
@@ -44,7 +44,6 @@ internal static partial class BatchExecutionCudaKernels
         GruProjection, GruCell, GruCellBackward, GruHiddenBackward, GruInputGrad, GruWeightIhGrad, GruWeightHhGrad, GruBiasGrad,
         GruRbResetHidden, GruRbCandidateProjection, GruRbCell, GruRbCellBackward, GruRbResetBackward, GruRbHiddenBackward,
         GruRbWeightHhGrad,
-        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw,
-        HouseholderNorm, HouseholderForward, HouseholderBackwardInput, HouseholderBackwardReflectorsRaw, HouseholderBackwardReflectorsNorm
+        DlLinearGelu, DlLinearGeluFp16, DlW8A8LinearGelu, DlW8A8Epilogue, DcConv2dDirectFp16Hw
     };
 }

@@ -224,7 +224,6 @@ internal static class OpRegistry
         "RoutedDiagonalSsmScanForward",
         "RgLruScanForward",
         "GlaScanForward",
-        "HouseholderChain",
         "AbcScanForward",
         "GatedDeltaNetScanForward",
         "XLstmScanForward",

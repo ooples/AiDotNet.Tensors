@@ -1176,13 +1176,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.HouseholderChain``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean,System.Double)</Target>
-    <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.KvCacheAppend``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net10.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net10.0/AiDotNet.Tensors.dll</Right>
@@ -1492,13 +1485,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.GraphAttentionCsr``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.CsrGraph,System.Double,System.Double,System.Random)</Target>
-    <Left>lib/net462/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net462/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.HouseholderChain``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean,System.Double)</Target>
     <Left>lib/net462/AiDotNet.Tensors.dll</Left>
     <Right>lib/net462/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -1820,13 +1806,6 @@
   </Suppression>
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.HouseholderChain``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean,System.Double)</Target>
-    <Left>lib/net471/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net471/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.KvCacheAppend``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0})</Target>
     <Left>lib/net471/AiDotNet.Tensors.dll</Left>
     <Right>lib/net471/AiDotNet.Tensors.dll</Right>
@@ -2136,13 +2115,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.GraphAttentionCsr``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.CsrGraph,System.Double,System.Double,System.Random)</Target>
-    <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.HouseholderChain``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean,System.Double)</Target>
     <Left>lib/net8.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/net8.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>
@@ -2494,13 +2466,6 @@
   <Suppression>
     <DiagnosticId>CP0006</DiagnosticId>
     <Target>M:AiDotNet.Tensors.Engines.IEngine.GraphAttentionCsr``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.Engines.CsrGraph,System.Double,System.Double,System.Random)</Target>
-    <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
-    <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
-    <IsBaselineSuppression>true</IsBaselineSuppression>
-  </Suppression>
-  <Suppression>
-    <DiagnosticId>CP0006</DiagnosticId>
-    <Target>M:AiDotNet.Tensors.Engines.IEngine.HouseholderChain``1(AiDotNet.Tensors.LinearAlgebra.Tensor{``0},AiDotNet.Tensors.LinearAlgebra.Tensor{``0},System.Boolean,System.Double)</Target>
     <Left>lib/netstandard2.0/AiDotNet.Tensors.dll</Left>
     <Right>lib/netstandard2.0/AiDotNet.Tensors.dll</Right>
     <IsBaselineSuppression>true</IsBaselineSuppression>

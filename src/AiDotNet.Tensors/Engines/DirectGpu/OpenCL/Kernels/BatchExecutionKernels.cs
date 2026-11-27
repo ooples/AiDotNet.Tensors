@@ -20,7 +20,7 @@ public static class BatchExecutionKernels
     /// The IExtendedLinalgBackend solvers, translated mechanically from the shared CUDA C so OpenCL runs the same
     /// code HIP and Metal run: kernel qualifiers, global pointers, the thread index and the float builtins.
     /// </summary>
-    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.HouseholderSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource)
+    private static readonly string SolverSource = TranslateSolvers(K.SolverSource + K.AttentionSource + K.LstmSource + K.GruSource + K.DecodeLinearSource + K.DirectConvSource + K.WeightNormSource + K.RfftMagnitudeSource + K.ChannelBiasLeakySource + K.GroupedConv2DSource + K.ChannelBiasResidualSource)
         .Replace(TranslateSolvers(K.ChannelBiasLeakySource), GetChannelBiasLeakySource());
 
     // Keep the shared CUDA constant intact so all backends deduplicate the common module in CLR metadata.
@@ -39,7 +39,7 @@ public static class BatchExecutionKernels
             .Replace("threadIdx.x", "get_local_id(0)")
             .Replace("blockDim.x", "get_local_size(0)");
         body = Regex.Replace(body, @"(?<![\w*])(const )?(float|int)\* ", "__global $1$2* ", RegexOptions.None, RegexTimeout);
-        return Regex.Replace(body, @"\b(sqrt|fmax|fabs|exp|log|tanh|cos|sin)f\(", "$1(", RegexOptions.None, RegexTimeout);
+        return Regex.Replace(body, @"\b(sqrt|fmax|fabs|exp|log|tanh)f\(", "$1(", RegexOptions.None, RegexTimeout);
     }
 
     public static string GetSource()
@@ -282,8 +282,7 @@ __kernel void bx_fft_from_storage(__global const uint* words, __global float* de
             K.GruProjection, K.GruCell, K.GruCellBackward, K.GruHiddenBackward, K.GruInputGrad, K.GruWeightIhGrad,
             K.GruWeightHhGrad, K.GruBiasGrad, K.GruRbResetHidden, K.GruRbCandidateProjection, K.GruRbCell, K.GruRbCellBackward,
             K.GruRbResetBackward, K.GruRbHiddenBackward, K.GruRbWeightHhGrad,
-            K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw,
-            K.HouseholderNorm, K.HouseholderForward, K.HouseholderBackwardInput, K.HouseholderBackwardReflectorsRaw, K.HouseholderBackwardReflectorsNorm
+            K.DlLinearGelu, K.DlLinearGeluFp16, K.DlW8A8LinearGelu, K.DlW8A8Epilogue, K.DcConv2dDirectFp16Hw
         };
     }
 }
