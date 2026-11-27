@@ -4661,18 +4661,6 @@ public partial interface IEngine
         int numHeads);
 
     /// <summary>
-    /// Applies a matrix-free chain of <c>K</c> Householder reflections <c>y = x H_0 H_1 ... H_{K-1}</c>
-    /// (or reverse order when <paramref name="transpose"/> is <c>true</c>) to <paramref name="input"/> (<c>[..., D]</c>)
-    /// using <paramref name="reflectors"/> (<c>[K, D]</c>) normalized with overflow-safe row scaling and squared-norm
-    /// floor <paramref name="normFloor"/> (when <c>&lt;= 0</c>, selects the element-type default floor).
-    /// </summary>
-    Tensor<T> HouseholderChain<T>(
-        Tensor<T> input,
-        Tensor<T> reflectors,
-        bool transpose = false,
-        double normFloor = 0.0);
-
-    /// <summary>
     /// Fused ABC (Attention with Bounded-memory Control) slot recurrence over a whole sequence as one
     /// differentiable op (forward + analytic BPTT backward); see <c>CpuEngine.AbcScan.cs</c> (#1464).
     /// </summary>

@@ -2264,7 +2264,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // A contiguous offset-0 tensor is no slice the overload below copies. Resolving a base for it would upload
         // and cache a second full buffer of a resident input (its pending persistent role) only to be declined.
-        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0))
+        if (typeof(T) != typeof(float) || (view.IsContiguous && view._storageOffset == 0 && !view.IsPrefixView))
         {
             result = default;
             return false;

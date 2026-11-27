@@ -94,7 +94,7 @@ public abstract class GpuSyncPoint : IDisposable
         return new CombinedSyncPoint(syncPoints);
     }
 
-    internal static GpuSyncPoint[] CreateSharedLeaseGroup(GpuSyncPoint inner, int count)
+    public static GpuSyncPoint[] CreateSharedLeaseGroup(GpuSyncPoint inner, int count)
     {
         if (inner is null)
         {

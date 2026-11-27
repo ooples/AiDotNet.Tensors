@@ -1577,11 +1577,6 @@ fn lstm_sig(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
         [BatchExecutionCudaKernels.DlLinearGelu] = DlLinearGelu, [BatchExecutionCudaKernels.DlLinearGeluFp16] = DlLinearGeluFp16,
         [BatchExecutionCudaKernels.DlW8A8LinearGelu] = DlW8A8LinearGelu, [BatchExecutionCudaKernels.DlW8A8Epilogue] = DlW8A8Epilogue,
         [BatchExecutionCudaKernels.DcConv2dDirectFp16Hw] = DcConv2dDirectFp16Hw,
-        [BatchExecutionCudaKernels.HouseholderNorm] = HouseholderNorm,
-        [BatchExecutionCudaKernels.HouseholderForward] = HouseholderForward,
-        [BatchExecutionCudaKernels.HouseholderBackwardInput] = HouseholderBackwardInput,
-        [BatchExecutionCudaKernels.HouseholderBackwardReflectorsRaw] = HouseholderBackwardReflectorsRaw,
-        [BatchExecutionCudaKernels.HouseholderBackwardReflectorsNorm] = HouseholderBackwardReflectorsNorm,
     };
 }
 #endif
