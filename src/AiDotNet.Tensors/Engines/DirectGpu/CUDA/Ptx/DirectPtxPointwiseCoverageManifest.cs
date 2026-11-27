@@ -71,6 +71,7 @@ internal static class DirectPtxPointwiseCoverageManifest
         Planned("CudaBackend.PRelu", "NVRTC prelu", "channel/scalar parameterized ReLU", Vector, "FP32", "prelu-layout-and-alpha-families"),
         Planned("CudaBackend.RRelu", "NVRTC rrelu", "randomized slope using supplied noise", Vector, "FP32", "rrelu-forward-noise-layout-families"),
         Planned("CudaBackend.Threshold", "NVRTC threshold", "x>threshold?x:value", Vector, "FP32", "threshold-baked-parameter-families"),
+        Planned("CudaBackend.SoftShrink", "NVRTC soft_shrink_forward", "x-clamp(x,-lambda,lambda)", Vector, "FP32", "threshold-baked-parameter-families"),
         Planned("CudaBackend.ReluBackward", "NVRTC relu_backward", "ReLU input gradient", Vector, "FP32", "activation-backward-vector-families"),
         Planned("CudaBackend.SigmoidBackward", "NVRTC sigmoid_backward", "sigmoid output gradient", Vector, "FP32", "activation-backward-vector-families"),
         Planned("CudaBackend.TanhBackward", "NVRTC tanh_backward", "tanh output gradient", Vector, "FP32", "activation-backward-vector-families"),

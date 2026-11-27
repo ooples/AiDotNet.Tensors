@@ -35,24 +35,12 @@ public static class Activations
 
     /// <summary>Soft shrinkage: <c>x − sign(x) · lambda</c> when
     /// <c>|x| &gt; lambda</c>, else 0.</summary>
+    /// <remarks>Runs <see cref="Engines.IEngine.TensorSoftShrink{T}"/> on the current engine: one fused pass (SIMD on the
+    /// CPU, a kernel on a GPU), recorded for autodiff.</remarks>
     public static Tensor<T> Softshrink<T>(Tensor<T> input, double lambda = 0.5)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
-        var ops = MathHelper.GetNumericOperations<T>();
-        var output = new Tensor<T>((int[])input._shape.Clone());
-        using var srcLease = input.Lease();
-        var src = srcLease.Span;
-        using var dstLease = output.LeaseWritable();
-        var dst = dstLease.Span;
-        for (int i = 0; i < src.Length; i++)
-        {
-            double v = ops.ToDouble(src[i]);
-            double r = v > lambda ? v - lambda
-                     : v < -lambda ? v + lambda
-                     : 0.0;
-            dst[i] = ops.FromDouble(r);
-        }
-        return output;
+        return Engines.AiDotNetEngine.Current.TensorSoftShrink(input, MathHelper.GetNumericOperations<T>().FromDouble(lambda));
     }
 
     /// <summary>Tanh shrinkage: <c>x − tanh(x)</c>.</summary>

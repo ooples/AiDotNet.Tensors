@@ -12380,6 +12380,17 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    public unsafe void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+    {
+        if (!_kernelCache.TryGetValue("soft_shrink_forward", out var kernel))
+            throw new GpuCapabilityUnavailableException("CUDA kernel not found: soft_shrink_forward");
+        using var _ = PushContext();
+        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr iPtr = input.Handle; IntPtr oPtr = output.Handle; int n = size;
+        void** args = stackalloc void*[4]; args[0] = &iPtr; args[1] = &oPtr; args[2] = &lambda; args[3] = &n;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         if (!_kernelCache.TryGetValue("threshold_backward", out var kernel))
