@@ -46,7 +46,10 @@ public class RetryingTranslatedModulesTests
             return "published";
         });
 
-        var first = Task.Run(() => CudaDialectToWgsl.Modules(modules));
+        // Its own thread, not a pool thread: under a full parallel run the pool can be busy with blocking tests for
+        // longer than the waits below, and the first translation then never started.
+        var first = Task.Factory.StartNew(() => CudaDialectToWgsl.Modules(modules), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
         Assert.True(firstStarted.Wait(TimeSpan.FromSeconds(30)), "the first translation never started");
         Assert.Equal("published", CudaDialectToWgsl.Modules(modules));
         secondPublished.Set();
