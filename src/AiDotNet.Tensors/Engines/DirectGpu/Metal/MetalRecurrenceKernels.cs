@@ -530,7 +530,7 @@ kernel void causal_dwconv1d_backward_kernel(
     dw[jc] = acc;
 }
 
-/ Checkpointed backward (GatedDeltaNetCheckpoint): one work-group per (batch, head) whose threads stride over the
+// Checkpointed backward (GatedDeltaNetCheckpoint): one work-group per (batch, head) whose threads stride over the
 // state rows. Pass 1 saves the state entering every `chunk` steps (Ckpt); pass 2 walks the chunks in reverse,
 // recomputes the chunk's states (Scratch), sums dQ over the rows, runs BPTT per row (carrying the row's adjoint in dS
 // between chunks, and overwriting each Scratch row with its dK contribution once nothing reads it), then sums dK, dA
