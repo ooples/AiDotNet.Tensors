@@ -33,12 +33,12 @@ internal static class PackedFloatLibrary
     }
 
     /// <summary>
-    /// The library's add and multiply for an OpenCL program, defined once however many of the program's sources include
-    /// it, followed by <c>pk_add_keep</c> and <c>pk_mul_keep</c>: the native sum and product, except where an operand is
+    /// The library's add, multiply and divide for an OpenCL program, defined once however many of the program's sources
+    /// include it, followed by <c>pk_add_keep</c> and <c>pk_mul_keep</c>: the native sum and product, except where an operand is
     /// subnormal or the result is below 2^-125 (where the device may have flushed it), which are computed on the bits.
     /// </summary>
     internal static string OpenCl => s_openCl ??= "#ifndef PK_FLOAT_LIBRARY\n#define PK_FLOAT_LIBRARY\n"
-        + CSpelling("", "uint", end: "uint pk_fdiv(")
+        + CSpelling("", "uint", end: "uint pk_usqrt(")
         + @"
 inline int pk_tiny(uint m) { return m - 1u < 0x007FFFFFu; }
 float pk_add_keep(float x, float y)

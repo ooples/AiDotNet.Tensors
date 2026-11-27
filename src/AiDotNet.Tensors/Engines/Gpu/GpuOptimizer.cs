@@ -1164,8 +1164,8 @@ public static partial class GpuOptimizer
     public static bool TryNagStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay)
         => TryExecuteDense(p, g, velocity, "TryNagStep", (b, pb, gb, vb) => b.NagUpdate(pb, gb, vb, lr, momentum, weightDecay, p.Length));
 
-    public static bool TryLarsStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay, float trustCoeff)
-        => TryExecuteDense(p, g, velocity, "TryLarsStep", (b, pb, gb, vb) => b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, p.Length));
+    public static bool TryLarsStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay, float trustCoeff, float epsilon)
+        => TryExecuteDense(p, g, velocity, "TryLarsStep", (b, pb, gb, vb) => b.LarsUpdate(pb, gb, vb, lr, momentum, weightDecay, trustCoeff, epsilon, p.Length));
 
     public static bool TryLambStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step,
         float maxTrustRatio = 0f, bool biasCorrection = true)

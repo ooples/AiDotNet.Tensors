@@ -514,49 +514,12 @@ __kernel void nag_update(
         grad += weightDecay * param[idx];
     }
 
-    // Nesterov momentum (Sutskever-style NAG)
-    // Note: Caller should compute gradient at lookahead position (theta + mu * v) for true NAG
+    // Nesterov momentum: the step looks ahead along the new velocity, as the CUDA, HIP, Vulkan and WebGPU kernels and
+    // the sparse kernel do (applying the velocity alone was plain momentum).
     float v = velocity[idx];
     float vNew = momentum * v - learningRate * grad;
     velocity[idx] = vNew;
-
-    // NAG update - apply velocity directly
-    param[idx] += vNew;
-}
-
-// ---------------------------------------------------------------------------
-// LARS (Layer-wise Adaptive Rate Scaling) optimizer update
-// Note: LARS applies trustCoeff to scale the learning rate adaptively per layer.
-// The trustCoeff should be pre-computed as: trustCoeff * ||w|| / (||grad|| + ||w|| * weightDecay)
-// Set trustCoeff=1.0f to disable trust coefficient scaling.
-// ---------------------------------------------------------------------------
-__kernel void lars_update(
-    __global float* param,
-    __global const float* gradient,
-    __global float* velocity,
-    const float learningRate,
-    const float momentum,
-    const float weightDecay,
-    const float trustCoeff,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float p = param[idx];
-
-    // Apply weight decay
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * p;
-    }
-
-    // Update velocity with momentum
-    float v = momentum * velocity[idx] + grad;
-    velocity[idx] = v;
-
-    // Update parameters with trust coefficient scaling
-    param[idx] = p - learningRate * trustCoeff * v;
+    param[idx] += momentum * vNew - learningRate * grad;
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,7 +1259,6 @@ __kernel void scale_by_device_scalar_inplace(__global float* x, const int n, __g
             "rmsprop_update",
             "adagrad_update",
             "nag_update",
-            "lars_update",
             "lamb_update",
             "adadelta_update",
             "amsgrad_update",

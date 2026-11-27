@@ -15,7 +15,7 @@ internal static class OpenClTorchParityElementwiseKernels
     /// <summary>Work-group size of the block scan (AMD and most OpenCL devices cap work groups at 256).</summary>
     internal const int ScanBlock = 256;
 
-    public static string GetSource() => @"
+    public static string GetSource() => ExactFloatKernels.OpenCl + @"
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
 #pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable
@@ -429,9 +429,28 @@ double parity_sinpi_d(double x)
 }
 // ---- unary kernels: y[i] = op(x[i]; p0, p1), evaluated in double ----
 
+// A float widened to double, and a double rounded to float, with binary32 subnormals done on the bits: a device may
+// flush them in both conversions (AMD's does), so ndtri(1e-45) came out -inf where the host gives -13.
+double parity_wide(float x)
+{
+    uint b = as_uint(x);
+    if ((b & 0x7F800000u) != 0u || (b & 0x007FFFFFu) == 0u) return (double)x;
+    double m = (double)(b & 0x007FFFFFu) * 1.4012984643248171e-45;
+    return (b & 0x80000000u) != 0u ? -m : m;
+}
+
+float parity_narrow(double d)
+{
+    double a = fabs(d);
+    if (!(a < 1.1754943508222875e-38) || a == 0.0) return (float)d;
+    // Below 2^-126: the multiple of 2^-149 to nearest, ties to even (2^-126 itself when it rounds up).
+    uint m = (uint)rint(a * 7.1362384635297994e44);
+    return as_float((d < 0.0 ? 0x80000000u : 0u) | m);
+}
+
 #define PARITY_UNARY_D(name, expr) \
 __kernel void name(__global const float* restrict x, __global float* restrict y, int n, float p0, float p1) \
-{ PARITY_INDEX double v = (double)x[i]; double a0 = (double)p0; double a1 = (double)p1; y[i] = (float)(expr); }
+{ PARITY_INDEX double v = parity_wide(x[i]); double a0 = parity_wide(p0); double a1 = parity_wide(p1); y[i] = parity_narrow(expr); }
 
 // min(max(v, lo), hi) with NaN propagating from v OR either bound (Math.Max / Math.Min semantics).
 double parity_clamp_nan(double v, double lo, double hi) { return (isnan(v) || isnan(lo) || isnan(hi)) ? NAN : (v < lo ? lo : (v > hi ? hi : v)); }
@@ -486,12 +505,16 @@ __kernel void parity_mvlgamma(__global const float* restrict x, __global float* 
 
 // ---- binary kernels (same shape) ----
 
-// fmax / fmin: NaN-ignoring max / min -- exactly OpenCL's fmax / fmin.
+// fmax / fmin: NaN-ignoring max / min, decided on the bits (a device may flush subnormals in fmax / fmin and in
+// compares). Equal operands are the same value but for zeros, where max is +0 and min is -0 (Math.Max / Math.Min).
+uint parity_fmax_bits(uint a, uint b) { return xf_isnan(a) ? b : xf_isnan(b) ? a : xf_gt(a, b) ? a : xf_gt(b, a) ? b : (a & b); }
+uint parity_fmin_bits(uint a, uint b) { return xf_isnan(a) ? b : xf_isnan(b) ? a : xf_lt(a, b) ? a : xf_lt(b, a) ? b : (a | b); }
+
 __kernel void parity_fmax(__global const float* restrict a, __global const float* restrict b, __global float* restrict y, int n)
-{ PARITY_INDEX y[i] = fmax(a[i], b[i]); }
+{ PARITY_INDEX y[i] = as_float(parity_fmax_bits(as_uint(a[i]), as_uint(b[i]))); }
 
 __kernel void parity_fmin(__global const float* restrict a, __global const float* restrict b, __global float* restrict y, int n)
-{ PARITY_INDEX y[i] = fmin(a[i], b[i]); }
+{ PARITY_INDEX y[i] = as_float(parity_fmin_bits(as_uint(a[i]), as_uint(b[i]))); }
 
 // heaviside: isnan(x) ? x : x < 0 ? 0 : x > 0 ? 1 : values
 __kernel void parity_heaviside(__global const float* restrict x, __global const float* restrict v, __global float* restrict y, int n)
@@ -501,12 +524,12 @@ __kernel void parity_heaviside(__global const float* restrict x, __global const 
     y[i] = isnan(t) ? t : (t < 0.0f ? 0.0f : (t > 0.0f ? 1.0f : v[i]));
 }
 
-// greater_equal / less_equal: 1 or 0 (a comparison with NaN is false, as in .NET)
+// greater_equal / less_equal: 1 or 0 (a comparison with NaN is false, as in .NET), on the bits as fmax.
 __kernel void parity_greater_equal(__global const float* restrict a, __global const float* restrict b, __global float* restrict y, int n)
-{ PARITY_INDEX y[i] = a[i] >= b[i] ? 1.0f : 0.0f; }
+{ PARITY_INDEX y[i] = xf_bool(xf_ge(as_uint(a[i]), as_uint(b[i]))); }
 
 __kernel void parity_less_equal(__global const float* restrict a, __global const float* restrict b, __global float* restrict y, int n)
-{ PARITY_INDEX y[i] = a[i] <= b[i] ? 1.0f : 0.0f; }
+{ PARITY_INDEX y[i] = xf_bool(xf_le(as_uint(a[i]), as_uint(b[i]))); }
 
 __kernel void parity_igamma(__global const float* restrict as, __global const float* restrict xs, __global float* restrict y, int n)
 {

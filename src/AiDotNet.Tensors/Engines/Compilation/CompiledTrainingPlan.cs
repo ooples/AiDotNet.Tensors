@@ -556,9 +556,23 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExec);
         _stepGraphOwner?.RetireIndexGraphBindings(_stepGraphExecOdd);
         _stepGraphOwner?.RetireIndexGraphBindings(_updateGraphExec);
+        _stepGraphOwner?.RetireIndexGraphBindings(_epilogueGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExecOdd);
         Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_updateGraphExec);
+        Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_epilogueGraphExec);
+        // The engine would keep the weights' buffers for its whole life. Guarded: a plan whose construction never
+        // completed has no list, and a finalizer must not throw.
+        if (_deviceOptimizerWeightsLock is not null && _deviceOptimizerWeights is not null)
+        {
+            try { ReleaseDeviceOptimizerWeights(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A finalizer must not throw; the failure is traced for the developer instead of swallowed silently.
+                System.Diagnostics.Trace.TraceWarning(
+                    "CompiledTrainingPlan finalizer: releasing the device optimizer weights failed: " + ex);
+            }
+        }
     }
 
     /// <summary>Set once every stage of <see cref="Dispose"/> has run, whether or not one of them threw (tests).</summary>
@@ -588,8 +602,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal static readonly string[] TeardownStages =
     {
         "land gradients", "reclaim idle memory", "invalidate graphs", "checkpoint buffers", "loss scale",
-        "pinned handles", "exchange staging", "flat exchange buffer", "shared moments", "optimizer buffers",
-        "pooled moments", "step state",
+        "pinned handles", "exchange staging", "flat exchange buffer", "gradient accumulator", "shared moments",
+        "optimizer buffers", "pooled moments", "step state",
     };
 
     // Which plans' finalizers ran, by id, while a test tracks them.
@@ -642,6 +656,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // these via the same list before re-allocating.
         Stage("exchange staging", ReleasePinnedExchangeStaging);
         Stage("flat exchange buffer", ReleaseFlatExchangeBuffer);
+        Stage("gradient accumulator", () => _gradientAccumulation?.Release());
         Stage("shared moments", LeaveSharedMoments);
         Stage("optimizer buffers", DisposeGpuOptimizerBuffers);
         Stage("pooled moments", () => { ReturnPooledMoments(_optimizerRuntimeState); _optimizerRuntimeState = null; });
@@ -1314,6 +1329,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public Action<Engines.DirectGpu.IGraphStepIo>? Prepare { get; set; }
         public uint InitialApplied { get; set; }
         public uint LaunchedAtCapture { get; set; }
+        /// <summary>Replays since <see cref="LaunchedAtCapture"/> whose update was deferred (only the epilogue ran).</summary>
+        public uint DeferredReplays { get; set; }
         public int SkipsRecorded { get; set; }
         public uint AgesApplied { get; set; }
         public bool[]? ParameterMembership { get; set; }
@@ -1496,13 +1513,24 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             io.WriteLearningRates(replay, first, rates);
         }
         LaunchStepGraph(cb, exec);
+        _lastLaunchDeferred = false;   // only a split launch can defer; a stale true would skip later verdicts
         if (_updateGraphExec != IntPtr.Zero)
         {
             // The backward graph's gradients, reduced across ranks, then the update graph on them. The exchange's
             // download synchronizes the stream (the backward has finished) and its upload completes before the launch.
-            ExchangeGradients(deviceAuthoritative: true);
-            LaunchStepGraph(cb, _updateGraphExec);
-            UpdateGraphReplayCount++;
+            // A deferred update (gradient accumulation) launches only the epilogue: the loss and the progress word are
+            // published, and no applied step is counted.
+            _lastLaunchDeferred = ExchangeGradients(deviceAuthoritative: true);
+            if (_lastLaunchDeferred)
+            {
+                LaunchStepGraph(cb, _epilogueGraphExec);
+                if (_capturedOptimizer is { } deferring) deferring.DeferredReplays++;
+            }
+            else
+            {
+                LaunchStepGraph(cb, _updateGraphExec);
+                UpdateGraphReplayCount++;
+            }
         }
         io.Flush();
         _stepIoLaunched = replay + 1;
@@ -1537,7 +1565,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         uint launched = _stepIoLaunched;
         io.WaitForReplays(launched);
         uint applied = io.AppliedSteps;
-        int replays = (int)(launched - optimizer.LaunchedAtCapture);
+        // A replay that deferred its update ran no optimizer: it is neither an applied nor a skipped step.
+        int replays = (int)(launched - optimizer.LaunchedAtCapture - optimizer.DeferredReplays);
         int skipped = replays - (int)(applied - optimizer.InitialApplied);
         for (int s = optimizer.SkipsRecorded; s < skipped; s++) _nonFiniteStepsSkipped++;
         optimizer.SkipsRecorded = Math.Max(optimizer.SkipsRecorded, skipped);
@@ -1547,7 +1576,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             optimizer.AgesApplied = applied;
         }
         _optimizerStep = (int)applied;
-        if (launched > 0)
+        // A deferred replay ran no update, so it has no verdict: the flag keeps the last update's, as on the eager path.
+        if (launched > 0 && !_lastLaunchDeferred)
         {
             double last = io.SumOfSquares(launched - 1);
             _lastStepSkippedNonFiniteGradients = double.IsNaN(last) || double.IsInfinity(last);
@@ -1563,6 +1593,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_capturedOptimizer is not { } optimizer || _stepIo is not { } io) return;
         optimizer.InitialApplied = (uint)Math.Max(0, _optimizerStep);
         optimizer.LaunchedAtCapture = _stepIoLaunched;
+        optimizer.DeferredReplays = 0;
         optimizer.SkipsRecorded = 0;
         optimizer.AgesApplied = optimizer.InitialApplied;
         io.InitializeAppliedSteps(optimizer.InitialApplied);
@@ -1836,6 +1867,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Part(() => DestroyUpdateGraph(gte));
         }
         _updateGraphExec = IntPtr.Zero;
+        _epilogueGraphExec = IntPtr.Zero;
         _stepGraphOwner = null;
         _stepGraphExec = IntPtr.Zero;
         StepGraphNodeCounts = null;
@@ -1905,6 +1937,20 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             var parameter = _parameters[p];
             var buffer = parameter._gpuBuffer;
+            // A weight the device optimizer holds that an invalidation unbound (its host values are authoritative): the
+            // lookup uploads them into the held buffer and binds it again, before this step's update (or a replayed
+            // graph) reads it. Not bound back to that buffer means it was replaced under the optimizer: fail loudly.
+            if (buffer is null && _optimizerGpuParams is { } held && p < held.Length && held[p] is { } heldBuffer
+                && heldBuffer.Handle != IntPtr.Zero)
+            {
+                gte.BindResidentParamBuffer(parameter);
+                if (!ReferenceEquals(parameter._gpuBuffer, heldBuffer))
+                    throw new InvalidOperationException(
+                        $"Parameter {p}'s device buffer, which this plan's optimizer updates in place, was replaced while "
+                        + "the parameter was unbound; reconfigure the optimizer (ConfigureOptimizer) after replacing a "
+                        + "parameter's device storage.");
+                continue;
+            }
             if (buffer is null || buffer.Handle == IntPtr.Zero || parameter._gpuBackend is not { } backend) continue;
             if (parameter._gpuBufferVersion == parameter.GpuCacheVersion) continue;
 
@@ -2166,6 +2212,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private long _diagnosticObservations;
     private long _planGraphReplayCount;
 
+    /// <summary>Replays of this plan's captured step graph (tests).</summary>
+    internal long PlanGraphReplayCountForTests => _planGraphReplayCount;
+
 
     // Diagnostic metadata only: never obtains readable spans, realizes deferred tensors or downloads device values.
     private void TraceRetainedStorageOnce()
@@ -2405,6 +2454,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 gradMap.TryGetValue(input, out var ownGrad);
                 var view = outputGrad.ReshapeViewUnrecorded(input._shape);
+                Autodiff.DifferentiableOps.MarkPlanGradientView(view);
                 gradMap[input] = view;
                 rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
                 if (ownGrad is not null) dropped.Add(ownGrad);
@@ -2553,6 +2603,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     foreach (var (v, tg) in deviceAliases)
                         if (ReferenceEquals(v, outputGrad)) { target = tg; break; }
                 var view = outputGrad.ReshapeViewUnrecorded(x._shape);
+                Autodiff.DifferentiableOps.MarkPlanGradientView(view);
                 gradMap[x] = view;
                 rootOf[view] = root;
                 if (device) (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
@@ -2563,6 +2614,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (ReferenceEquals(dependent, x) || !rootOf.TryGetValue(g, out var r) || !ReferenceEquals(r, ownGrad))
                         continue;
                     var moved = view.ReshapeViewUnrecorded(dependent._shape);
+                    Autodiff.DifferentiableOps.MarkPlanGradientView(moved);
                     gradMap[dependent] = moved;
                     if (producer.TryGetValue(dependent, out int dp) && dp < earliestRead) earliestRead = dp;
                     rootOf.Remove(g);
@@ -4663,6 +4715,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         lock (_stepSync)
         {
             _retainedOutputsAvailable = false;
+            // Set by this step's exchange. Reset under the step's lock, so each step reads the decision its own exchange
+            // wrote: reset before the lock, another caller could clear it while a captured step sits between its
+            // exchange and the AfterReplay decision.
+            _lastStepUpdateDeferred = false;
 
             // The step's memory is the step's again: whatever borrowed it between steps moves out first.
             ReclaimIdleStepMemory();
@@ -4758,7 +4814,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // embedding gather reads the now-resident index buffer WITHOUT an inline upload (a cuMemcpyHtoD
                     // inside capture is CUDA 906 STREAM_CAPTURE_UNSUPPORTED). Flag cleared after capture so the eager
                     // fallback (and warmup steps) upload inline again.
-                    IntPtr exec;
+                    IntPtr exec = IntPtr.Zero;
                     try
                     {
                         // CAPTURE-PATH SCOPE (issue #26): the resident-buffer op branches engage ONLY inside this
@@ -4820,6 +4876,15 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                     CaptureLossScaling();
                                     CaptureUpdateGraphBody(parity: 0);
                                 });
+                            if (_updateGraphExec != IntPtr.Zero)
+                            {
+                                // What a step whose exchange defers the update launches instead (accumulation).
+                                using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("EpilogueGraphCapture"))
+                                    _epilogueGraphExec = gte.CaptureGraphWithIndexBindings(cb, () =>
+                                        _stepIo!.CaptureEpilogue(_stepIoLossCaptured ? _lossOutput._gpuBuffer : null,
+                                            _lossOutput.Length, countsStep: false));
+                                if (_epilogueGraphExec == IntPtr.Zero) DestroyUpdateGraph(gte);
+                            }
                             if (_updateGraphExec == IntPtr.Zero)
                             {
                                 gte.DestroyGpuGraph(exec);
@@ -4830,6 +4895,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     catch (Exception captureFailure)
                     {
                         RecordGraphCaptureFailure(captureFailure.GetType().Name + ": " + captureFailure.Message);
+                        // An update or epilogue graph captured before the throw is never launched: release it now, and
+                        // the step graph too when it was captured but not yet stored.
+                        DestroyUpdateGraph(gte);
+                        if (exec != IntPtr.Zero) gte.DestroyGpuGraph(exec);
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
@@ -4888,6 +4957,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (_stepIo is not null) LaunchStepGraphWithStepIo(cb, NextStepGraph);
                     else LaunchStepGraph(cb, exec);
                     RefreshCapturedStateAndLoss(gte);
+                    if (_capturedOptimizer is not null && _lastStepUpdateDeferred) return _lossOutput;   // no update ran
                     if (_capturedOptimizer is { } capturedFirst)
                     {
                         capturedFirst.AfterReplay?.Invoke();   // the graph ran the update
@@ -4902,7 +4972,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // capture step. Its kernels enqueue (in order) after the graph launch.
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
-                    ExchangeGradients(deviceAuthoritative: true);
+                    if (ExchangeGradients(deviceAuthoritative: true)) return _lossOutput;   // update deferred
                     UnscaleAfterExchange();
                     RegularizeAndClipGradients();
                     CommitHostOptimizerGradients();
@@ -4958,6 +5028,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 _planGraphReplayCount++;
 
                 RefreshCapturedStateAndLoss(gte);
+                if (_capturedOptimizer is not null && _lastStepUpdateDeferred) return _lossOutput;   // no update ran
                 if (_capturedOptimizer is { } capturedReplay)
                 {
                     capturedReplay.AfterReplay?.Invoke();   // the graph ran the update
@@ -4965,7 +5036,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         NoteGradientNormRecord(capturedReplayBackend, capturedReplayNorm);
                     return _lossOutput;
                 }
-                ExchangeGradients(deviceAuthoritative: true);
+                if (ExchangeGradients(deviceAuthoritative: true)) return _lossOutput;   // update deferred
                 UnscaleAfterExchange();
                 RegularizeAndClipGradients();
                 CommitHostOptimizerGradients();
@@ -5020,12 +5091,14 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (s_stepProf && _profFwdUs is not null && ++s_residentProfSteps % StepProfDumpInterval == 0)
                         DumpPerOpProfile(s_residentProfSteps);
                     RefreshLossFromCapturedGraph(gte);
-                    ExchangeGradients(deviceAuthoritative: false);
-                    UnscaleLossScaledGradients();
-                    RegularizeAndClipGradients();   // in the order the eager and graph steps use
-                    CommitHostOptimizerGradients();
-                    InvokeOptimizerUpdate();
-                    CompleteLossScaledStep();
+                    if (!ExchangeGradients(deviceAuthoritative: false))   // true: the update was deferred
+                    {
+                        UnscaleLossScaledGradients();
+                        RegularizeAndClipGradients();   // in the order the eager and graph steps use
+                        CommitHostOptimizerGradients();
+                        InvokeOptimizerUpdate();
+                        CompleteLossScaledStep();
+                    }
                     completedWorkspaceStep = true;
 
                     return _lossOutput;
@@ -6757,14 +6830,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
-        ExchangeGradients(deviceAuthoritative: false);
-        UnscaleLossScaledGradients();
-        RegularizeAndClipGradients();
+        // A deferred update (gradient accumulation through the exchange) skips the clip and the optimizer.
+        bool updateDeferred = ExchangeGradients(deviceAuthoritative: false);
+        if (!updateDeferred)
+        {
+            UnscaleLossScaledGradients();
+            RegularizeAndClipGradients();
+        }
 
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
         long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
-        InvokeOptimizerUpdate();
+        if (!updateDeferred) InvokeOptimizerUpdate();
         if (bwdProbe != null) bwdProbe("END-OPT");
         long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -7397,6 +7474,54 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
         _lrVelocityScratch.Clear();
+        ReleaseDeviceOptimizerWeights();
+    }
+
+    // The persistent weight buffers this plan's device optimizer updates in place, held in the engine
+    // (RetainDeviceOptimizerWeight) from ConfigureOptimizer until the optimizer state is freed (or the plan is
+    // finalized). A training loop that invalidates the weight caches after every step (before the first update a
+    // configured weight has no pending device data) otherwise freed the buffer the optimizer, and the update graph
+    // captured from it, still wrote. Released by the key retained, which outlives a later change of storage.
+    private readonly List<(Engines.DirectGpuTensorEngine Engine, object Key)> _deviceOptimizerWeights = new();
+    private readonly object _deviceOptimizerWeightsLock = new();
+
+    private void RetainDeviceOptimizerWeight(int p)
+    {
+        if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var engine)) return;
+        if (engine.RetainDeviceOptimizerWeight(_parameters[p]) is not { } key) return;
+        lock (_deviceOptimizerWeightsLock) _deviceOptimizerWeights.Add((engine, key));
+    }
+
+    private void ReleaseDeviceOptimizerWeights()
+    {
+        lock (_deviceOptimizerWeightsLock)
+        {
+            foreach (var (engine, key) in _deviceOptimizerWeights) engine.ReleaseDeviceOptimizerWeight(key);
+            _deviceOptimizerWeights.Clear();
+        }
+    }
+
+    /// <summary>
+    /// A buffer the configured device optimizer updates in place (a parameter's, or its moments) that was freed under it
+    /// would make the update, eager or captured, write freed memory: a sticky CUDA 700 with no hint of the cause. Throws
+    /// a clear error instead. CUDA buffers only (the captured update is CUDA's; a WebGPU handle is always zero).
+    /// </summary>
+    private void ThrowIfDeviceOptimizerBufferReleased(Engines.DirectGpu.IGpuBuffer?[] gpuParam,
+        Engines.DirectGpu.IGpuBuffer?[] gpuM, Engines.DirectGpu.IGpuBuffer?[] gpuV, string where)
+    {
+        for (int p = 0; p < gpuParam.Length; p++)
+        {
+            if (!IsOptimizerParameterActive(p)) continue;
+            string? which = gpuParam[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "weight"
+                : gpuM[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "first-moment"
+                : gpuV[p] is Engines.DirectGpu.CUDA.CudaBackend.CudaGpuBuffer { IsReleased: true } ? "second-moment"
+                : null;
+            if (which is not null)
+                throw new InvalidOperationException(
+                    $"Parameter {p}'s {which} device buffer, which this plan's optimizer was configured to update in place, "
+                    + $"was released before {where}. Something freed it while the optimizer held it; reconfigure the "
+                    + "optimizer (ConfigureOptimizer) after replacing a parameter's device storage.");
+        }
     }
 
     /// <summary>The optimizer's device buffers (moments, scratch) currently allocated; for tests.</summary>
@@ -7578,6 +7703,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 gpuParam[p] = paramGpuBuf;
                 gpuBackends[p] = paramBackend;
+                RetainDeviceOptimizerWeight(p);
                 // Gradient may be CPU or GPU. If CPU (the common case where
                 // backward ran on the engine the tape was bound to, which
                 // for a GPU-resident param SHOULD also be GPU but isn't
@@ -7856,6 +7982,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the optimizer update");
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try
@@ -8812,6 +8939,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (clipNorm > 0.0 && (typeof(T) != typeof(float) || clipNorm > float.MaxValue
                     || clipPolicy == Engines.Gpu.NonFiniteGradientPolicy.Error))
                 return null;
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the update graph was captured");
             ResolveAuthoritativeGpuGradients(gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
             var capParams = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
             var capGrads = new List<Engines.DirectGpu.IGpuBuffer>(paramCount);
@@ -9111,6 +9239,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 gpuParam[p] = paramGpuBuf;
                 gpuBackends[p] = paramBackend;
+                RetainDeviceOptimizerWeight(p);
                 if (_gradients[p] is not null)
                 {
                     var gradGpuBuf = _gradients[p].TryGetGpuBuffer();
@@ -9300,6 +9429,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _capturedOptimizerFactory = null;
         _optimizerUpdate = () =>
         {
+            ThrowIfDeviceOptimizerBufferReleased(gpuParam, gpuM, gpuV, "the optimizer update");
             RefreshOptimizerStaging(_parameters, (T[][])(object)paramArrays, stagedParams);
             RefreshOptimizerStaging(_gradients, (T[][])(object)gradArrays, stagedGrads);
             try

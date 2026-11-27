@@ -64,9 +64,11 @@ internal interface IGraphStepIo : IDisposable
 
     /// <summary>
     /// Records the step's publication: the first <paramref name="lossCount"/> floats of <paramref name="loss"/> (at
-    /// most 64) and the progress word. Call last inside the capture.
+    /// most 64) and the progress word. Call last inside the capture. With <paramref name="countsStep"/> false the
+    /// replay ran no optimizer update (a deferred step of a gradient accumulation): the applied count does not move,
+    /// the gradients' sum of squares is neither read nor reset, and the published sum of squares is zero.
     /// </summary>
-    void CaptureEpilogue(IGpuBuffer? loss, int lossCount);
+    void CaptureEpilogue(IGpuBuffer? loss, int lossCount, bool countsStep = true);
 
     /// <summary>Replay <paramref name="replay"/>'s loss values, valid once it has completed.</summary>
     ReadOnlySpan<float> Loss(uint replay, int count);

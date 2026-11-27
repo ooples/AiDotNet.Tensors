@@ -746,6 +746,30 @@ internal sealed class LazyTensorScope : IDisposable
         HostEscape ??= $"the result of {operationName}";
     }
 
+    private HashSet<ILazyNode>? _retainedNodes;
+
+    /// <summary>
+    /// Traced nodes whose output the forward kept past the call (<see cref="TensorScope.Keep{T}"/>,
+    /// <see cref="TensorScope.Detach{T}"/>), or null. The caller reads them after the plan runs, so a compiled plan
+    /// must keep each one observable: fusion may not absorb it into a consumer, or replays would stop writing it.
+    /// </summary>
+    internal IReadOnlyCollection<ILazyNode>? RetainedNodes => _retainedNodes;
+
+    /// <summary>
+    /// Records that the forward keeps <paramref name="node"/>'s output past the call. A node from another (or a finished)
+    /// scope is not this trace's to keep and is ignored. A training trace also declares the output retained
+    /// (<see cref="RetainOutput{T}(Tensor{T})"/>): the training plan's buffer leasing and trace-time value release
+    /// consult only that set, so without it the caller's tensor could end up aliasing another value.
+    /// </summary>
+    internal void MarkRetained<T>(ILazyNode node)
+    {
+        if (!_nodes.Contains(node)) return;
+        (_retainedNodes ??= new HashSet<ILazyNode>()).Add(node);
+        if (_traceKind == GraphTraceKind.Training && !_isProbe && !_realized && !_disposed
+            && node is LazyNode<T> { Output: { } output })
+            _retainedOutputs.Add(output);
+    }
+
     /// <summary>The engine the recorded nodes replay on.</summary>
     internal IEngine Engine => _engine;
 

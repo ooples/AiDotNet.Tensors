@@ -1649,8 +1649,8 @@ public class DelegatingGpuBackend : IDirectGpuBackend, IIndexConversionBackend, 
 
     /// <inheritdoc/>
     public virtual void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-        => Inner.LarsUpdate(param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, size);
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        => Inner.LarsUpdate(param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     /// <inheritdoc/>
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,

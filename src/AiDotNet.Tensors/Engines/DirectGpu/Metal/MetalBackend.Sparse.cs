@@ -326,6 +326,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (reduceSize <= 0) throw new ArgumentOutOfRangeException(nameof(reduceSize));
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, maximum: 1u)) return;
         DispatchResidentMetal("arg_extrema_axis", outerSize, new[] { A, indices },
             (uint)outerSize, (uint)reduceSize, 1u);
     }
@@ -337,6 +338,7 @@ public sealed partial class MetalBackend
     {
         ThrowIfDisposed();
         if (reduceSize <= 0) throw new ArgumentOutOfRangeException(nameof(reduceSize));
+        if (TryLaunchArgExtremeRows(A, indices, outerSize, reduceSize, maximum: 0u)) return;
         DispatchResidentMetal("arg_extrema_axis", outerSize, new[] { A, indices },
             (uint)outerSize, (uint)reduceSize, 0u);
     }

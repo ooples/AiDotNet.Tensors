@@ -436,29 +436,6 @@ extern ""C"" __global__ __launch_bounds__(256) void nag_update(
 }
 
 // ---------------------------------------------------------------------------
-// LARS optimizer update
-// ---------------------------------------------------------------------------
-extern ""C"" __global__ __launch_bounds__(256) void lars_update(
-    float* __restrict__ param, const float* __restrict__ gradient, float* __restrict__ velocity,
-    float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float p = param[idx];
-
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * p;
-    }
-
-    float v = momentum * velocity[idx] + grad;
-    velocity[idx] = v;
-
-    param[idx] = p - learningRate * v;
-}
-
-// ---------------------------------------------------------------------------
 // LAMB optimizer update
 // Note: LAMB requires layer-wise trust ratio computation (||w|| / ||update||).
 // The trust ratio must be pre-computed externally and passed to this kernel.
@@ -1425,7 +1402,6 @@ extern ""C"" __global__ __launch_bounds__(256) void sgd_pingpong_update(
             "rmsprop_update",
             "adagrad_update",
             "nag_update",
-            "lars_update",
             "lamb_update",
             "adadelta_update",
             "amsgrad_update",
