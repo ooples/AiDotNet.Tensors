@@ -594,7 +594,9 @@ public class GradientExchangeAccumulationTests
             Assert.IsType<InvalidOperationException>(replaceFailure);
             Assert.Equal(1, compiled.AccumulatedGradientSteps);   // the original exchange kept its window
 
-            compiled.SetGradientExchange(null);                     // between steps it is replaced as before
+            // Between steps it is replaced; the plan's own pending window is dropped, and loudly.
+            var dropped = Assert.Throws<InvalidOperationException>(() => compiled.SetGradientExchange(null));
+            Assert.Contains("accumulation window was dropped", dropped.Message);
             Assert.Equal(0, compiled.AccumulatedGradientSteps);
         }
     }
