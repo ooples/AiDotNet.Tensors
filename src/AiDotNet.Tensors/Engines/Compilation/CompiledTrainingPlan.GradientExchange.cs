@@ -132,14 +132,16 @@ internal sealed class GradientExchange<T>
             if (length == 0) continue;
             if (_deviceGradients[i] is { } buffer)
             {
-                var held = slot.Device!;
+                var held = slot.Device
+                    ?? throw new InvalidOperationException("The accumulator has no device slot for a device gradient.");
                 Backend.Scale(buffer, buffer, (float)weight, length);
                 if (first) Backend.Copy(buffer, held, length);
                 else Backend.Add(held, buffer, held, length);
             }
             else
             {
-                var held = slot.Host!;
+                var held = slot.Host
+                    ?? throw new InvalidOperationException("The accumulator has no host slot for a host gradient.");
                 using var lease = _gradients[i].LeaseWritable();
                 var g = lease.Span.Slice(0, length);
                 GradientAccumulation<T>.ScaleInPlace(g, weight);
@@ -187,7 +189,8 @@ internal sealed class GradientExchange<T>
             {
                 Backend.Scale(buffer, buffer, (float)weight, length);
                 if (!slot.Holds) continue;   // no deferred step reached it: acc is zero, so the sum is g * weight
-                var held = slot.Device!;
+                var held = slot.Device
+                    ?? throw new InvalidOperationException("The accumulator has no device slot for a device gradient.");
                 Backend.Scale(held, held, (float)accumulatedScale, length);
                 Backend.Add(held, buffer, buffer, length);
             }
@@ -197,7 +200,8 @@ internal sealed class GradientExchange<T>
                 var g = lease.Span.Slice(0, length);
                 GradientAccumulation<T>.ScaleInPlace(g, weight);
                 if (!slot.Holds) continue;
-                var held = slot.Host!;
+                var held = slot.Host
+                    ?? throw new InvalidOperationException("The accumulator has no host slot for a host gradient.");
                 GradientAccumulation<T>.ScaleInPlace(held, accumulatedScale);
                 GradientAccumulation<T>.AddInto(held, g, g);
             }
