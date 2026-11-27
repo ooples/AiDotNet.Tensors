@@ -42,6 +42,18 @@ public enum BoxMullerBranch
     Sine = 1,
 }
 
+/// <summary>Where a Box-Muller draw applies its standard deviation; the two orders round differently in the last
+/// bit, so a scalar loop is reproduced exactly only in its own order.</summary>
+public enum BoxMullerScaleOrder
+{
+    /// <summary><c>mean + stdDev * (sqrt(-2 ln u1) * cos(2 pi u2))</c>: the normal is formed, then scaled.</summary>
+    ScaleLast = 0,
+
+    /// <summary><c>mean + (stdDev * sqrt(-2 ln u1)) * cos(2 pi u2)</c>: the radius is scaled before the angle term, as
+    /// in loops written <c>std * Math.Sqrt(...) * Math.Cos(...)</c>.</summary>
+    ScaleFirst = 1,
+}
+
 /// <summary>
 /// One Box-Muller convention: how <c>u1</c> and <c>u2</c> come from the caller's <see cref="System.Random"/> and which
 /// branch is kept, so an engine draw reproduces a scalar loop's stream and values exactly. Each element consumes one
@@ -50,8 +62,11 @@ public enum BoxMullerBranch
 /// <remarks>
 /// The element is <c>mean + stdDev * z</c> with
 /// <c>z = Math.Sqrt(-2.0 * Math.Log(Math.Max(u1, FirstUniformFloor))) * Math.Cos(2.0 * Math.PI * u2)</c> (or
-/// <c>Math.Sin</c>), evaluated in double in that order. The default value is the textbook form: raw <c>u1</c> and
-/// <c>u2</c>, no floor, cosine branch.
+/// <c>Math.Sin</c>), evaluated in double in that order; <see cref="ScaleOrder"/> moves <c>stdDev</c> onto the radius.
+/// The default value is the textbook form: raw <c>u1</c> and <c>u2</c>, no floor, cosine branch, scale last, and
+/// device evaluation allowed. A float draw on a GPU engine evaluates the angle and affine steps on the device, which
+/// agrees with the host to float rounding; <see cref="Exact"/> keeps every step on the host, so the values equal the
+/// scalar loop's bit for bit on every engine.
 /// </remarks>
 public readonly struct BoxMullerVariant
 {
@@ -71,6 +86,24 @@ public readonly struct BoxMullerVariant
         FirstUniformFloor = firstUniformFloor;
         SecondUniform = secondUniform;
         Branch = branch;
+        ScaleOrder = BoxMullerScaleOrder.ScaleLast;
+        Exact = false;
+    }
+
+    /// <summary>Creates a convention with its scale order and exactness.</summary>
+    /// <param name="firstUniform">How <c>u1</c> is drawn.</param>
+    /// <param name="firstUniformFloor">The lower bound <c>u1</c> is raised to; see the other constructor.</param>
+    /// <param name="secondUniform">How <c>u2</c> is drawn.</param>
+    /// <param name="branch">The branch kept.</param>
+    /// <param name="scaleOrder">Where <c>stdDev</c> is applied.</param>
+    /// <param name="exact">Whether every step runs on the host, so the values equal the scalar loop's bit for bit on
+    /// every engine.</param>
+    public BoxMullerVariant(BoxMullerFirstUniform firstUniform, double firstUniformFloor, BoxMullerSecondUniform secondUniform,
+        BoxMullerBranch branch, BoxMullerScaleOrder scaleOrder, bool exact)
+        : this(firstUniform, firstUniformFloor, secondUniform, branch)
+    {
+        ScaleOrder = scaleOrder;
+        Exact = exact;
     }
 
     /// <summary>How <c>u1</c> is drawn.</summary>
@@ -84,6 +117,13 @@ public readonly struct BoxMullerVariant
 
     /// <summary>The branch kept.</summary>
     public BoxMullerBranch Branch { get; }
+
+    /// <summary>Where <c>stdDev</c> is applied.</summary>
+    public BoxMullerScaleOrder ScaleOrder { get; }
+
+    /// <summary>Whether every step runs on the host, so a float draw on a GPU engine equals the scalar loop bit for
+    /// bit rather than to float rounding.</summary>
+    public bool Exact { get; }
 }
 
 /// <summary>Which side of the threshold a uniform draw must fall on to count as a success.</summary>

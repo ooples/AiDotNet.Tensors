@@ -86,6 +86,24 @@ public sealed class DataOps2GpuParityTests : IClassFixture<GpuCpuCorrectnessFixt
         AssertBitsEqual(cpuGammaPer.ToArray(), gpuGammaPer.ToArray(), "gamma, per-element shape");
     }
 
+    [SkippableTheory]
+    [InlineData(BoxMullerScaleOrder.ScaleLast, true)]
+    [InlineData(BoxMullerScaleOrder.ScaleFirst, false)]
+    [InlineData(BoxMullerScaleOrder.ScaleFirst, true)]
+    public void NormalBoxMuller_ExactOrScaleFirst_IsBitIdenticalToTheCpu(BoxMullerScaleOrder order, bool exact)
+    {
+        Skip.IfNot(_fixture.IsGpuReady, "No GPU backend.");
+        var variant = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw,
+            BoxMullerBranch.Cosine, order, exact);
+        var a = RandomHelper.CreateSeededRandom(47);
+        var b = RandomHelper.CreateSeededRandom(47);
+        var gpu = _fixture.Gpu.TensorNormalBoxMullerFromRng<float>(a, new[] { 9, 113 }, variant, 0.5, 3.5).ToArray();
+        var cpu = _fixture.Cpu.TensorNormalBoxMullerFromRng<float>(b, new[] { 9, 113 }, variant, 0.5, 3.5).ToArray();
+        Assert.Equal(b.NextDouble(), a.NextDouble());
+        // Every step on the host, then uploaded: equal bit for bit, not to float rounding.
+        AssertBitsEqual(cpu, gpu, $"{order}, exact {exact}");
+    }
+
     [SkippableFact]
     public void TruncatedNormal_MeanPastFloatRange_MatchesTheHostDouble()
     {

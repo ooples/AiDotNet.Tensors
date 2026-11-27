@@ -1,0 +1,103 @@
+name: Unlist package versions
+
+# Manual only. Unlists (nuget.org's "delete") listed versions of one package so they leave search results.
+# Unlisted versions stay restorable by exact version; nuget.org never removes a package. Relist from the
+# package's Manage page on nuget.org.
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package id
+        required: true
+        default: AiDotNet.Tensors
+      versions:
+        description: Versions to unlist, separated by spaces, commas or newlines
+        required: true
+      dry_run:
+        description: List what would be unlisted without changing nuget.org
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unlist-package-versions
+  cancel-in-progress: false
+
+jobs:
+  unlist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Set up .NET
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Unlist
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSIONS: ${{ inputs.versions }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$PACKAGE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'$PACKAGE' is not a package id."
+            exit 1
+          fi
+          mapfile -t versions < <(printf '%s' "$VERSIONS" | tr ', ' '\n\n' | sed '/^$/d' | sort -V | uniq)
+          if [ ${#versions[@]} -eq 0 ]; then
+            echo "::error::No versions given."
+            exit 1
+          fi
+          for v in "${versions[@]}"; do
+            if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::'$v' is not a version."
+              exit 1
+            fi
+          done
+
+          # Only versions nuget.org actually has; a typo must not be reported as unlisted.
+          index="https://api.nuget.org/v3-flatcontainer/${PACKAGE,,}/index.json"
+          published="$(curl -fsSL "$index" | jq -r '.versions[]')"
+          missing=()
+          for v in "${versions[@]}"; do
+            grep -qxF "${v,,}" <<< "${published,,}" || missing+=("$v")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Not on nuget.org: ${missing[*]}"
+            exit 1
+          fi
+
+          echo "${#versions[@]} version(s) of $PACKAGE: ${versions[0]} .. ${versions[-1]}"
+          if [ "$DRY_RUN" = "true" ]; then
+            printf '  %s\n' "${versions[@]}"
+            echo "Dry run: nothing unlisted."
+            exit 0
+          fi
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::The NUGET_API_KEY secret is empty. Add a nuget.org key with the Unlist scope for $PACKAGE."
+            exit 1
+          fi
+
+          failed=()
+          for v in "${versions[@]}"; do
+            if dotnet nuget delete "$PACKAGE" "$v" --api-key "$NUGET_API_KEY" \
+                --source https://api.nuget.org/v3/index.json --non-interactive; then
+              echo "unlisted $PACKAGE $v"
+            else
+              failed+=("$v")
+            fi
+          done
+          {
+            echo "### Unlist $PACKAGE"
+            echo "Requested: ${#versions[@]}. Failed: ${#failed[@]}."
+            [ ${#failed[@]} -eq 0 ] || echo "Failed versions: ${failed[*]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::${#failed[@]} version(s) failed: ${failed[*]}. A 403 means the key lacks the Unlist scope or has expired."
+            exit 1
+          fi
