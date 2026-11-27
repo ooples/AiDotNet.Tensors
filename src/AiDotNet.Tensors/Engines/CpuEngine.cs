@@ -25707,6 +25707,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Each row is independent: max → subtract → exp → sum → divide.
     /// Parallelized across rows for large tensors.
     /// </summary>
+    /// <summary>Test hook: runs on the calling thread after the float GroupNorm has decided its chunking.</summary>
+    internal static Action? GroupNormDegreeDecidedForTests;
+
     /// <summary>
     /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
     /// and parallelizes across batch*groups using PersistentParallelExecutor.
@@ -25728,13 +25731,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var meanLocal = meanArr;
         var varLocal = varArr;
 
-        // Parallelize across batch*groups — each group is independent
+        // Parallelize across batch*groups — each group is independent. The degree of parallelism is a process-wide
+        // setting another thread may change at any time, so it is read once: the chunk count and the chunk size must
+        // come from the same value, or a change between two reads leaves groups no chunk covers.
+        int workers = Math.Max(1, Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism));
+        int chunkSize = (totalGroups + workers - 1) / workers;
+        GroupNormDegreeDecidedForTests?.Invoke();
         PersistentParallelExecutor.Instance.Execute(
-            Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism),
+            workers,
             [MethodImpl(Hot)] (chunk) =>
             {
-                int chunkSize = (totalGroups + Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism) - 1)
-                    / Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism);
                 int startIdx = chunk * chunkSize;
                 int endIdx = Math.Min(startIdx + chunkSize, totalGroups);
 
