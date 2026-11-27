@@ -479,6 +479,12 @@ public partial class CpuEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
+        // The destination adopts a strided view, so a registered streaming weight cannot be it (the pool never writes
+        // back or sheds a view; see TensorAsStridedInPlace). Rejected before any page-in. A streaming SOURCE is fine.
+        if (tensor.Lifetime == WeightLifetime.Streaming && tensor.StreamingPoolHandle >= 0)
+            throw new InvalidOperationException(
+                "TensorSetInPlace cannot write a strided view into a registered streaming weight; build the view in another " +
+                "tensor (with this weight as the source) instead.");
         // A streaming source whose storage was dropped pages in (a no-upcast int8/int4 one dequantizes) first, marked in
         // use until the view holds the storage, and the view is built under the source's transition gate so a drop a
         // release already claimed cannot empty the storage between the page-in and the view (BuildViewOfResidentStorage).

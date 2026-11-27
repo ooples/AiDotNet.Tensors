@@ -444,6 +444,9 @@ public class StreamingBf16InferenceTests
             cpu.TensorSetInPlace(strided, w, 0, new[] { r, c }, new[] { c, 1 });
             Assert.Equal(w.ToArray(), strided.ToArray());
             Assert.Throws<InvalidOperationException>(() => cpu.TensorAsStridedInPlace(w, new[] { c, r }, new[] { 1, c }));
+            // Nor can the offset TensorSetInPlace make the registered weight a strided view, even of itself.
+            Assert.Throws<InvalidOperationException>(() => cpu.TensorSetInPlace(w, w, 0, new[] { c, r }, new[] { 1, c }));
+            Assert.Equal(new[] { r, c }, w.Shape.ToArray());
         }
         finally { Cleanup(dir); }
     }
