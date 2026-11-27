@@ -347,8 +347,8 @@ public class DeviceOptimizerWeightRetentionTests
         if (engine is null) return;
         var weights = Weights(flat: false);
         var target = Values(Rows * Out, 2, 2f);
-        var first = Compile(engine, weights, target);
-        var second = Compile(engine, weights, target);
+        using var first = Compile(engine, weights, target);
+        using var second = Compile(engine, weights, target);
         first.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
         Assert.Equal(1, engine.DeviceOptimizerWeightHoldsForTests(weights[0]));
         first.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-3);
@@ -447,6 +447,89 @@ public class DeviceOptimizerWeightRetentionTests
             double diff = reference.Zip(placedRun, (a, b) => Math.Abs(a - b)).Max();
             Console.WriteLine($"placed+invalidated vs reference: max diff {diff:G4}");
             Assert.True(diff < 1e-5, $"the placed, invalidated parameters trained differently: {diff}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    /// <summary>
+    /// The engine's other invalidations honour the hold: InvalidateWeightCache marks the held buffer stale (the next
+    /// lookup refreshes it in place) and InvalidatePersistentTensor uploads into it. Neither replaces the buffer the
+    /// optimizer updates, so training goes on exactly as without them.
+    /// </summary>
+    [SkippableFact]
+    public void InvalidateWeightCacheAndInvalidatePersistentTensor_KeepTheHeldBuffer()
+    {
+        using var engine = CudaEngine();
+        if (engine is null) return;
+        var target = Values(Rows * Out, 2, 2f);
+        float[] Run(bool invalidate)
+        {
+            var weights = Weights(flat: false);
+            using var plan = Compile(engine, weights, target);
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
+            var bound = weights.Select(w => (AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer?)null).ToArray();
+            for (int step = 0; step < Steps; step++)
+            {
+                plan.SetInputs(new[] { new Tensor<float>(new[] { Rows, In }, new Vector<float>(Inputs(step))) });
+                plan.Step();
+                if (!invalidate) continue;
+                for (int i = 0; i < weights.Length; i++)
+                {
+                    var w = weights[i];
+                    _ = w.ToArray();   // the host current first: both invalidations take the host as authoritative
+                    var now = TestRequire.NotNull(w.TryGetGpuBuffer(), "the binding");
+                    if (step == 0) bound[i] = now;
+                    else Assert.Same(bound[i], now);
+                    if (step % 2 == 0) engine.InvalidateWeightCache(TestRequire.NotNull(
+                        (float[]?)w.GetBackingArrayForCacheLookupUnsafe(), "the backing array"));
+                    else engine.InvalidatePersistentTensor(w);
+                    Assert.True(engine.IsDeviceOptimizerWeight(w));
+                }
+            }
+            return weights.SelectMany(w => w.ToArray()).ToArray();
+        }
+        var reference = Run(invalidate: false);
+        var invalidated = Run(invalidate: true);
+        double diff = reference.Zip(invalidated, (a, b) => Math.Abs(a - b)).Max();
+        Console.WriteLine($"invalidated vs reference: max diff {diff:G4}");
+        Assert.True(diff < 1e-6, $"training with the invalidations left the reference by {diff}");
+    }
+
+    /// <summary>
+    /// InvalidateResidentWeightBuffer's contract, pinned: it follows an in-place host write, so the host is
+    /// authoritative and a pending device download is dropped. A weight the device optimizer just updated, invalidated
+    /// without being read first, therefore goes back to its host values (the update is discarded, for a caller-placed
+    /// weight as for a cache-bound one), without an error, and the next step trains from there.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AnInvalidationWithoutARead_DiscardsTheDeviceUpdate_AsDocumented(bool placed)
+    {
+        using var engine = CudaEngine();
+        if (engine is null) return;
+        var prior = AiDotNetEngine.Current;
+        try
+        {
+            AiDotNetEngine.Current = engine;
+            var weights = Weights(flat: false);
+            if (placed) foreach (var w in weights) w.Gpu();
+            using var plan = Compile(engine, weights, Values(Rows * Out, 2, 2f));
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
+            plan.SetInputs(new[] { new Tensor<float>(new[] { Rows, In }, new Vector<float>(Inputs(0))) });
+            plan.Step();   // updated on the device, its download pending
+            // The host arrays as they are, read without materializing the pending download.
+            var host = weights.Select(w => w.GetBackingArrayForCacheLookupUnsafe() is float[] a
+                ? a.Take(w.Length).ToArray() : null).ToArray();
+            foreach (var w in weights) engine.InvalidateResidentWeightBuffer(w);
+            for (int i = 0; i < weights.Length; i++)
+                Assert.Equal(TestRequire.NotNull(host[i], "the host values"), weights[i].ToArray());
+            plan.SetInputs(new[] { new Tensor<float>(new[] { Rows, In }, new Vector<float>(Inputs(1))) });
+            plan.Step();
+            Assert.NotEqual(host[0], weights[0].ToArray());   // and it trains on from them, without an error
         }
         finally
         {

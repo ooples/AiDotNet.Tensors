@@ -647,11 +647,13 @@ public class GradientExchangeAccumulationTests
             {
                 if (mode == "defer") { exchange.DeferUpdate(1.0); return; }
                 if (mode == "neither") return;
-                // "write-then-combine"
+                // "write-then-combine" / "write-then-defer"
                 var g = new float[exchange.TotalLength];
                 exchange.Read(g);
                 exchange.Write(g);
-                inner = Record.Exception(() => exchange.CombineAccumulated(0.5, 0.5));
+                inner = mode == "write-then-defer"
+                    ? Record.Exception(() => exchange.DeferUpdate(1.0))
+                    : Record.Exception(() => exchange.CombineAccumulated(0.5, 0.5));
                 if (inner is not null) throw inner;
             });
             var before = w.ToArray();
@@ -668,6 +670,10 @@ public class GradientExchangeAccumulationTests
             Assert.ThrowsAny<Exception>(() => plan.Step());
             Assert.Contains("combined before the exchange writes", Assert.IsType<InvalidOperationException>(inner).Message);
 
+            mode = "write-then-defer";
+            Assert.ThrowsAny<Exception>(() => plan.Step());
+            Assert.Contains("cannot defer its update", Assert.IsType<InvalidOperationException>(inner).Message);
+
             mode = "defer";
             plan.Step();
             // The refused combine threw before touching the accumulator, so the window kept its step (a retry may combine).
@@ -682,11 +688,16 @@ public class GradientExchangeAccumulationTests
     }
 
     // A deferred step runs no update, so it has no finiteness verdict of its own: LastStepSkippedNonFiniteGradients keeps
-    // the last update's, on the eager steps and the captured replays (CUDA captures on the 4th step) alike.
+    // the last update's, on the eager steps and the captured replays (CUDA captures on the 4th step) alike. Windows of 2
+    // until step 7, whose update is poisoned (skipped); then one long window of deferred steps, read only at its end
+    // (a read after every step would resolve the verdict each time and hide a stale slot), optionally after the captured
+    // graph was dropped and captured again (its replay numbering restarts).
     [SkippableTheory]
-    [InlineData("cpu")]
-    [InlineData("device")]
-    public void ADeferredStep_KeepsTheLastUpdatesFinitenessVerdict(string where)
+    [InlineData("cpu", false, false)]
+    [InlineData("device", false, false)]
+    [InlineData("device", true, false)]
+    [InlineData("device", false, true)]
+    public void ADeferredStep_KeepsTheLastUpdatesFinitenessVerdict(string where, bool readEveryStep, bool recapture)
     {
         var engine = TestRequire.NotNull(ResolveEngine(where, out bool cuda), "the engine");
         using (engine as IDisposable)
@@ -695,31 +706,71 @@ public class GradientExchangeAccumulationTests
             var compiled = (CompiledTrainingPlan<float>)plan;
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2);
             plan.SetMaxGradNorm(1.0);
+            // Long enough that, after a recapture, the new step I/O launches more replays than the old one's last update index
+            // before the read: a stale index then names a replay of the new step I/O.
+            const int Poisoned = 7, LongWindowEnd = 17;   // steps 8..16 defer, 17 combines
             int step = 0;
-            const int PoisonedWindow = 3;   // steps 6 and 7: replays on CUDA
-            compiled.SetGradientExchange(exchange =>
+            Action<GradientExchange<float>> callback = exchange =>
             {
-                if (step % 2 == 0) { exchange.DeferUpdate(1.0); return; }
+                bool defer = step < Poisoned + 1 ? step % 2 == 0 : step < LongWindowEnd;
+                if (defer) { exchange.DeferUpdate(1.0); return; }
                 exchange.CombineAccumulated(0.5, 0.5);
-                if (step / 2 != PoisonedWindow) return;
+                if (step != Poisoned) return;
                 var g = new float[exchange.TotalLength];
                 exchange.Read(g);
                 g[0] = float.NaN;
                 exchange.Write(g);
-            });
+            };
+            compiled.SetGradientExchange(callback);
             var verdicts = new List<bool>();
-            for (step = 0; step < 10; step++)
+            for (step = 0; step <= LongWindowEnd; step++)
             {
+                if (recapture && step == Poisoned + 1)
+                    compiled.SetGradientExchange(callback);   // at a window boundary: drops the captured graphs
                 plan.Step();
-                verdicts.Add(compiled.LastStepSkippedNonFiniteGradients);
+                if (readEveryStep) verdicts.Add(compiled.LastStepSkippedNonFiniteGradients);
+                else if (step == LongWindowEnd - 1)
+                    Assert.True(compiled.LastStepSkippedNonFiniteGradients,
+                        "after the deferred steps, the verdict must still be the poisoned update's");
             }
-            Console.WriteLine($"cuda={cuda} split={compiled.HasSplitStepGraph} verdicts={string.Join(",", verdicts)}");
+            Console.WriteLine($"cuda={cuda} split={compiled.HasSplitStepGraph} recapture={recapture} verdicts={string.Join(",", verdicts)}");
+            Assert.False(compiled.LastStepSkippedNonFiniteGradients);   // the long window's update was finite
+            if (readEveryStep)
+                Assert.Equal(Enumerable.Range(0, LongWindowEnd + 1).Select(s => s >= Poisoned && s < LongWindowEnd).ToList(),
+                    verdicts);
             Assert.Equal(cuda, compiled.HasSplitStepGraph);
-            // Step 7 (the poisoned window's update) skipped; step 8 (deferred) keeps that verdict; step 9 updates again.
-            var expected = Enumerable.Range(0, 10).Select(s => s == 7 || s == 8).ToList();
-            Assert.Equal(expected, verdicts);
             Assert.Equal(1, compiled.NonFiniteStepsSkipped);
-            Assert.Equal(4, compiled.OptimizerStep);
+            Assert.Equal(4, compiled.OptimizerStep);   // updates at 1, 3, 5 and 17 (7 skipped)
+        }
+    }
+
+    // Plans sharing one accumulator step one at a time: a step while another holds it is refused before anything is
+    // touched, and a disposed accumulator refuses every step.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void ASharedAccumulator_RefusesConcurrentAndDisposedUse(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        {
+            using var plan = CompileSmall(engine, out var w);
+            var compiled = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            var accumulation = new GradientAccumulation<float>();
+            compiled.SetGradientExchange(e => e.DeferUpdate(1.0), accumulation);
+            plan.Step();
+            Assert.Equal(1, accumulation.Steps);
+            accumulation.EnterStep();   // another plan's step is using it
+            var busy = Assert.Throws<InvalidOperationException>(() => plan.Step());
+            Assert.Contains("in use by another step", busy.Message);
+            Assert.Equal(1, accumulation.Steps);
+            accumulation.ExitStep();
+            plan.Step();
+            Assert.Equal(2, accumulation.Steps);
+            accumulation.Dispose();
+            Assert.Throws<ObjectDisposedException>(() => plan.Step());
+            Assert.Equal(0, compiled.OptimizerStep);
         }
     }
 }

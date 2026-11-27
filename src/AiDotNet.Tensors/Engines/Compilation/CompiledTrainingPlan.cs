@@ -1023,8 +1023,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         $"Parameter {p} of this training plan was moved to another GPU backend and could not be bound on "
                         + $"{backend.BackendName} again, so its optimizer state no longer matches it. Reconfigure the "
                         + "optimizer, or keep the parameter on one backend.");
+                var previous = gpuParam[p];
                 gpuParam[p] = current;
-                MoveDeviceOptimizerWeight(p, current);
+                if (previous is not null) MoveDeviceOptimizerWeight(p, previous, current);
             }
         }
         Volatile.Write(ref _migrationEpochSeen, epoch);
@@ -1407,6 +1408,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepIoLeaves = leaves.ToArray();
         _stepIoBuffers = buffers.ToArray();
         _stepIoLaunched = 0;
+        _lastUpdateReplay = null;   // replay indices restart with the new step I/O
         _stepIoCopiedSlot = Enumerable.Repeat(-1, leaves.Count).ToArray();
         _stepIoCopiedVersion = Enumerable.Repeat(int.MinValue, leaves.Count).ToArray();
         return io;
@@ -1645,6 +1647,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _stepIoLeaves = null;
         _stepIoBuffers = null;
         _stepIoLaunched = 0;
+        _lastUpdateReplay = null;   // no step I/O, no replay to read a verdict from
         _stepIoLossCaptured = false;
     }
 
@@ -1944,7 +1947,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var buffer = parameter._gpuBuffer;
             // A weight bound to the device optimizer that an invalidation unbound (its host values are authoritative): the
             // host values go into the optimizer's buffer, which is bound again, before this step's update (or a replayed
-            // graph) reads it -- whether that buffer is the cache's entry or the tensor's own resident buffer.
+            // graph) reads it -- whether that buffer is the cache's entry or the tensor's own resident buffer. The host
+            // is authoritative by InvalidateResidentWeightBuffer's contract (it follows an in-place host write, and drops
+            // a pending device download): a caller that invalidates a weight the device updated, without reading it
+            // first, discards that update, as it does for any cache-bound weight.
             if (buffer is null && _optimizerGpuParams is { } held && p < held.Length && held[p] is { } heldBuffer
                 && DirectGpuTensorEngine.IsLiveDeviceBuffer(heldBuffer)
                 && _optimizerGpuBackends is { } heldBackends && p < heldBackends.Length && heldBackends[p] is { } heldBackend)
@@ -7524,19 +7530,25 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // The optimizer of parameter p moved to `now` (a migration rebind): its hold on the old buffer ends (the engine
     // retires that copy if nothing else holds it), and `now` is held if it is the cache's entry.
-    private void MoveDeviceOptimizerWeight(int p, Engines.DirectGpu.IGpuBuffer now)
+    private void MoveDeviceOptimizerWeight(int p, Engines.DirectGpu.IGpuBuffer previous, Engines.DirectGpu.IGpuBuffer now)
     {
+        if (ReferenceEquals(previous, now)) return;   // nothing moved: the hold stays as it is
+        if (!_engine.TryGet<Engines.DirectGpuTensorEngine>(out var current)) return;
         lock (_deviceOptimizerWeightsLock)
         {
+            Engines.DirectGpuTensorEngine.DeviceOptimizerWeightToken? held = null;
             for (int i = _deviceOptimizerWeights.Count - 1; i >= 0; i--)
             {
                 var (engine, token, parameter) = _deviceOptimizerWeights[i];
                 if (parameter != p) continue;
-                engine.ReleaseDeviceOptimizerWeight(token, now);
                 _deviceOptimizerWeights.RemoveAt(i);
+                if (ReferenceEquals(engine, current) && held is null) { held = token; continue; }
+                engine.ReleaseDeviceOptimizerWeight(token, now);
             }
+            // One engine lock acquisition: nothing can see the weight unheld between the release and the new hold.
+            if (current.MoveDeviceOptimizerWeight(held, _parameters[p], now) is { } moved)
+                _deviceOptimizerWeights.Add((current, moved, p));
         }
-        RetainDeviceOptimizerWeight(p, now);
     }
 
     private void ReleaseDeviceOptimizerWeights(bool fromFinalizer = false)

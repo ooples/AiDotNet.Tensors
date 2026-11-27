@@ -112,6 +112,10 @@ internal sealed class GradientExchange<T>
         if (AccumulationFaulted)
             throw new InvalidOperationException(
                 "An earlier accumulation write on this step failed part-way; the step cannot write the accumulator again.");
+        if (_written)
+            throw new InvalidOperationException(
+                "A step whose reduced gradients were written back cannot defer its update: the accumulator would hold "
+                + "reduced gradients, which the window's last step then reduces again.");
         if (double.IsNaN(weight) || double.IsInfinity(weight))
             throw new ArgumentOutOfRangeException(nameof(weight), "The weight must be finite.");
         var acc = _accumulation!;
@@ -355,9 +359,9 @@ internal sealed class GradientExchange<T>
     /// </summary>
     public void WriteStaged()
     {
-        _written = true;
         if (!_readStaged || _pinned is null)
             throw new InvalidOperationException("WriteStaged needs a TryReadStaged of the same step first.");
+        _written = true;
         var host = _pinned.Host;
         if (_flat is not null && TotalLength > 0)
         {
@@ -453,11 +457,11 @@ internal sealed class GradientExchange<T>
     /// </summary>
     public void UploadRangeFrom(Engines.DirectGpu.IGradientHostStaging source, int hostOffset, int flatOffset, int count)
     {
-        _written = true;
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (typeof(T) != typeof(float)) throw new NotSupportedException("Staged transfers are float only.");
         if (flatOffset < 0 || count < 0 || (long)flatOffset + count > TotalLength)
             throw new ArgumentOutOfRangeException(nameof(count), "The range is outside the gradients.");
+        _written = true;
         int end = flatOffset + count;
         if (_flat is not null && count > 0)
         {
@@ -492,9 +496,9 @@ internal sealed class GradientExchange<T>
     /// <summary>Writes the reduced gradients back where <see cref="Read"/> found them.</summary>
     public void Write(T[] source)
     {
-        _written = true;
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (source.Length < TotalLength) throw new ArgumentException("The source is shorter than the gradients.", nameof(source));
+        _written = true;
         int offset = 0;
         for (int i = 0; i < _gradients.Length; i++)
         {
@@ -541,6 +545,26 @@ internal sealed class GradientAccumulation<T> : IDisposable
     private readonly Dictionary<Tensor<T>, Slot> _slots =
         new(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
     private Engines.DirectGpu.IDirectGpuBackend? _backend;
+    private bool _disposed;
+    // 1 while a step is using the accumulator (EnterStep .. ExitStep). Plans that share it serialize their steps on
+    // their own locks only, so two steps on two threads would both mutate it: the second is refused instead (torch's
+    // no_sync is not thread-safe either).
+    private int _inUse;
+
+    /// <summary>
+    /// Claims the accumulator for one step; throws when another step is using it or it was disposed. Pair with
+    /// <see cref="ExitStep"/>.
+    /// </summary>
+    internal void EnterStep()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientAccumulation<T>));
+        if (System.Threading.Interlocked.CompareExchange(ref _inUse, 1, 0) != 0)
+            throw new InvalidOperationException(
+                "The gradient accumulator is in use by another step: plans that share an accumulator must step one at a "
+                + "time (from one thread, as a data-parallel rank does).");
+    }
+
+    internal void ExitStep() => System.Threading.Volatile.Write(ref _inUse, 0);
 
     /// <summary>The deferred steps the accumulator holds (0: none; the slots' contents are then stale).</summary>
     internal int Steps { get; set; }
@@ -728,13 +752,27 @@ internal sealed class GradientAccumulation<T> : IDisposable
     /// <summary>Drops the held steps and frees the buffers.</summary>
     internal void Release()
     {
+        ReleaseSlots();
+    }
+
+    /// <summary>
+    /// Frees the device slots; afterwards the accumulator refuses every step. Dispose it before the engine whose backend
+    /// allocated its slots.
+    /// </summary>
+    public void Dispose()
+    {
+        _disposed = true;
+        ReleaseSlots();
+    }
+
+    private void ReleaseSlots()
+    {
         foreach (var slot in _slots.Values) slot.Device?.Dispose();
         _slots.Clear();
         _backend = null;
         Steps = 0;
     }
 
-    public void Dispose() => Release();
 }
 
 internal sealed partial class CompiledTrainingPlan<T>
@@ -876,6 +914,8 @@ internal sealed partial class CompiledTrainingPlan<T>
         var step = new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
             _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray),
             _gradientAccumulation, deferRefusal);
+        var accumulation = _gradientAccumulation;
+        accumulation.EnterStep();
         try
         {
             _exchangeCallbackRunning = true;
@@ -888,6 +928,10 @@ internal sealed partial class CompiledTrainingPlan<T>
             // would count twice, and a combined window lives only in this step's gradients. The window is dropped.
             _gradientAccumulation.Release();
             throw;
+        }
+        finally
+        {
+            accumulation.ExitStep();
         }
         if (step.AccumulationFaulted)
         {
