@@ -4509,10 +4509,14 @@ internal static partial class BackwardFunctions<T>
         // 1 where |x| > lambda, else 0: the derivative of x - clamp(x, -lambda, lambda), which is a constant mask.
         var pass = engine.TensorGreaterThan(engine.TensorAbs(x), lambda);
         var grad = CreatesGraph
-            ? DiagonalLinearGrad("SoftShrinkBackward", gradOutput, engine, (e, w) => e.TensorMultiply(w, pass))
+            ? SoftShrinkBackwardCreateGraph(gradOutput, engine, pass)
             : engine.TensorMultiply(gradOutput, pass);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
+
+    // The create-graph path of SoftShrinkBackward, kept out of it so its first-order path allocates no closure.
+    private static Tensor<T> SoftShrinkBackwardCreateGraph(Tensor<T> gradOutput, IEngine engine, Tensor<T> pass)
+        => DiagonalLinearGrad("SoftShrinkBackward", gradOutput, engine, (e, w) => e.TensorMultiply(w, pass));
 
     /// <summary>Flatten backward: reshape gradient back to input shape</summary>
     internal static void FlattenBackward(
