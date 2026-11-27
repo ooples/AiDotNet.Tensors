@@ -71,7 +71,7 @@ internal static class GpuLaunchProbe
     /// <summary>Distinct readback call sites and their invocation counts since the last reset.</summary>
     public static string[] ReadbackSites => System.Linq.Enumerable.ToArray(
         System.Linq.Enumerable.Select(
-            System.Linq.Enumerable.OrderBy(_readbackSites, entry => entry.Key),
+            System.Linq.Enumerable.OrderBy(_readbackSites.ToArray(), entry => entry.Key),
             entry => $"{entry.Value}x {(_readbackSiteBytes.TryGetValue(entry.Key, out long b) ? b : 0):N0} B {entry.Key}"));
 
     private static long _readbackSyncTicks;
@@ -346,7 +346,7 @@ internal static class GpuLaunchProbe
     /// <summary>Distinct upload call sites, formatted like <see cref="ReadbackSites"/>.</summary>
     public static string[] UploadSites => System.Linq.Enumerable.ToArray(
         System.Linq.Enumerable.Select(
-            System.Linq.Enumerable.OrderBy(_uploadSites, entry => entry.Key),
+            System.Linq.Enumerable.OrderBy(_uploadSites.ToArray(), entry => entry.Key),
             entry => $"{entry.Value}x {(_uploadSiteBytes.TryGetValue(entry.Key, out var b) ? b : 0):N0} B {entry.Key}"));
 
     /// <summary>Records one host-to-device transfer at a driver copy (every cuMemcpyHtoD / HtoDAsync).</summary>
@@ -387,10 +387,16 @@ internal static class GpuLaunchProbe
     /// parity (the CPU answer is right) and the hollow-override check (no kernel-cache miss is recorded).
     /// This channel makes that class observable: a fallback records the op and the exception that caused it.
     /// </remarks>
-    public static string[] Fallbacks => System.Linq.Enumerable.ToArray(
-        System.Linq.Enumerable.Select(
-            System.Linq.Enumerable.OrderBy(_fallbacks, entry => entry.Key),
-            entry => $"{entry.Value}x {entry.Key}"));
+    public static string[] Fallbacks => FormatFallbacks(_fallbacks);
+
+    // ConcurrentDictionary.ToArray takes one consistent snapshot. LINQ over the live dictionary sized its buffer from
+    // Count and then copied, so an entry recorded on another thread in between threw (ArgumentException or
+    // IndexOutOfRangeException). The readback and upload site reports take the same snapshot.
+    internal static string[] FormatFallbacks(System.Collections.Concurrent.ConcurrentDictionary<string, int> fallbacks)
+        => System.Linq.Enumerable.ToArray(
+            System.Linq.Enumerable.Select(
+                System.Linq.Enumerable.OrderBy(fallbacks.ToArray(), entry => entry.Key),
+                entry => $"{entry.Value}x {entry.Key}"));
 
     /// <summary>Records one silent GPU-to-CPU fallback. <paramref name="reason"/> is the caught exception, or
     /// null when a guard or route declined the device path before attempting it.</summary>
