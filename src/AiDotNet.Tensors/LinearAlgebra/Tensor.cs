@@ -259,10 +259,37 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedD
         // A normal tensor takes the allocation-free direct path. COW tensors coordinate the
         // vector/storage snapshot and family registration under the detach lock; otherwise a
         // concurrent writer could swap storage between evaluation of the two constructor args.
-        var view = HasCowAliasFamily
-            ? CreateViewInCowAliasFamily(
-                () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
-            : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        Tensor<T> view;
+        if (Lifetime != WeightLifetime.Streaming)
+        {
+            view = HasCowAliasFamily
+                ? CreateViewInCowAliasFamily(
+                    () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
+                : new Tensor<T>(_data, shape, strides, storageOffset, _storage);
+        }
+        else
+        {
+            // A streaming weight's storage is marked in use until the view holds it, so owner shedding skips it, and
+            // the view is built under the weight's transition gate (BuildViewOfResidentStorage), so a drop a release
+            // already claimed cannot empty the storage between the residency check and the view's reference to it.
+            // One whose storage was dropped (paged out, or left on the device by MaterializeForForward) pages back in
+            // first: the view shares the storage and is no streaming weight itself, so it could not.
+            long ownerUse = WeightRegistry.BeginOwnerUse(this);
+            bool pagedIn = false;
+            try
+            {
+                view = BuildViewOfResidentStorage(
+                    () => HasCowAliasFamily
+                        ? CreateViewInCowAliasFamily(
+                            () => new Tensor<T>(_data, shape, strides, storageOffset, _storage))
+                        : new Tensor<T>(_data, shape, strides, storageOffset, _storage),
+                    out pagedIn);
+            }
+            finally
+            {
+                WeightRegistry.EndOwnerUse(ownerUse, shed: pagedIn);
+            }
+        }
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 

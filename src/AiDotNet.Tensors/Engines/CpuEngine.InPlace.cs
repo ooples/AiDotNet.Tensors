@@ -451,6 +451,12 @@ public partial class CpuEngine
         if (stride is null) throw new ArgumentNullException(nameof(stride));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorAsStridedInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorAsStridedInPlace");
+        // A registered streaming weight's storage is the pool's copy of its registered layout: adopting a strided view
+        // would make the weight itself a view (which the pool never writes back or sheds) and could change its length.
+        if (tensor.Lifetime == WeightLifetime.Streaming && tensor.StreamingPoolHandle >= 0)
+            throw new InvalidOperationException(
+                "TensorAsStridedInPlace cannot re-stride a registered streaming weight; build the strided view in another tensor " +
+                "(TensorSetInPlace with this weight as the source) instead.");
         // A view of the tensor's own storage; its constructor checks the layout stays inside the storage.
         using var view = new Tensor<T>(tensor.DataVector, size, stride, storageOffset ?? tensor._storageOffset, tensor._storage);
         tensor.AdoptFrom(view);
@@ -473,8 +479,25 @@ public partial class CpuEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.Stateful, "TensorSetInPlace");
         ThrowIfStorageSwapRecorded<T>("TensorSetInPlace");
-        using var view = new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage);
-        tensor.AdoptFrom(view);
+        // The destination adopts a strided view, so a registered streaming weight cannot be it (the pool never writes
+        // back or sheds a view; see TensorAsStridedInPlace). Rejected before any page-in. A streaming SOURCE is fine.
+        if (tensor.Lifetime == WeightLifetime.Streaming && tensor.StreamingPoolHandle >= 0)
+            throw new InvalidOperationException(
+                "TensorSetInPlace cannot write a strided view into a registered streaming weight; build the view in another " +
+                "tensor (with this weight as the source) instead.");
+        // A streaming source whose storage was dropped pages in (a no-upcast int8/int4 one dequantizes) first, marked in
+        // use until the view holds the storage, and the view is built under the source's transition gate so a drop a
+        // release already claimed cannot empty the storage between the page-in and the view (BuildViewOfResidentStorage).
+        long ownerUse = WeightRegistry.BeginOwnerUse(source);
+        try
+        {
+            source.EnsureHostStorageResident();
+            _ = source.DataVector;   // realizes a pending value here, outside the gate the view is built under
+            using var view = source.BuildViewOfResidentStorage(
+                () => new Tensor<T>(source.DataVector, size, stride, storageOffset, source._storage), out _);
+            tensor.AdoptFrom(view);
+        }
+        finally { WeightRegistry.EndOwnerUse(ownerUse, shed: true); }
     }
 
     /// <inheritdoc/>

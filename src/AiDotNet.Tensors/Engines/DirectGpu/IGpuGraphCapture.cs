@@ -45,6 +45,13 @@ internal interface IGpuGraphCapture : IDirectGpuBackend
     /// <summary>True while a capture is recording on the calling thread's stream.</summary>
     bool IsStreamCapturing();
 
+    /// <summary>
+    /// True while the calling thread is capturing through this library on this backend. Managed state only (no driver
+    /// call, no context push), so a capability query without an op lease may read it. CUDA also reports a capture this
+    /// thread runs on another CUDA backend (its capture depth is per thread): a conservative answer, never a wrong one.
+    /// </summary>
+    bool CaptureActiveOnThisThread { get; }
+
     /// <summary>The driver's raw capture status for diagnostics: 0 none, 1 active, 2 invalidated.</summary>
     int StreamCaptureStatusRaw();
 
