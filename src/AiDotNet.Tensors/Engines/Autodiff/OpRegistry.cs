@@ -33,6 +33,8 @@ internal static class OpRegistry
         "TensorRsqrt", "TensorTan", "TensorTrunc",
         // Activations and index-map ops with their own backward (CpuEngine.TorchMisc)
         "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
+        // Soft-shrink records its own node: the gradient is the |x| > lambda mask (CpuEngine, DirectGpuTensorEngine)
+        "TensorSoftShrink",
         "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
         // Model-level ops with their own backward (CpuEngine.TorchModelOps): CRF log-partition (forward-backward),
         // fake quantization (range-masked straight-through), surrogate spikes, top-k routing softmax, time
