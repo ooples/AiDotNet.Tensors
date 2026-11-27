@@ -62,7 +62,7 @@ The mixed-dtype mechanism AND the memory win are done via the lazy-graph path. W
 - **Phase B — DONE.** `MixedPrecisionCompiledPlan.Backward()` over the captured order via the shared `MixedPrecisionGraphBackward.BackwardOverOrder` (single dispatch; works after lazy-source detachment). Gate: matches the non-compiled backward within FP16 GEMM tolerance.
 - **Phase C — DONE.** `MixedPrecisionCompiledPlan.Step(params, lr, scaler)` — forward + loss-scaled backward + SGD on FP32 masters + `GradScaler` (skip-on-overflow + backoff). Gate: compiled training descends loss >2×, 0 overflow.
 - **Phase D — DONE (correctness at scale).** Compiled plan trains the design-target stack (d512/L6/B256) on `DirectGpuTensorEngine`: loss finite + non-increasing, 0 NaN, VRAM 1229 MiB. The 0.500× activation-storage ratio is proven deterministically (`Fp16ActivationMemoryTests`). *Remaining refinement: CUDA-graph capture of the mixed-dtype step (perf), and a clean at-scale FP32-vs-FP16 in-process VRAM A/B.*
-- **Phase E — REMAINING (cross-repo deployment).** Make the plan a public Tensors API and route AiDotNet `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to it under the flag, so downstream consumers and opt-parity exercise it through the high-level training path on GPU.
+- **Phase E — REMAINING (cross-repo deployment).** Make the plan a public Tensors API and route AiDotNet `NeuralNetworkBase.TrainWithTape` / `CompiledTapeTrainingStep` to it under the flag, so downstream consumers exercise it through the high-level training path on GPU.
 
 Phases A–D landed (CPU + GPU verified) behind `AIDOTNET_FP16_ACTIVATIONS`; default FP32 fused path byte-identical. **Phase E** (public API + AiDotNet wiring + GPU validation through the high-level path) is the remaining cross-repo step.
 
@@ -98,7 +98,7 @@ But GPU measurement on the downstream model shows it does **NOT** reduce GPU VRA
 
 ## Test gate (non-negotiable, every phase)
 - `LayerNormGradientCheckTests`-style finite-diff vs analytic, extended to the mixed-precision node.
-- Resident-memory measurement via `opt-parity LEAKPROBE` (no downstream rebuild).
+- Resident-memory measurement with a downstream leak probe (no downstream rebuild).
 - End-to-end downstream model: loss drops, param-L1 moves, **0 NaN**.
 
 ## ⚠️ SIXTH / BOTTOM FINDING — race-safe deferred-free defeats mid-step compression; real fix is a stream-ordered allocator

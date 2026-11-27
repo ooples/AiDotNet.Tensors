@@ -156,14 +156,14 @@ public class NativeComplexFftBlittableTests
     }
 
     // ---- Allocation + wall-time A/B (opt-in) ---------------------------------
-    // HE_FFT_ALLOC_BENCH=1 : prints GC.GetAllocatedBytesForCurrentThread and median
+    // AIDOTNET_FFT_ALLOC_BENCH=1 : prints GC.GetAllocatedBytesForCurrentThread and median
     // ms/call for the blittable fast path vs the legacy generic path on [128,1024],
     // same process. This is the trustworthy before/after (no cross-build noise).
 
     [Fact]
     public void NativeComplexFFT_AllocAndTime_Bench()
     {
-        if (Environment.GetEnvironmentVariable("HE_FFT_ALLOC_BENCH") != "1") return;
+        if (Environment.GetEnvironmentVariable("AIDOTNET_FFT_ALLOC_BENCH") != "1") return;
         int b = 128, n = 1024, WARM = 5, REP = 50;
         var cpu = Cpu();
         var x = RandD(b, n, 20260721);

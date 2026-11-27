@@ -39090,7 +39090,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Sparse-CE true-class gather: returns out[i] = logP[i, round(target[i])] for [B,V] log-probs and
     /// [B] FLOAT class targets — the differentiable core of GpuSparseCrossEntropyLoss WITHOUT a [B,V]
     /// one-hot. Targets are re-read LIVE each compiled-plan replay (and at backward time), so it does NOT
-    /// freeze at the trace batch (the #1331 bug class that killed HE_SPARSE_CE training). Backward scatters
+    /// freeze at the trace batch (the #1331 bug class that stopped sparse cross-entropy training). Backward scatters
     /// the upstream gradient to logP[i, target[i]]. virtual so a GPU engine may override with a kernel.
     /// </summary>
     [MethodImpl(Hot)]
