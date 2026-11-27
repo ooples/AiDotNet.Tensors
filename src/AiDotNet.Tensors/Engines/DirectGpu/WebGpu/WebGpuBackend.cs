@@ -620,7 +620,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         await DispatchActivationAsync("mish", A, B, size, 0);
     }
 
-    private async Task DispatchActivationAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, int size, float alpha)
+    private async Task DispatchActivationAsync(string kernelName, IGpuBuffer A, IGpuBuffer B, int size, float alpha, float beta = 0f)
     {
         ThrowIfNotInitialized();
 
@@ -629,7 +629,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
 
         var pipelineId = await GetOrCreatePipelineAsync("Activation", WebGpuKernels.ActivationSource, kernelName);
 
-        var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), alpha, 0, 0 };
+        var paramsData = new float[] { BitConverter.Int32BitsToSingle(size), alpha, beta, 0 };
         using var uniformBuffer = new WebGpuBuffer(paramsData, WebGpuBufferUsage.Uniform | WebGpuBufferUsage.CopyDst);
 
         using var bindGroup = new WebGpuBindGroup(pipelineId, aBuffer, bBuffer);

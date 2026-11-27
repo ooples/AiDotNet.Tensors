@@ -9245,6 +9245,20 @@ public partial interface IEngine
     /// <summary>Threshold: x > threshold ? x : value.</summary>
     Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value);
 
+    /// <summary>
+    /// Soft shrinkage (PyTorch <c>softshrink</c>), the proximal operator of <c>lambda * |x|</c>: <c>x - lambda</c> where
+    /// <c>x &gt; lambda</c>, <c>x + lambda</c> where <c>x &lt; -lambda</c>, and 0 in between, in one fused pass.
+    /// </summary>
+    /// <param name="tensor">The input.</param>
+    /// <param name="lambda">The shrinkage, at least 0.</param>
+    /// <returns>A new tensor of the input's shape.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="lambda"/> is negative or NaN.</exception>
+    /// <remarks>
+    /// The gradient passes through where <c>|x| &gt; lambda</c> and is 0 elsewhere. This is the soft-threshold step of
+    /// L1-regularized (lasso, elastic-net) proximal gradient descent and of ISTA.
+    /// </remarks>
+    Tensor<T> TensorSoftShrink<T>(Tensor<T> tensor, T lambda);
+
     /// <summary>Element-wise reciprocal: 1/x.</summary>
     Tensor<T> TensorReciprocal<T>(Tensor<T> tensor);
 

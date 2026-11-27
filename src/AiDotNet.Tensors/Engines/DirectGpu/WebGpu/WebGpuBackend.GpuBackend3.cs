@@ -388,7 +388,10 @@ public sealed partial class WebGpuBackend
     }
 
     public void Threshold(IGpuBuffer input, IGpuBuffer output, float threshold, float value, int size)
-        => DispatchActivationAsync("threshold_op", input, output, size, threshold).GetAwaiter().GetResult();
+        => DispatchActivationAsync("threshold_op", input, output, size, threshold, value).GetAwaiter().GetResult();
+
+    public void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+        => DispatchActivationAsync("soft_shrink", input, output, size, lambda).GetAwaiter().GetResult();
 
     public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
