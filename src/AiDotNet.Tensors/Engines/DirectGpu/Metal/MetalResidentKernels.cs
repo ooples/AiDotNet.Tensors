@@ -5,7 +5,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// <summary>Correctness-first resident kernels for operations that cannot use a host fallback.</summary>
 internal static class MetalResidentKernels
 {
-    public const string Source = MetalBiasCorrectionPrelude.Source + ExactFloatKernels.Msl + @"
+    // The work-group-per-row arg-extreme kernel is an embedded resource, kept out of the user-string heap (CS8103).
+    public static string Source => CoreSource + KernelSourceResources.Read("ArgExtremeRows.metal");
+
+    private const string CoreSource = MetalBiasCorrectionPrelude.Source + ExactFloatKernels.Msl + @"
 
 kernel void hyperbolic_linear_forward(
     device const float* input [[buffer(0)]],

@@ -1640,7 +1640,9 @@ __kernel void scatter_softmax_backward_rows(
         if (indices[dd] == g) sumg += output[dd * innerSize + inner] * gradOutput[dd * innerSize + inner];
     gradSource[idx] = output[idx] * (gradOutput[idx] - sumg);
 }
-";
+"
+                // Kept out of the user-string heap (CS8103).
+                + KernelSourceResources.Read("ArgExtremeRows.opencl.c");
         }
 
         /// <summary>
@@ -1667,7 +1669,7 @@ __kernel void scatter_softmax_backward_rows(
                 "transpose2d", "batched_transpose",
                 "fill_buffer", "copy_buffer",
                 "greater_than", "less_than", "equal_values", "where_select",
-                "mean_axis", "var_axis", "argmax_axis", "argmin_axis",
+                "mean_axis", "var_axis", "argmax_axis", "argmin_axis", "arg_extreme_axis_rows",
                 "dropout_forward", "dropout_backward",
                 "embedding_lookup", "embedding_backward", "embedding_backward_deterministic",
                 "fma_kernel", "gather_kernel", "scatter_add_kernel", "scatter_add_kernel_deterministic", "scatter_add_rows", "scatter_mean_rows", "scatter_max_rows", "scatter_softmax_rows", "scatter_add_backward_rows", "scatter_mean_backward_rows", "scatter_max_backward_rows", "scatter_softmax_backward_rows",
