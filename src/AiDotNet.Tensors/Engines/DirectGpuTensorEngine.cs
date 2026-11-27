@@ -362,8 +362,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private readonly object _persistentBufferLock = new();
 
     // Persistent weight buffers a compiled plan's device optimizer was configured to update in place (keyed like
-    // _persistentBufferCache, by backing array), with the number of plans holding each. Under _persistentBufferLock.
-    private readonly Dictionary<object, int> _deviceOptimizerWeights = new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+    // _persistentBufferCache, by backing array): how many holds each has, and the generation its entry was made in. A
+    // recycled array drops its entry, so a release from an earlier generation's hold must not end a later one's. Under
+    // _persistentBufferLock, apart from the queue a finalizer posts its releases to without taking that lock.
+    private sealed class DeviceOptimizerWeightHold
+    {
+        internal int Count;
+        internal long Generation;
+    }
+    private readonly Dictionary<object, DeviceOptimizerWeightHold> _deviceOptimizerWeights =
+        new(Autodiff.ReferenceEqualityComparer<object>.Instance);
+    private readonly ConcurrentQueue<DeviceOptimizerWeightToken> _queuedDeviceOptimizerWeightReleases = new();
+    private long _deviceOptimizerWeightGenerations;
 
     // Roles of tensors registered persistent but not yet read on the GPU. Registration defers the upload to the first
     // read; without this record an op that fetched a registered weight through GetOrAllocateBuffer (TensorMatMul,
@@ -1417,7 +1427,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the one recorded for the old owner, so a surviving entry would serve the old owner's device data; and an array
         // nobody owns any more (a streamed weight's dropped storage) would hold its device copy for the engine's life.
         // Checked before the pending-download early-out below: the cache does not depend on any download existing.
-        lock (_persistentBufferLock) _deviceOptimizerWeights.Remove(array);   // its tensor, and so its optimizer, is gone
+        lock (_persistentBufferLock)
+        {
+            // A recycled array has a new owner (or none): the holds taken on it end, and a later release from one of
+            // them ends nothing (the generation differs). A plan still bound to the array's old buffer is no longer
+            // protected by the cache; its optimizer buffer reference keeps the buffer object alive.
+            DrainQueuedDeviceOptimizerWeightReleasesLocked();
+            _deviceOptimizerWeights.Remove(array);
+        }
         if (_persistentBufferCache.ContainsKey(array))
         {
             lock (_persistentBufferLock)
@@ -2742,7 +2759,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 // A weight a configured device optimizer holds keeps its buffer, marked stale: the next lookup (or the
                 // plan's pre-step upload) writes the host values into it, after whatever host write follows this call.
-                if (!_deviceOptimizerWeights.ContainsKey(backing) && _persistentBufferCache.TryRemove(backing, out var pe))
+                if (!IsDeviceOptimizerWeightLocked(backing) && _persistentBufferCache.TryRemove(backing, out var pe))
                     pe.Dispose();
                 _tensorVersions.TryRemove(backing, out _);
                 _persistentWeightHostVersion.TryRemove(backing, out _);
@@ -4056,21 +4073,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // A weight a configured device optimizer holds (RetainDeviceOptimizerWeight): the optimizer, and any
                 // update graph captured from it, writes this buffer, so the host values go into it rather than into a
                 // replacement. In place on the compute stream, so it lands after the work already enqueued on it.
-                if (_deviceOptimizerWeights.ContainsKey(data))
+                if (IsDeviceOptimizerWeightLocked(data))
                 {
                     if (capturing)
                         throw new InvalidOperationException(
                             "A weight held by a configured device optimizer was written on the host during graph "
                             + "capture; its device buffer cannot be refreshed inside the capture.");
-                    // IsLiveDeviceBuffer, not a native-handle check: a WebGPU buffer has no native handle, and a held
-                    // one replaced here would leave the optimizer writing a buffer the engine retired.
-                    if (IsLiveDeviceBuffer(existing.Buffer) && existing.Buffer.Size >= data.Length)
-                    {
-                        backend.UploadBufferInPlace(DirectGpuEngine.ToFloatArray(data), existing.Buffer);
-                        RefreshFp16CopiesAfterInPlaceUpload(backend, existing.Buffer, data.Length);
-                        _persistentWeightHostVersion[data] = hostVersion;
-                        return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
-                    }
+                    // Never replaced: the optimizer and its graph would keep writing the retired buffer once a drain
+                    // freed it. One that cannot take the values fails here instead. IsLiveDeviceBuffer, not a
+                    // native-handle check: a WebGPU buffer has no native handle.
+                    bool live = IsLiveDeviceBuffer(existing.Buffer);
+                    if (!live || existing.Buffer.Size < data.Length)
+                        throw new InvalidOperationException(
+                            "A weight held by a configured device optimizer cannot be refreshed in its device buffer ("
+                            + (!live ? "the buffer was released" : $"the buffer holds {existing.Buffer.Size} "
+                                + $"elements, the weight {data.Length}") + "); reconfigure the optimizer (ConfigureOptimizer).");
+                    backend.UploadBufferInPlace(DirectGpuEngine.ToFloatArray(data), existing.Buffer);
+                    RefreshFp16CopiesAfterInPlaceUpload(backend, existing.Buffer, data.Length);
+                    _persistentWeightHostVersion[data] = hostVersion;
+                    return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
                 }
 
                 // Stale: the host tensor was mutated in place since upload. Evict the entry now (no new reader
@@ -11109,7 +11130,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // the process all the same. Safe with work still queued on it: OpenCL defers the free until the commands
             // on it complete, CUDA and HIP synchronize the free, and Vulkan waits on every dispatch outside a batch
             // (a weight is never made resident inside one).
-            if (!_deviceOptimizerWeights.ContainsKey(backing) && _persistentBufferCache.TryRemove(backing, out var entry))
+            if (!IsDeviceOptimizerWeightLocked(backing) && _persistentBufferCache.TryRemove(backing, out var entry))
             {
                 if (entry.Buffer is IPoolableGpuBuffer poolable) poolable.Release();
                 else entry.Dispose();
@@ -11127,6 +11148,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         lock (_persistentBufferLock)
         {
+            if (IsDeviceOptimizerWeightLocked(data) && _persistentBufferCache.ContainsKey(data))
+            {
+                // Held by a device optimizer: marked stale, kept (the next lookup uploads the host values into it).
+                _tensorVersions.TryRemove(data, out _);
+                _persistentWeightHostVersion.TryRemove(data, out _);
+                return true;
+            }
             if (_persistentBufferCache.TryRemove(data, out var entry))
             {
                 entry.Dispose();
@@ -11138,32 +11166,136 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>A hold from <see cref="RetainDeviceOptimizerWeight"/>: the key it was taken on and that entry's generation.</summary>
+    internal sealed class DeviceOptimizerWeightToken
+    {
+        internal readonly object Key;
+        internal readonly long Generation;
+        internal DeviceOptimizerWeightToken(object key, long generation) { Key = key; Generation = generation; }
+    }
+
     /// <summary>
     /// Marks <paramref name="param"/>'s persistent weight buffer as updated in place by a configured device optimizer
     /// (as torch's optimizer holds its parameters). While held, the engine never frees or replaces that buffer on its
-    /// own: invalidations mark it stale, and the next lookup uploads the host values into it. Counted, so several plans
-    /// may hold one parameter. Returns the key to pass to <see cref="ReleaseDeviceOptimizerWeight"/> (the parameter's
-    /// storage may change before the release), or null when the parameter has no backing array.
+    /// own: invalidations mark it stale, and the next lookup, or an explicit invalidation, uploads the host values into
+    /// it. Counted, so several plans may hold one parameter. Taken only when <paramref name="buffer"/> (the one the
+    /// optimizer was bound to) is the parameter's persistent cache entry: any other buffer is the tensor's own, which
+    /// the engine does not free while the optimizer references it. Returns the token to release, or null.
     /// </summary>
-    internal object? RetainDeviceOptimizerWeight<T>(Tensor<T> param)
+    internal DeviceOptimizerWeightToken? RetainDeviceOptimizerWeight<T>(Tensor<T> param, IGpuBuffer buffer)
     {
-        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return null;
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key || buffer is null) return null;
         lock (_persistentBufferLock)
         {
-            _deviceOptimizerWeights.TryGetValue(key, out int holders);
-            _deviceOptimizerWeights[key] = holders + 1;
+            DrainQueuedDeviceOptimizerWeightReleasesLocked();
+            if (!_persistentBufferCache.TryGetValue(key, out var entry) || !ReferenceEquals(entry.Buffer, buffer)) return null;
+            if (!_deviceOptimizerWeights.TryGetValue(key, out var hold))
+                _deviceOptimizerWeights[key] = hold = new DeviceOptimizerWeightHold
+                    { Generation = ++_deviceOptimizerWeightGenerations };
+            hold.Count++;
+            return new DeviceOptimizerWeightToken(key, hold.Generation);
         }
-        return key;
     }
 
-    /// <summary>Ends one <see cref="RetainDeviceOptimizerWeight"/>, by the key it returned.</summary>
-    internal void ReleaseDeviceOptimizerWeight(object key)
+    /// <summary>
+    /// Ends one hold. When it was the last and the parameter is now bound to <paramref name="nowBound"/>, a different
+    /// buffer (the optimizer moved with a migrated parameter), the cache's superseded copy is retired, as an unheld
+    /// <c>DropPersistentCopy</c> would have done, instead of staying as a second device copy.
+    /// </summary>
+    internal void ReleaseDeviceOptimizerWeight(DeviceOptimizerWeightToken token, IGpuBuffer? nowBound = null)
     {
         lock (_persistentBufferLock)
         {
-            if (!_deviceOptimizerWeights.TryGetValue(key, out int holders)) return;
-            if (holders <= 1) _deviceOptimizerWeights.Remove(key);
-            else _deviceOptimizerWeights[key] = holders - 1;
+            DrainQueuedDeviceOptimizerWeightReleasesLocked();
+            if (!EndDeviceOptimizerWeightHoldLocked(token)) return;
+            if (nowBound is not null && _persistentBufferCache.TryGetValue(token.Key, out var entry)
+                && !ReferenceEquals(entry.Buffer, nowBound) && _persistentBufferCache.TryRemove(token.Key, out _))
+            {
+                _retiredWeightBuffers.Add(entry.Buffer);   // freed by the next drain, past a synchronize
+                _tensorVersions.TryRemove(token.Key, out _);
+                _persistentWeightHostVersion.TryRemove(token.Key, out _);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ends <paramref name="held"/> (when given) and takes a hold on <paramref name="now"/> (when it is the parameter's
+    /// cache entry) under one acquisition of the cache lock, so no invalidation sees the weight unheld in between. A copy
+    /// the old hold protected that is no longer the bound buffer is retired, as in <see cref="ReleaseDeviceOptimizerWeight"/>.
+    /// </summary>
+    internal DeviceOptimizerWeightToken? MoveDeviceOptimizerWeight<T>(DeviceOptimizerWeightToken? held, Tensor<T> param,
+        IGpuBuffer now)
+    {
+        lock (_persistentBufferLock)
+        {
+            DrainQueuedDeviceOptimizerWeightReleasesLocked();
+            DeviceOptimizerWeightToken? taken = null;
+            if (param?.GetBackingArrayForCacheLookupUnsafe() is { } key && now is not null
+                && _persistentBufferCache.TryGetValue(key, out var entry) && ReferenceEquals(entry.Buffer, now))
+            {
+                // Taken first, so the release below never sees the count reach zero for a buffer still held.
+                if (!_deviceOptimizerWeights.TryGetValue(key, out var hold))
+                    _deviceOptimizerWeights[key] = hold = new DeviceOptimizerWeightHold
+                        { Generation = ++_deviceOptimizerWeightGenerations };
+                hold.Count++;
+                taken = new DeviceOptimizerWeightToken(key, hold.Generation);
+            }
+            if (held is not null && EndDeviceOptimizerWeightHoldLocked(held)
+                && _persistentBufferCache.TryGetValue(held.Key, out var old) && !ReferenceEquals(old.Buffer, now)
+                && _persistentBufferCache.TryRemove(held.Key, out _))
+            {
+                _retiredWeightBuffers.Add(old.Buffer);   // freed by the next drain, past a synchronize
+                _tensorVersions.TryRemove(held.Key, out _);
+                _persistentWeightHostVersion.TryRemove(held.Key, out _);
+            }
+            return taken;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ReleaseDeviceOptimizerWeight"/> for a finalizer: queued without taking any lock (a thread allocating
+    /// under the cache lock may be waiting for finalizers to run), and applied by the next operation that reads the holds.
+    /// </summary>
+    internal void QueueReleaseDeviceOptimizerWeight(DeviceOptimizerWeightToken token)
+        => _queuedDeviceOptimizerWeightReleases.Enqueue(token);
+
+    // Returns whether the hold was the key's last (the key is then no longer held).
+    private bool EndDeviceOptimizerWeightHoldLocked(DeviceOptimizerWeightToken token)
+    {
+        if (!_deviceOptimizerWeights.TryGetValue(token.Key, out var hold) || hold.Generation != token.Generation) return false;
+        if (--hold.Count > 0) return false;
+        _deviceOptimizerWeights.Remove(token.Key);
+        return true;
+    }
+
+    private void DrainQueuedDeviceOptimizerWeightReleasesLocked()
+    {
+        while (_queuedDeviceOptimizerWeightReleases.TryDequeue(out var token)) EndDeviceOptimizerWeightHoldLocked(token);
+    }
+
+    private bool IsDeviceOptimizerWeightLocked(object key)
+    {
+        DrainQueuedDeviceOptimizerWeightReleasesLocked();
+        return _deviceOptimizerWeights.ContainsKey(key);
+    }
+
+    /// <summary>
+    /// Binds <paramref name="param"/> to <paramref name="buffer"/> when that is its persistent cache entry and current at
+    /// the parameter's version (an invalidation dropped only the binding); false otherwise, nothing changed.
+    /// </summary>
+    internal bool TryBindCurrentCachedWeight<T>(Tensor<T> param, IGpuBuffer buffer, IDirectGpuBackend backend)
+    {
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return false;
+        int version = param.GpuCacheVersion;
+        lock (_persistentBufferLock)
+        {
+            if (!_persistentBufferCache.TryGetValue(key, out var entry) || !ReferenceEquals(entry.Buffer, buffer)) return false;
+            if (!_persistentWeightHostVersion.TryGetValue(key, out int stamped) || stamped != version) return false;
+            // Under the lock: an invalidation cannot slip between the check and the binding.
+            param._gpuBuffer = buffer;
+            param._gpuBackend = backend;
+            param._gpuBufferVersion = version;
+            return true;
         }
     }
 
@@ -11171,13 +11303,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal bool IsDeviceOptimizerWeight<T>(Tensor<T> param)
     {
         if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return false;
-        lock (_persistentBufferLock) return _deviceOptimizerWeights.ContainsKey(key);
+        lock (_persistentBufferLock) return IsDeviceOptimizerWeightLocked(key);
+    }
+
+    /// <summary>The holds on <paramref name="param"/>'s weight buffer; for tests.</summary>
+    internal int DeviceOptimizerWeightHoldsForTests<T>(Tensor<T> param)
+    {
+        if (param?.GetBackingArrayForCacheLookupUnsafe() is not { } key) return 0;
+        lock (_persistentBufferLock)
+        {
+            DrainQueuedDeviceOptimizerWeightReleasesLocked();
+            return _deviceOptimizerWeights.TryGetValue(key, out var hold) ? hold.Count : 0;
+        }
     }
 
     /// <summary>Backing arrays a device optimizer holds; for tests.</summary>
     internal int DeviceOptimizerWeightCountForTests
     {
-        get { lock (_persistentBufferLock) return _deviceOptimizerWeights.Count; }
+        get { lock (_persistentBufferLock) { DrainQueuedDeviceOptimizerWeightReleasesLocked(); return _deviceOptimizerWeights.Count; } }
     }
 
     /// <summary>
@@ -11210,7 +11353,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // (as torch's optimizer holds its parameters) even before its first update: freeing it left the
                 // optimizer, and any update graph captured from it, writing freed memory (a sticky CUDA 700).
                 if (Helpers.HostSync.IsPending(pair.Key) || pair.Value.Role == PersistentTensorRole.Constant
-                    || _deviceOptimizerWeights.ContainsKey(pair.Key))
+                    || IsDeviceOptimizerWeightLocked(pair.Key))
                     (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
                 else if (CacheMayFreeReleasedBuffers)
                     pair.Value.Dispose();
@@ -16882,7 +17025,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor.Device = TensorDevice.CPU;
         lock (_persistentBufferLock)
         {
-            if (!_deviceOptimizerWeights.ContainsKey(key) && _persistentBufferCache.TryRemove(key, out var entry))
+            if (!IsDeviceOptimizerWeightLocked(key) && _persistentBufferCache.TryRemove(key, out var entry))
             {
                 entry.Dispose();
             }
@@ -16926,6 +17069,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Materialize deferred input while the old buffer is still live. Cache
             // maintenance must never detach a COW alias just to read its value.
             T[] hostData = tensor.GetReadOnlyDataArray();
+            if (IsDeviceOptimizerWeightLocked(key))
+            {
+                if (backend is IGpuGraphCapture heldCapture && heldCapture.IsStreamCapturing())
+                    throw new InvalidOperationException(
+                        "A weight held by a configured device optimizer was invalidated during graph capture; its device "
+                        + "buffer cannot be refreshed inside the capture.");
+                // Held by a device optimizer, which (with any update graph captured from it) writes this very buffer: the
+                // host values go into it, on the compute stream; it is never replaced. A failure leaves it stale, so the
+                // next lookup refreshes it (or fails loudly there).
+                _tensorVersions.TryRemove(key, out _);
+                _persistentWeightHostVersion.TryRemove(key, out _);
+                if (_persistentBufferCache.TryGetValue(key, out var held) && IsLiveDeviceBuffer(held.Buffer)
+                    && held.Buffer.Size >= hostData.Length)
+                {
+                    try
+                    {
+                        backend.UploadBufferInPlace(DirectGpuEngine.ToFloatArray(hostData), held.Buffer);
+                        _persistentWeightHostVersion[key] = tensor.GpuCacheVersion;
+                    }
+                    catch (Exception reuploadFailure) { GpuLaunchProbe.OnFallback("InvalidatePersistentTensor", reuploadFailure); }
+                }
+                return;
+            }
             IGpuBuffer? replacement = null;
             try
             {

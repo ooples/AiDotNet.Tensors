@@ -145,8 +145,8 @@ extern ""C"" __global__ __launch_bounds__(32) void step_io_epilogue(
     for (int i = threadIdx.x; i < lossCount; i += 32) results->loss[slot][i] = loss[i];
     __syncwarp();
     if (threadIdx.x == 0) {
-        if (guard != 0) *guard = 0.0;
-        results->sumSquares[slot] = sum;
+        // No guard (no update ran, as in a deferred replay): the slot keeps the last update's sum, its verdict.
+        if (guard != 0) { *guard = 0.0; results->sumSquares[slot] = sum; }
         unsigned int applied = guard != 0 && isfinite(sum) ? s1 + 1u : s1;
         unsigned int done = s0 + 1u;
         state[1] = applied;
