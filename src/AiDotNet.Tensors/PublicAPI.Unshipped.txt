@@ -614,6 +614,12 @@ AiDotNet.Tensors.Engines.BoxMullerVariant.FirstUniform.get -> AiDotNet.Tensors.E
 AiDotNet.Tensors.Engines.BoxMullerVariant.FirstUniformFloor.get -> double
 AiDotNet.Tensors.Engines.BoxMullerVariant.SecondUniform.get -> AiDotNet.Tensors.Engines.BoxMullerSecondUniform
 AiDotNet.Tensors.Engines.BoxMullerVariant.Branch.get -> AiDotNet.Tensors.Engines.BoxMullerBranch
+AiDotNet.Tensors.Engines.BoxMullerVariant.BoxMullerVariant(AiDotNet.Tensors.Engines.BoxMullerFirstUniform firstUniform, double firstUniformFloor, AiDotNet.Tensors.Engines.BoxMullerSecondUniform secondUniform, AiDotNet.Tensors.Engines.BoxMullerBranch branch, AiDotNet.Tensors.Engines.BoxMullerScaleOrder scaleOrder, bool exact) -> void
+AiDotNet.Tensors.Engines.BoxMullerVariant.ScaleOrder.get -> AiDotNet.Tensors.Engines.BoxMullerScaleOrder
+AiDotNet.Tensors.Engines.BoxMullerVariant.Exact.get -> bool
+AiDotNet.Tensors.Engines.BoxMullerScaleOrder
+AiDotNet.Tensors.Engines.BoxMullerScaleOrder.ScaleLast = 0 -> AiDotNet.Tensors.Engines.BoxMullerScaleOrder
+AiDotNet.Tensors.Engines.BoxMullerScaleOrder.ScaleFirst = 1 -> AiDotNet.Tensors.Engines.BoxMullerScaleOrder
 static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorNormalFromRng<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.Random! generator, int[]! shape, System.Func<System.Random!, double>! sampler) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 virtual AiDotNet.Tensors.Engines.CpuEngine.TensorNormalFromRng<T>(System.Random! generator, int[]! shape, System.Func<System.Random!, double>! sampler) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 static AiDotNet.Tensors.Engines.TensorDataEngineExtensions.TensorNormalBoxMullerFromRng<T>(this AiDotNet.Tensors.Engines.IEngine! engine, System.Random! generator, int[]! shape, AiDotNet.Tensors.Engines.BoxMullerVariant variant, double mean = 0, double stdDev = 1) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
