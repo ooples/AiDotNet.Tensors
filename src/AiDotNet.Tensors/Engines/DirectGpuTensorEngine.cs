@@ -4441,6 +4441,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // The flat array's device buffer when it already holds the current value (device-authoritative, or cached at
+    // hostVersion); null when only the host copy is current. Never uploads.
+    private IGpuBuffer? TryGetCurrentFlatDeviceBuffer(float[] flat, int hostVersion)
+    {
+        lock (_persistentBufferLock)
+        {
+            if (!_persistentBufferCache.TryGetValue(flat, out var entry) || entry.Buffer.Handle == IntPtr.Zero) return null;
+            if (Helpers.HostSync.IsPending(flat)) return entry.Buffer;
+            return _persistentWeightHostVersion.TryGetValue(flat, out int stamp) && stamp == hostVersion ? entry.Buffer : null;
+        }
+    }
+
     /// <summary>
     /// For a parameter view the backend cannot address as a sub-buffer (a backend without IGpuBufferViews, or an offset
     /// it refuses: OpenCL sub-buffers need offsets aligned to the device's base-address alignment, which a flat
@@ -4627,7 +4639,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend? backend)
+    /// <summary>
+    /// With <paramref name="allowUpload"/> false the parameter is served only from a buffer already holding its current
+    /// value (its bound buffer, the weight cache at its version, a device-authoritative activation-cache buffer, or for
+    /// a flat view the flat array's device buffer);
+    /// a parameter that would need a host upload or an in-place refresh returns <c>null</c> instead. The list optimizer
+    /// steps resolve parameters this way, so a host-authoritative parameter refuses the list rather than being staged.
+    /// </summary>
+    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend? backend, bool allowUpload = true)
     {
         using var __gpuOp = EnterGpuOp();
         backend = null;
@@ -4640,7 +4659,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // existing buffer is current; otherwise the host copy is, so it is uploaded once for every parameter.
             // A backend without sub-buffer views updates the parameter through a staged copy (TryStageFlatParameter).
             if (be is not IGpuBufferViews views) return null;
-            return views.TryCreateView(AcquireFlatDeviceBuffer(flatView.Flat, be, param.GpuCacheVersion), flatView.Offset, param.Length);
+            var flatBuffer = allowUpload
+                ? AcquireFlatDeviceBuffer(flatView.Flat, be, param.GpuCacheVersion)
+                : TryGetCurrentFlatDeviceBuffer(flatView.Flat, param.GpuCacheVersion);
+            return flatBuffer is null ? null : views.TryCreateView(flatBuffer, flatView.Offset, param.Length);
         }
         if (param._storageOffset != 0) return null;
         var paramArray = param.GetBackingArrayForCacheLookupUnsafe();
@@ -4686,6 +4708,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         return existingBuf;
                 }
             }
+            else if (!allowUpload)
+            {
+                // A stale buffer the parameter owns would be refreshed in place, a host upload. Otherwise the current
+                // value may already be in the weight cache under a newer buffer: the lookup below serves it.
+                if (param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf) || param._device != TensorDevice.CPU)
+                    return null;
+            }
             else if (param._ownsGpuBuffer || param._storage.OwnsGpuBuffer(existingBuf) || param._device != TensorDevice.CPU)
             {
                 try
@@ -4720,7 +4749,29 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        var owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
+        OwnedBuffer owned;
+        if (allowUpload)
+        {
+            owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
+        }
+        else
+        {
+            if (paramArray is null || paramArray.Length != param.Length) return null;
+            if (TryGetVersionedPersistentBuffer(paramArray, param.GpuCacheVersion, out var cachedCurrent))
+            {
+                owned = new OwnedBuffer(cachedCurrent, ownsBuffer: false);
+            }
+            else if (Helpers.HostSync.IsPending(paramArray)
+                && _activationCache.TryGetValue(paramArray, out var pendingActivation) && ReferenceEquals(pendingActivation.Backend, be)
+                && !pendingActivation.IsFp16 && pendingActivation.Buffer.Handle != IntPtr.Zero && pendingActivation.Buffer.Size >= param.Length)
+            {
+                owned = new OwnedBuffer(pendingActivation.Buffer, ownsBuffer: false);
+            }
+            else
+            {
+                return null;   // the current value is only on the host
+            }
+        }
         if (owned.OwnsBuffer) { owned.Dispose(); return null; }   // not cacheable; the caller keeps the host path
         if (paramArray is not null && paramArray.Length == param.Length)
         {

@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -189,6 +190,15 @@ public sealed class GpuOptimizerResidencyMockTests
         yield return ("ProximalL1Update", 0, (p, g, s) => GpuOptimizer.TryProximalL1StepMultiTensor(p, g, 0.01f, 0.1f));
     }
 
+    // Every list step that must refuse a host-only list, including the fused Adam/AdamW lists (one launch, so they are
+    // not in ListSteps' per-tensor launch assertions).
+    private static IEnumerable<(string Kernel, int States, ListStep Run)> RefusingListSteps()
+    {
+        foreach (var step in ListSteps()) yield return step;
+        yield return ("AdamUpdate", 2, (p, g, s) => GpuOptimizer.TryAdamStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
+        yield return ("AdamWUpdate", 2, (p, g, s) => GpuOptimizer.TryAdamWStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1));
+    }
+
     private static Tensor<float>[] GpuList(IDirectGpuBackend backend, params int[] lengths)
         => Array.ConvertAll(lengths, len => GpuFloat(backend, len));
 
@@ -228,10 +238,11 @@ public sealed class GpuOptimizerResidencyMockTests
     [Fact]
     public void EveryListOptimizerStep_RefusesTheWholeListBeforeAnyLaunch_WhenOneTensorIsHostOnly()
     {
-        foreach (var (kernel, stateCount, run) in ListSteps())
+        foreach (var (kernel, stateCount, run) in RefusingListSteps())
         {
             // The host-only tensor is the LAST entry, so a per-tensor loop would already have stepped the others.
-            int variants = stateCount > 0 ? 3 : 2;
+            // Variants: the gradient, the parameter, then each optimizer state in turn (all three of AMSGrad's).
+            int variants = 2 + stateCount;
             for (int variant = 0; variant < variants; variant++)
             {
                 using var ctx = new MockGpuEngineScope();
@@ -241,13 +252,162 @@ public sealed class GpuOptimizerResidencyMockTests
                 var host = new Tensor<float>(new float[1], new[] { 1 });
                 if (variant == 0) gs[2] = host;
                 else if (variant == 1) ps[2] = host;
-                else states[stateCount - 1][2] = host;
+                else states[variant - 2][2] = host;
                 var pBefore = Array.ConvertAll(ps, p => p.Version);
+                var gBefore = Array.ConvertAll(gs, g => g.Version);
+                var sBefore = Array.ConvertAll(states, list => Array.ConvertAll(list, x => x.Version));
+                int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+                int uploadsBefore = ctx.State.UploadInPlaceCalls;
 
                 Assert.False(run(ps, gs, states), $"{kernel} variant {variant}");
                 Assert.Empty(ctx.State.OptimizerCalls);
                 Assert.Equal(pBefore, Array.ConvertAll(ps, p => p.Version));
+                Assert.Equal(gBefore, Array.ConvertAll(gs, g => g.Version));
+                for (int st = 0; st < stateCount; st++)
+                    Assert.Equal(sBefore[st], Array.ConvertAll(states[st], x => x.Version));
+                // Refused before staging: the host tensor was neither uploaded nor bound to a device buffer.
+                Assert.Null(host._gpuBuffer);
+                Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+                Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
             }
+        }
+    }
+
+    [Fact]
+    public void ListOptimizerStep_AcceptsAParameterHeldOnlyInTheWeightCache_WithoutAnUpload()
+    {
+        // An eager model's weight lives in the persistent weight cache at its current version without being bound to
+        // the tensor that the optimizer holds. It is on the device, so the list step runs it rather than refusing.
+        using var ctx = new MockGpuEngineScope();
+        var cached = new Tensor<float>(new float[9], new[] { 9 });
+        Assert.NotNull(ctx.Engine.AcquireParameterBuffer(cached, out _));
+        cached._gpuBuffer = null;
+        cached._gpuBackend = null;
+        var ps = new[] { GpuFloat(ctx.Backend, 4), cached };
+        var gs = GpuList(ctx.Backend, 4, 9);
+        var states = GpuStates(ctx.Backend, 1, 4, 9);
+        int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+        int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+        Assert.True(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, states[0], 0.01f, 0.9f, 0f));
+        Assert.Equal(new[] { "SgdMomentumUpdate", "SgdMomentumUpdate" }, ctx.State.OptimizerCalls);
+        Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+        Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+    }
+
+    private static Tensor<float>[] FlatViewParameters(MockGpuEngineScope ctx, out Tensor<float>[][] states, out Tensor<float>[] gs)
+    {
+        var buffer = new ParameterBuffer<float>(new[] { new[] { 4 }, new[] { 9 } });
+        var views = buffer.CreateAllViews();
+        gs = GpuList(ctx.Backend, 4, 9);
+        states = GpuStates(ctx.Backend, 1, 4, 9);
+        return new[] { GpuFloat(ctx.Backend, 4), views[1] };
+    }
+
+    [Fact]
+    public void ListOptimizerStep_RefusesAHostAuthoritativeFlatParameterView_WithoutUploadingTheFlatArray()
+    {
+        // A ParameterBuffer view on a backend with sub-buffer views, whose flat array was never placed on the device:
+        // resolving it as a per-tensor step does would upload the flat array, so the list is refused instead.
+        using var ctx = new MockGpuEngineScope(bufferViews: true);
+        var ps = FlatViewParameters(ctx, out var states, out var gs);
+        int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+        int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+        Assert.False(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, states[0], 0.01f, 0.9f, 0f));
+        Assert.Empty(ctx.State.OptimizerCalls);
+        Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+        Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+    }
+
+    [Fact]
+    public void ListOptimizerStep_AcceptsAFlatParameterViewWhoseFlatArrayIsOnTheDevice_WithoutAnUpload()
+    {
+        using var ctx = new MockGpuEngineScope(bufferViews: true);
+        var ps = FlatViewParameters(ctx, out var states, out var gs);
+        Assert.NotNull(ctx.Engine.AcquireParameterBuffer(ps[1], out _));   // the flat array uploaded once, cached
+        int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+        int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+        Assert.True(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, states[0], 0.01f, 0.9f, 0f));
+        Assert.Equal(new[] { "SgdMomentumUpdate", "SgdMomentumUpdate" }, ctx.State.OptimizerCalls);
+        Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+        Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+    }
+
+    [Fact]
+    public void ListOptimizerStep_RefusesAParameterBoundToABufferTheWeightCacheDropped_WithoutAnUpload()
+    {
+        // Bound at its version, but neither owned nor cached any more: the per-tensor step re-uploads it.
+        using var ctx = new MockGpuEngineScope();
+        var dropped = new Tensor<float>(new float[9], new[] { 9 });
+        Assert.NotNull(ctx.Engine.AcquireParameterBuffer(dropped, out _));
+        ctx.Engine.InvalidateAllWeightCaches();
+        Assert.NotNull(dropped._gpuBuffer);
+        var ps = new[] { GpuFloat(ctx.Backend, 4), dropped };
+        var gs = GpuList(ctx.Backend, 4, 9);
+        var states = GpuStates(ctx.Backend, 1, 4, 9);
+        int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+        int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+        Assert.False(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, states[0], 0.01f, 0.9f, 0f));
+        Assert.Empty(ctx.State.OptimizerCalls);
+        Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+        Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+    }
+
+    [Fact]
+    public void ListOptimizerStep_RefusesAParameterSharedWithACopyOnWriteSnapshot_WithoutAnUpload()
+    {
+        // A cached parameter with a copy-on-write snapshot (a checkpoint copy): the step writes it, so it detaches onto
+        // fresh host storage first, and the list is refused rather than the detached copy being uploaded.
+        using var ctx = new MockGpuEngineScope();
+        var shared = new Tensor<float>(new float[9], new[] { 9 });
+        Assert.NotNull(ctx.Engine.AcquireParameterBuffer(shared, out _));
+        var snapshot = shared.CloneShared();
+        Assert.True(shared.HasPendingCopyOnWritePeer);
+        var ps = new[] { GpuFloat(ctx.Backend, 4), shared };
+        var gs = GpuList(ctx.Backend, 4, 9);
+        var states = GpuStates(ctx.Backend, 1, 4, 9);
+        int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+        int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+        Assert.False(GpuOptimizer.TrySgdMomentumStepMultiTensor(ps, gs, states[0], 0.01f, 0.9f, 0f));
+        Assert.Empty(ctx.State.OptimizerCalls);
+        Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+        Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+        GC.KeepAlive(snapshot);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AdamListSteps_RefuseDroppedCacheAndCopyOnWriteParameters_WithoutAnUpload(bool decoupled)
+    {
+        for (int scenario = 0; scenario < 2; scenario++)
+        {
+            using var ctx = new MockGpuEngineScope();
+            var host = new Tensor<float>(new float[9], new[] { 9 });
+            Assert.NotNull(ctx.Engine.AcquireParameterBuffer(host, out _));
+            object keep = null;
+            if (scenario == 0) ctx.Engine.InvalidateAllWeightCaches();
+            else keep = host.CloneShared();
+            var ps = new[] { GpuFloat(ctx.Backend, 4), host };
+            var gs = GpuList(ctx.Backend, 4, 9);
+            var m = GpuList(ctx.Backend, 4, 9);
+            var v = GpuList(ctx.Backend, 4, 9);
+            int allocationsBefore = ctx.State.AllocatedBuffers.Count;
+            int uploadsBefore = ctx.State.UploadInPlaceCalls;
+
+            bool stepped = decoupled
+                ? GpuOptimizer.TryAdamWStepMultiTensor(ps, gs, m, v, 0.01f, 0.9f, 0.999f, 1e-8f, 0.01f, 1)
+                : GpuOptimizer.TryAdamStepMultiTensor(ps, gs, m, v, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1);
+
+            Assert.False(stepped, $"scenario {scenario}");
+            Assert.Empty(ctx.State.OptimizerCalls);
+            Assert.Equal(allocationsBefore, ctx.State.AllocatedBuffers.Count);
+            Assert.Equal(uploadsBefore, ctx.State.UploadInPlaceCalls);
+            GC.KeepAlive(keep);
         }
     }
 
@@ -656,7 +816,7 @@ public sealed class GpuOptimizerResidencyMockTests
         public IDirectGpuBackend Backend { get; }
         public DirectGpuTensorEngine Engine { get; }
 
-        public MockGpuEngineScope(bool multiTensor = false)
+        public MockGpuEngineScope(bool multiTensor = false, bool bufferViews = false)
         {
             _priorEngine = AiDotNetEngine.Current;
             _priorBackendEnv = Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS");
@@ -664,7 +824,8 @@ public sealed class GpuOptimizerResidencyMockTests
             var directGpu = new DirectGpuEngine();
             Environment.SetEnvironmentVariable("AIDOTNET_DIRECTGPU_BACKENDS", _priorBackendEnv);
 
-            Backend = multiTensor ? MockDirectGpuBackend.CreateMultiTensor(State) : MockDirectGpuBackend.Create(State);
+            Backend = bufferViews ? MockDirectGpuBackend.CreateWithBufferViews(State)
+                : multiTensor ? MockDirectGpuBackend.CreateMultiTensor(State) : MockDirectGpuBackend.Create(State);
             SetField(directGpu, "_backend", Backend);
             SetField(directGpu, "_isAvailable", true);
 
