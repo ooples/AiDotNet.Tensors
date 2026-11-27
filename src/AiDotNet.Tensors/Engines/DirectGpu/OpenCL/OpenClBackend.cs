@@ -362,12 +362,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // its kernels. Out of memory is fatal and propagates.
         private void CompileOptionalModule(string source, IEnumerable<string> kernelNames, string buildOptions, string label)
         {
+            var context = _context
+                ?? throw new InvalidOperationException("The OpenCL context must exist before kernel modules compile.");
             try
             {
                 var program = CompileOrLoadCached(source, buildOptions, label);
                 _programs.Add(program);
                 foreach (var name in kernelNames)
-                    _kernelCache[name] = new DirectOpenClKernel(_context, program, name);
+                    _kernelCache[name] = new DirectOpenClKernel(context, program, name);
             }
             catch (OutOfMemoryException)
             {
