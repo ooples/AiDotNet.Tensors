@@ -1,0 +1,44 @@
+name: Cancel runs of a closed pull request
+
+# A merged or closed pull request's checks can no longer gate anything; main runs its own CI for the merge commit.
+# Without this, ci.yml's per-PR concurrency group only cancels on a newer push, so a merged PR's run kept its jobs on
+# the account's hosted runners and queued ahead of open pull requests (2026-11-27: 11 running jobs and about 150
+# queued for #1868-#1870 after they had merged).
+#
+# pull_request_target so the token can cancel runs for pull requests from forks too. Nothing from the pull request
+# is checked out or executed; the job only reads its number and head branch from the event.
+on:
+  pull_request_target:
+    types: [ closed ]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel the pull request's queued and running runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          SELF: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cancelled=0
+          for status in queued in_progress pending waiting requested; do
+            ids=$(gh api -X GET "repos/$REPO/actions/runs" -f branch="$BRANCH" -f event=pull_request \
+              -f status="$status" -f per_page=100 \
+              --jq ".workflow_runs[] | select(any(.pull_requests[]?; .number == $NUMBER) or (.pull_requests | length) == 0) | .id")
+            for id in $ids; do
+              [ "$id" = "$SELF" ] && continue
+              if gh api -X POST "repos/$REPO/actions/runs/$id/cancel" --silent 2>/dev/null; then
+                cancelled=$((cancelled + 1))
+              fi
+            done
+          done
+          echo "Cancelled $cancelled run(s) of #$NUMBER ($BRANCH)." | tee -a "$GITHUB_STEP_SUMMARY"
