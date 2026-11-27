@@ -95,7 +95,10 @@ public partial class DirectGpuTensorEngine
         int count = ValidateShapeElements(shape);
         ValidateVariant(variant);
         ValidateClampBounds(low, high);
+        // An exact or scale-first draw stays on the host: the device kernel evaluates the angle and the affine step in
+        // float, scale last, which agrees with the host only to float rounding.
         if (typeof(T) != typeof(float) || count == 0 || (long)count * 2 > int.MaxValue / 2
+            || variant.Exact || variant.ScaleOrder != BoxMullerScaleOrder.ScaleLast
             || !AffineFitsInFloat(mean, stdDev)
             || !TryGetTransformBackend("TruncatedNormalFromRng", out var backend, out var transforms))
             return base.TensorTruncatedNormalFromRng<T>(generator, shape, variant, mean, stdDev, low, high);
@@ -110,7 +113,7 @@ public partial class DirectGpuTensorEngine
                     (float)low, (float)high))
             {
                 GpuLaunchProbe.OnFallback("TruncatedNormalFromRng", null);
-                return UploadResult<T>(backend, ToSingles(TransformBoxMullerPairs(pairs, variant.Branch, mean, stdDev, low, high)), shape);
+                return UploadResult<T>(backend, ToSingles(TransformBoxMullerPairs(pairs, variant.Branch, variant.ScaleOrder, mean, stdDev, low, high)), shape);
             }
             var result = DeferTensorResult<T>(backend, output.Buffer, count, (int[])shape.Clone());
             output.RelinquishOwnership();
