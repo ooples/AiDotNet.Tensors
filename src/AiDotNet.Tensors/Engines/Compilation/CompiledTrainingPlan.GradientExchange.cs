@@ -95,11 +95,20 @@ internal sealed class GradientExchange<T>
     /// <summary>Whether <see cref="DeferUpdate"/> or <see cref="CombineAccumulated"/> began writing the accumulator.</summary>
     internal bool AccumulatorTouched { get; private set; }
 
+    /// <summary>
+    /// Whether an accumulation write began and did not finish (it threw after its validation, and the callback may have
+    /// caught that): the accumulator and this step's gradients are part-written, so the step cannot update or retry.
+    /// </summary>
+    internal bool AccumulationFaulted => AccumulatorTouched && !UpdateDeferred && !_combined;
+
     public void DeferUpdate(double weight)
     {
         if (_deferRefusal is { } why) throw new InvalidOperationException("This step's update cannot be deferred: " + why + ".");
         if (UpdateDeferred || _combined)
             throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
+        if (AccumulationFaulted)
+            throw new InvalidOperationException(
+                "An earlier accumulation write on this step failed part-way; the step cannot write the accumulator again.");
         if (double.IsNaN(weight) || double.IsInfinity(weight))
             throw new ArgumentOutOfRangeException(nameof(weight), "The weight must be finite.");
         var acc = _accumulation!;
@@ -144,6 +153,9 @@ internal sealed class GradientExchange<T>
             throw new InvalidOperationException("There are no accumulated gradients to combine.");
         if (UpdateDeferred || _combined)
             throw new InvalidOperationException("This step already deferred its update or combined the accumulated gradients.");
+        if (AccumulationFaulted)
+            throw new InvalidOperationException(
+                "An earlier accumulation write on this step failed part-way; the step cannot write the accumulator again.");
         if (double.IsNaN(accumulatedScale) || double.IsInfinity(accumulatedScale))
             throw new ArgumentOutOfRangeException(nameof(accumulatedScale), "The scale must be finite.");
         if (double.IsNaN(weight) || double.IsInfinity(weight))
@@ -542,9 +554,18 @@ internal sealed class GradientAccumulation<T> : IDisposable
                     buffer = backend.AllocateBuffer(length);
                 if (Steps > 0 && Host[i] is { } values)
                 {
-                    var upload = new float[length];
-                    Array.Copy((float[])(object)values, upload, length);
-                    backend.UploadBufferInPlace(upload, buffer);
+                    // The buffer is owned by nothing until Device[i] takes it: a failed upload must not leak it.
+                    try
+                    {
+                        var upload = new float[length];
+                        Array.Copy(values, upload, length);   // T is float on this path
+                        backend.UploadBufferInPlace(upload, buffer);
+                    }
+                    catch
+                    {
+                        buffer.Dispose();
+                        throw;
+                    }
                 }
                 Device[i] = buffer;
                 Host[i] = null;
@@ -566,9 +587,11 @@ internal sealed class GradientAccumulation<T> : IDisposable
         var values = new T[_lengths[i]];
         if (Steps > 0)
         {
+            var owner = _backend
+                ?? throw new InvalidOperationException("A device gradient accumulator has no backend to download it from.");
             var host = new float[buffer.Size];
-            _backend!.DownloadBuffer(buffer, host);
-            Array.Copy(host, (float[])(object)values, values.Length);
+            owner.DownloadBuffer(buffer, host);
+            Array.Copy(host, values, values.Length);   // T is float on this path
         }
         buffer.Dispose();
         Device[i] = null;
@@ -669,6 +692,9 @@ internal sealed partial class CompiledTrainingPlan<T>
     /// <summary>The deferred steps whose gradients the plan's accumulator holds now.</summary>
     internal int AccumulatedGradientSteps => _gradientAccumulation?.Steps ?? 0;
 
+    // Set while the exchange callback runs (see SetGradientExchange).
+    private bool _exchangeCallbackRunning;
+
     // The exchange's host staging (see GradientExchange): one slot per exchanged gradient, kept across steps.
     private readonly float[]?[][] _exchangeStaging = { Array.Empty<float[]?>(), Array.Empty<float[]?>() };
 
@@ -696,6 +722,10 @@ internal sealed partial class CompiledTrainingPlan<T>
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
         lock (_stepSync)
         {
+            // The running callback still holds its step's exchange, whose accumulator the replacement would clear and
+            // the old callback could then refill for the new exchange to combine. Replace between steps.
+            if (_exchangeCallbackRunning)
+                throw new InvalidOperationException("The gradient exchange cannot be replaced from inside its own callback.");
             if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
             _gradientExchange = exchange;
             // Accumulated gradients belong to the exchange that deferred them.
@@ -738,13 +768,19 @@ internal sealed partial class CompiledTrainingPlan<T>
         _gradientAccumulation ??= new GradientAccumulation<T>();
         string? deferRefusal = _lossScaling is not null
             ? "loss scaling is configured (a deferred step's overflow check is not supported)"
+            : _preForwardParamTransform is not null
+            // Schedule-Free writes its evaluation point y into the live parameters before the forward, and only the
+            // update puts x back: a deferred step would leave y in the parameters until the next accepted update.
+            ? "the optimizer evaluates the forward at transformed parameters (Schedule-Free), which only its update restores"
             : null;
         var step = new GradientExchange<T>(parameters.ToArray(), gradients.ToArray(), deviceArray, backend, loss, deviceLoss,
             _exchangeStaging, PinnedExchangeStaging(backend, gradients), FlatExchangeBuffer(backend, gradients, deviceArray),
             _gradientAccumulation, deferRefusal);
         try
         {
-            exchange(step);
+            _exchangeCallbackRunning = true;
+            try { exchange(step); }
+            finally { _exchangeCallbackRunning = false; }
         }
         catch when (step.AccumulatorTouched)
         {
@@ -752,6 +788,15 @@ internal sealed partial class CompiledTrainingPlan<T>
             // would count twice, and a combined window lives only in this step's gradients. The window is dropped.
             _gradientAccumulation.Release();
             throw;
+        }
+        if (step.AccumulationFaulted)
+        {
+            // An accumulation write threw part-way and the callback returned anyway: the gradients are part-scaled, so
+            // the update must not run on them, and the part-written window is dropped.
+            _gradientAccumulation.Release();
+            throw new InvalidOperationException(
+                "An accumulation write failed part-way inside the gradient exchange; the step was refused and the "
+                + "accumulation window was dropped.");
         }
         if (!step.UpdateDeferred && !step.CombinedAccumulation && _gradientAccumulation.Steps > 0)
         {

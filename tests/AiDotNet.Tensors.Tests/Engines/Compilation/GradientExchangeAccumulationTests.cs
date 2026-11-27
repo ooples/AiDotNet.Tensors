@@ -258,7 +258,7 @@ public class GradientExchangeAccumulationTests
                 var tokens = Enumerable.Range(0, Micro).Select(m => Tokens(w, m)).ToArray();
                 var eager = EagerCombined(acc.Raw[w], tokens);
                 for (int i = 0; i < eager.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(eager[i]) == BitConverter.SingleToInt32Bits(acc.Combined[w][i]),
+                    Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(eager[i]) == TestHelpers.MathCompat.SingleToInt32Bits(acc.Combined[w][i]),
                         $"window {w} element {i}: combined {acc.Combined[w][i]:R}, eager accumulation {eager[i]:R}");
             }
 
@@ -354,6 +354,94 @@ public class GradientExchangeAccumulationTests
                 Assert.Equal(new[] { 0, 1, 2, 0 }, held);
                 Assert.Equal(1, compiled.AccumulatedGradientSteps);
             }
+        }
+    }
+
+    private static ICompiledTrainingPlan<float> LinearPlan(IEngine engine)
+    {
+        var x = new Tensor<float>(new[] { Rows, In }, new Vector<float>(MicroInputs(0, 0)));
+        var w = new Tensor<float>(new[] { In, Out }, new Vector<float>(Values(In * Out, 5, 0.4f)));
+        using var scope = GraphMode.Enable();
+        engine.TensorMultiplyScalar(engine.ReduceSum(engine.TensorMultiply(engine.TensorMatMul(x, w),
+            engine.TensorMatMul(x, w)), null), 1f / Rows);
+        return scope.CompileTraining(new[] { w });
+    }
+
+    // A window opened at one loss scale and combined at another would be unscaled as a whole by the new factor.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void LossScaling_CannotChangeWhileDeferredStepsArePending(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        using (var plan = LinearPlan(engine))
+        {
+            var compiled = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            compiled.SetGradientExchange(exchange => exchange.DeferUpdate(1.0));
+            plan.Step();
+            Assert.Equal(1, compiled.AccumulatedGradientSteps);
+
+            var failure = Assert.Throws<InvalidOperationException>(() =>
+                ((ICompiledTrainingPlanLossScaling)plan).ConfigureLossScaling(new LossScalingOptions { InitialScale = 8f }));
+            Assert.Contains("pending", failure.Message);
+            Assert.Equal(1, compiled.AccumulatedGradientSteps);   // the refusal changed nothing
+        }
+    }
+
+    // The running callback could refill the accumulator the replacement clears, for the new exchange to combine.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void TheExchange_CannotBeReplacedFromInsideItsOwnCallback(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        using (var plan = LinearPlan(engine))
+        {
+            var compiled = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 1e-2);
+            Exception? replaceFailure = null;
+            compiled.SetGradientExchange(exchange =>
+            {
+                replaceFailure = Record.Exception(() => compiled.SetGradientExchange(_ => { }));
+                exchange.DeferUpdate(1.0);
+            });
+            plan.Step();
+            Assert.IsType<InvalidOperationException>(replaceFailure);
+            Assert.Equal(1, compiled.AccumulatedGradientSteps);   // the original exchange kept its window
+
+            compiled.SetGradientExchange(null);                     // between steps it is replaced as before
+            Assert.Equal(0, compiled.AccumulatedGradientSteps);
+        }
+    }
+
+    // Schedule-Free writes its evaluation point into the parameters before the forward and only its update restores
+    // them, so a deferred step would leave the evaluation point in the parameters.
+    [SkippableTheory]
+    [InlineData("cpu")]
+    [InlineData("device")]
+    public void Deferral_IsRefusedForAnOptimizerThatTransformsTheParametersBeforeTheForward(string where)
+    {
+        var engine = TestRequire.NotNull(ResolveEngine(where, out _), "the engine");
+        using (engine as IDisposable)
+        using (var plan = LinearPlan(engine))
+        {
+            var compiled = (CompiledTrainingPlan<float>)plan;
+            plan.ConfigureOptimizer(OptimizerType.ScheduleFreeSGD, learningRate: 1e-2);
+            string? reason = null;
+            Exception? deferFailure = null;
+            compiled.SetGradientExchange(exchange =>
+            {
+                reason = exchange.DeferUnavailableReason;
+                deferFailure = Record.Exception(() => exchange.DeferUpdate(1.0));
+            });
+            plan.Step();
+            Assert.Contains("Schedule-Free", reason);
+            Assert.IsType<InvalidOperationException>(deferFailure);
+            Assert.Equal(0, compiled.DeferredUpdateCount);
+            Assert.Equal(1, compiled.OptimizerStep);
         }
     }
 }

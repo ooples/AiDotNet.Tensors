@@ -1057,6 +1057,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // is the root of a view chain, not the view: a weight resolved as a parameter view gets a new view object on every
     // call, and the handle (root pointer plus offset) already tells two views of one root apart.
     private readonly System.Collections.Concurrent.ConcurrentDictionary<System.IntPtr, (WeakReference<IGpuBuffer> Source, IGpuBuffer Half)> _fp16WeightCache = new();
+    // A held FP32 weight refreshed in place keeps its handle and owner, so a cached FP16 copy of it would still hit and
+    // the next FP16 convolution would read the old weights. The copy of the buffer itself is converted again in place
+    // (on the stream, after the upload; a captured graph's baked pointer stays valid); a copy made from a view of the
+    // same root cannot be redone from here and is retired, so the next use converts it afresh.
+    private void RefreshFp16CopiesAfterInPlaceUpload(IDirectGpuBackend backend, IGpuBuffer refreshed, int count)
+    {
+        if (_fp16WeightCache.IsEmpty) return;
+        var root = GpuBufferViewRoot.Of(refreshed);
+        foreach (var key in _fp16WeightCache.Keys)
+        {
+            if (!_fp16WeightCache.TryGetValue(key, out var cached)
+                || !cached.Source.TryGetTarget(out var source) || !ReferenceEquals(source, root))
+                continue;
+            if (key == refreshed.Handle && refreshed.Handle != IntPtr.Zero && cached.Half.Handle != IntPtr.Zero)
+            {
+                int converted = (int)Math.Min(count, cached.Half.SizeInBytes / 2);
+                backend.ConvertToFp16(refreshed, cached.Half, converted);
+            }
+            else if (_fp16WeightCache.TryRemove(key, out var stale))
+            {
+                _retiredWeightBuffers.Add(stale.Half);
+            }
+        }
+    }
+
     private IGpuBuffer GetOrCacheFp16Weights(IDirectGpuBackend backend, IGpuBuffer wFp32, int count)
     {
         var owner = GpuBufferViewRoot.Of(wFp32);
@@ -4035,9 +4060,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         throw new InvalidOperationException(
                             "A weight held by a configured device optimizer was written on the host during graph "
                             + "capture; its device buffer cannot be refreshed inside the capture.");
-                    if (existing.Buffer.Handle != IntPtr.Zero && existing.Buffer.Size >= data.Length)
+                    // IsLiveDeviceBuffer, not a native-handle check: a WebGPU buffer has no native handle, and a held
+                    // one replaced here would leave the optimizer writing a buffer the engine retired.
+                    if (IsLiveDeviceBuffer(existing.Buffer) && existing.Buffer.Size >= data.Length)
                     {
                         backend.UploadBufferInPlace(DirectGpuEngine.ToFloatArray(data), existing.Buffer);
+                        RefreshFp16CopiesAfterInPlaceUpload(backend, existing.Buffer, data.Length);
                         _persistentWeightHostVersion[data] = hostVersion;
                         return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
                     }

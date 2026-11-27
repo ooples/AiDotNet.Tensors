@@ -566,7 +566,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (_deviceOptimizerWeightsLock is not null && _deviceOptimizerWeights is not null)
         {
             try { ReleaseDeviceOptimizerWeights(); }
-            catch (Exception) { /* nothing to report to from a finalizer */ }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A finalizer must not throw; the failure is traced for the developer instead of swallowed silently.
+                System.Diagnostics.Trace.TraceWarning(
+                    "CompiledTrainingPlan finalizer: releasing the device optimizer weights failed: " + ex);
+            }
         }
     }
 
@@ -4574,7 +4579,6 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gpuEngine = _engine.As<Engines.DirectGpuTensorEngine>();
             gpuEngine?.NoteCompiledStepThread(_planId);
             Tensor<T> result;
-            _lastStepUpdateDeferred = false;   // set by this step's exchange
             if (gpuEngine is null) result = StepLocked();
             else lock (gpuEngine.CompiledStepLock) result = StepLocked();
             TraceRetainedStorageOnce();
@@ -4708,6 +4712,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         lock (_stepSync)
         {
             _retainedOutputsAvailable = false;
+            // Set by this step's exchange. Reset under the step's lock, so each step reads the decision its own exchange
+            // wrote: reset before the lock, another caller could clear it while a captured step sits between its
+            // exchange and the AfterReplay decision.
+            _lastStepUpdateDeferred = false;
 
             // The step's memory is the step's again: whatever borrowed it between steps moves out first.
             ReclaimIdleStepMemory();
