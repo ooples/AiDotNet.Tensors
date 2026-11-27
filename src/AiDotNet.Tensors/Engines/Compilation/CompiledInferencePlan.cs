@@ -76,6 +76,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // output tensor's own binding does not survive the call (its host refresh makes it stale, and a host read or an
     // engine op over it can drop it), which failed the next replay's download.
     private Engines.DirectGpu.IGpuBuffer? _capturedOutputBuffer;
+    // Tensors the forward kept or detached (read after Execute like the output) and the buffers a captured graph writes
+    // them at. A replay runs no binding delegate, so RearmStates re-arms each one's host download from its buffer;
+    // otherwise a host read after a replay returned the previous execution's values.
+    private Tensor<T>[] _retainedOutputs = Array.Empty<Tensor<T>>();
+    private Engines.DirectGpu.IGpuBuffer?[] _capturedRetainedBuffers = Array.Empty<Engines.DirectGpu.IGpuBuffer?>();
     private readonly List<GCHandle> _pinnedHandles = new();
     private TensorStorageLeaseSet? _storageLeases;
 
@@ -1084,6 +1089,17 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                                 _graphBackend = cb;
                                 _graphEngine = gte;
                                 _capturedOutputBuffer = _finalOutput._gpuBuffer;
+                                var retainedBuffers = new Engines.DirectGpu.IGpuBuffer?[_retainedOutputs.Length];
+                                for (int i = 0; i < retainedBuffers.Length; i++)
+                                {
+                                    retainedBuffers[i] = _retainedOutputs[i]._gpuBuffer;
+                                    // A kept tensor the graph does not write on the device would keep its capture-time
+                                    // host values on every replay: run eagerly instead.
+                                    if (retainedBuffers[i] is null)
+                                        throw new InvalidOperationException(
+                                            "A retained tensor is not device-resident after capture; abandoning capture.");
+                                }
+                                _capturedRetainedBuffers = retainedBuffers;
                                 stateLaunchAttempted = _writtenTargets.Length != 0;
                                 cb.LaunchCapturedGraph(exec);
                                 RearmStates();
@@ -1250,6 +1266,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             gte.RearmStateAfterReplay(_writtenTargets[i], _writtenTargetBuffers[i]);
             _writtenTargetVersions[i] = _writtenTargets[i].GpuCacheVersion;
         }
+        for (int i = 0; i < _capturedRetainedBuffers.Length; i++)
+            if (_capturedRetainedBuffers[i] is { } retainedBuffer)
+                gte.RearmStateAfterReplay(_retainedOutputs[i], retainedBuffer);
     }
 
     // Before a replay: each tensor the graph writes holds the last launch's value in its captured buffer. One the caller
@@ -1942,9 +1961,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // A tensor the forward kept or detached (LazyTensorScope.RetainedNodes) is read after Execute like the output.
         // Memory planning must not count it dead after its last reader in the plan and hand its storage to a later
         // result: the caller's reference would then show that result's values.
+        var retainedOutputs = new List<Tensor<T>>();
         if (scope.RetainedNodes is { Count: > 0 } retainedNodes)
-            foreach (var node in retainedNodes)
-                if (node is LazyNode<T> { Output: { } kept } && !protectedOutputs.Contains(kept)) protectedOutputs.Add(kept);
+        {
+            foreach (var kept in retainedNodes.OfType<LazyNode<T>>().Select(node => node.Output).Where(kept => kept is not null))
+            {
+                if (!protectedOutputs.Contains(kept)) protectedOutputs.Add(kept);
+                if (!ReferenceEquals(kept, explicitOutput) && !retainedOutputs.Contains(kept)) retainedOutputs.Add(kept);
+            }
+        }
         steps = RunStepMutatingPasses(steps, engine, protectedOutputs);
         Tensor<T>[] stateTensors = Array.Empty<Tensor<T>>();
         if (stateUpdates is { Count: > 0 })
@@ -2097,6 +2122,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 compiledInputTensors: compiledInputTensors,
                 storageLeases: storageLeases);
             plan._stateTensors = stateTensors;
+            plan._retainedOutputs = retainedOutputs.Where(kept => !ReferenceEquals(kept, finalOutput)).ToArray();
             if (stateTensors.Length > 0) ValidateStateStepsSurvived(optimizedSteps, stateTensors);
             // Only when a pass replaced steps: otherwise the executed steps already are the recorded ones.
             if (!ReferenceEquals(optimizedSteps, specializedSteps)) plan._exportSteps = specializedSteps;
