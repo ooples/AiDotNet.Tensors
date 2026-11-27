@@ -1230,9 +1230,10 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Checked out at the workspace root: Codecov's file fixes open each report path relative to the working
+      # directory, so a checkout under a subfolder failed the upload with FileNotFoundError on the first source path.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: AiDotNet.Tensors
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
@@ -1250,7 +1251,6 @@ jobs:
         with:
           files: ${{ runner.temp }}/cuda-coverage/**/coverage.cobertura.xml
           disable_search: true
-          root_dir: ${{ github.workspace }}/AiDotNet.Tensors
           flags: unittests
           name: gpu-cuda
           fail_ci_if_error: ${{ secrets.CODECOV_TOKEN != '' }}
