@@ -380,33 +380,6 @@ extern ""C"" __global__ __launch_bounds__(256) void nag_update(
 }
 
 // ---------------------------------------------------------------------------
-// LARS optimizer update
-// Note: LARS applies trustCoeff to scale the learning rate adaptively per layer.
-// The trustCoeff should be pre-computed as: trustCoeff * ||w|| / (||grad|| + ||w|| * weightDecay)
-// Set trustCoeff=1.0f to disable trust coefficient scaling.
-// ---------------------------------------------------------------------------
-extern ""C"" __global__ __launch_bounds__(256) void lars_update(
-    float* param, const float* gradient, float* velocity,
-    float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= size) return;
-
-    float grad = gradient[idx];
-    float p = param[idx];
-
-    if (weightDecay > 0.0f) {
-        grad += weightDecay * p;
-    }
-
-    float v = momentum * velocity[idx] + grad;
-    velocity[idx] = v;
-
-    // Apply trust coefficient to scale learning rate (LARS adaptive LR)
-    param[idx] = p - learningRate * trustCoeff * v;
-}
-
-// ---------------------------------------------------------------------------
 // LAMB optimizer update
 // Note: LAMB requires layer-wise trust ratio computation (||w|| / ||update||).
 // The trust ratio must be pre-computed externally and passed to this kernel.
@@ -911,7 +884,6 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
             "rmsprop_update",
             "adagrad_update",
             "nag_update",
-            "lars_update",
             "lamb_update",
             "adadelta_update",
             "amsgrad_update",

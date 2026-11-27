@@ -2454,6 +2454,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 }
                 gradMap.TryGetValue(input, out var ownGrad);
                 var view = outputGrad.ReshapeViewUnrecorded(input._shape);
+                Autodiff.DifferentiableOps.MarkPlanGradientView(view);
                 gradMap[input] = view;
                 rootOf[view] = rootOf.TryGetValue(outputGrad, out var outputRoot) ? outputRoot : outputGrad;
                 if (ownGrad is not null) dropped.Add(ownGrad);
@@ -2602,6 +2603,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     foreach (var (v, tg) in deviceAliases)
                         if (ReferenceEquals(v, outputGrad)) { target = tg; break; }
                 var view = outputGrad.ReshapeViewUnrecorded(x._shape);
+                Autodiff.DifferentiableOps.MarkPlanGradientView(view);
                 gradMap[x] = view;
                 rootOf[view] = root;
                 if (device) (deviceAliases ??= new List<(Tensor<T> View, Tensor<T> Target)>()).Add((view, target));
@@ -2612,6 +2614,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     if (ReferenceEquals(dependent, x) || !rootOf.TryGetValue(g, out var r) || !ReferenceEquals(r, ownGrad))
                         continue;
                     var moved = view.ReshapeViewUnrecorded(dependent._shape);
+                    Autodiff.DifferentiableOps.MarkPlanGradientView(moved);
                     gradMap[dependent] = moved;
                     if (producer.TryGetValue(dependent, out int dp) && dp < earliestRead) earliestRead = dp;
                     rootOf.Remove(g);

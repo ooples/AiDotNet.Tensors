@@ -252,9 +252,9 @@ public static partial class GpuOptimizer
     /// </summary>
     public static bool TryLarsStepMultiTensor(
         IReadOnlyList<Tensor<float>> parameters, IReadOnlyList<Tensor<float>> gradients,
-        IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay, float trustCoeff)
+        IReadOnlyList<Tensor<float>> velocities, float lr, float momentum, float weightDecay, float trustCoeff, float epsilon)
         => TryStepMultiTensor(nameof(TryLarsStepMultiTensor), parameters, gradients, new[] { velocities },
-            (b, p, g, s, len) => b.LarsUpdate(p, g, s[0], lr, momentum, weightDecay, trustCoeff, len));
+            (b, p, g, s, len) => b.LarsUpdate(p, g, s[0], lr, momentum, weightDecay, trustCoeff, epsilon, len));
 
     /// <summary>Proximal gradient (L1) over a parameter list; equals <see cref="TryProximalL1Step"/> per tensor.</summary>
     public static bool TryProximalL1StepMultiTensor(

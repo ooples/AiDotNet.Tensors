@@ -1140,25 +1140,6 @@ kernel void optimizer_update_guarded(
         cBits, dBits, gid);
 }
 
-kernel void lars_update_serial(
-    device float* parameter [[buffer(0)]], device const float* gradient [[buffer(1)]], device float* velocity [[buffer(2)]],
-    constant uint& count [[buffer(3)]], constant uint& learningRateBits [[buffer(4)]], constant uint& momentumBits [[buffer(5)]],
-    constant uint& decayBits [[buffer(6)]], constant uint& trustBits [[buffer(7)]], uint gid [[thread_position_in_grid]])
-{
-    if (gid != 0u) return;
-    float parameterNorm = 0.0f, gradientNorm = 0.0f;
-    for (uint i = 0; i < count; ++i) { parameterNorm += parameter[i] * parameter[i]; gradientNorm += gradient[i] * gradient[i]; }
-    parameterNorm = sqrt(parameterNorm); gradientNorm = sqrt(gradientNorm);
-    float learningRate = as_type<float>(learningRateBits), decay = as_type<float>(decayBits);
-    float localRate = learningRate;
-    if (parameterNorm > 0.0f && gradientNorm > 0.0f)
-        localRate = learningRate * as_type<float>(trustBits) * parameterNorm / (gradientNorm + decay * parameterNorm);
-    for (uint i = 0; i < count; ++i) {
-        float state = as_type<float>(momentumBits) * velocity[i] + localRate * (gradient[i] + decay * parameter[i]);
-        velocity[i] = state; parameter[i] -= state;
-    }
-}
-
 kernel void lamb_update_serial(
     device float* parameter [[buffer(0)]], device const float* gradient [[buffer(1)]], device float* m [[buffer(2)]], device float* v [[buffer(3)]],
     constant uint& count [[buffer(4)]], constant uint& step [[buffer(5)]], constant uint& learningRateBits [[buffer(6)]],

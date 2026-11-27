@@ -46,7 +46,7 @@ public sealed class GpuOptimizerResidencyMockTests
             t => GpuOptimizer.TryNagStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f),
             t => t.P, t => t.Velocity);
         RunDenseCase(ctx, "LarsUpdate",
-            t => GpuOptimizer.TryLarsStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f, 0.001f),
+            t => GpuOptimizer.TryLarsStep(t.P, t.G, t.Velocity, 0.01f, 0.9f, 0f, 0.001f, 1e-8f),
             t => t.P, t => t.Velocity);
         RunDenseCase(ctx, "LambUpdate",
             t => GpuOptimizer.TryLambStep(t.P, t.G, t.M, t.V, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1),
@@ -185,7 +185,7 @@ public sealed class GpuOptimizerResidencyMockTests
         yield return ("NadamUpdate", 2, (p, g, s) => GpuOptimizer.TryNadamStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
         yield return ("FtrlUpdate", 2, (p, g, s) => GpuOptimizer.TryFtrlStepMultiTensor(p, g, s[0], s[1], 0.01f, 0f, 0f, 0f));
         yield return ("LambUpdate", 2, (p, g, s) => GpuOptimizer.TryLambStepMultiTensor(p, g, s[0], s[1], 0.01f, 0.9f, 0.999f, 1e-8f, 0f, 1));
-        yield return ("LarsUpdate", 1, (p, g, s) => GpuOptimizer.TryLarsStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0f, 0.001f));
+        yield return ("LarsUpdate", 1, (p, g, s) => GpuOptimizer.TryLarsStepMultiTensor(p, g, s[0], 0.01f, 0.9f, 0f, 0.001f, 1e-8f));
         yield return ("ProximalL1Update", 0, (p, g, s) => GpuOptimizer.TryProximalL1StepMultiTensor(p, g, 0.01f, 0.1f));
     }
 

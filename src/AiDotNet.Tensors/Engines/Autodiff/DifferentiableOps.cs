@@ -683,6 +683,22 @@ internal static class DifferentiableOps
         return generation == 0 || buffer._gradWriteGeneration == generation;
     }
 
+    // The gradients a compiled plan made views of a pass-through's output gradient (CompiledTrainingPlan
+    // .AliasReshapeViewGradients): weakly held, so a disposed plan's views leave with it.
+    private static readonly ConditionalWeakTable<object, object> s_planGradientViews = new();
+    private static readonly object s_planGradientViewMark = new();
+
+    /// <summary>Registers <paramref name="view"/> as a gradient a compiled plan aliased onto a pass-through's output
+    /// gradient: the pass-through's own contribution is then that buffer, already in place.</summary>
+    internal static void MarkPlanGradientView<T>(Tensor<T> view) => s_planGradientViews.GetValue(view, _ => s_planGradientViewMark);
+
+    /// <summary>True when <paramref name="contribution"/> is the pass-through gradient an aliased accumulator already
+    /// is: adding it would count it twice. Only a registered plan view qualifies; an eager accumulator that holds a
+    /// donated contribution (x + x) still adds its second one.</summary>
+    private static bool IsAliasedPassThrough<T>(Tensor<T> existing, Tensor<T> contribution)
+        => !ReferenceEquals(existing, contribution) && s_planGradientViews.TryGetValue(existing, out _)
+            && IsSameDenseRegion(contribution, existing);
+
     /// <summary>The step's first contribution to a gradient buffer that was not zeroed: copied in, not added.</summary>
     private static Tensor<T> CopyFirstWrite<T>(Tensor<T> tensor, Tensor<T> buffer, Tensor<T> contribution, IEngine engine)
     {
@@ -1041,7 +1057,13 @@ internal static class DifferentiableOps
                     // another input has had a chance to consume it. Detach this
                     // one slot out-of-place; ordinary unique accumulation stays
                     // on the zero-allocation in-place path.
-                    if (HasOverlappingStorage(existing, GradForInPlace()))
+                    // Without a write generation (a device plan zeroes its gradients first) the aliased pass-through
+                    // lands here rather than in CopyFirstWrite, and must be skipped the same way.
+                    if (IsAliasedPassThrough(existing, GradForInPlace()))
+                    {
+                        accumulated = existing;
+                    }
+                    else if (HasOverlappingStorage(existing, GradForInPlace()))
                     {
                         accumulated = AddAliasedContributionOutOfPlace(existing, GradForInPlace(), engine);
                         ReplaceAccumulatorBufferOwner(tensor, existing, accumulated);
@@ -1102,7 +1124,11 @@ internal static class DifferentiableOps
                     grads[tensor] = existingDict;
                     ReplaceAccumulatorBufferOwner(tensor, previous, existingDict);
                 }
-                if (HasOverlappingStorage(existingDict, GradForInPlace()))
+                if (IsAliasedPassThrough(existingDict, GradForInPlace()))
+                {
+                    tensor.Grad = existingDict;
+                }
+                else if (HasOverlappingStorage(existingDict, GradForInPlace()))
                 {
                     var accumulated = AddAliasedContributionOutOfPlace(existingDict, GradForInPlace(), engine);
                     grads[tensor] = accumulated;

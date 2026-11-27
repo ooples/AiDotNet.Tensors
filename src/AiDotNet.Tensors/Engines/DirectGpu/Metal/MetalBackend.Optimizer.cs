@@ -247,14 +247,10 @@ public sealed partial class MetalBackend
     /// LARS (Layer-wise Adaptive Rate Scaling) update.
     /// </summary>
     public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-        float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-    {
-        ThrowIfDisposed();
-        if (size <= 0) return;
-        DispatchResidentMetal("lars_update_serial", 1, new[] { param, gradient, velocity },
-            (uint)size, unchecked((uint)SingleToInt32BitsCompat(learningRate)), unchecked((uint)SingleToInt32BitsCompat(momentum)),
-            unchecked((uint)SingleToInt32BitsCompat(weightDecay)), unchecked((uint)SingleToInt32BitsCompat(trustCoeff)));
-    }
+        float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+        // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+        // algorithm on every backend.
+        => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
     /// <summary>
     /// LAMB (Layer-wise Adaptive Moments) update.

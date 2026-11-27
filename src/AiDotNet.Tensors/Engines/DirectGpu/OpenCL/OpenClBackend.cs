@@ -12208,21 +12208,10 @@ KERNEL VARIANTS (A/B testing):
 
         /// <inheritdoc/>
         public void LarsUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer velocity,
-            float learningRate, float momentum, float weightDecay, float trustCoeff, int size)
-        {
-            var k = _kernelCache["lars_update"];
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)velocity).Buffer.Handle);
-            k.SetArg(arg++, learningRate);
-            k.SetArg(arg++, momentum);
-            k.SetArg(arg++, weightDecay);
-            k.SetArg(arg++, trustCoeff);
-            k.SetArg(arg++, size);
-
-            k.Execute1D(size, Math.Min(256, size));
-        }
+            float learningRate, float momentum, float weightDecay, float trustCoeff, float epsilon, int size)
+            // The local rate needs two whole-tensor norms, so it is computed between phases (GpuLars), the same
+            // algorithm on every backend.
+            => GpuLars.Step(this, param, gradient, velocity, learningRate, momentum, weightDecay, trustCoeff, epsilon, size);
 
         /// <inheritdoc/>
         public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
