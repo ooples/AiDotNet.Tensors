@@ -16,6 +16,10 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </summary>
 public sealed class CudaStepArenaPlanTests
 {
+    private readonly Xunit.Abstractions.ITestOutputHelper _out;
+
+    public CudaStepArenaPlanTests(Xunit.Abstractions.ITestOutputHelper output) => _out = output;
+
     private static readonly IntPtr FakeBlock = new(0x10_0000);
 
     private static CudaStepArena NewArena() => new(IntPtr.Zero, 0, _ => FakeBlock, _ => { });
@@ -235,9 +239,35 @@ public sealed class CudaStepArenaPlanTests
     [Fact]
     public void Twenty_thousand_overlapping_lifetimes_pack_in_milliseconds_without_aliasing()
     {
-        const int segments = 8;
-        const int perSegment = 2500;
-        const int totalCount = segments * perSegment;
+        // Correctness at full size: every one of the 20,000 replayed claims hits a planned slot and none falls back to
+        // the pool, which proves the plan has no two overlapping live intervals sharing storage.
+        ReplayLifetimes(segments: 8, perSegment: 2500, out long hits, out long fallbacks);
+        Assert.Equal(8L * 2500, hits);
+        Assert.Equal(0L, fallbacks);
+
+        // Speed, as a scaling law rather than a wall-clock constant (a fixed "< 500 ms" fails whenever the host is busy):
+        // planning and replaying 8x the lifetimes must cost well under the 64x a quadratic plan would. Near-linear
+        // packing costs ~8-10x. Each size takes the fastest of several runs, the run least disturbed by other load,
+        // and both sizes run interleaved so load affects them alike.
+        ReplayLifetimes(segments: 1, perSegment: 2500, out _, out _); // JIT warmup
+        long small = long.MaxValue, large = long.MaxValue;
+        for (int rep = 0; rep < 5; rep++)
+        {
+            small = Math.Min(small, ReplayLifetimes(segments: 1, perSegment: 2500, out _, out _));
+            large = Math.Min(large, ReplayLifetimes(segments: 8, perSegment: 2500, out _, out _));
+        }
+        double ratio = (double)large / Math.Max(1, small);
+        _out.WriteLine($"8x lifetimes: {large} vs {small} ticks = {ratio:F2}x");
+        Assert.True(ratio < 24.0,
+            $"8x the lifetimes cost {ratio:F1}x the time ({large} vs {small} ticks); near-linear packing is ~8-10x, quadratic 64x.");
+    }
+
+    // Records one step of checkpoint-like lifetimes (each segment keeps one boundary tensor until backward while its
+    // internal buffers overlap within a sliding window of 16 live buffers), then replays the same lifetimes. Returns
+    // the Stopwatch ticks of BuildPlan + replay and reports the replay's slot hits and pool fallbacks.
+    private static long ReplayLifetimes(int segments, int perSegment, out long slotHits, out long poolFallbacks)
+    {
+        int totalCount = segments * perSegment;
         var rng = new Random(20261125);
         var sizes = new int[totalCount];
         for (int i = 0; i < totalCount; i++)
@@ -248,8 +278,6 @@ public sealed class CudaStepArenaPlanTests
         Assert.Null(arena.TryRent(64));
         TrainingStep.End();
 
-        // Record checkpoint-like lifetime structure: each segment keeps one boundary tensor until backward,
-        // while internal buffers overlap within a sliding window of 16 live buffers.
         TrainingStep.Begin();
         var boundaries = new List<CudaBackend.CudaGpuBuffer>(segments);
         var window = new Queue<CudaBackend.CudaGpuBuffer>(16);
@@ -269,8 +297,6 @@ public sealed class CudaStepArenaPlanTests
             arena.OnReturned(boundaries[seg]);
         TrainingStep.End();
 
-        // Replay with identical lifetimes: BuildPlan() + 20,000 claims/releases must finish in well under 500 ms
-        // with zero pool fallbacks (proving zero overlapping live intervals).
         var sw = Stopwatch.StartNew();
         TrainingStep.Begin();
         var replayBoundaries = new List<CudaBackend.CudaGpuBuffer>(segments);
@@ -295,8 +321,8 @@ public sealed class CudaStepArenaPlanTests
         TrainingStep.End();
         sw.Stop();
 
-        Assert.Equal(totalCount, arena.SlotHits);
-        Assert.Equal(0, arena.PoolFallbacks);
-        Assert.True(sw.ElapsedMilliseconds < 500, $"20,000-slot BuildPlan + Replay took {sw.ElapsedMilliseconds} ms (expected < 500 ms)");
+        slotHits = arena.SlotHits;
+        poolFallbacks = arena.PoolFallbacks;
+        return sw.ElapsedTicks;
     }
 }

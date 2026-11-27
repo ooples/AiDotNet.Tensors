@@ -4240,6 +4240,9 @@ public static class OpParityRegistry
         yield return new OpCase("TensorLerp[4,64]", "arithmetic", e => e.TensorLerp(a.F(), b.F(), 0.3f), e => e.TensorLerp(a.D(), b.D(), 0.3), ParityTol.Exact, opMethod: "TensorLerp");
         yield return new OpCase("TensorClip[4,64]", "arithmetic", e => e.TensorClip(a.F(), -0.5f, 0.5f), e => e.TensorClip(a.D(), -0.5, 0.5), ParityTol.Exact, opMethod: "TensorClip");
         yield return new OpCase("TensorThreshold[4,64]", "arithmetic", e => e.TensorThreshold(a.F(), 0.0f, 0.0f), e => e.TensorThreshold(a.D(), 0.0, 0.0), ParityTol.Exact, opMethod: "TensorThreshold");
+        // A nonzero fill value: WebGPU's threshold kernel once ignored it and always wrote 0.
+        yield return new OpCase("TensorThreshold[4,64;v0.25]", "arithmetic", e => e.TensorThreshold(a.F(), 0.1f, 0.25f), e => e.TensorThreshold(a.D(), 0.1, 0.25), ParityTol.Exact, opMethod: "TensorThreshold");
+        yield return new OpCase("TensorSoftShrink[4,64;l0.3]", "arithmetic", e => e.TensorSoftShrink(a.F(), 0.3f), e => e.TensorSoftShrink(a.D(), 0.3), ParityTol.Exact, opMethod: "TensorSoftShrink");
 
         yield return U("TensorErfinv", "arithmetic", (e, t) => e.TensorErfinv(t), (e, t) => e.TensorErfinv(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(805, s, -0.9, 0.9));
         yield return U("TensorI0", "arithmetic", (e, t) => e.TensorI0(t), (e, t) => e.TensorI0(t), ParityTol.Ulp(256, 1e-5), OpInput.Rand(806, s, -2.0, 2.0));

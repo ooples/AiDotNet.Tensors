@@ -623,6 +623,22 @@ public sealed partial class MetalBackend
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 
+    public void SoftShrink(IGpuBuffer input, IGpuBuffer output, float lambda, int size)
+    {
+        ThrowIfDisposed();
+        if (input is not MetalGpuBuffer iBuffer || output is not MetalGpuBuffer oBuffer)
+            throw new ArgumentException("Buffers must be MetalGpuBuffer");
+        var pipeline = GetPipeline("Activation", _activationLibrary, "soft_shrink_forward");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(size);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer(iBuffer, 0);
+        encoder.SetBuffer(oBuffer, 1);
+        encoder.SetBytes(lambda, 2);
+        encoder.SetBytes((uint)size, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
     public void ThresholdBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, float threshold, int size)
     {
         ThrowIfDisposed();

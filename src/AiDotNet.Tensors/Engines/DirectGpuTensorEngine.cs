@@ -28579,7 +28579,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorThreshold<T>(Tensor<T> tensor, T threshold, T value)
     {
         using var __gpuOp = EnterGpuOp();
-        if (!TryGetBackend(out var backend))
+        // A float kernel: a double (or any type the policy keeps at its own precision) would come back rounded to
+        // float32. Decline as TryRunScalar does.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>() || !TryGetBackend(out var backend))
             return base.TensorThreshold(tensor, threshold, value);
 
         try
@@ -28602,6 +28604,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorThreshold", capabilityGap);
             return base.TensorThreshold(tensor, threshold, value);
+        }
+    }
+
+    public override Tensor<T> TensorSoftShrink<T>(Tensor<T> tensor, T lambda)
+    {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        using var __gpuOp = EnterGpuOp();
+        double lambdaD = MathHelper.GetNumericOperations<T>().ToDouble(lambda);
+        // The kernels compute in float32; other types keep their own precision on the CPU engine (which also validates
+        // lambda and handles the empty tensor).
+        if (!(lambdaD >= 0) || tensor.Length == 0 || DirectGpuEngine.ShouldFallbackForPrecision<T>()
+            || !TryGetBackend(out var backend))
+            return base.TensorSoftShrink(tensor, lambda);
+
+        try
+        {
+            using var bufIn = GetOrAllocateBuffer(backend, tensor);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
+            backend.SoftShrink(bufIn.Buffer, bufOut.Buffer, (float)lambdaD, tensor.Length);
+            var output = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            Autodiff.DifferentiableOps.RecordUnary("SoftShrink", output, tensor,
+                Autodiff.BackwardFunctions<T>.SoftShrinkBackward, new object[] { lambdaD });
+            return output;
+        }
+        catch (NotSupportedException capabilityGap) { GpuLaunchProbe.OnFallback("TensorSoftShrink", capabilityGap);
+            return base.TensorSoftShrink(tensor, lambda);
         }
     }
 

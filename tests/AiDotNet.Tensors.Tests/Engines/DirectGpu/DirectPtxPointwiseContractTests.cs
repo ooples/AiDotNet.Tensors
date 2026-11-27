@@ -12,7 +12,7 @@ public sealed class DirectPtxPointwiseContractTests
     [Fact]
     public void CoverageManifest_IsCompleteUniqueAndFailClosed()
     {
-        Assert.Equal(74, DirectPtxPointwiseCoverageManifest.All.Count);
+        Assert.Equal(75, DirectPtxPointwiseCoverageManifest.All.Count);
         Assert.Equal(
             DirectPtxPointwiseCoverageManifest.All.Count,
             DirectPtxPointwiseCoverageManifest.All
