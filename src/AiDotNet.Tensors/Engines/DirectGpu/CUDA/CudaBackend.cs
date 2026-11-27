@@ -929,7 +929,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             // it — but a kernel launched earlier may not have EXECUTED yet (work is queued async on
             // _stream). That kernel then accesses freed memory → a use-after-free that faults the context
             // with a STICKY CUDA 700 (illegal address). It reproduces only on large models under
-            // VRAM-pressure buffer churn (the d768/L6 cortex) and vanishes entirely under
+            // VRAM-pressure buffer churn (the d768/L6 model) and vanishes entirely under
             // CUDA_LAUNCH_BLOCKING=1 — the signature of an async free-before-execute race. cuMemFreeAsync
             // is stream-ordered (the free is enqueued AFTER in-flight kernels on _stream), eliminating the
             // race by construction. Blocking stream FLAGS do NOT fix it (the free is host-side, not
@@ -2417,7 +2417,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     /// bounded-but-real device memory (up to <c>_maxPerSize</c> buffers per
     /// power-of-two bucket); under genuine pressure reclaiming it lets the
     /// allocation through. This is the fix for the cross-step working-set growth
-    /// that OOM'd a 12 GB card on a tiny d256/L2 cortex past ~200K tokens
+    /// that OOM'd a 12 GB card on a tiny d256/L2 model past ~200K tokens
     /// (200K trained, 250K OOM'd at the same per-step cost → accumulation, not a
     /// single-step peak). If it still OOMs after draining, report the actual
     /// free/total device memory (cuMemGetInfo) in the exception so the residual

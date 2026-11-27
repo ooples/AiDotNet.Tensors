@@ -96,9 +96,8 @@ We lose head-to-head on dense math NVIDIA has tuned in SASS for 15 years. We win
 fusion and specialization are forced. Chasing cuDNN on conv3x3 is fighting on their
 ground.
 
-**Corollary:** cuDNN has no kernel at all for the HRE operators (Born-retrieval readout,
-content-conditioned spectral gating, DSB pilot-reinjection, Pyramid). Any PyTorch
-implementation is a *composition* of many eager ops - flaws #1 and #2 simultaneously.
+**Corollary:** cuDNN has no kernel at all for non-standard operators outside its layer
+catalogue. Any PyTorch implementation is a *composition* of many eager ops - flaws #1 and #2 simultaneously.
 That is where a 10x gap is available, not 1.1x.
 
 ---
@@ -117,8 +116,8 @@ is the honest peer for a fused block.
 - **Before porting all kernels**, run the small-scale bake-off in section 4 against a
   Rust implementation and decide on measured evidence.
 
-### Track 3 - HRE novel operators (mandatory, independent)
-Fused kernels for Born-retrieval, spectral gating, DSB, Pyramid. Proceeds regardless of
+### Track 3 - custom fused operators (mandatory, independent)
+Fused kernels for non-standard operators. Proceeds regardless of
 Tracks 1-2 because it is where the competition must compose and where the 100x thesis
 lives.
 

@@ -534,8 +534,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableTheory]
-    [InlineData(16, 256, 4, 65)]  // a HarmonicEngine v2 training step (batch 16, seq 256, 4 heads of 64 + normaliser)
-    [InlineData(3, 37, 2, 65)]    // the Born scan width (64 + normaliser), seqLen not a multiple of the chunk
+    [InlineData(16, 256, 4, 65)]  // a downstream training step (batch 16, seq 256, 4 heads of 64 + normaliser)
+    [InlineData(3, 37, 2, 65)]    // a linear-attention scan width (64 + normaliser), seqLen not a multiple of the chunk
     [InlineData(2, 20, 3, 8)]
     [InlineData(2, 33, 2, 64)]    // even head dim: the odd tile stride keeps banks distinct
     [InlineData(1, 17, 2, 100)]   // 10,000 state elements: 10 per thread

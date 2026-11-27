@@ -2362,7 +2362,7 @@ class Program
         Console.WriteLine("  --vs-mlnet-cpu      : AiDotNet CPU vs ML.NET");
         Console.WriteLine("  --vs-all            : Run all CPU competitive benchmarks");
         Console.WriteLine("  --workspace         : Run TensorWorkspace zero-allocation benchmarks");
-        Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on HRE + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
+        Console.WriteLine("  --vs-deterministic-matmul: Deterministic vs non-deterministic SimdGemm on small-model + square shapes (post-MKL-removal both paths are SimdGemm; pair with iter-17 MKL baseline for vs-MKL comparison)");
         Console.WriteLine("  --dit-xl-matmul     : SimdGemm at DiT-XL shapes; compare against docs/mkl-replacement/baseline/baseline-iter17.md for vs-MKL numbers");
         Console.WriteLine("  --dit-xl-matmul-double : FP64 GEMM at DiT-XL + cluster-#6 shapes; Stage 0 baseline (docs/mkl-replacement/PLAN.md)");
         Console.WriteLine("  --fused-attention : #889 attention training step, materialising SDPA vs weightless fused FlashAttention-2 (time + bytes)");

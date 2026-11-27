@@ -12,13 +12,13 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
 /// The fused MoE op (<see cref="MixtureOfExperts.SwiGluExperts"/>) inside a compiled training plan, with the
-/// auxiliary-loss-free selection bias nudged in place from each step's loads (DeepSeek-V3 style, as HreLm's router
-/// does). The oracle is the eager tape loop: per-step losses, final weights and the final bias must match it.
+/// auxiliary-loss-free selection bias nudged in place from each step's loads (DeepSeek-V3 style, as a downstream
+/// router does). The oracle is the eager tape loop: per-step losses, final weights and the final bias must match it.
 /// </summary>
 /// <remarks>
 /// The op had no graph node, so a training trace ran it once and froze its output and loads into the plan: every
 /// replay returned the capture batch's MoE output, its inputs got no gradient, and the bias took the capture step's
-/// nudge every step. HreLm's moe-g model trained that way for 40 steps ended 0.067 nats behind its eager run, and at a
+/// nudge every step. A downstream MoE model trained that way for 40 steps ended 0.067 nats behind its eager run, and at a
 /// near-zero learning rate its validation loss after step 2 already differed from eager.
 /// </remarks>
 [Collection("DirectGpuSerial")]
@@ -76,7 +76,7 @@ public class CompiledMoeTrainingTests : IDisposable
                 var below = e.TensorAddScalar(e.TensorNegate(total), (float)N * K / G);
                 e.TensorAddInPlace(Bias, e.TensorMultiplyScalar(e.TensorSign(below), BiasRate));
             }
-            // An op that reads its input eagerly in a trace (HreLm's next RMSNorm on the GPU) realizes the MoE node
+            // An op that reads its input eagerly in a trace (a downstream model's next RMSNorm on the GPU) realizes the MoE node
             // there, after the nudge was recorded; the node must still read the bias from before the nudge.
             if (_readMidTrace) _ = y.ToArray();
             return e.TensorMSELoss(y, Y);
@@ -216,7 +216,7 @@ public class CompiledMoeTrainingTests : IDisposable
             }
             var eager = TrainEager(gpu);
             AssertNotVacuous(eager);
-            // A host-only bias (HreLm's router keeps its bias on the host): the in-place nudge took the host path and the
+            // A host-only bias (a downstream router keeps its bias on the host): the in-place nudge took the host path and the
             // MoE re-uploaded the bias inside the capture, so the plan never captured.
             var compiled = TrainCompiled(gpu, capture, hopThreads: hopThreads, hostBias: hostBias);
             AssertSameTraining(capture ? (hopThreads ? "gpu-captured-hopping" : "gpu-captured") : "gpu", eager, (compiled.Losses, compiled.Weights, compiled.Bias), 1e-4);

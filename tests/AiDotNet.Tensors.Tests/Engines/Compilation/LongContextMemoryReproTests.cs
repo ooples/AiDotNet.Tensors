@@ -9,23 +9,23 @@ using Xunit.Abstractions;
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
-/// Manual CUDA repro for the HarmonicEngine Cortex fused-training memory envelope.
+/// Manual CUDA repro for a downstream fused-training memory envelope.
 /// This is intentionally opt-in because the default target shape can use many GB
 /// of device memory and is meant for local bug isolation, not CI.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class CortexTransformerMemoryReproTests
+public sealed class LongContextMemoryReproTests
 {
     private readonly ITestOutputHelper _output;
 
-    public CortexTransformerMemoryReproTests(ITestOutputHelper output) => _output = output;
+    public LongContextMemoryReproTests(ITestOutputHelper output) => _output = output;
 
     [SkippableFact]
-    public void CortexLikeD256L4CompiledStep_MemoryEnvelopeProbe()
+    public void TransformerD256L4CompiledStep_MemoryEnvelopeProbe()
     {
         Skip.IfNot(
-            string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_CORTEX_MEMORY_REPRO"), "1", StringComparison.Ordinal),
-            "Manual CUDA memory-envelope repro. Set AIDOTNET_RUN_CORTEX_MEMORY_REPRO=1 to run.");
+            string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_RUN_LONG_CONTEXT_MEMORY_REPRO"), "1", StringComparison.Ordinal),
+            "Manual CUDA memory-envelope repro. Set AIDOTNET_RUN_LONG_CONTEXT_MEMORY_REPRO=1 to run.");
 
         using var gpu = new DirectGpuTensorEngine();
         Skip.IfNot(gpu.SupportsGpu, "DirectGpu backend is not available.");
@@ -44,7 +44,7 @@ public sealed class CortexTransformerMemoryReproTests
             int maxPeakMb = ReadInt("AIDOTNET_REPRO_MAX_PEAK_MB", 0);
 
             _output.WriteLine(
-                $"Cortex-like repro shape: B={batch}, S={seqLen}, D={dModel}, FF={ffDim}, L={layers}, steps={steps}");
+                $"Transformer repro shape: B={batch}, S={seqLen}, D={dModel}, FF={ffDim}, L={layers}, steps={steps}");
 
             var input = Rand([batch, seqLen, dModel], seed: 11, scale: 0.02f);
             var target = Rand([batch, seqLen, dModel], seed: 12, scale: 0.02f);

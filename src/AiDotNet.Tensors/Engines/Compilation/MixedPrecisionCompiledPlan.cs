@@ -548,7 +548,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     /// <summary>
     /// Phase (fused-Adam): one compiled mixed-precision training step with the Adam optimizer. Identical
     /// to <see cref="Step"/> but the FP32 master update is Adam (m/v moments kept in FP32, bias-corrected),
-    /// matching the optimizer Adam-configured models (e.g. the cortex) use. Loss scaling + skip-on-overflow
+    /// matching the optimizer Adam-configured models (e.g. the downstream model) use. Loss scaling + skip-on-overflow
     /// via <paramref name="scaler"/> as in <see cref="Step"/>. The plan output must be the scalar loss.
     /// </summary>
     public StepResult StepAdam(

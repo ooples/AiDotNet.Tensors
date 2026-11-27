@@ -1023,7 +1023,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // node; under CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH the graph frees+reallocs its pool every launch,
     // so reading the capture-time output pointer after a later replay returns STALE data (the captured-step
     // output) — the graph computes fresh values into the realloc'd internal buffer but the externally-held
-    // pointer no longer aliases them. Fix (the cortex resident-into pattern): pre-allocate ONE persistent buffer
+    // pointer no longer aliases them. Fix (the resident-into pattern): pre-allocate ONE persistent buffer
     // OUTSIDE the graph and make the final captured op copy the forward output into it, so the externally-read
     // address is fixed and holds fresh data every replay.
     private IGpuBuffer? _stableCaptureOutput;
@@ -2771,7 +2771,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Backward last-use release of a step intermediate, WITHOUT a download. A tensor whose only copy is on the device
     /// is left for the tape's dispose-time release: the last-use schedule sees recorded inputs and saved state but not
     /// tensors captured inside custom backward closures, so freeing device-only data here could pull it out from under
-    /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
+    /// a later backward step (it did, in a downstream model's specialized backwards). The old materialize-then-free contract
     /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
     /// </summary>
     internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor, Helpers.ReleaseNote? note = null,
@@ -3624,7 +3624,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // paths leave to their finalizers -- is released when the GC runs. The materialize-then-free contract downloaded
     // ~4 GB per training step into managed arrays, and that allocation churn kept the GC (and so the finalizers)
     // running; with the downloads gone a GPU training loop allocates almost nothing managed, the GC stops, and dead
-    // buffers pile up on the device (measured: the HRE LM step degraded from 0.3 s to 37-137 s; collecting after
+    // buffers pile up on the device (measured: a downstream LM step degraded from 0.3 s to 37-137 s; collecting after
     // every step held it at 0.28 s).
     private long _freeBytesAtLastReclaim = -1;
 
@@ -3988,7 +3988,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Look up by the backing array WITHOUT materializing it first. GetReadOnlyDataArray fires a pending
         // device-to-host download, so a weight whose current value lives on the device (a parameter the optimizer
         // updated in place, or a GPU-computed table such as RoPE's cos/sin) was downloaded on EVERY forward only to
-        // find its buffer already cached (measured: every HRE LM step re-read the RoPE tables).
+        // find its buffer already cached (measured: every step of a downstream LM re-read the RoPE tables).
         if (TryResolveDeviceParameterView(backend, weights, out var parameterView, out bool parameterViewOwned))
             return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
         var key = weights.GetBackingArrayForCacheLookupUnsafe();
@@ -6996,7 +6996,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // engine captures again.
     // A thread change alone is not a second trainer: an async training loop resumes on whichever pool thread finishes
     // its await (AiModelBuilder's streaming loop after each validation), and its steps never overlap. That hop turned
-    // capture off for good, and the HreLm transformer trained at 230 ms/step with validation against 57 without.
+    // capture off for good, and a downstream transformer trained at 230 ms/step with validation against 57 without.
     private int _compiledStepThread;
     private long _compiledStepPlan;
     private volatile bool _compiledStepsFromSeveralThreads;
@@ -7817,7 +7817,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // LayerNorm normalizes over the LAST dimension (gamma/beta length); outerSize = all the leading
             // positions. The legacy GPU path used dims[0] which is only correct for a rank-2 [B*S, D] input —
-            // wrong for the cortex's rank-3 [B, S, D] (it would normalize over S*D and corrupt the result).
+            // wrong for the downstream model's rank-3 [B, S, D] (it would normalize over S*D and corrupt the result).
             int normSize = gamma.Length > 0 ? gamma.Length : input.Shape._dims[input.Rank - 1];
             int outerSize = input.Length / normSize;
             using var bufIn = GetOrAllocateContiguousInputBuffer(backend, input);
@@ -8081,7 +8081,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (NotSupportedException mex) { GpuLaunchProbe.OnFallback("TryMultiplyResidentInto", mex); AliasDiag($"Mul-resident FELLBACK a=[{string.Join(",", a._shape)}] b=[{string.Join(",", b._shape)}]: {mex.GetType().Name}: {mex.Message}"); return false; }
     }
 
-    /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the cortex's actual
+    /// <summary>GPU-RESIDENT embedding lookup from FLOAT indices for the compiled step (the downstream model's actual
     /// embedding op): backend.Embedding (the kernel casts float→int) into the destination's stable buffer, with
     /// the table from the PERSISTENT weight cache and the indices from the resident input buffer — no host gather
     /// (3× GetDataArray = DtoH downloads = non-capturable CUDA-900 that invalidates the whole graph capture).
@@ -8313,7 +8313,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Without this, a matmul WEIGHT operand fell through to GetOrCacheWeightBuffer below and allocated a fresh
         // device buffer DURING CUDA-graph capture (GetDataArray() returns a new host array each call → a guaranteed
         // cache miss) — a graph-purity violation (CUDA 906) that aborts whole-step capture and PERMANENTLY drops the
-        // cortex onto the launch-bound eager path (~60 s/step). Same root cause as the #611 LayerNorm fix.
+        // downstream model onto the launch-bound eager path (~60 s/step). Same root cause as the #611 LayerNorm fix.
         var resident = t.TryGetGpuBuffer();
         if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need)
             return new OwnedBuffer(resident, ownsBuffer: false);
@@ -10642,7 +10642,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // ownsBuffer:true fresh allocation that the `using` disposes — re-uploading the weights on EVERY call).
         // That per-call cuMemcpyHtoD is both a steady-state waste AND fatal under CUDA-graph capture: a
         // synchronous HtoD inside a stream capture throws CUDA 906 (STREAM_CAPTURE_UNSUPPORTED), aborting the
-        // whole-step graph and pinning the cortex to the launch-bound eager path (~14% util). GetOrCacheWeightBuffer
+        // whole-step graph and pinning the downstream model to the launch-bound eager path (~14% util). GetOrCacheWeightBuffer
         // adds to _persistentBufferCache — the same cache the optimizer updates in place — so the weights stay
         // resident AND fresh. Matches the sibling fused-op path below (#GPU-graph-capture).
         using var weightsBuffer = GetWeightBufferPreferResident(backend, weights, PersistentTensorRole.Weights);
@@ -15201,7 +15201,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             for (; allocated < 5; allocated++)
                 gradBuffers[allocated] = AllocateFullyWrittenOutputBuffer(backend, allocated < 3 ? n : ng);
             // No fill: the backend zeroes the gradients its atomic path accumulates into, and the deterministic path writes
-            // every element (poison-mode HreLm runs give the same loss with and without these fills).
+            // every element (poison-mode downstream runs give the same loss with and without these fills).
             var (keyScale, decayFirst) = CpuEngine.GatedDeltaRuleTerms(rule, headDim);
             gdnBackend.GatedDeltaNetScanBackward(
                 dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, aB.Buffer, bB.Buffer,
@@ -19136,7 +19136,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // (IEngine.LayerNorm bails to base while a tape is active), and base's `variance` out-param is TRUE
             // variance — so passing it raw made the kernels read variance AS invVar, yielding ~zero/garbage
             // gradInput AND gradGamma. LayerNorm is in every transformer layer, so that zeroed the backward
-            // signal at every layer → GPU cortex training never learned (flat at ln(V), both CUDA and OpenCL),
+            // signal at every layer → GPU training of the downstream model never learned (flat at ln(V), both CUDA and OpenCL),
             // while the forward + matmul/softmax/embedding backward were all correct (see Phase_GPU_Grad_Check).
             // Convert variance → invVar here so the kernels get the inverse-std they actually consume.
             using var trueVarianceBuffer = GetOrAllocateBuffer(backend, variance);
@@ -26831,7 +26831,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // ND × 2D — the dominant transformer case ([B, S, K] activations × [K, N] weight for every
         // Dense/FFN/QKV/output projection). This used to fall to base.TensorMatMul (CpuEngine host BLAS),
-        // running the transformer's heavy GEMMs on the CPU and starving the device (cortex GPU util ~5-7%).
+        // running the transformer's heavy GEMMs on the CPU and starving the device (downstream-model GPU util ~5-7%).
         // A is row-major [.., K], so collapsing all leading dims into a single M is a pure reshape (same
         // memory): do ONE GPU GEMM [M*, K]×[K, N] then reshape the result back to a.dims[:-1] + [N].
         // MatMulBackward already handles the ND×2D shapes (the base CpuEngine path recorded it identically).
@@ -27150,9 +27150,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Fused transpose-free backward → FP32 grad buffers, wrapped via the DEFERRED-download FinishGpuOp: the
             // grad's FP32 GPU buffer is cached (consumers read it on-device, no re-upload) and the host Half[]
             // materializes LAZILY only if read on the CPU (intermediate grads never are). This keeps the grads
-            // GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the cortex's ~5x
+            // GPU-resident with NO eager host round-trip — the per-matmul DownloadBuffer was the downstream model's ~5x
             // slowdown. (Caching the grads as IsFp16 instead churns the activation cache with fresh per-step grad
-            // arrays — measured to hang the cortex — so use the normal FP32 deferred path here.)
+            // arrays — measured to hang the downstream model — so use the normal FP32 deferred path here.)
             gAf = backend.AllocateBuffer(M * K);
             gBf = backend.AllocateBuffer(K * N);
             hp.MatMulBackwardFp16Fused(hGc, hA, hB, gAf, gBf, M, N, K, gradOutHalf: false);
@@ -34327,8 +34327,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // the backend has no direct primitive (UnitPhaseCodebook,
     // PhaseCoherenceDecode, HRRBindAccumulate) fall through to the
     // CpuEngine base implementation; a follow-up PR can add fused GPU
-    // kernels for the hottest path (HRRBindAccumulate) if the HRE
-    // campaign's workloads warrant it. All paths catch exceptions and
+    // kernels for the hottest path (HRRBindAccumulate) if downstream
+    // workloads warrant it. All paths catch exceptions and
     // fall back to CPU so a single backend hiccup never takes the op
     // offline — matches the existing Native* override convention.
 

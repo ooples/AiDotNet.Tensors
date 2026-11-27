@@ -184,7 +184,7 @@ public class FlashAttentionCompiledPlanTests
     }
 
     /// <summary>
-    /// End-to-end regression mirroring the HarmonicEngine PathB consumer
+    /// End-to-end regression mirroring a downstream consumer
     /// failure (AiDotNet#1346): a minimal transformer block built like
     /// FlashAttentionLayer&lt;T&gt;.Forward — Q/K/V projection via MatMul,
     /// Reshape to [B, H, Sq, D], Permute, then FA, then Permute back +

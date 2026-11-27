@@ -16,7 +16,7 @@ Complete the replacement of MKL.NET with our own SIMD GEMM kernels such that:
 
 The downstream consumer reported DiT-XL CPU forward pass shards being cancelled at the 45-minute CI budget. Investigation shows the per-block DiT-XL matmuls are concentrated in the exact "square-ish" regime where we trail MKL. Local 10-20% wins on top of the current path are not enough to bring shards under budget — we need to close the gap to MKL entirely.
 
-The existing `DeterministicMatMulBenchmarks` already tracks HRE-tiny shapes; this branch adds DiT-XL shapes (`DitXLMatMulBenchmarks`) and treats them as the acceptance gate.
+The existing `DeterministicMatMulBenchmarks` already tracks small-model shapes; this branch adds DiT-XL shapes (`DitXLMatMulBenchmarks`) and treats them as the acceptance gate.
 
 ## Current baseline (from Issue #131 memory, 2026-04-11, iter 9 — pre-iter-17)
 
@@ -25,7 +25,7 @@ The existing `DeterministicMatMulBenchmarks` already tracks HRE-tiny shapes; thi
 | [512,512]² | 5,933 μs | 1,160 μs | 1.35× slower |
 | [1024,1024]² | 48,830 μs | 5,631 μs | 1.64× slower |
 | LM-head [64,128]×[128,50257] | 70,140 μs | 9,917 μs | **0.83× (17% faster)** |
-| HRE shapes | unchanged | sequential | — |
+| Small-model shapes | unchanged | sequential | — |
 
 After PR #136 master is at iter 17 — we re-baseline in Phase 0 before any kernel work.
 
@@ -142,7 +142,7 @@ Ordered by expected impact against the **square-shape gap**. Each iteration = on
 # Phase 0 baseline (run once, commit results)
 dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks -- --dit-xl-matmul
 
-# HRE + square shapes (existing harness, for historical continuity)
+# Small-model + square shapes (existing harness, for historical continuity)
 dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks -- --vs-deterministic-matmul
 
 # Run both with raw CSV output for A/B diffing

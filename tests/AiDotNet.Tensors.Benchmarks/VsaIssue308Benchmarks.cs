@@ -10,7 +10,7 @@ namespace AiDotNet.Tensors.Benchmarks;
 
 /// <summary>
 /// Issue #308 acceptance harness for cross-position HRR sequence primitives.
-/// Shape matches the HarmonicEngine L3 isolation target: T=64 slots, D=64
+/// Shape matches a downstream isolation target: T=64 slots, D=64
 /// split-complex code dimensions, stored as [T, 2D].
 /// </summary>
 [SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 10)]

@@ -6,7 +6,7 @@
 // _storage.Length == Length so GetFlattenedData returns that oversized array. The unchecked AVX
 // store in the backward kernel then wrote PAST the logical-sized result buffer -> AccessViolation.
 //
-// Discovered via the HRE standard-transformer block (attention intermediates cycle the pool, then
+// Discovered via a downstream standard-transformer block (attention intermediates cycle the pool, then
 // the wide 4E Tanh FFN backward crashes). This test reproduces that shape/pressure through the tape
 // so it faults deterministically if the bound regresses; the fix bounds the kernels by the logical
 // length. Verified to CRASH with the bound reverted and PASS with it in place.
@@ -21,7 +21,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 
 public class ActivationBackwardOverAllocatedTests
 {
-    // One attention-then-FFN block, matching the HRE standard-transformer arm that surfaced the bug:
+    // One attention-then-FFN block, matching the downstream standard-transformer model that surfaced the bug:
     // 3D permute / batched-matmul / softmax intermediates cycle the tape's buffer pool, then a wide
     // [B*S, 4E] activation backward runs against a pool-over-allocated forward output.
     private static void RunBlock(IEngine e, System.Func<Tensor<float>, Tensor<float>> act,

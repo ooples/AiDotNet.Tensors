@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// The engine's single-trainer rule for whole-step CUDA-graph capture
 /// (<see cref="DirectGpuTensorEngine.NoteCompiledStepThread"/>). A second plan training from another thread must turn
 /// capture off. A plan that only changed threads must not: an async training loop resumes on another pool thread after
-/// each await, and treating that as a second trainer left HreLm training uncaptured after its first validation.
+/// each await, and treating that as a second trainer left a downstream trainer uncaptured after its first validation.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public class CompiledStepCaptureOwnershipTests

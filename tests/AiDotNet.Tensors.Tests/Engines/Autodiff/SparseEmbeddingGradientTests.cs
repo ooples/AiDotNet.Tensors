@@ -195,8 +195,8 @@ public class SparseEmbeddingGradientTests
     /// <c>GetDataArray()</c> returns a POOLED download buffer whose length exceeds the logical
     /// element count, so the raw <c>Tensor(data, dims)</c> ctor threw "The number of values does not
     /// match the specified shape" — which latched <c>_fusedTrainingDisabled</c> and silently dropped
-    /// the entire cortex onto the eager path after one step. The fix routes through the
-    /// logical-length-aware <c>Tensor.Reshape</c> (validated end-to-end by the d768/L6 cortex run:
+    /// the entire downstream model onto the eager path after one step. The fix routes through the
+    /// logical-length-aware <c>Tensor.Reshape</c> (validated end-to-end by the d768/L6 model run:
     /// the ArgumentException disappears and the fused/compiled path engages). The oversized-backing
     /// condition is GPU-pool-specific and cannot be reproduced with a CPU tensor (CPU
     /// <c>GetDataArray()</c> always materializes exactly-sized logical data), so this test asserts
@@ -216,7 +216,7 @@ public class SparseEmbeddingGradientTests
                 for (int d = 0; d < dim; d++)
                     gradOutput[b, s, d] = (b * seq + s) * 0.5f + d * 0.1f;
 
-        // Float indices — the cortex path is TensorEmbeddingLookupFromFloatIndicesBackward; index 5
+        // Float indices — the downstream model's path is TensorEmbeddingLookupFromFloatIndicesBackward; index 5
         // is duplicated so the dense scatter-ADD accumulation is exercised too.
         var indices = new Tensor<float>(new float[] { 2, 5, 0, 5, 1, 3 }, new[] { batch, seq });
 

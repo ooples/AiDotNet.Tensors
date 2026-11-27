@@ -9,7 +9,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Under an active GradientTape the GPU engine used to route GlaScanForward (and therefore its BPTT backward) to the
-/// managed CPU recurrence, so every training step of a GLA / Born-linear language model ran its scan on the CPU with
+/// managed CPU recurrence, so every training step of a GLA / feature-map linear-attention language model ran its scan on the CPU with
 /// device-host copies around it. The scan now stays on the device and records a tape node whose backward is
 /// backend.GlaScanBackward. These tests pin the forward and all four gradients (dQ, dK, dV, dGate) to the CPU engine.
 /// </summary>
@@ -64,7 +64,7 @@ public sealed class GlaScanTapeGpuTests : IClassFixture<DirectGpuTensorEngineTes
 
     [SkippableTheory]
     [InlineData(2, 16, 64, 4)]    // headDim 16
-    [InlineData(2, 16, 800, 8)]   // the Born-linear LM shape: 8 heads x 100 features
+    [InlineData(2, 16, 800, 8)]   // a linear-attention LM shape: 8 heads x 100 features
     // Checkpointed backward (chunk = ceil(sqrt(seqLen))): a single step; seqLen 37 (chunk 7, last
     // chunk 2 tokens); an exact square (64 = 8 x 8); headDim 128 with seqLen 50 (chunk 8, last chunk 2),
     // the head width whose full state trajectory reached 2.1 GB at batch 16, seqLen 256.

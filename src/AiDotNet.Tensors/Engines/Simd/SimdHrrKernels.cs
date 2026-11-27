@@ -21,9 +21,8 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// <para>Design notes:</para>
 /// <list type="bullet">
 ///   <item>No tensor wrapping — callers pass raw spans / arrays, so the
-///   per-call overhead that drove issue #248 disappears (the HRE research
-///   campaign's cycle 12 build at D=16384 × 1M pairs was blocked by
-///   allocation churn, not compute).</item>
+///   per-call overhead that drove issue #248 disappears (a memory build
+///   at D=16384 × 1M pairs was blocked by allocation churn, not compute).</item>
 ///   <item>Kernels validate shapes then dispatch a single vectorised
 ///   loop. No GraphMode recording or autograd — these are eager spans,
 ///   the caller is responsible for tape hookups when needed.</item>
@@ -161,8 +160,8 @@ public static class SimdHrrKernels
     ///
     /// <para>Optional K-PSK quantization: when <paramref name="kPsk"/> is
     /// true, phases are snapped to the nearest multiple of <c>2π/k</c> —
-    /// this is the M-ary phase-shift-keying constraint used in HRE's
-    /// discrete-phase cycles (4-PSK, 8-PSK, 16-PSK). <paramref name="k"/>
+    /// this is the M-ary phase-shift-keying constraint used for
+    /// discrete-phase codebooks (4-PSK, 8-PSK, 16-PSK). <paramref name="k"/>
     /// must be positive when <paramref name="kPsk"/> is set.</para>
     ///
     /// <para>Uses the same stateless 32-bit hash as the GPU backends, keyed by
@@ -323,8 +322,8 @@ public static class SimdHrrKernels
     /// i.e., the inner product of the query against each code in the
     /// codebook, dropping the imaginary part (which cancels in expectation
     /// for independent random phases). This is the "circular-convolution
-    /// unbind" readout used across HRE's associative-recall, reversal-curse,
-    /// and multi-hop-reasoning cycles.
+    /// unbind" readout used for associative recall and multi-hop
+    /// retrieval.
     ///
     /// <para>Per-candidate cost is 2D fused multiply-adds; the AVX2 path
     /// handles 4 doubles per lane. Parallelises across V when the total
@@ -562,9 +561,9 @@ public static class SimdHrrKernels
     /// <paramref name="valPermCodeI"/> pre-permuted so the gather + permute
     /// + complex-multiply + accumulate collapses into one hot loop.
     ///
-    /// <para>This is the single hottest op in HRE's memory-build phase;
+    /// <para>This is the single hottest op in the memory-build workload of issue #248;
     /// per issue #248 the hand-rolled version accounted for roughly half
-    /// of the total cycle-12 wall-clock at D=16384 × 1M pairs.</para>
+    /// of the total wall-clock at D=16384 × 1M pairs.</para>
     /// </summary>
     /// <summary>
     /// Float overload of <see cref="HRRBindAccumulateDouble"/>. Same

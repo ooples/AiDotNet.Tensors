@@ -3,7 +3,7 @@
 ## Goal
 Eliminate **per-kernel launch overhead** — the proven dominant bottleneck for small-model GPU
 training in this engine. A small transformer fires hundreds of micro-kernels per step; each carries
-CPU-side launch cost the GPU can't hide (measured: RTX 3080 cortex training sits at ~8–30% util with
+CPU-side launch cost the GPU can't hide (measured: RTX 3080 downstream-model training sits at ~8–30% util with
 the GPU memory-controller ~0%, and the fused fwd+bwd+update path is already engaged yet still
 launch-bound). Capturing the *repeated* per-step GPU kernel sequence into a `cudaGraph` and replaying
 it with a single `cuGraphLaunch` collapses N launches into 1.
