@@ -1155,17 +1155,46 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             }
         }
 
-        // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
-        // release the mapping before swapping in the owned bytes.
-        DisposeStreamingMmapOwner();
-        var oldStorage = _storage;
-        _data = fresh;
-        // A restore-pool array shares its array's GPU-cache epoch, as other wrappers of a caller-owned array do: the
-        // GPU engine keys persistent buffers by the backing array, so a recycled array's storage with a fresh local
-        // version would match an upload made for the weight it held before, and the epoch bump below would not reach it.
-        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: restoredArray is not null);
-        InvalidateGpuBindingAfterStorageReplacement();
-        oldStorage.Release();
+        // The decode above runs outside the transition gate; the publication runs under it. BuildViewOfResidentStorage
+        // reads _data and _storage under the gate, so without it a view built while two restores of one dropped weight
+        // overlap (Materialize tests residency without a lock and leaves the registry lock before decoding) could pair
+        // the first restore's vector with the second's storage, and keep a storage whose array was then released.
+        // Nothing below takes the weight registry's lock or an engine lock: the registry may hold its own while it
+        // waits for this gate.
+        bool discarded = false;
+        TensorStorage<T>? replaced = null;
+        lock (StreamingTransitionGate)
+        {
+            // A second decode of a streaming weight that another restore has already made resident is discarded, so
+            // the weight keeps the storage views may already hold.
+            if (Lifetime == WeightLifetime.Streaming && _data.Length == Length)
+            {
+                discarded = true;
+            }
+            else
+            {
+                // Re-materializing as a heap copy supersedes any zero-copy mmap alias;
+                // release the mapping before swapping in the owned bytes.
+                DisposeStreamingMmapOwner();
+                replaced = _storage;
+                _data = fresh;
+                // A restore-pool array shares its array's GPU-cache epoch, as other wrappers of a caller-owned array do:
+                // the GPU engine keys persistent buffers by the backing array, so a recycled array's storage with a fresh
+                // local version would match an upload made for the weight it held before, and the epoch bump below would
+                // not reach it.
+                _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: restoredArray is not null);
+                InvalidateGpuBindingAfterStorageReplacement();
+            }
+        }
+        // Outside the gate: releasing the last reference disposes the storage's GPU-buffer owner (a backend call), and
+        // parking reads the registry's pool cap. A view built under the gate holds its own reference to the storage it
+        // took, so releasing the replaced one here cannot free an array a view still uses.
+        replaced?.Release();
+        if (discarded)
+        {
+            if (restoredArray is not null) ParkUnpublishedRestoreArray(restoredArray);
+            return;
+        }
 
         // A recycled array (#2322) keeps the identity of the weight it last held, so every cache keyed by array
         // identity sees the refill as an in-place mutation: the CPU derived-weight caches and any GPU upload epoch.
@@ -1174,6 +1203,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             Engines.InferenceWeightCache.Invalidate(restoredArray);
             TensorStorage<T>.InvalidateExternalArrayEpoch(restoredArray);
         }
+    }
+
+    // Returns a restore-pool array that a discarded decode filled but never published: nothing else references it.
+    private static void ParkUnpublishedRestoreArray(T[] array)
+    {
+        if (array is float[] floats) StreamingRestoreBuffers<float>.Park(floats);
+        else if (array is double[] doubles) StreamingRestoreBuffers<double>.Park(doubles);
     }
 
     private static int ElementSizeForStreaming()
@@ -3143,6 +3179,48 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             node.Realize(node.RecordingEngine);
         }
     }
+
+    /// <summary>
+    /// <see cref="EnsureStorageResident"/> for engine code that reads the storage directly (a view of it): a dropped
+    /// streaming weight pages in, a no-upcast int8/int4 one dequantizes, as for any host read.
+    /// </summary>
+    internal void EnsureHostStorageResident() => EnsureStorageResident();
+
+    /// <summary>
+    /// Builds a view of this tensor's raw storage once that storage is resident; <paramref name="pagedIn"/> reports
+    /// whether this call paged it in. A streaming weight pages in outside its transition gate (the page-in takes the
+    /// weight registry's lock) and <paramref name="build"/> then runs under the gate, which every streaming drop holds.
+    /// A drop a release had already claimed therefore either landed first, so the residency check under the gate sees
+    /// it and the page-in runs again, or runs after the view took its storage reference and, finding the storage
+    /// shared, defers. Without the gate the view could wrap the emptied replacement storage with the full shape.
+    /// </summary>
+    /// <remarks>
+    /// <paramref name="build"/> must take no weight-registry lock: the registry may hold its lock while it tries the
+    /// gate. Constructing a view (an atomic storage AddRef) takes none.
+    /// </remarks>
+    internal TView BuildViewOfResidentStorage<TView>(Func<TView> build, out bool pagedIn)
+    {
+        pagedIn = false;
+        if (Lifetime != WeightLifetime.Streaming) return build();
+        for (int attempt = 1; ; attempt++)
+        {
+            if (_data.Length != Length)
+            {
+                EnsureStorageResident();
+                pagedIn = true;
+            }
+            lock (StreamingTransitionGate)
+            {
+                // Past the retry bound the view is built as it stands: one that still does not fit fails the view
+                // constructor's bounds check, as a weight that cannot page in always has, rather than spinning.
+                if (_data.Length == Length || attempt >= MaxResidentViewAttempts) return build();
+            }
+        }
+    }
+
+    // Each retry means a release dropped the weight between this thread's page-in and its view; a handful covers any
+    // real interleaving.
+    private const int MaxResidentViewAttempts = 16;
 
     /// <summary>
     /// The storage half of <see cref="EnsureMaterialized"/>: creates a deferred buffer and pages a dropped

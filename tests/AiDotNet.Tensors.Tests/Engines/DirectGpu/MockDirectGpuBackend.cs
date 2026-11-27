@@ -18,6 +18,11 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
+/// <summary>A backend surface with sub-buffer views, so <see cref="MockDirectGpuBackend"/> can stand in for one.</summary>
+internal interface IMockBufferViewsBackend : IDirectGpuBackend, IGpuBufferViews
+{
+}
+
 /// <summary>
 /// Minimal IGpuBuffer wrapping a host float[] — the mock backend's
 /// "device buffer" is just the array itself.
@@ -68,6 +73,7 @@ internal sealed class MockBackendState
     public int FailIntAllocationAt { get; set; }
     public int IntAllocationCalls { get; set; }
     public int DownloadBufferCalls { get; set; }
+    public int UploadInPlaceCalls { get; set; }
     public int ClassifyFloatCalls { get; set; }
     public int FillCalls { get; set; }
     public int MultiplyCalls { get; set; }
@@ -98,6 +104,14 @@ public class MockDirectGpuBackend : DispatchProxy
     internal static IDirectGpuBackend Create(MockBackendState state)
     {
         var proxy = (MockDirectGpuBackend)Create<IDirectGpuBackend, MockDirectGpuBackend>();
+        proxy._state = state;
+        return (IDirectGpuBackend)(object)proxy;
+    }
+
+    /// <summary>A mock backend that also addresses sub-buffer views (as CUDA does), for ParameterBuffer view paths.</summary>
+    internal static IDirectGpuBackend CreateWithBufferViews(MockBackendState state)
+    {
+        var proxy = (MockDirectGpuBackend)Create<IMockBufferViewsBackend, MockDirectGpuBackend>();
         proxy._state = state;
         return (IDirectGpuBackend)(object)proxy;
     }
@@ -133,6 +147,9 @@ public class MockDirectGpuBackend : DispatchProxy
     protected override object Invoke(MethodInfo targetMethod, object[] args)
     {
         if (_state.ThrowOnCall.TryGetValue(targetMethod.Name, out var injected)) throw injected;
+        if (targetMethod.Name == "TryCreateView" && args.Length == 3 && args[2] is int viewCount)
+            return new MockGpuBuffer(new float[viewCount]);   // a view: no allocation is recorded
+        if (targetMethod.Name == "get_ViewsAreFreeAtAnyOffset") return true;
         if (targetMethod.Name == "AllocateIntBuffer" && ++_state.IntAllocationCalls == _state.FailIntAllocationAt)
             throw new InvalidOperationException("Injected integer allocation failure.");
         switch (targetMethod.Name)
@@ -142,6 +159,7 @@ public class MockDirectGpuBackend : DispatchProxy
             case "get_SupportsGraphCapture": return true;
             case "get_ContextIsLive": return true;
             case "IsStreamCapturing": return _state.Capturing;
+            case "get_CaptureActiveOnThisThread": return _state.Capturing;
             case "StreamCaptureStatusRaw": return _state.Capturing ? 1 : 0;
             case "get_LastCaptureFailure":
             case "get_LastCaptureNodeCounts":
@@ -225,6 +243,7 @@ public class MockDirectGpuBackend : DispatchProxy
             }
             case "UploadBufferInPlace" when args.Length == 2 && args[0] is float[] uploadSrc && args[1] is MockGpuBuffer uploadDst:
             {
+                _state.UploadInPlaceCalls++;
                 if (uploadSrc.Length > uploadDst.Size)
                     throw new ArgumentException("Host data exceeds buffer capacity.", nameof(args));
                 Array.Copy(uploadSrc, uploadDst.Data, uploadSrc.Length);

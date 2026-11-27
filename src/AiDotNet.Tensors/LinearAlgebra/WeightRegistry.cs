@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
@@ -1146,6 +1147,47 @@ public static partial class WeightRegistry
     }
 
     /// <summary>
+    /// Makes a streaming weight ready for the computation about to use it: a layer's residency boundary before its
+    /// forward. Like <see cref="Materialize{T}"/>, except for a float weight with a bf16 store when the engine keeps a
+    /// bf16 device copy of it (a GPU engine): its ops read the device copy and widen it on the device, so no fp32 host
+    /// copy is restored. A host copy that already exists is left to the owner budget, and a host read or a view of the
+    /// weight pages it back in.
+    /// </summary>
+    /// <remarks>
+    /// The weight then lives on the device, beside its bf16 store, as a PyTorch module's weight on a device does. A
+    /// layer forward that called <see cref="Materialize{T}"/> instead restored an fp32 host copy of every weight it
+    /// reached and held it up to the materialized-owner budget (half the pool's): a mixture of experts on a GPU grew
+    /// the host by two bytes per bf16 byte its forward reached, beside the bf16 device copies that served the ops.
+    /// </remarks>
+    /// <param name="weight">The weight; a tensor that is not a streaming weight is left as it is.</param>
+    /// <param name="engine">The engine the computation runs on (a layer's own); null for the current engine.</param>
+    public static void MaterializeForForward<T>(Tensor<T> weight, Engines.IEngine? engine = null)
+    {
+        if (weight is null) throw new ArgumentNullException(nameof(weight));
+        // The engine is resolved only for a weight the skip can apply to: Current may complete a deferred GPU
+        // detection, which a weight Materialize would restore anyway must not cost. (A writable mmap alias has no
+        // bf16 store, so HasBf16Store already refuses it; the check states Materialize's own early return.)
+        if (weight.Lifetime == WeightLifetime.Streaming && weight.StreamingPoolHandle >= 0
+            && !weight.IsWritableMmapAliased && CouldServeFromBf16DeviceCopy(weight)
+            && ServedFromBf16DeviceCopy(weight, engine ?? Engines.AiDotNetEngine.Current))
+        {
+            // Not restored, but used: the bf16 store stays hot in the pool (a re-upload after a device eviction reads
+            // it), and evictions elsewhere drop their owners as Materialize's resident path does.
+            StreamingTensorPool? poolRef;
+            lock (_lock) { poolRef = _streamingPool; }
+            poolRef?.MarkAccessed(weight.StreamingPoolHandle);
+            DrainOwnerDropsAfterEviction();
+            // A host copy that is resident anyway (a host read, or a drop deferred at registration) counts against
+            // the owner budget and is refreshed in its LRU, as Materialize's resident path does: otherwise a copy no
+            // Materialize tracked stayed for good, and a tracked one was shed first while its forward used it.
+            if (weight.DataVector.Length == weight.Length)
+                NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
+            return;
+        }
+        Materialize(weight);
+    }
+
+    /// <summary>
     /// Restores a streaming weight's in-memory data from the pool. If the
     /// pool has already paged the bytes out to disk, the backing file is
     /// read first. No-op for tensors that aren't <see cref="WeightLifetime.Streaming"/>
@@ -1304,6 +1346,33 @@ public static partial class WeightRegistry
         NoteMaterializedAndShed(weight.StreamingPoolHandle, CheckedStreamingByteCount<T>(weight.Length));
     }
 
+    // Whether the current engine serves this weight from a bf16 device copy (DirectGpuTensorEngine.TryBf16StreamingWeight
+    // takes the same contiguous float bf16-store weights).
+    private static bool CouldServeFromBf16DeviceCopy<T>(Tensor<T> weight)
+        => typeof(T) == typeof(float) && weight.StreamingStoreEncoding == StreamingEncoding.Bf16
+            && weight.IsContiguous && weight._storageOffset == 0;
+
+    private static bool ServedFromBf16DeviceCopy<T>(Tensor<T> weight, Engines.IEngine? engine)
+        => engine.As<Engines.DirectGpuTensorEngine>() is { ServesBf16WeightCopies: true } && HasBf16Store(weight);
+
+    /// <summary>
+    /// Marks <paramref name="weight"/>'s resident copy in use until <see cref="EndOwnerUse"/>, so owner shedding and
+    /// eviction drains leave it: for a caller that pages it in and then reads its storage (a view's construction).
+    /// Returns the handle to end, or -1 for a tensor that is not a registered streaming weight.
+    /// </summary>
+    internal static long BeginOwnerUse<T>(Tensor<T> weight) => EnterMaterializedOwnerUse(weight);
+
+    /// <summary>
+    /// Ends a use <see cref="BeginOwnerUse{T}"/> began. <paramref name="shed"/> runs the owner-budget shed pass, for a
+    /// use that paged a copy in; a use of a copy already resident added nothing to shed, and a pass per view (a bias
+    /// reshaped every forward) would retry, under the registry lock, the write-back of a cold owner a live view pins.
+    /// </summary>
+    internal static void EndOwnerUse(long handle, bool shed) => ExitMaterializedOwnerUse(handle, shed);
+
+    // Shed passes run on this thread (tests: a view of a resident weight runs none).
+    [ThreadStatic] private static long t_ownerShedPasses;
+    internal static long OwnerShedPassesOnThisThread => t_ownerShedPasses;
+
     /// <summary>
     /// Re-serializes a resident, writable streaming weight's CURRENT data into its pool entry
     /// under the same handle (#1715). Called by <see cref="Tensor{T}.TryWriteBackResidentForStreaming"/>
@@ -1386,6 +1455,7 @@ public static partial class WeightRegistry
 
     private static void ShedMaterializedOwnersUnlocked(long budget, long protectedHandle)
     {
+        t_ownerShedPasses++;
         // Shed the coldest materialized owners until back under budget. Skip active
         // MaterializeMany scopes; correctness beats the soft resident-byte cap while
         // a caller is explicitly reading those tensors.
@@ -1470,7 +1540,7 @@ public static partial class WeightRegistry
         }
     }
 
-    private static void ExitMaterializedOwnerUse(long handle)
+    private static void ExitMaterializedOwnerUse(long handle, bool shed = true)
     {
         if (handle < 0) return;
 
@@ -1482,7 +1552,7 @@ public static partial class WeightRegistry
                 else _materializedActiveUses[handle] = activeUses - 1;
             }
 
-            ShedMaterializedOwnersUnlocked(MaterializedOwnerBudgetUnlocked(), protectedHandle: -1);
+            if (shed) ShedMaterializedOwnersUnlocked(MaterializedOwnerBudgetUnlocked(), protectedHandle: -1);
         }
     }
 
@@ -1498,7 +1568,10 @@ public static partial class WeightRegistry
             _materializedBytes.Remove(handle);
             _materializedResidentBytes -= bytes;
         }
-        _materializedActiveUses.Remove(handle);
+        // Active uses are NOT cleared here: each belongs to a holder (a view being built, a MaterializeMany scope, a
+        // release's own claim) that removes it when it ends. Clearing them let one completed release erase every other
+        // holder's use, so the next ReleaseToPool saw an idle owner and dropped the storage under a view still paging
+        // it in. Handles are never reused, so a count left on an unregistered handle cannot pin another weight.
     }
 
     /// <summary>
