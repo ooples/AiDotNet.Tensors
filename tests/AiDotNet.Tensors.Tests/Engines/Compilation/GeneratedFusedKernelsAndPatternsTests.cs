@@ -237,13 +237,26 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(lossEager, new[] { x, res, gamma, beta });
         }
 
+        // A training plan keeps the residual add and the LayerNorm: the fused node never writes the residual sum,
+        // which a training caller can still read after Step().
+        List<ILazyNode> trainingNodes;
+        using (var scope = GraphMode.Enable())
+        {
+            var sumLazy = engine.TensorAdd(x, res);
+            var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
+            _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
+            trainingNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+        Assert.DoesNotContain(trainingNodes, n => n.OpName == "FusedLayerNormResidual");
+        Assert.Contains(trainingNodes, n => n.OpName == "LayerNorm");
+
         List<ILazyNode> compiledNodes;
         using (var scope = GraphMode.Enable())
         {
             var sumLazy = engine.TensorAdd(x, res);
             var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
             _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
-            compiledNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+            compiledNodes = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
         }
 
         Assert.Contains(compiledNodes, n => n.OpName == "FusedLayerNormResidual");

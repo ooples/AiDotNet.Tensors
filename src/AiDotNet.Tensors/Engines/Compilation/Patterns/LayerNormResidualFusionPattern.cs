@@ -20,7 +20,10 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
 {
     public string Name => "LayerNormResidual";
 
-    public bool IsDifferentiable => true;
+    // Inference only. The fused node never writes the residual sum, and a training plan's caller reads that sum after
+    // Step() (the LayerNorm input of an embedding -> linear -> residual -> LayerNorm block came back as freed storage).
+    // The fused backward stays exact, so the node is still correct wherever an inference plan runs it.
+    public bool IsDifferentiable => false;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,

@@ -19,7 +19,11 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
 {
     public string Name => "AddAndBiasActivation";
 
-    public bool IsDifferentiable => true;
+    // Inference only. In a training plan the fused node replaced the add's own backward -- the specialized writer that
+    // claims the first write of a multi-consumer gradient, so the step skips zeroing it -- with a generic accumulate,
+    // and erased the pre-activation sum a caller can still read after Step() (a declared matmul result's consumer sum
+    // came back as freed storage). Training keeps the add and the activation as their own steps.
+    public bool IsDifferentiable => false;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,
@@ -81,6 +85,14 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
         var actKind = MapActivationKind(actNode.OpType, out CodegenOpKind codegenOp);
         if (actKind == RowActivationKind.None)
             return false;
+        var fusedActType = actKind switch
+        {
+            RowActivationKind.ReLU => FusedActivationType.ReLU,
+            RowActivationKind.GELU => FusedActivationType.GELU,
+            RowActivationKind.Swish => FusedActivationType.Swish,
+            RowActivationKind.Sigmoid => FusedActivationType.Sigmoid,
+            _ => FusedActivationType.Tanh,
+        };
 
         var outShape = (int[])actNode.Output._shape.Clone();
         var fwdGraph = BuildCodegenGraph(mainInput._shape, biasInput._shape, outShape, codegenOp);
