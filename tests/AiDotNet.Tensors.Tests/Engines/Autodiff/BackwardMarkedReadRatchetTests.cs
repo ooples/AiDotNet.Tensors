@@ -17,7 +17,7 @@ public sealed class BackwardMarkedReadRatchetTests
         new(@"\.AsSpan\(\)|\.AsWritableSpan\(\)|\.AsMemory\(\)|GetDataArray\(\)", RegexOptions.Compiled);
 
     // Marked reads per backward source file. Files not listed have none.
-    private const int BackwardFunctionsMarkedReads = 73;
+    private const int BackwardFunctionsMarkedReads = 70;
 
     [Fact]
     public void BackwardSources_AddNoMarkedReads()

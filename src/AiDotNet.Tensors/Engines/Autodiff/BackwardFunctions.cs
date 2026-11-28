@@ -1302,6 +1302,81 @@ internal static partial class BackwardFunctions<T>
     /// assumes <c>C = A · B</c> — registering the wrong one would silently
     /// emit incorrect gradients for the attention-Q·Kᵀ fast path.
     /// </summary>
+    // C = A·Bᵀ backward on the host, float, A [M,K] and B [N,K] contiguous: dA = dC·B and dB = dCᵀ·A, each into one
+    // rented array that goes back to the pool once it has been added into the operand's gradient. Reads go through
+    // AsSpanUnmarked under KeepAliveScope (no storage is kept), so the operands are not marked escaped.
+    //
+    // dB contracts over the M rows. With more rows than outputs (M > N: a dense layer's batch against a narrow output)
+    // the packed transposed-A GEMM is slow -- 1024 x 784 -> 128: 8.0 ms single-threaded and 1.1 ms on 64 threads -- so
+    // dCᵀ is formed once and the product taken untransposed (3.4 ms and 0.45 ms). Otherwise the packed GEMM is kept.
+    private static bool TryMatMulTransposedBackwardHost(Tensor<T> gradOutput, Tensor<T>[] inputs, IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> grads, bool needsInputGradient, bool needsWeightGradient)
+    {
+        var a = inputs[0];
+        var b = inputs[1];
+        if (!gradOutput.IsContiguous || !a.IsContiguous || !b.IsContiguous) return false;
+        if (gradOutput._gpuBuffer is not null || a._gpuBuffer is not null || b._gpuBuffer is not null
+            || gradOutput.HasPendingGpuData || a.HasPendingGpuData || b.HasPendingGpuData)
+            return false;
+        int M = a._shape[0], K = a._shape[1], N = b._shape[0];
+        if (b._shape[1] != K || gradOutput.Length != M * N) return false;
+
+        var dC = (Tensor<float>)(object)gradOutput;
+        if (needsInputGradient)
+        {
+            var gradA = TensorAllocator.RentUninitialized<T>((int[])a._shape.Clone());
+            using (new KeepAliveScope(gradOutput))
+            using (new KeepAliveScope(b))
+            using (new KeepAliveScope(gradA))
+            {
+                // gradA[M,K] = gradC[M,N] · B[N,K]
+                SimdGemm.Sgemm(dC.AsSpanUnmarked(), N, false, ((Tensor<float>)(object)b).AsSpanUnmarked(), K, false,
+                    ((Tensor<float>)(object)gradA).AsWritableSpanUnmarked(), M, N, K);
+            }
+            if (DifferentiableOps.AccumulateGradPoolable(grads, a, gradA, engine))
+                ((IScopedHostTensor)gradA).ReleaseHostFromScope();
+        }
+
+        if (needsWeightGradient)
+        {
+            var gradB = TensorAllocator.RentUninitialized<T>((int[])b._shape.Clone());
+            using (new KeepAliveScope(gradOutput))
+            using (new KeepAliveScope(a))
+            using (new KeepAliveScope(gradB))
+            {
+                ReadOnlySpan<float> dCSpan = dC.AsSpanUnmarked();
+                ReadOnlySpan<float> aSpan = ((Tensor<float>)(object)a).AsSpanUnmarked();
+                Span<float> dBSpan = ((Tensor<float>)(object)gradB).AsWritableSpanUnmarked();
+#if NET5_0_OR_GREATER
+                if (M > N)
+                {
+                    var pool = System.Buffers.ArrayPool<float>.Shared;
+                    float[] dCT = pool.Rent(N * M);
+                    try
+                    {
+                        // gradB[N,K] = (gradCᵀ)[N,M] · A[M,K]
+                        SimdTranspose.Transpose(dCSpan.Slice(0, M * N), dCT.AsSpan(0, N * M), M, N);
+                        SimdGemm.Sgemm(dCT.AsSpan(0, N * M), M, false, aSpan, K, false, dBSpan, N, M, K);
+                    }
+                    finally
+                    {
+                        pool.Return(dCT);
+                    }
+                }
+                else
+#endif
+                {
+                    // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA)
+                    Engines.BlasManaged.BlasManaged.Gemm<float>(dCSpan, N, true, aSpan, K, false, dBSpan, K, N, K, M,
+                        new Engines.BlasManaged.BlasOptions<float> { BetaZero = true });
+                }
+            }
+            if (DifferentiableOps.AccumulateGradPoolable(grads, b, gradB, engine))
+                ((IScopedHostTensor)gradB).ReleaseHostFromScope();
+        }
+        return true;
+    }
+
     internal static void MatMulTransposedBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -1325,42 +1400,9 @@ internal static partial class BackwardFunctions<T>
             // (CUDA-900). Skip it so the engine fallback (resident Reshape/Transpose/MatMul) keeps grads resident.
             && !engine.SupportsGpu)
         {
-            var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
-            var aArr = needsWeightGradient ? (inputs[0] as Tensor<float>)?.GetDataArray() : null;
-            var bArr = needsInputGradient ? (inputs[1] as Tensor<float>)?.GetDataArray() : null;
-            if (dCArr is not null && (!needsWeightGradient || aArr is not null) && (!needsInputGradient || bArr is not null))
-            {
-                int M = inputs[0]._shape[0];
-                int K = inputs[0]._shape[1];
-                int N = inputs[1]._shape[0];
-
-                // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
-                // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
-                if (needsInputGradient)
-                {
-                    var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-                    using (var gradADataLease = gradATensor.LeaseArray())
-                    {
-                        var gradAData = (float[])(object)gradADataLease.Array;
-                        // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                        BlasProvider.GemmEx(M, K, N, dCArr, 0, N, false, bArr!, 0, K, false, gradAData, 0, K);
-                    }
-                    DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
-                }
-
-                if (needsWeightGradient)
-                {
-                    var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                    using (var gradBDataLease = gradBTensor.LeaseArray())
-                    {
-                        var gradBData = (float[])(object)gradBDataLease.Array;
-                        // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                        BlasProvider.GemmEx(N, K, M, dCArr, 0, N, true, aArr!, 0, K, false, gradBData, 0, K);
-                    }
-                    DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
-                }
+            if (TryMatMulTransposedBackwardHost(gradOutput, inputs, engine, grads, needsInputGradient,
+                    needsWeightGradient))
                 return;
-            }
         }
 
         // Generic fallback: gradA = gradOut · B, gradB = gradOutᵀ · A.
