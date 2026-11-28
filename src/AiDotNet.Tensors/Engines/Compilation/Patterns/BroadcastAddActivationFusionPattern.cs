@@ -77,8 +77,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
             }
         }
 
-        int actKind = MapActivationKind(actNode.OpType, out CodegenOpKind codegenOp, out FusedActivationType fusedActType);
-        if (actKind == 0)
+        var actKind = MapActivationKind(actNode.OpType, out CodegenOpKind codegenOp);
+        if (actKind == RowActivationKind.None)
             return false;
 
         var outShape = (int[])actNode.Output._shape.Clone();
@@ -114,19 +114,19 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                         return;
                     }
 
-                    if (actKind == 1)
+                    if (actKind == RowActivationKind.Relu)
                     {
                         CompiledFusedKernels.AddRelu(mainInput.AsSpan(), biasInput.AsSpan(), output.AsWritableSpan());
                         output.IncrementVersion();
                         return;
                     }
-                    if (actKind == 2)
+                    if (actKind == RowActivationKind.Gelu)
                     {
                         CompiledFusedKernels.AddGelu(mainInput.AsSpan(), biasInput.AsSpan(), output.AsWritableSpan());
                         output.IncrementVersion();
                         return;
                     }
-                    if (actKind == 3)
+                    if (actKind == RowActivationKind.Swish)
                     {
                         CompiledFusedKernels.AddSwish(mainInput.AsSpan(), biasInput.AsSpan(), output.AsWritableSpan());
                         output.IncrementVersion();
@@ -157,11 +157,11 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     return;
 
                 Tensor<float> dPre;
-                if (actKind == 4)
+                if (actKind == RowActivationKind.Sigmoid)
                 {
                     dPre = engine.SigmoidBackward(gradOutput, output);
                 }
-                else if (actKind == 5)
+                else if (actKind == RowActivationKind.Tanh)
                 {
                     dPre = engine.TanhBackward(gradOutput, output);
                 }
@@ -179,9 +179,9 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     }
                     dPre = actKind switch
                     {
-                        1 => engine.ReluBackward(gradOutput, preAct),
-                        2 => engine.GeluBackward(gradOutput, preAct),
-                        3 => engine.SwishBackward(gradOutput, preAct),
+                        RowActivationKind.Relu => engine.ReluBackward(gradOutput, preAct),
+                        RowActivationKind.Gelu => engine.GeluBackward(gradOutput, preAct),
+                        RowActivationKind.Swish => engine.SwishBackward(gradOutput, preAct),
                         _ => gradOutput
                     };
                 }
@@ -208,7 +208,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                 }
             },
             // The activation kind is the step's saved state, so a stored plan rebuilds the same fused op on load.
-            new object[] { actKind })
+            // Stored as its integer value: that is the plan file format.
+            new object[] { (int)actKind })
         {
             RecordingEngine = actNode.RecordingEngine
         };
@@ -223,44 +224,27 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
     private static bool IsSupportedActivation(LazyNodeType op) =>
         op is LazyNodeType.ReLU or LazyNodeType.GELU or LazyNodeType.Swish or LazyNodeType.Sigmoid or LazyNodeType.Tanh;
 
-    private static int MapActivationKind(LazyNodeType op, out CodegenOpKind codegenOp, out FusedActivationType fusedType)
+    private static RowActivationKind MapActivationKind(LazyNodeType op, out CodegenOpKind codegenOp)
     {
         switch (op)
         {
-            case LazyNodeType.ReLU:
-                codegenOp = CodegenOpKind.ReLU;
-                fusedType = FusedActivationType.ReLU;
-                return 1;
-            case LazyNodeType.GELU:
-                codegenOp = CodegenOpKind.GELU;
-                fusedType = FusedActivationType.GELU;
-                return 2;
-            case LazyNodeType.Swish:
-                codegenOp = CodegenOpKind.Swish;
-                fusedType = FusedActivationType.Swish;
-                return 3;
-            case LazyNodeType.Sigmoid:
-                codegenOp = CodegenOpKind.Sigmoid;
-                fusedType = FusedActivationType.Sigmoid;
-                return 4;
-            case LazyNodeType.Tanh:
-                codegenOp = CodegenOpKind.Tanh;
-                fusedType = FusedActivationType.Tanh;
-                return 5;
-            default:
-                codegenOp = CodegenOpKind.ReLU;
-                fusedType = FusedActivationType.None;
-                return 0;
+            case LazyNodeType.ReLU: codegenOp = CodegenOpKind.ReLU; return RowActivationKind.Relu;
+            case LazyNodeType.GELU: codegenOp = CodegenOpKind.GELU; return RowActivationKind.Gelu;
+            case LazyNodeType.Swish: codegenOp = CodegenOpKind.Swish; return RowActivationKind.Swish;
+            case LazyNodeType.Sigmoid: codegenOp = CodegenOpKind.Sigmoid; return RowActivationKind.Sigmoid;
+            case LazyNodeType.Tanh: codegenOp = CodegenOpKind.Tanh; return RowActivationKind.Tanh;
+            default: codegenOp = CodegenOpKind.ReLU; return RowActivationKind.None;
         }
     }
 
-    private static Tensor<float> ApplyActivationEager(IEngine eng, Tensor<float> x, int actKind) => actKind switch
+    /// <summary>The unfused activation for a kind; the plan codec rebuilds stored steps with the same mapping.</summary>
+    internal static Tensor<T> ApplyActivationEager<T>(IEngine eng, Tensor<T> x, RowActivationKind actKind) => actKind switch
     {
-        1 => eng.ReLU(x),
-        2 => eng.GELU(x),
-        3 => eng.Swish(x),
-        4 => eng.Sigmoid(x),
-        5 => eng.Tanh(x),
+        RowActivationKind.Relu => eng.ReLU(x),
+        RowActivationKind.Gelu => eng.GELU(x),
+        RowActivationKind.Swish => eng.Swish(x),
+        RowActivationKind.Sigmoid => eng.Sigmoid(x),
+        RowActivationKind.Tanh => eng.Tanh(x),
         _ => x
     };
 

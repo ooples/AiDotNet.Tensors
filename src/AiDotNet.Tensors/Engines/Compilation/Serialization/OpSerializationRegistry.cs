@@ -508,21 +508,16 @@ internal static class OpSerializationRegistry<T>
         Tensor<T>[] inputs, object[]? savedState, bool broadcastBias)
     {
         RequireInputsInRange(inputs, 2, 2, broadcastBias ? "FusedBiasActivation" : "FusedAddActivation");
-        if (savedState is not { Length: 1 } || savedState[0] is not int actKind || actKind < 1 || actKind > 5)
+        if (savedState is not { Length: 1 } || savedState[0] is not int stored
+            || !GeneratedKernels.RowActivationKindProtocol.IsActivation(stored))
             throw new InvalidDataException("Fused add+activation saved state is invalid. The plan file is corrupt.");
+        var actKind = (GeneratedKernels.RowActivationKind)stored;
         var main = inputs[0];
         var bias = inputs[1];
         return (eng, output) =>
         {
             var pre = eng.TensorAdd(main, bias);
-            var result = actKind switch
-            {
-                1 => eng.ReLU(pre),
-                2 => eng.GELU(pre),
-                3 => eng.Swish(pre),
-                4 => eng.Sigmoid(pre),
-                _ => eng.Tanh(pre),
-            };
+            var result = BroadcastAddActivationFusionPattern.ApplyActivationEager(eng, pre, actKind);
             DirectGpuTensorEngine.CopyResultInto(eng, result, output);
         };
     }
