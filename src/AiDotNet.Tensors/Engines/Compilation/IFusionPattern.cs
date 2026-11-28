@@ -46,3 +46,13 @@ internal interface IFusionPattern
         HashSet<ILazyNode> alreadyRemoved,
         out ILazyNode? fused);
 }
+
+/// <summary>
+/// A differentiable pattern whose fused backward has a host kernel only. On a GPU engine its backward decomposes into
+/// generic engine ops, which costs more kernels than the unfused ops' resident backward and cannot write the plan's
+/// gradient buffers directly, so <see cref="CpuFusionPass"/> skips it when compiling a TRAINING plan recorded on a GPU
+/// engine. Inference plans (forward only) and host training plans still fuse.
+/// </summary>
+internal interface IHostTrainingFusionPattern : IFusionPattern
+{
+}

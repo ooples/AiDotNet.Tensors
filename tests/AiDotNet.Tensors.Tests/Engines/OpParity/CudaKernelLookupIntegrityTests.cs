@@ -24,6 +24,8 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 
 public sealed class CudaKernelLookupIntegrityTests
 {
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
+
     // Kernel names CudaBackend looks up that have NO definition in any CUDA kernel source. Each one
     // throws the moment its op runs on CUDA. They are NOT renames — verified against the nearest
     // similarly named kernels:
@@ -154,21 +156,19 @@ public sealed class CudaKernelLookupIntegrityTests
             AiDotNet.Tensors.Engines.DirectGpu.DeterministicNormKernels.Dialect.Cuda);
         foreach (Match definition in Regex.Matches(normSource, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
             defined.Add(definition.Groups[1].Value);
-        // The source-generated row fusions and the linker's cross-layer norm+RoPE tile are compiled from strings
-        // built at run time, so their definitions are read from the very text CudaBackend hands NVRTC, and only
-        // after proving the backend compiles it.
-        Assert.Matches(@"CompiledFusedKernels\.UniversalRowFusedCudaSource", backend);
-        foreach (Match definition in Regex.Matches(
-            AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.CompiledFusedKernels.UniversalRowFusedCudaSource,
-            @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
-            defined.Add(definition.Groups[1].Value);
-        Assert.Matches(@"FusionTileLinker\.CreateCrossLayerNormResidualRopeTile\(\s*useLayerNorm:\s*false\s*\)", backend);
-        Assert.Matches(@"tile\.CudaDeviceFragment", backend);
-        foreach (Match definition in Regex.Matches(
-            AiDotNet.Tensors.Engines.Compilation.FusionTileIr.FusionTileLinker
-                .CreateCrossLayerNormResidualRopeTile(useLayerNorm: false).CudaDeviceFragment,
-            @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\("))
-            defined.Add(definition.Groups[1].Value);
+        // Sources that exist only at run time: the source-generated row-fusion module (CompiledFusedKernels, emitted by
+        // AiDotNet.Tensors.Generators) and the FusionTileLinker cross-layer norm+RoPE tile. Each counts only when the
+        // backend actually hands it to CompileKernelModule, and only the __global__ definitions in the compiled text.
+        var runtimeSources = new List<string>();
+        if (Regex.IsMatch(backend, @"CompileKernelModule\(\s*\w+\s*,\s*CompiledFusedKernels\.UniversalRowFusedCudaSource\b", RegexOptions.None, RegexTimeout))
+            runtimeSources.Add(AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.CompiledFusedKernels.UniversalRowFusedCudaSource);
+        foreach (Match tileCall in Regex.Matches(backend,
+            @"(\w+)\s*=\s*FusionTileLinker\.CreateCrossLayerNormResidualRopeTile\(\s*useLayerNorm:\s*(true|false)\s*\)[\s\S]{0,400}?CompileKernelModule\(\s*\w+\s*,\s*\1\.CudaDeviceFragment\b", RegexOptions.None, RegexTimeout))
+            runtimeSources.Add(AiDotNet.Tensors.Engines.Compilation.FusionTileIr.FusionTileLinker
+                .CreateCrossLayerNormResidualRopeTile(tileCall.Groups[2].Value == "true").CudaDeviceFragment);
+        foreach (string runtimeSource in runtimeSources)
+            foreach (Match definition in Regex.Matches(runtimeSource, @"__global__[\s\S]{0,120}?\bvoid\s+(\w+)\s*\(", RegexOptions.None, RegexTimeout))
+                defined.Add(definition.Groups[1].Value);
         // CudaBackend also compiles the batch-execution source it shares with HIP (#1142).
         var kernelSources = Directory.GetFiles(Path.Combine(cuda, "Kernels"), "*.cs")
             .Append(Path.Combine(cuda, "..", "BatchExecutionCudaKernels.cs"));

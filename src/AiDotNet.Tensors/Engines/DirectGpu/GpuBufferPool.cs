@@ -203,8 +203,18 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
             && Interlocked.Exchange(ref _drainedAtMeasurement, measurements) != measurements)
             DrainMeasurementParked();
 
-        // Use power-of-two bucket key for higher cache hit rate
-        return TryRentFromBucket(size, BucketKey(size), affinity, out buffer);
+        int bucketKey = BucketKey(size);
+        if (TryRentFromBucket(size, bucketKey, affinity, out buffer)) return true;
+        // A half-step class (1.5 * 2^k) misses: try the power of two above it, the bucket a power-of-two pool would have
+        // served this request from. Without it a parked 8192-capacity buffer is not reused for a 5000-element request
+        // (class 6144) and a fresh device allocation is made while capacity that fits sits idle. Every buffer in that
+        // bucket holds more than 1.5 * 2^k elements, so it never yields an undersized candidate.
+        if (!_exactSizes && bucketKey > 4 && (bucketKey & (bucketKey - 1)) != 0)
+        {
+            long powerOfTwo = NextSizeClassAfter(bucketKey);
+            if (powerOfTwo <= _maxSize && TryRentFromBucket(size, (int)powerOfTwo, affinity, out buffer)) return true;
+        }
+        return false;
     }
 
     private bool TryRentFromBucket(int size, int bucketKey, GpuBufferPoolAffinity affinity, out TBuffer? buffer)

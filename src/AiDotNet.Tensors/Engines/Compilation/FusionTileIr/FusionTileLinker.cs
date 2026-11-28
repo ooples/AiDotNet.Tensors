@@ -223,8 +223,17 @@ internal static class FusionTileLinker
         if (dBias.Length != cols)
             throw new ArgumentException($"Expected dBias length {cols}, got {dBias.Length}.", nameof(dBias));
 
-        Array.Clear(dBias, 0, cols);
-        for (int r = 0; r < rows; r++)
+        if (rows == 0)
+        {
+            Array.Clear(dBias, 0, cols);
+            return;
+        }
+
+        // Seed from row 0 instead of clearing first: dBias may alias expandedBiasGrad (only possible when
+        // rows == 1, since the lengths must match), and the same-index copy is then a no-op, so in-place
+        // reduction is supported.
+        Array.Copy(expandedBiasGrad, 0, dBias, 0, cols);
+        for (int r = 1; r < rows; r++)
         {
             int rowBase = r * cols;
             for (int c = 0; c < cols; c++)
@@ -756,8 +765,13 @@ extern ""C"" __global__ void __KERNEL__(
 }"u8);
         return tpl.Replace("__KERNEL__", kernelName).Replace("__DIM__", dStr);
     }
-    private static string FormatFloatLiteral(float value)
+    internal static string FormatFloatLiteral(float value)
     {
+        // NaN / +-Inf have no CUDA C literal form ("NaN.0f" does not compile); emit the exact IEEE bit pattern.
+        if (float.IsNaN(value)) return "__int_as_float(0x7fc00000)";
+        if (float.IsPositiveInfinity(value)) return "__int_as_float(0x7f800000)";
+        if (float.IsNegativeInfinity(value)) return "(-__int_as_float(0x7f800000))";
+
         string s = value.ToString("R", CultureInfo.InvariantCulture);
         if (s.IndexOf('.') < 0 && s.IndexOf('e') < 0 && s.IndexOf('E') < 0)
             s += ".0";
