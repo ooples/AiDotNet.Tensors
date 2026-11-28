@@ -33,9 +33,9 @@ internal sealed partial class GpuBufferPool<TBuffer> where TBuffer : class, IGpu
         buffer = null;
         if (_exactSizes || size <= 0 || size > _maxSize || Volatile.Read(ref _disposed) != 0) return false;
         int requestedBucket = BucketKey(size);
-        if (requestedBucket <= 0) return false; // Power-of-two rounding overflow: preserve the native fallback.
+        if (requestedBucket <= 0) return false;
         long limit = Math.Min((long)size * 4, int.MaxValue);
-        for (long bucket = (long)requestedBucket * 2; bucket <= limit; bucket *= 2)
+        for (long bucket = NextSizeClassAfter(requestedBucket); bucket <= limit; bucket = NextSizeClassAfter(bucket))
             if (TryRentFromBucket(size, (int)bucket, affinity, out buffer)) return true;
         return false;
     }

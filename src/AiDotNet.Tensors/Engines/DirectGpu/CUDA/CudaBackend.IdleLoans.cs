@@ -391,10 +391,16 @@ public sealed partial class CudaBackend : IIdleDeviceMemoryLender, IIdleLoanCapt
         CudaGpuBuffer owned;
         using (NoIdleLoans())
         {
-            owned = _asyncAlloc
-                ? TryRentAsyncBuffer(size) ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)),
-                    size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount)
-                : (CudaGpuBuffer)AllocateBufferFromPool(size);
+            if (_asyncAlloc)
+            {
+                int allocCapacity = ResolvePooledAllocationCapacity(size, sizeof(float));
+                owned = TryRentAsyncBuffer(size) ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)allocCapacity * sizeof(float)),
+                    size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount, capacity: allocCapacity);
+            }
+            else
+            {
+                owned = (CudaGpuBuffer)AllocateBufferFromPool(size);
+            }
         }
         var from = borrower.RawDevicePointer;
         try

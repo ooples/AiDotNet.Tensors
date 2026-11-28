@@ -88,7 +88,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             // BatchNorm+ReLU fusion.
             if (_forTraining && (node.RecordedUnderNoGrad
                 || (node is ISignableLazyNode { BackwardDelegate: null }
-                    && node.OpName is not ("BatchNormBatchMean" or "BatchNormBatchVariance"))
+                    && node.OpName is not ("BatchNormBatchMean" or "BatchNormBatchVariance" or "LayerNormMean" or "LayerNormVariance" or "RMSNormRms"))
                 || node is ISignableLazyNode { DifferentiableInputIndices: not null })) blocked.Add(node);
             if (node is not IInPlaceReadOrdering ordered || ordered.EarlierReaders.Count == 0) continue;
             blocked.Add(node);
@@ -115,6 +115,9 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             for (int p = 0; p < patterns.Count; p++)
             {
                 if (_forTraining && !patterns[p].IsDifferentiable)
+                    continue;
+                if (_forTraining && patterns[p] is IHostTrainingFusionPattern
+                    && nodes[i].RecordingEngine.Is<DirectGpuTensorEngine>())
                     continue;
                 if (patterns[p].TryFuse(nodes, i, consumerCounts, removed, out var fused))
                 {

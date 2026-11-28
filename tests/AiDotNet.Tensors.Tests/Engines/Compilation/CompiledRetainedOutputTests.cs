@@ -188,12 +188,54 @@ public sealed class CompiledRetainedOutputTests : IDisposable
     // MatMul -> broadcast add of a 1-D bias -> ReLU is what the linear fusion rewrites into one FusedLinear node, which
     // never writes the matmul's own output. The undeclared plan proves this graph fuses; declaring the matmul result
     // (or the pre-activation sum) must keep that node, with the same loss and gradients.
+    /// <summary>
+    /// A declared matmul output keeps the linear fusion away, so the bias + ReLU after it fuses instead: the declared
+    /// product must still hold each step's values and the gradients must match the unfused chain's.
+    /// </summary>
+    [Fact]
+    public void Declared_matmul_ahead_of_a_fused_bias_relu_is_still_computed()
+    {
+        var engine = new CpuEngine();
+        AiDotNetEngine.Current = engine;
+        var input = new Tensor<float>([4, 4]);
+        var weight = new Tensor<float>([4, 4]);
+        var bias = new Tensor<float>([4]);
+        weight.AsWritableSpan().Fill(0.25f);
+        bias.AsWritableSpan().Fill(0.5f);
+        Tensor<float> product;
+        CompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(new[] { weight, bias }))
+        {
+            product = engine.TensorMatMul(input, weight);
+            GradientRecording.RetainOutput(product);
+            var sum = engine.TensorBroadcastAdd(product, bias);
+            engine.ReduceSum(engine.ReLU(sum), null);
+            plan = scope.CompileTraining(new[] { weight, bias });
+        }
+        using (plan)
+        {
+            Assert.Contains(plan.BackwardStepKinds, kind => kind.IndexOf("FusedBiasActivation", StringComparison.Ordinal) >= 0);
+            for (int step = 1; step <= 3; step++)
+            {
+                input.AsWritableSpan().Fill(step);
+                input.IncrementVersion();
+                Assert.Equal(16f * (step + 0.5f), plan.Step().ToArray()[0]);
+                foreach (float value in product.ToArray()) Assert.Equal((float)step, value);
+                foreach (float gradient in plan.Gradients[0].ToArray()) Assert.Equal(4f * step, gradient);
+                foreach (float gradient in plan.Gradients[1].ToArray()) Assert.Equal(4f, gradient);
+            }
+        }
+    }
+
     [Theory]
     [InlineData(0)]   // nothing declared: the control
     [InlineData(1)]   // the matmul result
     [InlineData(2)]   // the pre-activation sum
     public void Declared_interior_of_a_fusable_linear_chain_is_still_computed(int declared)
     {
+        // The linear chain's own fusion is under test: the bias+ReLU fusion would absorb the undeclared sum this reads.
+        using var suspended0 = FusionPatternRegistry.Suspend("AddAndBiasActivation");
+        Assert.NotNull(suspended0);
         var engine = new CpuEngine();
         AiDotNetEngine.Current = engine;
         var input = new Tensor<float>([4, 4]);

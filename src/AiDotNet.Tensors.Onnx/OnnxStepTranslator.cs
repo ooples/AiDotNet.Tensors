@@ -30,6 +30,8 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         "TensorSlice", "TensorSplit", "Concat", "Concatenate", "Gather",
         "Conv2D", "ConvTranspose2D", "MaxPool2D", "AvgPool2D", "Pad",
         "BatchNormInference", "LayerNorm", "LayerNorm[0]", "ReduceSum", "ReduceMean", "FusedLinear",
+        // The compile-time generated elementwise fusions, written back as the ops they fused.
+        "FusedAddActivation", "FusedBiasActivation", "FusedElementwiseChain",
     };
 
     /// <summary>Pads folded into the conv or pool that reads them: the padded tensor, its source and the padding.</summary>
@@ -53,8 +55,12 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
     {
         if (!Supported.Contains(step.OpName)) return false;
         if (step.OpName == "Tile") return IsBroadcastTile(step);
-        // A fused linear translates when its activation has an exact ONNX form without parameters.
-        return step.OpName != "FusedLinear" || FusedActivation(step) is
+        // A fused add + activation translates only when it saved its activation.
+        if (step.OpName is "FusedAddActivation" or "FusedBiasActivation"
+            && !(step.SavedState is { Length: > 0 } saved && saved[0] is FusedActivationType))
+            return false;
+        // A fused linear or add translates when its activation has an exact ONNX form without parameters.
+        return step.OpName is not ("FusedLinear" or "FusedAddActivation" or "FusedBiasActivation") || FusedActivation(step) is
             FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.Sigmoid or
             FusedActivationType.Tanh or FusedActivationType.GELU or FusedActivationType.Softmax or
             FusedActivationType.Swish;
@@ -231,6 +237,9 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             case "ReduceSum":
             case "ReduceMean": Reduce(step, inputs, output); return;
             case "FusedLinear": FusedLinear(step, inputs, output); return;
+            case "FusedAddActivation":
+            case "FusedBiasActivation": FusedAddActivation(step, inputs, output); return;
+            case "FusedElementwiseChain": ElementwiseChain(step, inputs, output); return;
         }
         throw new NotSupportedException($"No ONNX translation for '{step.OpName}'.");
     }
@@ -384,6 +393,53 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         => step.SavedState is { Length: > 0 } state ? state[0] as FusedActivationType? : FusedActivationType.None;
 
     /// <summary>input @ weights (+ bias), then the activation: MatMul, Add and the activation's ONNX operator.</summary>
+
+    // A fused elementwise chain, op by op from the program it saved (see ElementwiseChainProgram).
+    private void ElementwiseChain(CompiledStep<T> step, string[] inputs, string output)
+    {
+        if (step.SavedState is not { Length: 1 } || step.SavedState[0] is not int[] program)
+            throw new NotSupportedException("FusedElementwiseChain step saved no op program.");
+        ElementwiseChainProgram.Validate(program, inputs.Length);
+        int stride = ElementwiseChainProgram.Stride;
+        int ops = program.Length / stride;
+        var names = new string[ops];
+        string Source(int source) => source < 0 ? names[-(source + 1)] : inputs[source];
+        for (int i = 0; i < ops; i++)
+        {
+            var type = (Engines.Compilation.LazyNodeType)program[i * stride];
+            string a = Source(program[i * stride + 1]);
+            string result = i == ops - 1 ? output : _w.NewName("chain");
+            double scalar = ElementwiseChainProgram.Scalar(program, i);
+            switch (type)
+            {
+                case Engines.Compilation.LazyNodeType.Negate: _w.AddNode("Neg", new[] { a }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.ReLU: _w.AddNode("Relu", new[] { a }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.GELU: Gelu(a, result); break;
+                case Engines.Compilation.LazyNodeType.Sigmoid: _w.AddNode("Sigmoid", new[] { a }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Tanh: _w.AddNode("Tanh", new[] { a }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Swish:
+                {
+                    string sig = _w.NewName("sigmoid");
+                    _w.AddNode("Sigmoid", new[] { a }, new[] { sig });
+                    _w.AddNode("Mul", new[] { a, sig }, new[] { result });
+                    break;
+                }
+                case Engines.Compilation.LazyNodeType.ELU:
+                    _w.AddNode("Elu", new[] { a }, new[] { result }, Float("alpha", scalar));
+                    break;
+                case Engines.Compilation.LazyNodeType.AddScalar: _w.AddNode("Add", new[] { a, _w.AddScalar(scalar) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.MultiplyScalar: _w.AddNode("Mul", new[] { a, _w.AddScalar(scalar) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.DivideScalar: _w.AddNode("Div", new[] { a, _w.AddScalar(scalar) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Add: _w.AddNode("Add", new[] { a, Source(program[i * stride + 2]) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Subtract: _w.AddNode("Sub", new[] { a, Source(program[i * stride + 2]) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Multiply: _w.AddNode("Mul", new[] { a, Source(program[i * stride + 2]) }, new[] { result }); break;
+                case Engines.Compilation.LazyNodeType.Divide: _w.AddNode("Div", new[] { a, Source(program[i * stride + 2]) }, new[] { result }); break;
+                default: throw new NotSupportedException($"FusedElementwiseChain op {type} has no ONNX translation.");
+            }
+            names[i] = result;
+        }
+    }
+
     private void FusedLinear(CompiledStep<T> step, string[] inputs, string output)
     {
         var activation = FusedActivation(step) ?? throw new NotSupportedException("FusedLinear saved no activation.");
@@ -396,6 +452,21 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             pre = activation == FusedActivationType.None ? output : _w.NewName("biased");
             _w.AddNode("Add", new[] { linear, inputs[2] }, new[] { pre });
         }
+        Activation("FusedLinear", activation, pre, output);
+    }
+
+    /// <summary>a + b (b broadcast along the trailing axis for the bias form), then the activation.</summary>
+    private void FusedAddActivation(CompiledStep<T> step, string[] inputs, string output)
+    {
+        var activation = FusedActivation(step) ?? throw new NotSupportedException($"{step.OpName} saved no activation.");
+        string pre = activation == FusedActivationType.None ? output : _w.NewName("sum");
+        _w.AddNode("Add", new[] { inputs[0], inputs[1] }, new[] { pre });
+        Activation(step.OpName, activation, pre, output);
+    }
+
+    /// <summary>The fused activation's ONNX operator from <paramref name="pre"/> to <paramref name="output"/>.</summary>
+    private void Activation(string opName, FusedActivationType activation, string pre, string output)
+    {
         switch (activation)
         {
             case FusedActivationType.None: return;
@@ -414,7 +485,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
                 return;
             }
         }
-        throw new NotSupportedException($"FusedLinear activation {activation} has no ONNX translation.");
+        throw new NotSupportedException($"{opName} activation {activation} has no ONNX translation.");
     }
 
     private void Conv(CompiledStep<T> step, string[] inputs, string output)

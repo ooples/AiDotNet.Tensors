@@ -611,9 +611,77 @@ public class MultiMatMulFusedAdamParamUpdateTests
     /// TensorAdd, since the Transformer's residual
     /// path goes: MHA_out + input → LayerNorm.
     /// </summary>
+    /// <summary>
+    /// The same residual + LayerNorm graph with the add+LayerNorm fusion active: the fused step's gradients for every
+    /// parameter must match the eager tape's.
+    /// </summary>
+    [Fact]
+    public void Embedding_FusedLinear_FusedResidualLayerNorm_GradientsMatchEager()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, vocab = 8, dModel = 32;
+        var indices = new Tensor<int>(new[] { batch, seqLen });
+        indices[0, 0] = 0; indices[0, 1] = 2; indices[0, 2] = 4; indices[0, 3] = 6;
+
+        Tensor<float>[] MakeParams()
+        {
+            var gamma = FilledRand(new[] { dModel }, seed: 304);
+            for (int i = 0; i < gamma.Length; i++) gamma[i] = gamma[i] + 1f;
+            return new[]
+            {
+                FilledRand(new[] { vocab, dModel }, seed: 301), FilledRand(new[] { dModel, dModel }, seed: 302),
+                FilledRand(new[] { dModel }, seed: 303), gamma, FilledRand(new[] { dModel }, seed: 305),
+            };
+        }
+        Tensor<float> Forward(Tensor<float>[] p)
+        {
+            var emb2D = engine.Reshape(engine.TensorEmbeddingLookup<float, int>(p[0], indices), new[] { batch * seqLen, dModel });
+            var attn3D = engine.Reshape(engine.FusedLinear(emb2D, p[1], p[2], FusedActivationType.None), new[] { batch, seqLen, dModel });
+            var residual = engine.TensorAdd(attn3D, engine.Reshape(emb2D, new[] { batch, seqLen, dModel }));
+            var normed = engine.LayerNorm(residual, p[3], p[4], 1e-5, out _, out _);
+            return engine.ReduceSum(engine.TensorMultiply(normed, normed), null);
+        }
+
+        var eagerParams = MakeParams();
+        var eager = new float[eagerParams.Length][];
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
+        {
+            var grads = tape.ComputeGradients(Forward(eagerParams), sources: eagerParams);
+            for (int i = 0; i < eagerParams.Length; i++) eager[i] = grads[eagerParams[i]].ToArray();
+        }
+
+        var ps = MakeParams();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Forward(ps);
+            plan = scope.CompileTraining(ps);
+        }
+        using (plan)
+        {
+            var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            Assert.Contains(concrete.BackwardStepKinds, kind => kind.IndexOf("FusedLayerNormResidual", StringComparison.Ordinal) >= 0);
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+            for (int i = 0; i < ps.Length; i++)
+            {
+                var grad = ps[i].Grad;
+                Assert.NotNull(grad);
+                var actual = grad.ToArray();
+                Assert.Equal(eager[i].Length, actual.Length);
+                for (int j = 0; j < actual.Length; j++)
+                    Assert.True(Math.Abs(eager[i][j] - actual[j]) <= 1e-4f * (1f + Math.Abs(eager[i][j])),
+                        $"param {i}[{j}]: eager {eager[i][j]} vs fused {actual[j]}");
+            }
+        }
+    }
+
     [Fact]
     public void Embedding_FusedLinear_Residual_LayerNorm_InputBufferMustPropagate()
     {
+        // The residual add's write into LayerNorm's input is under test; the add+LayerNorm fusion would never materialize it.
+        using var suspended0 = FusionPatternRegistry.Suspend("LayerNormResidual");
+        Assert.NotNull(suspended0);
         var engine = new CpuEngine();
         const int batch = 1, seqLen = 4, vocab = 8, dModel = 32;
 

@@ -59,6 +59,8 @@ public sealed class MatMulTransposedEagerBackwardTests
             }
     }
 
+    // GC.GetAllocatedBytesForCurrentThread is .NET Core / .NET 5+ only.
+#if NET5_0_OR_GREATER
     [Fact]
     public void BackwardKernel_SteadyState_AllocatesNoOperandSizedArray()
     {
@@ -82,4 +84,5 @@ public sealed class MatMulTransposedEagerBackwardTests
         long smallestOperand = (long)n * k * sizeof(float);
         Assert.True(perCall < smallestOperand / 4, $"{perCall} B per backward call; dB alone is {smallestOperand} B");
     }
+#endif
 }

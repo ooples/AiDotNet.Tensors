@@ -41,6 +41,8 @@
   <ItemGroup>
     <ProjectReference Include="..\AiDotNet.Tensors.Analyzers\AiDotNet.Tensors.Analyzers.csproj"
                       OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="..\AiDotNet.Tensors.Generators\AiDotNet.Tensors.Generators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
     <AdditionalFiles Include="BackendParityBaseline.txt" />
     <!-- Element-wise gate (TENS0010-TENS0012): ElementWiseRecord=true leaves the inventory out so every occurrence is
          reported; scripts/Update-ElementWiseBaseline.ps1 rewrites it from that build's SARIF log. -->

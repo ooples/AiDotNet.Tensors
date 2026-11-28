@@ -1808,7 +1808,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (explicitOutput is null && scope.Nodes.LastOrDefault() is LazyNode<T> last)
         {
             if (last.PrimaryOutput is not null) explicitOutput = last.PrimaryOutput;
-            else if (last.OpName is "LayerNormMean" or "LayerNormVariance" or "BatchNormBatchMean" or "BatchNormBatchVariance")
+            else if (last.OpName is "LayerNormMean" or "LayerNormVariance" or "BatchNormBatchMean" or "BatchNormBatchVariance" or "RMSNormRms")
                 explicitOutput = last.GetInputsArray()[0];
         }
 

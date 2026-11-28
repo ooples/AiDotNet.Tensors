@@ -431,8 +431,33 @@ namespace AiDotNet.Tensors.Tests.Engines
         }
 
         [Fact]
+        public void CompiledInferencePlan_FusedAddRelu_MatchesEager()
+        {
+            var engine = new CpuEngine();
+            var a = MakeRandom(new[] { 32, 32 }, seed: 30);
+            var b = MakeRandom(new[] { 32, 32 }, seed: 31);
+            var eagerRelu = engine.ReLU(engine.TensorAdd(a, b));
+
+            CompiledInferencePlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.ReLU(engine.TensorAdd(a, b));
+                plan = scope.CompileInference<float>();
+            }
+            // The add and the ReLU run as one fused step.
+            Assert.Equal(1, plan.StepCount);
+            Assert.Equal("FusedAddActivation", Assert.Single(plan.Steps).OpName);
+            AssertTensorsEqual(eagerRelu, plan.Execute(), "Fused CompiledInferencePlan");
+        }
+
+        [Fact]
         public void CompiledInferencePlan_MatchesEager()
         {
+            // This checks the unfused two-step plan; the add+activation fusions would collapse it to one step.
+            using var suspended0 = FusionPatternRegistry.Suspend("AddAndBiasActivation");
+            Assert.NotNull(suspended0);
+            using var suspended1 = FusionPatternRegistry.Suspend("ElementwiseCodegenChain");
+            Assert.NotNull(suspended1);
             var engine = new CpuEngine();
             var a = MakeRandom(new[] { 32, 32 }, seed: 30);
             var b = MakeRandom(new[] { 32, 32 }, seed: 31);

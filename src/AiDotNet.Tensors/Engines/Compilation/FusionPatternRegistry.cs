@@ -47,6 +47,14 @@ internal static class FusionPatternRegistry
         Register(new MultiHeadAttentionPackedFusionPattern());
         Register(new LinearMseLossFusionPattern());
         Register(new MseLossFusionPattern());
+        Register(new RotaryPositionEmbeddingFusionPattern());
+        Register(new LogSoftmaxCrossEntropyFusionPattern());
+        Register(new NormResidualRopeFusionPattern());
+        Register(new RmsNormResidualFusionPattern());
+        Register(new LayerNormResidualFusionPattern());
+        Register(new SwiGluFusionPattern());
+        Register(new BroadcastAddActivationFusionPattern());
+        Register(new ElementwiseChainFusionPattern());
     }
 
     /// <summary>
@@ -104,47 +112,58 @@ internal static class FusionPatternRegistry
         }
     }
 
+    // Names suspended on the current logical flow (thread or async context). Suspension used to remove the pattern
+    // process-wide, so a test suspending a fusion changed what every test running in parallel compiled.
+    private static readonly System.Threading.AsyncLocal<string[]?> s_suspended = new();
+
     /// <summary>
-    /// Removes a pattern until the returned scope is disposed, then puts it back in the slot it had: a pattern that
-    /// subsumes later ones must keep its priority, and <see cref="Unregister"/> followed by <see cref="Register"/> would
-    /// move it to the end of the order. Null when no such pattern is registered.
+    /// Hides a pattern from the fusion pass on the calling logical flow until the returned scope is disposed. Other
+    /// threads keep seeing it, and its priority slot is untouched (<see cref="Unregister"/> followed by
+    /// <see cref="Register"/> would move it to the end of the order). Null when no such pattern is registered.
     /// </summary>
     internal static IDisposable? Suspend(string name)
     {
-        lock (_orderLock)
-        {
-            int slot = -1;
-            for (int i = 0; i < _ordered.Count; i++)
-                if (_ordered[i].Name == name) { slot = i; break; }
-            if (slot < 0 || !_patterns.TryRemove(name, out var pattern)) return null;
-            var next = new List<IFusionPattern>(_ordered);
-            next.RemoveAt(slot);
-            _ordered = next;
-            return new Restore(pattern, slot);
-        }
+        if (!_patterns.ContainsKey(name)) return null;
+        var previous = s_suspended.Value;
+        var next = previous is null ? new[] { name } : AppendName(previous, name);
+        s_suspended.Value = next;
+        return new Restore(previous);
+    }
+
+    private static string[] AppendName(string[] names, string name)
+    {
+        var next = new string[names.Length + 1];
+        Array.Copy(names, next, names.Length);
+        next[names.Length] = name;
+        return next;
     }
 
     private sealed class Restore : IDisposable
     {
-        private IFusionPattern? _pattern;
-        private readonly int _slot;
+        private readonly string[]? _previous;
+        private int _disposed;
 
-        public Restore(IFusionPattern pattern, int slot) { _pattern = pattern; _slot = slot; }
+        public Restore(string[]? previous) { _previous = previous; }
 
         public void Dispose()
         {
-            var pattern = System.Threading.Interlocked.Exchange(ref _pattern, null);
-            if (pattern is null) return;
-            lock (_orderLock)
-            {
-                if (!_patterns.TryAdd(pattern.Name, pattern)) return;   // re-registered meanwhile: keep that one
-                var next = new List<IFusionPattern>(_ordered);
-                next.Insert(Math.Min(_slot, next.Count), pattern);
-                _ordered = next;
-            }
+            if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            s_suspended.Value = _previous;
         }
     }
 
     /// <summary>Snapshot of the currently registered patterns, in priority order.</summary>
-    public static IReadOnlyList<IFusionPattern> Patterns => _ordered;
+    public static IReadOnlyList<IFusionPattern> Patterns
+    {
+        get
+        {
+            var ordered = _ordered;
+            var suspended = s_suspended.Value;
+            if (suspended is null) return ordered;
+            var visible = new List<IFusionPattern>(ordered.Count);
+            foreach (var pattern in ordered)
+                if (Array.IndexOf(suspended, pattern.Name) < 0) visible.Add(pattern);
+            return visible;
+        }
+    }
 }

@@ -8,7 +8,7 @@ internal static class HipNeuralNetKernels
     public static string GetSource()
     {
         // Note: hiprtc provides device intrinsics built-in, no includes needed
-        return ExactFloatKernels.Cuda + @"
+        return ExactFloatKernels.Cuda + global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@"
 // 1 - beta^t without cancellation (see CudaOptimizerKernels.bias_correction).
 __device__ __forceinline__ float hip_nn_bias_correction(float beta, float t)
 {
@@ -2653,7 +2653,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
 }
 
 #undef BATCHED_TILE_SIZE
-";
+"u8);
     }
 
     public static string[] GetKernelNames()

@@ -566,6 +566,41 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (_backendStreamCaptureActive || _mainStream == IntPtr.Zero) return null;
         return _bufferPool.TryRentForBackend(size, AsyncPoolAffinity, this, out var pooled) ? pooled : null;
     }
+
+    /// <summary>
+    /// Computes the physical allocation capacity matching <see cref="_bufferPool"/>'s bucket ceiling when pooling is active,
+    /// clamping back to <paramref name="requestedSize"/> during stream capture, under a <c>GpuMemoryBudget</c>, or when
+    /// rounding would exceed the device allocation cap.
+    /// </summary>
+    internal int ResolvePooledAllocationCapacity(int requestedSize, int elementSizeBytes)
+    {
+        if (requestedSize <= 0 || CaptureMemoryPool.Current is not null || _backendStreamCaptureActive || IsCapturingOnThisThread)
+        {
+            return requestedSize;
+        }
+
+        int rounded = _bufferPool.RoundUpToBucketCapacity(requestedSize);
+        if (rounded <= requestedSize)
+        {
+            return requestedSize;
+        }
+
+        long roundedBytes = (long)rounded * elementSizeBytes;
+        if (roundedBytes <= 0 || roundedBytes > MaxBufferAllocBytes)
+        {
+            return requestedSize;
+        }
+
+        // Under a GpuMemoryBudget the padding is charged at admission, so a padded request could be refused while the
+        // requested size alone fits the remaining headroom. Headroom checked here can change before admission (other
+        // threads, reclaim), so the only guarantee that padding never causes a refusal is not to pad under a budget.
+        if (_memoryAccount.LimitBytes is not null)
+        {
+            return requestedSize;
+        }
+
+        return rounded;
+    }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
     // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
@@ -2135,9 +2170,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         if (_asyncAlloc)
         {
             // Reuse a pooled stream-ordered buffer when one fits, and stage the copy so it does not block the host.
+            int allocCapacity = ResolvePooledAllocationCapacity(size, sizeof(float));
             var target = TryRentAsyncBuffer(size)
-                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)allocCapacity * sizeof(float)), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount, capacity: allocCapacity);
             try
             {
                 if (TryStageUpload(target.Handle, data, byteSize))
@@ -2191,7 +2227,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return pooled;
         }
 
-        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
+        int syncAllocCapacity = ResolvePooledAllocationCapacity(size, sizeof(float));
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry((ulong)syncAllocCapacity * sizeof(float));
 
         try
         {
@@ -2212,7 +2249,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount, capacity: syncAllocCapacity);
     }
 
     /// <summary>
@@ -2633,9 +2670,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
     private IGpuBuffer AllocateBufferFromPool(int size)
     {
         if (TryRentPooledZeroed(size) is { } reused) return reused;
+        int allocCapacity = ResolvePooledAllocationCapacity(size, sizeof(float));
         if (_asyncAlloc)
         {
-            var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+            var p = AllocDeviceMemoryAsync((ulong)allocCapacity * sizeof(float));
             // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
             // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
             // null-stream cuMemsetD32 touches an async pointer not yet valid on the null stream (non-blocking
@@ -2646,11 +2684,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount, capacity: allocCapacity);
         }
 
-        ulong byteSize = (ulong)size * sizeof(float);
-        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
+        ulong allocByteSize = (ulong)allocCapacity * sizeof(float);
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry(allocByteSize);
         // Stream-ordered: a synchronous cuMemset runs on the legacy stream, which is illegal while _stream is being
         // captured (CUDA 906) and serializes the device everywhere else.
         var fill = CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream);
@@ -2661,7 +2699,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             CuBlasNative.CheckCudaResult(fill, "cuMemsetD32Async");
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount, capacity: allocCapacity);
     }
 
     /// <inheritdoc/>
@@ -2694,9 +2732,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
         buffer ??= TryRentIdleLoan(size);
         if (buffer is null)
+        if (buffer is null)
         {
-            buffer = new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)size * sizeof(float)), size,
-                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+            int allocCapacity = ResolvePooledAllocationCapacity(size, sizeof(float));
+            buffer = new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)allocCapacity * sizeof(float)), size,
+                returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount, capacity: allocCapacity);
             arena?.Track(buffer);
         }
         if (PoisonUninitializedBuffers)
@@ -10767,9 +10807,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         using var _ = PushContext();
         if (_asyncAlloc)
         {
+            int allocCapacity = ResolvePooledAllocationCapacity(size, sizeof(int));
             var target = TryRentAsyncBuffer(size)
-                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount);
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync((ulong)allocCapacity * sizeof(int)), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream, account: _memoryAccount, capacity: allocCapacity);
             try
             {
                 if (TryStageUpload(target.Handle, data, byteSize))
@@ -10820,7 +10861,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         }
 
         // The shared allocator reclaims and retries once on out-of-memory, then raises GpuOutOfMemoryException.
-        IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
+        int syncAllocCapacity = ResolvePooledAllocationCapacity(size, sizeof(int));
+        IntPtr devicePtr = AllocDeviceMemoryWithRetry((ulong)syncAllocCapacity * sizeof(int));
 
         try
         {
@@ -10841,7 +10883,7 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer, account: _memoryAccount, capacity: syncAllocCapacity);
     }
 
     #endregion
@@ -22320,14 +22362,18 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
         /// <param name="account">The device's memory counters, for a fresh allocation; null for a pool's new wrapper of
         /// memory already counted.</param>
         public CudaGpuBuffer(IntPtr context, IntPtr devicePtr, int size, Action<CudaGpuBuffer>? returnToPool = null,
-            IntPtr asyncFreeStream = default, DeviceMemoryAccount? account = null)
+            IntPtr asyncFreeStream = default, DeviceMemoryAccount? account = null, int capacity = 0)
         {
+            int resolvedCapacity = capacity > 0 ? capacity : size;
+            if (resolvedCapacity < size)
+                throw new ArgumentOutOfRangeException(nameof(capacity), "Physical capacity cannot be smaller than logical size.");
+            long physicalBytes = (long)resolvedCapacity * sizeof(float);
             // Stream-ordered memory is counted as reserved by the driver pool itself (see _memoryAccount).
-            _memory.OnAllocated(account, (long)size * sizeof(float), countReserved: asyncFreeStream == IntPtr.Zero);
+            _memory.OnAllocated(account, physicalBytes, countReserved: asyncFreeStream == IntPtr.Zero);
             _context = context;
             _devicePtr = devicePtr;
             _size = size;
-            Capacity = size;
+            Capacity = resolvedCapacity;
             _returnToPool = returnToPool;
             _asyncFreeStream = asyncFreeStream;
             if (CaptureMemoryPool.Current is { } capture)
@@ -22339,11 +22385,11 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
                 {
                     var frames = CallerFrames(new System.Diagnostics.StackTrace(1, false), 6, "CudaBackend", "CaptureMemory");
                     AiDotNet.Tensors.Engines.AiDotNetEngine.LogDiagnostic(
-                        $"[CAPTURE-ALLOC] bytes={(long)size * sizeof(float)} at {string.Join(" < ", frames)}");
+                        $"[CAPTURE-ALLOC] bytes={physicalBytes} at {string.Join(" < ", frames)}");
                 }
             }
             InitCudaBufferLifecycle(
-                context, account is not null ? (long)size * sizeof(float) : 0,
+                context, account is not null ? physicalBytes : 0,
                 out _allocatedDuringCapture, out _contextGeneration, out _reclaimCharge, out _reclaimEpoch);
         }
 

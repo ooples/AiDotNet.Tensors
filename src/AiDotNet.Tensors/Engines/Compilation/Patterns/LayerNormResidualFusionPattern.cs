@@ -1,0 +1,339 @@
+// Copyright (c) CrowdTrainer LLC. All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Reflection;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation.GeneratedKernels;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+
+namespace AiDotNet.Tensors.Engines.Compilation;
+
+/// <summary>
+/// Matches <c>Add(input, residual) -&gt; LayerNorm(sum, gamma, beta, epsilon)</c> and emits a single
+/// <c>FusedLayerNormResidual</c> node that executes without materializing the intermediate residual-sum tensor
+/// in global memory (using compile-time generated AVX2/FMA SIMD on CPU and warp-shuffle NVRTC CUDA on GPU).
+/// </summary>
+internal sealed class LayerNormResidualFusionPattern : IHostTrainingFusionPattern
+{
+    public string Name => "LayerNormResidual";
+
+    // Training plans fuse too. The fused node does not write the residual (or pre-activation) sum: a caller that
+    // reads it after Step() declares it (GradientRecording.RetainOutput), and CpuFusionPass keeps a declared node
+    // out of every fusion in a training plan.
+    public bool IsDifferentiable => true;
+
+    public bool TryFuse(
+        IReadOnlyList<ILazyNode> nodes,
+        int index,
+        IReadOnlyDictionary<ILazyNode, int> consumerCounts,
+        HashSet<ILazyNode> alreadyRemoved,
+        out ILazyNode? fused)
+    {
+        fused = null;
+        if (nodes[index] is not LazyNode<float> addNode
+            || addNode.OpType != LazyNodeType.Add
+            || addNode.Input1 is null
+            || !PatternHelpers.SameShape(addNode.Input0, addNode.Input1)
+            || !PatternHelpers.FanOutAtMostOne(addNode, consumerCounts))
+        {
+            return false;
+        }
+
+        int lnIndex = -1;
+        LazyNode<float>? lnNode = null;
+        int searchEnd = Math.Min(nodes.Count - 1, index + 6);
+        for (int j = index + 1; j <= searchEnd; j++)
+        {
+            if (alreadyRemoved.Contains(nodes[j])) continue;
+            if (nodes[j] is LazyNode<float> candidate
+                && candidate.OpType == LazyNodeType.Custom
+                && candidate.OpName == "LayerNorm"
+                && ReferenceEquals(candidate.Input0, addNode.Output))
+            {
+                lnNode = candidate;
+                lnIndex = j;
+                break;
+            }
+        }
+
+        if (lnNode is null || lnNode.Input1 is null || lnNode.Input2 is null)
+            return false;
+
+        // Inspect optional auxiliary LayerNormMean / LayerNormVariance nodes recorded right after LayerNorm.
+        // Only fuse when those auxiliary statistic nodes themselves have zero downstream consumers, so we can
+        // drop them cleanly without forcing extra variance conversions. A statistic node the fusion pass handed in
+        // as already removed is a blocked one (retained/observable in training, realized, or in-place ordered): it
+        // stays in the plan and its delegate copies from the LayerNorm writer's state, so removing that writer
+        // would leave it reading nothing. Decline in that case.
+        LazyNode<float>? meanAux = null;
+        LazyNode<float>? varAux = null;
+        int statEnd = Math.Min(nodes.Count - 1, lnIndex + 3);
+        for (int j = lnIndex + 1; j <= statEnd; j++)
+        {
+            if (nodes[j] is LazyNode<float> statNode && ReferenceEquals(statNode.Input0, lnNode.Output))
+            {
+                if (alreadyRemoved.Contains(statNode))
+                {
+                    if (statNode.OpName is "LayerNormMean" or "LayerNormVariance") return false;
+                    continue;
+                }
+                if (statNode.OpName == "LayerNormMean")
+                {
+                    if (consumerCounts.TryGetValue(statNode, out int mc) && mc > 0) return false;
+                    meanAux = statNode;
+                }
+                else if (statNode.OpName == "LayerNormVariance")
+                {
+                    if (consumerCounts.TryGetValue(statNode, out int vc) && vc > 0) return false;
+                    varAux = statNode;
+                }
+            }
+        }
+
+        var gamma = lnNode.Input1;
+        var beta = lnNode.Input2;
+        int cols = gamma.Length;
+        if (cols <= 0 || beta.Length != cols || addNode.Output.Length == 0 || addNode.Output.Length % cols != 0)
+            return false;
+
+        int normDims = gamma.Rank;
+        if (normDims > addNode.Output.Rank)
+            return false;
+        for (int d = 0; d < normDims; d++)
+        {
+            if (gamma._shape[d] != addNode.Output._shape[addNode.Output.Rank - normDims + d])
+                return false;
+        }
+
+        if (!TryExtractLayerNormEpsilon(lnNode, out float epsilon))
+            return false;
+
+        int rows = addNode.Output.Length / cols;
+        var capturedInput = addNode.Input0;
+        var capturedResidual = addNode.Input1;
+        var capturedGamma = gamma;
+        var capturedBeta = beta;
+        var meanHolder = new Tensor<float>(new[] { rows });
+        var invStdHolder = new Tensor<float>(new[] { rows });
+
+        addNode.Output.LazySource = null;
+        if (meanAux is not null) meanAux.Output.LazySource = null;
+        if (varAux is not null) varAux.Output.LazySource = null;
+
+        var node = new LazyNode<float>(
+            LazyNodeType.Custom,
+            "FusedLayerNormResidual",
+            new[] { capturedInput, capturedResidual, capturedGamma, capturedBeta },
+            lnNode.Output,
+            (eng, output) =>
+            {
+                if (eng.TryGet<DirectGpuTensorEngine>(out var gpu)
+                    && gpu.TryExecuteFusedLayerNormResidualInto(
+                        capturedInput, capturedResidual, capturedGamma, capturedBeta,
+                        output, meanHolder, invStdHolder, rows, cols, epsilon))
+                {
+                    return;
+                }
+
+                if (!eng.Is<DirectGpuTensorEngine>()
+                    && capturedInput.IsContiguous
+                    && capturedResidual.IsContiguous
+                    && capturedGamma.IsContiguous
+                    && capturedBeta.IsContiguous
+                    && output.IsContiguous)
+                {
+                    CompiledFusedKernels.LayerNormResidualForward(
+                        capturedInput.AsSpan(),
+                        capturedResidual.AsSpan(),
+                        capturedGamma.AsSpan(),
+                        capturedBeta.AsSpan(),
+                        output.AsWritableSpan(),
+                        meanHolder.AsWritableSpan(),
+                        invStdHolder.AsWritableSpan(),
+                        rows,
+                        cols,
+                        epsilon);
+                    output.IncrementVersion();
+                    meanHolder.IncrementVersion();
+                    invStdHolder.IncrementVersion();
+                    return;
+                }
+
+                var sum = eng.TensorAdd(capturedInput, capturedResidual);
+                var r = eng.LayerNorm(sum, capturedGamma, capturedBeta, epsilon, out var freshMean, out var freshVar);
+                DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                var mSpan = freshMean.AsSpan();
+                var vSpan = freshVar.AsSpan();
+                var mDst = meanHolder.AsWritableSpan();
+                var invDst = invStdHolder.AsWritableSpan();
+                for (int i = 0; i < rows; i++)
+                {
+                    mDst[i] = mSpan[i];
+                    invDst[i] = 1.0f / GeneratedKernelSimdMath.SqrtScalar(vSpan[i] + epsilon);
+                }
+                meanHolder.IncrementVersion();
+                invStdHolder.IncrementVersion();
+            },
+            (gradOutput, inputs, _, _, engine, grads) =>
+            {
+                var x = inputs[0];
+                var res = inputs[1];
+                var g = inputs[2];
+                var b = inputs[3];
+                bool needX = DifferentiableOps.IsGradientRequired(x);
+                bool needRes = DifferentiableOps.IsGradientRequired(res);
+                bool needGamma = DifferentiableOps.IsGradientRequired(g);
+                bool needBeta = DifferentiableOps.IsGradientRequired(b);
+                if (!needX && !needRes && !needGamma && !needBeta)
+                    return;
+
+                if (!engine.Is<DirectGpuTensorEngine>()
+                    && gradOutput.IsContiguous
+                    && x.IsContiguous
+                    && res.IsContiguous
+                    && g.IsContiguous)
+                {
+                    // The scratch comes from the shared array pool and each gradient is written straight into its
+                    // accumulator where one exists (stored on the step's first write, added otherwise), as the compiled
+                    // LayerNorm's backward does. Renting fresh tensors handed a new [rows, cols] array to the gradient
+                    // map every step: 135 KB more managed allocation per step on the parity Transformer.
+                    int total = rows * cols;
+                    var pool = System.Buffers.ArrayPool<float>.Shared;
+                    float[] shared = pool.Rent(total);
+                    float[]? gammaScratch = needGamma ? pool.Rent(cols) : null;
+                    float[]? betaScratch = needBeta ? pool.Rent(cols) : null;
+                    try
+                    {
+                        CompiledFusedKernels.LayerNormResidualBackward(
+                            gradOutput.AsSpan(),
+                            x.AsSpan(),
+                            res.AsSpan(),
+                            g.AsSpan(),
+                            meanHolder.AsSpan(),
+                            invStdHolder.AsSpan(),
+                            shared.AsSpan(0, total),
+                            gammaScratch is not null ? gammaScratch.AsSpan(0, cols) : Span<float>.Empty,
+                            betaScratch is not null ? betaScratch.AsSpan(0, cols) : Span<float>.Empty,
+                            rows,
+                            cols);
+                        // Writing straight into an accumulator is only safe when no two of the targets are one tensor.
+                        bool distinct = !ReferenceEquals(x, res) && !ReferenceEquals(x, g) && !ReferenceEquals(x, b)
+                            && !ReferenceEquals(res, g) && !ReferenceEquals(res, b) && !ReferenceEquals(g, b);
+                        if (needX) WriteGradient(grads, x, shared, total, engine, distinct);
+                        if (needRes) WriteGradient(grads, res, shared, total, engine, distinct);
+                        if (gammaScratch is not null) WriteGradient(grads, g, gammaScratch, cols, engine, distinct);
+                        if (betaScratch is not null) WriteGradient(grads, b, betaScratch, cols, engine, distinct);
+                    }
+                    finally
+                    {
+                        pool.Return(shared);
+                        if (gammaScratch is not null) pool.Return(gammaScratch);
+                        if (betaScratch is not null) pool.Return(betaScratch);
+                    }
+                    return;
+                }
+
+                // Engine fallback (the GPU, or a strided operand): recover the variance LayerNormBackward expects from the
+                // saved inverse standard deviation with engine ops, var = max(0, 1 / invStd^2 - eps), so the statistics
+                // stay where the forward wrote them. Reading them on the host downloaded every step and broke CUDA graph
+                // capture.
+                var varTensor = engine.ReLU(engine.TensorAddScalar(
+                    engine.TensorReciprocal(engine.TensorMultiply(invStdHolder, invStdHolder)), -epsilon));
+                var sum = engine.TensorAdd(x, res);
+                var gradSum = engine.LayerNormBackward(gradOutput, sum, g, meanHolder, varTensor, epsilon, out var dGamma, out var dBeta);
+                if (needX)
+                    DifferentiableOps.AccumulateGrad(grads, x, gradSum, engine);
+                if (needRes)
+                    DifferentiableOps.AccumulateGrad(grads, res, gradSum, engine);
+                if (needGamma)
+                    DifferentiableOps.AccumulateGrad(grads, g, dGamma, engine);
+                if (needBeta)
+                    DifferentiableOps.AccumulateGrad(grads, b, dBeta, engine);
+            },
+            new object[] { (double)epsilon })
+        {
+            RecordingEngine = lnNode.RecordingEngine
+        };
+
+        fused = node;
+        PatternHelpers.SetLazySource(node);
+        alreadyRemoved.Add(addNode);
+        alreadyRemoved.Add(lnNode);
+        if (meanAux is not null) alreadyRemoved.Add(meanAux);
+        if (varAux is not null) alreadyRemoved.Add(varAux);
+        return true;
+    }
+
+    /// <summary>
+    /// Hands one input its gradient <paramref name="source"/>[0..length): written straight into the existing host
+    /// accumulator when there is one (stored on the step's first write, added otherwise), else as a new contribution.
+    /// </summary>
+    private static void WriteGradient(
+        Dictionary<Tensor<float>, Tensor<float>> grads, Tensor<float> input, float[] source, int length, IEngine engine,
+        bool distinct)
+    {
+        if (distinct)
+        {
+            var acc = DifferentiableOps.TryGetDirectGradTarget(grads, input, engine, out bool overwrite);
+            int offset = 0;
+            var arr = acc?.GetCpuBackingForContiguousWrite(out offset);
+            if (acc is not null && arr is not null)
+            {
+                var src = new ReadOnlySpan<float>(source, 0, length);
+                var dst = new Span<float>(arr, offset, length);
+                if (overwrite) src.CopyTo(dst);
+                else for (int i = 0; i < length; i++) dst[i] += src[i];
+                acc.IncrementVersion();
+                return;
+            }
+        }
+        var contribution = new Tensor<float>(input._shape);
+        new ReadOnlySpan<float>(source, 0, length).CopyTo(contribution.AsWritableSpan());
+        contribution.IncrementVersion();
+        DifferentiableOps.AccumulateGrad(grads, input, contribution, engine);
+    }
+
+    private static bool TryExtractLayerNormEpsilon(LazyNode<float> lnNode, out float epsilon)
+    {
+        epsilon = 1e-5f;
+        if (lnNode.SavedState is not { Length: >= 1 } state)
+            return false;
+
+        // Generic LayerNorm records { stateRef, stateRef, (double)epsilon }; inference records { (double)epsilon };
+        // CpuEngine.LayerNormCompiled records { stats, LayerNormRowShape(rows, features, eps) }.
+        for (int i = state.Length - 1; i >= 0; i--)
+        {
+            object? entry = state[i];
+            if (entry is double d)
+            {
+                epsilon = (float)d;
+                return epsilon >= 0.0f && !float.IsNaN(epsilon) && !float.IsInfinity(epsilon);
+            }
+            if (entry is float f)
+            {
+                epsilon = f;
+                return epsilon >= 0.0f && !float.IsNaN(epsilon) && !float.IsInfinity(epsilon);
+            }
+            if (entry is not null)
+            {
+                var field = entry.GetType().GetField("Epsilon", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (field?.GetValue(entry) is float fieldFloat)
+                {
+                    epsilon = fieldFloat;
+                    return epsilon >= 0.0f && !float.IsNaN(epsilon) && !float.IsInfinity(epsilon);
+                }
+                var prop = entry.GetType().GetProperty("Epsilon", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (prop?.GetValue(entry) is float propFloat)
+                {
+                    epsilon = propFloat;
+                    return epsilon >= 0.0f && !float.IsNaN(epsilon) && !float.IsInfinity(epsilon);
+                }
+            }
+        }
+
+        return false;
+    }
+}

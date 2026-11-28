@@ -73,6 +73,14 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
     // all of the dictionary's locks (it showed as lock contention on the hot launch path of VGG-11 inference).
     private int _measurementParkedCount;
     private int _disposed;
+    private long _undersizedCandidateSkips;
+    private long _restoreLockAcquisitions;
+
+    /// <summary>Total number of undersized candidates skipped during <see cref="TryRentFromBucket"/>.</summary>
+    internal long UndersizedCandidateSkipCount => Interlocked.Read(ref _undersizedCandidateSkips);
+
+    /// <summary>Total number of <c>_lifecycleGate</c> acquisitions performed by <see cref="RestoreUndersizedCandidates"/>.</summary>
+    internal long RestoreLockAcquisitions => Interlocked.Read(ref _restoreLockAcquisitions);
 
     private void UnmarkMeasurementParked(TBuffer buffer)
     {
@@ -112,23 +120,68 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
         _drainedAtMeasurement = Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasurementGeneration;
     }
 
-    private int BucketKey(int size) => _exactSizes ? size : NextPowerOfTwo(size);
+    /// <summary>
+    /// Computes the physical allocation capacity matching this pool's bucket ceiling for <paramref name="requestedSize"/>.
+    /// Allocating physical capacity equal to the bucket ceiling guarantees every buffer parked in bucket <c>B</c>
+    /// satisfies <c>Capacity &gt;= requestedSize</c> for any future request routing to bucket <c>B</c>, eliminating
+    /// undersized-candidate skips and lock contention during dynamic-shape execution.
+    /// </summary>
+    internal int RoundUpToBucketCapacity(int requestedSize)
+    {
+        if (requestedSize <= 0)
+        {
+            return 0;
+        }
+
+        if (_exactSizes || requestedSize > _maxSize)
+        {
+            return requestedSize;
+        }
+
+        int ceiling = ComputeSizeClassCeiling(requestedSize);
+        return ceiling > _maxSize ? _maxSize : ceiling;
+    }
+
+    private int BucketKey(int size) => _exactSizes ? size : ComputeSizeClassCeiling(size);
 
     /// <summary>
-    /// Rounds up to the next power of two for bucket key.
-    /// This increases cache hit rate by reducing the number of distinct bucket sizes.
-    /// A request for 1000 elements reuses a buffer allocated for 1024 elements.
+    /// Rounds up to the half-step size class (<c>2^k</c> or <c>1.5 * 2^k</c>: 1, 2, 3, 4, 6, 8, 12, 16, ..., 512, 768, 1024, ...).
+    /// Bounds worst-case internal fragmentation at &lt;= 50% (&lt;= 33.3% on the upper half-step) rather than ~100% under pure
+    /// powers of two, while avoiding 32-bit signed overflow near <see cref="int.MaxValue"/>.
     /// </summary>
-    private static int NextPowerOfTwo(int size)
+    internal static int ComputeSizeClassCeiling(int size)
     {
-        if (size <= 0) return 1;
-        size--;
-        size |= size >> 1;
-        size |= size >> 2;
-        size |= size >> 4;
-        size |= size >> 8;
-        size |= size >> 16;
-        return size + 1;
+        if (size <= 1) return 1;
+        if (size <= 4) return size;
+
+        ulong v = (ulong)(uint)(size - 1);
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        ulong nextPow2 = v + 1UL;
+        ulong halfStep = nextPow2 - (nextPow2 >> 2);
+
+        ulong chosen = (ulong)(uint)size <= halfStep ? halfStep : nextPow2;
+        return chosen >= int.MaxValue ? int.MaxValue : (int)chosen;
+    }
+
+    /// <summary>
+    /// Advances from one half-step size class to the next larger size class in O(1), or returns <see cref="long.MaxValue"/>
+    /// once <see cref="int.MaxValue"/> has been reached.
+    /// </summary>
+    internal static long NextSizeClassAfter(long currentBucket)
+    {
+        if (currentBucket <= 0) return long.MaxValue;
+        if (currentBucket < 4) return currentBucket + 1;
+        if (currentBucket >= int.MaxValue) return long.MaxValue;
+
+        long next = (currentBucket & (currentBucket - 1)) == 0
+            ? currentBucket + (currentBucket >> 1)
+            : currentBucket + (currentBucket / 3);
+
+        return next >= int.MaxValue ? int.MaxValue : next;
     }
 
     public bool TryRent(int size, out TBuffer? buffer)
@@ -150,8 +203,18 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
             && Interlocked.Exchange(ref _drainedAtMeasurement, measurements) != measurements)
             DrainMeasurementParked();
 
-        // Use power-of-two bucket key for higher cache hit rate
-        return TryRentFromBucket(size, BucketKey(size), affinity, out buffer);
+        int bucketKey = BucketKey(size);
+        if (TryRentFromBucket(size, bucketKey, affinity, out buffer)) return true;
+        // A half-step class (1.5 * 2^k) misses: try the power of two above it, the bucket a power-of-two pool would have
+        // served this request from. Without it a parked 8192-capacity buffer is not reused for a 5000-element request
+        // (class 6144) and a fresh device allocation is made while capacity that fits sits idle. Every buffer in that
+        // bucket holds more than 1.5 * 2^k elements, so it never yields an undersized candidate.
+        if (!_exactSizes && bucketKey > 4 && (bucketKey & (bucketKey - 1)) != 0)
+        {
+            long powerOfTwo = NextSizeClassAfter(bucketKey);
+            if (powerOfTwo <= _maxSize && TryRentFromBucket(size, (int)powerOfTwo, affinity, out buffer)) return true;
+        }
+        return false;
     }
 
     private bool TryRentFromBucket(int size, int bucketKey, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
@@ -173,6 +236,7 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
                 // an undersized top entry into a false miss when a sufficient entry is also pooled.
                 if (candidate.Capacity < size)
                 {
+                    Interlocked.Increment(ref _undersizedCandidateSkips);
                     (undersized ??= new List<TBuffer>()).Add(candidate);
                     continue;
                 }
@@ -194,14 +258,68 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
         List<TBuffer>? candidates,
         GpuBufferPoolAffinity affinity)
     {
-        if (candidates is null)
+        if (candidates is null || candidates.Count == 0)
             return;
 
-        // Re-enter through Return so disposal, maximum-size checks, and capacity accounting remain
-        // atomic with the lifecycle gate. Adding directly to the bag could race Dispose and orphan
-        // an allocation in a bucket that has already been removed.
-        foreach (TBuffer candidate in candidates)
-            Return(candidate, affinity);
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            foreach (TBuffer candidate in candidates)
+            {
+                UnmarkMeasurementParked(candidate);
+                candidate.Release();
+            }
+            return;
+        }
+
+        List<TBuffer>? overflow = null;
+        bool measuringOnThisThread = Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasuringOnThisThread;
+
+        // Re-insert all undersized candidates under a single _lifecycleGate acquisition rather than N acquisitions,
+        // and release any rejected/disposed buffers outside the gate so native driver frees never hold _lifecycleGate.
+        lock (_lifecycleGate)
+        {
+            Interlocked.Increment(ref _restoreLockAcquisitions);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                overflow = candidates;
+            }
+            else
+            {
+                for (int i = candidates.Count - 1; i >= 0; i--)
+                {
+                    TBuffer candidate = candidates[i];
+                    if (candidate.Capacity > _maxSize)
+                    {
+                        (overflow ??= new List<TBuffer>()).Add(candidate);
+                        continue;
+                    }
+
+                    int bucketKey = BucketKey(candidate.Capacity);
+                    var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
+                    int count = Interlocked.Increment(ref bucket.Count);
+                    if (count > _maxPerSize || Interlocked.Add(ref _pooledElements, candidate.Capacity) > MaxPooledElements)
+                    {
+                        Interlocked.Decrement(ref bucket.Count);
+                        if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -candidate.Capacity);
+                        (overflow ??= new List<TBuffer>()).Add(candidate);
+                        continue;
+                    }
+
+                    if (measuringOnThisThread && _measurementParked.TryAdd(candidate, 0))
+                        Interlocked.Increment(ref _measurementParkedCount);
+                    bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentStack<TBuffer>()).Push(candidate);
+                }
+            }
+        }
+
+        if (overflow is not null)
+        {
+            foreach (TBuffer rejected in overflow)
+            {
+                UnmarkMeasurementParked(rejected);
+                rejected.Release();
+            }
+        }
     }
 
     public void Return(TBuffer buffer)
@@ -216,34 +334,41 @@ internal sealed partial class GpuBufferPool<TBuffer> : IDisposable where TBuffer
             return;
         }
 
+        bool shouldRelease = false;
         lock (_lifecycleGate)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
-                UnmarkMeasurementParked(buffer);
-                buffer.Release();
-                return;
+                shouldRelease = true;
             }
-
-            // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
-            // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
-            // device buffer in a bucket that is no longer reachable.
-            int bucketKey = BucketKey(buffer.Capacity);
-            var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
-            int count = Interlocked.Increment(ref bucket.Count);
-            if (count > _maxPerSize || Interlocked.Add(ref _pooledElements, buffer.Capacity) > MaxPooledElements)
+            else
             {
-                Interlocked.Decrement(ref bucket.Count);
-                if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -buffer.Capacity);
-                UnmarkMeasurementParked(buffer);
-                buffer.Release();
-                return;
+                // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
+                // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
+                // device buffer in a bucket that is no longer reachable.
+                int bucketKey = BucketKey(buffer.Capacity);
+                var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
+                int count = Interlocked.Increment(ref bucket.Count);
+                if (count > _maxPerSize || Interlocked.Add(ref _pooledElements, buffer.Capacity) > MaxPooledElements)
+                {
+                    Interlocked.Decrement(ref bucket.Count);
+                    if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -buffer.Capacity);
+                    shouldRelease = true;
+                }
+                else
+                {
+                    // Marked before it is visible to a rent, which clears the mark.
+                    if (Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasuringOnThisThread)
+                        if (_measurementParked.TryAdd(buffer, 0)) Interlocked.Increment(ref _measurementParkedCount);
+                    bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentStack<TBuffer>()).Push(buffer);
+                }
             }
+        }
 
-            // Marked before it is visible to a rent, which clears the mark.
-            if (Helpers.Autotune.TunedKernels.TunedKernelRegistry.MeasuringOnThisThread)
-                if (_measurementParked.TryAdd(buffer, 0)) Interlocked.Increment(ref _measurementParkedCount);
-            bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentStack<TBuffer>()).Push(buffer);
+        if (shouldRelease)
+        {
+            UnmarkMeasurementParked(buffer);
+            buffer.Release();
         }
     }
 

@@ -119,6 +119,9 @@ public class CompiledEagerFirstWriteGradientTests
     [Fact]
     public void ClaimingSpecializedWriters_SkipZeroingAndReproduceStepZeroGradients_BitExact()
     {
+        // The specialized TensorAdd writer is under test; the add+tanh fusion would replace it.
+        using var suspended0 = FusionPatternRegistry.Suspend("AddAndBiasActivation");
+        Assert.NotNull(suspended0);
         const int Rows = 8, Dim = 6;
         var engine = new CpuEngine();
         var x = Filled(new[] { Rows, Dim }, 11, 2f);
@@ -152,6 +155,65 @@ public class CompiledEagerFirstWriteGradientTests
             // The claiming delegates must actually be in the plan, or this test proves nothing.
             Assert.Contains("specialized:TensorMatMul", concrete.BackwardStepKinds);
             Assert.Contains("specialized:TensorAdd", concrete.BackwardStepKinds);
+
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            plan.Step();
+            var step0 = new float[ps.Length][];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                step0[i] = Snapshot(ps[i].Grad, names[i]);
+                AssertClose(eager[i], step0[i], $"{names[i]} step 0 vs eager");
+            }
+
+            for (int step = 1; step < 5; step++)
+            {
+                plan.Step();
+                for (int i = 0; i < ps.Length; i++)
+                    AssertBitEqual(step0[i], ps[i].Grad, $"{names[i]} step {step}");
+                if (step >= 2)
+                    Assert.Equal(0L, concrete.LastClearedGradElements);
+            }
+        }
+    }
+
+    /// <summary>The same residual graph with the add+tanh fusion active: the fused backward is exact and claims too.</summary>
+    [Fact]
+    public void FusedAddActivation_SkipsZeroingAndReproducesStepZeroGradients_BitExact()
+    {
+        const int Rows = 8, Dim = 6;
+        var engine = new CpuEngine();
+        var x = Filled(new[] { Rows, Dim }, 11, 2f);
+        Tensor<float>[] MakeParams() => new[]
+        {
+            Filled(new[] { Dim, Dim }, 12, 1f), Filled(new[] { Dim }, 13, 1f), Filled(new[] { Dim }, 14, 1f),
+            Filled(new[] { Dim, Dim }, 15, 1f), Filled(new[] { Dim, Dim }, 16, 1f), Filled(new[] { Dim, Dim }, 17, 1f),
+        };
+        string[] names = { "W0", "gamma", "beta", "Wq", "Wk", "Wv" };
+
+        var eagerParams = MakeParams();
+        var eager = new Tensor<float>[eagerParams.Length];
+        using (var tape = new GradientTape<float>())
+        {
+            var p = eagerParams;
+            var loss = ResidualForward(engine, x, p[0], p[1], p[2], p[3], p[4], p[5]);
+            var grads = tape.ComputeGradients(loss, sources: p);
+            for (int i = 0; i < p.Length; i++) eager[i] = grads[p[i]];
+        }
+
+        var ps = MakeParams();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            ResidualForward(engine, x, ps[0], ps[1], ps[2], ps[3], ps[4], ps[5]);
+            plan = scope.CompileTraining(ps);
+        }
+        using (plan)
+        {
+            var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            // The claiming delegates must actually be in the plan, or this test proves nothing.
+            Assert.Contains("specialized:TensorMatMul", concrete.BackwardStepKinds);
+            // The residual add + tanh is fused: its backward must match eager and still clear nothing.
+            Assert.Contains("generic:FusedAddActivation", concrete.BackwardStepKinds);
 
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
             plan.Step();

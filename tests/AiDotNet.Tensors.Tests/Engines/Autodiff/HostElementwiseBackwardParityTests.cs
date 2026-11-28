@@ -97,6 +97,6 @@ public sealed class HostElementwiseBackwardParityTests
         var actual = RunBackward("clamp", x, y, g, new object[] { -0.5, 0.5 });
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.Equal(BitConverter.SingleToInt32Bits(expected[i]), BitConverter.SingleToInt32Bits(actual[i]));
+            Assert.Equal(TestHelpers.MathCompat.SingleToInt32Bits(expected[i]), TestHelpers.MathCompat.SingleToInt32Bits(actual[i]));
     }
 }
