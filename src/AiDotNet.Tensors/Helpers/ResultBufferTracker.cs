@@ -329,6 +329,24 @@ internal static class ResultBufferTracker
     }
 
     /// <summary>
+    /// Makes the array behind <paramref name="state"/> free now, without waiting for a collection to clear its owner:
+    /// its result was released (disposed, or its <see cref="Engines.TensorScope"/> ended) and nothing else can reach
+    /// the array, but the thread cache had no room for it. The next rent of its size takes it. False when the entry is
+    /// not <paramref name="state"/>'s, or the array escaped.
+    /// </summary>
+    internal static bool MarkFree(ResultBufferState state)
+    {
+        lock (s_lock)
+        {
+            if (state.Escaped || state.TrackedArray is not { } array || !s_byArray.TryGetValue(array, out var entry)
+                || !ReferenceEquals(entry.State, state) || entry.Parked)
+                return false;
+            entry.Owner.Target = null;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// The owner a new result takes over a parked array the thread cache just handed out; null when the array is not
     /// parked (an explicitly returned array, which stays untracked). Free when nothing is parked.
     /// </summary>
@@ -408,10 +426,14 @@ internal static class ResultBufferTracker
         int shift = GetBackoff(key);
         if (IssuedSinceCollect(bytes) < (CollectBudgetBytes << shift)) return null;
 
-        // Freed nothing of this size last time: the dead owners may be older than gen 0, so this one includes gen 1.
-        // Never gen 2: a full collection costs too much in a large heap (an inference loop whose results all escaped
-        // paid 0.35 ms per call that way) and the GC runs gen 2 on its own schedule anyway.
-        GC.Collect(shift > 0 ? 1 : 0, GCCollectionMode.Forced, blocking: true);
+        // Gen 1 when gen 0 cannot free what is pending: this size freed nothing last time, or a collection's worth of
+        // tracked owners already sit in gen 1. A collection runs inside an op, so the results still in flight (the op's
+        // inputs, the caller's partial results) survive it and are promoted, and a gen-0 collection never frees them
+        // even once they die. Counting them keeps them from piling up until a natural gen-2: with no other garbage, a
+        // five-op chain over 4 MB results held 700 MB tracked between gen-2s, a third of its results fresh. Never
+        // gen 2: a full collection costs too much in a large heap (an inference loop whose results all escaped paid
+        // 0.35 ms per call that way) and the GC runs gen 2 on its own schedule anyway.
+        GC.Collect(shift > 0 || PromotedOwnerBytes() >= CollectBudgetBytes ? 1 : 0, GCCollectionMode.Forced, blocking: true);
         Interlocked.Increment(ref InducedCollections);
         Volatile.Write(ref s_lastGen0, GC.CollectionCount(0));
         Interlocked.Exchange(ref s_issuedSinceCollect, 0);
@@ -419,6 +441,24 @@ internal static class ResultBufferTracker
         SetBackoff(key, array is not null ? 0 : Math.Min(5, shift + 1));
         TrimFree();
         return array;
+    }
+
+    /// <summary>
+    /// Bytes of tracked arrays whose owner is still reachable and in gen 1: dead or alive, only a gen-1 (or deeper)
+    /// collection can tell. Gen-2 owners are left to the GC's own gen-2 schedule.
+    /// </summary>
+    private static long PromotedOwnerBytes()
+    {
+        long bytes = 0;
+        lock (s_lock)
+        {
+            foreach (var entry in s_byArray.Values)
+            {
+                if (entry.Parked || entry.Owner.Target is not { } owner) continue;
+                if (GC.GetGeneration(owner) == 1) bytes += entry.Bytes;
+            }
+        }
+        return bytes;
     }
 
     private static int GetBackoff((Type, int) key)

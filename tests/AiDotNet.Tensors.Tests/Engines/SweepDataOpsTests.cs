@@ -115,6 +115,66 @@ public sealed class SweepDataOpsTests
         Assert.Equal(b.NextDouble(), a.NextDouble());
     }
 
+    // The two scale orders of a loop over seed 1234: (std * r) * cos and std * (r * cos) round differently.
+    private static double[] ScaledLoop(int seed, int count, double mean, double std, bool scaleFirst, BoxMullerBranch branch)
+    {
+        var r = RandomHelper.CreateSeededRandom(seed);
+        var values = new double[count];
+        for (int i = 0; i < count; i++)
+        {
+            double u1 = 1.0 - r.NextDouble();
+            double u2 = r.NextDouble();
+            double trig = branch == BoxMullerBranch.Sine ? Math.Sin(2.0 * Math.PI * u2) : Math.Cos(2.0 * Math.PI * u2);
+            values[i] = scaleFirst
+                ? mean + std * Math.Sqrt(-2.0 * Math.Log(u1)) * trig
+                : mean + std * (Math.Sqrt(-2.0 * Math.Log(u1)) * trig);
+        }
+        return values;
+    }
+
+    [Theory]
+    [InlineData(0.667, 0.0, BoxMullerBranch.Cosine)]
+    [InlineData(3.5, 0.0, BoxMullerBranch.Cosine)]
+    [InlineData(0.02, 1.0, BoxMullerBranch.Cosine)]
+    [InlineData(0.02, 0.0, BoxMullerBranch.Sine)]
+    public void BoxMuller_EachScaleOrder_ReproducesItsOwnLoop(double std, double mean, BoxMullerBranch branch)
+    {
+        const int count = 257;
+        var first = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, branch,
+            BoxMullerScaleOrder.ScaleFirst, exact: false);
+        var last = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, branch,
+            BoxMullerScaleOrder.ScaleLast, exact: false);
+        var drawnFirst = Cpu.TensorNormalBoxMullerFromRng<double>(RandomHelper.CreateSeededRandom(1234), new[] { count }, first, mean, std).ToArray();
+        var drawnLast = Cpu.TensorNormalBoxMullerFromRng<double>(RandomHelper.CreateSeededRandom(1234), new[] { count }, last, mean, std).ToArray();
+        var loopFirst = ScaledLoop(1234, count, mean, std, scaleFirst: true, branch);
+        var loopLast = ScaledLoop(1234, count, mean, std, scaleFirst: false, branch);
+
+        AssertSame(loopFirst, drawnFirst, "scale first");
+        AssertSame(loopLast, drawnLast, "scale last");
+        // The orders really differ on this stream, so each assertion above can tell them apart.
+        Assert.Contains(Enumerable.Range(0, count), i => loopFirst[i] != loopLast[i]);
+    }
+
+    [Fact]
+    public void BoxMuller_TheFourArgumentConstructor_IsScaleLastAndNotExact()
+    {
+        var v = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine);
+        Assert.Equal(BoxMullerScaleOrder.ScaleLast, v.ScaleOrder);
+        Assert.False(v.Exact);
+        Assert.Equal(BoxMullerScaleOrder.ScaleLast, default(BoxMullerVariant).ScaleOrder);
+    }
+
+    [Fact]
+    public void BoxMuller_UnknownScaleOrder_Throws_WithTheRandomUntouched()
+    {
+        var v = new BoxMullerVariant(BoxMullerFirstUniform.OneMinus, 0.0, BoxMullerSecondUniform.Raw, BoxMullerBranch.Cosine,
+            (BoxMullerScaleOrder)7, exact: false);
+        var a = RandomHelper.CreateSeededRandom(9);
+        var b = RandomHelper.CreateSeededRandom(9);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Cpu.TensorNormalBoxMullerFromRng<double>(a, new[] { 3 }, v));
+        Assert.Equal(b.NextDouble(), a.NextDouble());
+    }
+
     [Fact]
     public void BoxMuller_Float_IsTheDoubleValueRounded()
     {

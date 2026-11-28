@@ -28,10 +28,45 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// - Third dimension: color channels (red, green, blue)
 /// </para>
 /// </remarks>
-public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedDeviceTensor
+public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedDeviceTensor, Engines.IScopedHostTensor
 {
     void Engines.IScopedDeviceTensor.ReleaseFromScope(Engines.DirectGpuTensorEngine engine)
         => engine.ReleaseDeadDeviceStorage(this, afterQueuedWork: true);
+
+    /// <summary>
+    /// Returns this host result's array for reuse at once, as its <see cref="Engines.TensorScope"/> ended without keeping
+    /// it, and leaves the tensor (and every view of its storage) throwing on any later access. Left untouched, and to
+    /// the tracker, when anything else can still reach the array: raw access escaped it, another vector wraps it, or
+    /// it is no longer this result's.
+    /// </summary>
+    void Engines.IScopedHostTensor.ReleaseHostFromScope()
+    {
+#if NET5_0_OR_GREATER
+        if (IsDisposed || _pooledArray is not { } array) return;
+        var vector = _data;
+        if (vector.ResultOwner is not { } owner) return;
+        var state = owner.State;
+        if (state.Escaped || Volatile.Read(ref state.Wrappers) != 1 || !ReferenceEquals(state.TrackedArray, array)) return;
+
+        _pooledArray = null;
+        vector.ResultOwner = null;
+        vector.ReleaseHostStorage(Engines.TensorScope.ReleasedHostResultMessage);
+        RecycleReleasedArray(array, state);
+#endif
+    }
+
+#if NET5_0_OR_GREATER
+    // Hands a released result's array to the thread cache, or (no room there) marks it free with the tracker, so
+    // either way the next rent of its size takes it without a collection.
+    private static void RecycleReleasedArray(T[] array, Helpers.ResultBufferState state)
+    {
+        // A deferred GPU download registered against this array must not land in it after it is handed to a new owner.
+        Helpers.HostSync.Forget(array);
+        if (Helpers.ResultBufferTracker.Stress) Helpers.ResultBufferTracker.Poison(array);
+        // Taken: the tracker entry stays (parked) so the next result over the array is tracked again.
+        if (!Helpers.ThreadLocalTensorCache<T>.TryReturn(array, state)) Helpers.ResultBufferTracker.MarkFree(state);
+    }
+#endif
     /// <summary>
     /// Accumulated gradient from backward passes. Null until first backward, then
     /// lazily allocated and reused across training steps to avoid per-step allocation.
@@ -97,12 +132,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedD
 
         _pooledArray = null;
         vector.ResultOwner = null;
-        // A deferred GPU download registered against this array must not land in it after it is handed to a new owner.
-        Helpers.HostSync.Forget(array);
-        if (Helpers.ResultBufferTracker.Stress) Helpers.ResultBufferTracker.Poison(array);
-        // Taken: the tracker entry stays (parked) so the next result over the array is tracked again. Declined: the
-        // tracker keeps the array and reuses it after a collection, as for any result nobody disposed.
-        Helpers.ThreadLocalTensorCache<T>.TryReturn(array, state);
+        RecycleReleasedArray(array, state);
 #endif
     }
     /// <summary>
@@ -1017,6 +1047,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>, Engines.IScopedD
         else if (track) vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
+        // Inside a TensorScope a tracked host result goes back for reuse when the scope ends, unless kept.
+        if (vector.ResultOwner is not null && Engines.TensorScope.Current is not null) Engines.TensorScope.TrackHost(vector, tensor);
         return tensor;
     }
 

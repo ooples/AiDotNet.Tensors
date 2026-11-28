@@ -628,7 +628,41 @@ public static class CpuParallelSettings
         // pattern as ParallelForChunks (line 84) and the legacy LightweightParallel
         // code path. Snapshot BOTH gating values once so a concurrent setter
         // mid-call can't toggle us between the serial and parallel paths.
-        int maxDegree = Math.Min(MaxDegreeOfParallelism, maximumDegreeOfParallelism);
+        if (!TryPlanIndependentDispatch(toExclusive - fromInclusive, totalWork, maximumDegreeOfParallelism,
+                deterministicSafe, out int chunks, out int maxDegree))
+        {
+            // Match Parallel.For's exception semantics: capture
+            // first thrown exception, finish remaining iterations,
+            // re-throw at end. Parallel.For uses
+            // AggregateException — for serial-mode we re-throw the
+            // raw first exception (consistent with the
+            // PersistentParallelExecutor.Execute serial path).
+            Exception? firstException = null;
+            for (int i = fromInclusive; i < toExclusive; i++)
+            {
+                try { body(i); }
+                catch (Exception ex) { firstException ??= ex; }
+            }
+            if (firstException is not null) throw firstException;
+            return;
+        }
+
+        DispatchChunks(fromInclusive, toExclusive - fromInclusive, chunks, maxDegree, body);
+    }
+
+    /// <summary>
+    /// The dispatch decision of <see cref="ParallelForOrSerial(int, int, long, Action{int}, int, bool)"/>, without the
+    /// dispatch: false when the loop runs serially on the calling thread (one thread allowed, deterministic mode for a
+    /// loop that is not <paramref name="deterministicSafe"/>, already inside a parallel region, one iteration, or too
+    /// little work); otherwise the number of pool chunks and the degree cap to pass to
+    /// <see cref="PersistentParallelExecutor.Execute(int, int, Action{int})"/>. The global degree is read once.
+    /// Callers that cache their chunk body (no per-call closure) plan here and dispatch themselves.
+    /// </summary>
+    internal static bool TryPlanIndependentDispatch(int count, long totalWork, int maximumDegreeOfParallelism,
+        bool deterministicSafe, out int chunks, out int maxDegree)
+    {
+        chunks = 0;
+        maxDegree = Math.Min(MaxDegreeOfParallelism, maximumDegreeOfParallelism);
         // DeterministicReductions forces order-dependent reductions serial for
         // bit-reproducibility; deterministicSafe callers stay parallel (they're already
         // reproducible across thread counts) so deterministic mode doesn't lose GEMM
@@ -647,24 +681,9 @@ public static class CpuParallelSettings
         // serial fraction of foundation-scale diffusion training. ParallelForRegion
         // already special-cases count==1; this brings ParallelForOrSerial in line.
         if (maxDegree <= 1 || deterministic || _inParallelRegion
-            || (toExclusive - fromInclusive) <= 1
+            || count <= 1
             || totalWork < PersistentParallelExecutor.DefaultSerialGrainSize)
-        {
-            // Match Parallel.For's exception semantics: capture
-            // first thrown exception, finish remaining iterations,
-            // re-throw at end. Parallel.For uses
-            // AggregateException — for serial-mode we re-throw the
-            // raw first exception (consistent with the
-            // PersistentParallelExecutor.Execute serial path).
-            Exception? firstException = null;
-            for (int i = fromInclusive; i < toExclusive; i++)
-            {
-                try { body(i); }
-                catch (Exception ex) { firstException ??= ex; }
-            }
-            if (firstException is not null) throw firstException;
-            return;
-        }
+            return false;
 
         // PR #531: route the general parallel-op path off raw Parallel.For (the .NET
         // ThreadPool — high dispatch latency + per-call task/range allocation, and the
@@ -679,7 +698,6 @@ public static class CpuParallelSettings
         // Default-on (validated across the full test suite); the A/B / kill-switch fallback
         // to Parallel.For (AIDOTNET_COOP_POOL=0)
         // now lives in ONE place inside PersistentParallelExecutor.Execute.
-        int count = toExclusive - fromInclusive;
         // Scale the chunk count with the work, not blindly to maxDegree. Waking all
         // cores-1 workers (plus the participating caller) for a small memory-bound op
         // oversubscribes the box — the OS preempts active workers and a stolen chunk
@@ -691,13 +709,18 @@ public static class CpuParallelSettings
         // `chunks` of them wake per dispatch.
         const long workPerChunk = 8 * 1024;
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
-        int chunks = Math.Min(maxDegree, byWork);
+        chunks = Math.Min(maxDegree, byWork);
         // The pool hands chunks out round-robin with no stealing, so chunks beyond its participants (workers + the
         // caller) only add per-chunk overhead and an uneven tail: on 128 logical CPUs (32 workers) a 256-head
         // attention forward split 128 ways took 84-90 us vs 50 us split 33 ways. AIDOTNET_PFOS_CHUNK_CAP=0 disables.
         if (s_capChunksAtParticipants)
             chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
-        int from = fromInclusive;
+        return true;
+    }
+
+    // The pool dispatch, apart from the serial path above so a serial call does not allocate the closure.
+    private static void DispatchChunks(int from, int count, int chunks, int maxDegree, Action<int> body)
+    {
         PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [MethodImpl(Hot)] (chunk) =>
         {
             using var _region = EnterParallelRegion();
