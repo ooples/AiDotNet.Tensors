@@ -177,6 +177,8 @@ internal static class ElementwiseChainProgram
             }
             results[i] = created;
         }
+        graph.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { results[ops - 1] }, CodegenElementType.Float32,
+            (int[])outShape.Clone(), 0));
         return graph;
     }
 
@@ -212,6 +214,9 @@ internal static class ElementwiseChainProgram
         }
         return results[ops - 1];
     }
+
+    /// <summary>The scalar operand op <paramref name="op"/> saved (ELU alpha, or the add/multiply/divide scalar).</summary>
+    internal static float Scalar(int[] program, int op) => BitsToSingle(program[op * Stride + 3]);
 
     private static T Scalar<T>(float value) => typeof(T) == typeof(float)
         ? (T)(object)value
