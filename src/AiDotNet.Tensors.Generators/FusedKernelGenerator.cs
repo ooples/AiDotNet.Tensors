@@ -40,6 +40,14 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    private static readonly DiagnosticDescriptor OverloadedMethodDiagnostic = new(
+        "TENSGEN003",
+        "Overloaded fused kernel method",
+        "Fused kernel method '{0}' is overloaded in '{1}': each generated kernel needs its own method name, because its companion members (CudaKernelName, CudaSource, TileDescriptor) are named after the method",
+        "FusedKernelCodegen",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var elementwiseSpecs = context.SyntaxProvider.ForAttributeWithMetadataName(
@@ -67,7 +75,7 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
                     continue;
                 }
 
-                string ownerKey = spec.NamespaceName + "." + spec.ContainingTypeName;
+                string ownerKey = spec.NamespaceName + "|" + spec.ContainingTypeName;
                 if (!validByOwner.TryGetValue(ownerKey, out var list))
                 {
                     list = new List<ElementwiseMethodSpec>();
@@ -79,8 +87,16 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
             foreach (var kvp in validByOwner.OrderBy(k => k.Key, StringComparer.Ordinal))
             {
                 var methods = kvp.Value.OrderBy(m => m.MethodName, StringComparer.Ordinal).ToList();
+                var overloaded = methods.GroupBy(m => m.MethodName, StringComparer.Ordinal).Where(g => g.Count() > 1).ToList();
+                foreach (var group in overloaded)
+                    foreach (var m in group)
+                        spc.ReportDiagnostic(Diagnostic.Create(OverloadedMethodDiagnostic, m.Location, m.MethodName, m.ContainingTypeName));
+                if (overloaded.Count > 0)
+                    methods = methods.Where(m => overloaded.All(g => g.Key != m.MethodName)).ToList();
+                if (methods.Count == 0)
+                    continue;
                 var first = methods[0];
-                string hintName = SanitizeHintName(first.ContainingTypeName) + ".Elementwise.g.cs";
+                string hintName = HintName(first.NamespaceName, first.ContainingTypeName) + ".Elementwise.g.cs";
                 spc.AddSource(hintName, EmitElementwiseClass(first.NamespaceName, first.ContainingTypeName, first.TypeAccessibility, methods));
             }
         });
@@ -94,7 +110,7 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
         {
             if (suite is null)
                 return;
-            string hintName = SanitizeHintName(suite.TypeName) + ".RowPatterns.g.cs";
+            string hintName = HintName(suite.NamespaceName, suite.TypeName) + ".RowPatterns.g.cs";
             spc.AddSource(hintName, FusedRowPatternTemplates.EmitRowPatternClass(suite.NamespaceName, suite.TypeName, suite.Accessibility));
         });
     }
@@ -132,8 +148,10 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
         string methodAccess = AccessibilityKeyword(method.DeclaredAccessibility);
         Location location = ctx.TargetNode.GetLocation();
 
-        // Validate partial static signature and parameter types.
-        if (!method.IsStatic || !method.ReturnsVoid || !method.IsPartialDefinition || inputCount < 1 || inputCount > 4 || scalarCount < 0 || scalarCount > 3)
+        // Validate partial static signature and parameter types. A nested owner is refused: the class is emitted at
+        // namespace level, so its implementation would land in an unrelated type.
+        if (!method.IsStatic || !method.ReturnsVoid || !method.IsPartialDefinition || inputCount < 1 || inputCount > 4 || scalarCount < 0 || scalarCount > 3
+            || containingType.ContainingType is not null || containingType.IsGenericType)
         {
             return ElementwiseMethodSpec.SignatureError(ns, containingType.Name, method.Name, inputCount, scalarCount, location);
         }
@@ -149,6 +167,9 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
         {
             var p = method.Parameters[i];
             paramNames[i] = p.Name;
+            // The emitter writes by-value parameters only: a ref/in/out/params one would not match the declaration.
+            if (p.RefKind != RefKind.None || p.IsParams)
+                return ElementwiseMethodSpec.SignatureError(ns, containingType.Name, method.Name, inputCount, scalarCount, location);
             string typeDisplay = p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
             if (i < inputCount)
             {
@@ -165,6 +186,13 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
                 if (typeDisplay != "Span<float>" && typeDisplay != "System.Span<float>")
                     return ElementwiseMethodSpec.SignatureError(ns, containingType.Name, method.Name, inputCount, scalarCount, location);
             }
+        }
+
+        // The kernel name is a CUDA symbol and sits inside C# string literals: an identifier only.
+        if (!IsCIdentifier(kernelName))
+        {
+            return ElementwiseMethodSpec.ExpressionError(ns, containingType.Name, method.Name, inputCount, scalarCount,
+                $"kernel name '{kernelName}' is not a C identifier (letters, digits and '_', not starting with a digit)", location);
         }
 
         try
@@ -256,6 +284,7 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
           .Append(m.MethodName).Append("TileDescriptor = ").Append(m.TileDescriptorInitializer).AppendLine(";");
         sb.AppendLine();
 
+        string kernel = "__" + m.MethodName + "_GeneratedKernel";
         sb.AppendLine("    [MethodImpl(MethodImplOptions.AggressiveInlining)]");
         sb.Append("    ").Append(m.MethodAccessibility).Append(" static partial void ").Append(m.MethodName).Append('(');
         for (int i = 0; i < m.InputCount; i++)
@@ -268,19 +297,27 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
             sb.Append(", float ").Append(m.ParamNames[m.InputCount + s]);
         }
         sb.Append(", Span<float> ").Append(destParam).AppendLine(")");
-        sb.AppendLine("    {");
+        sb.Append("        => ").Append(kernel).Append('(').Append(string.Join(", ", m.ParamNames)).AppendLine(");");
+        sb.AppendLine();
 
-        // Bind canonical local aliases x0..x{k-1}, s0..s{m-1}, dst so emitted AST expressions are invariant to parameter names.
-        sb.Append("        Span<float> dst = ").Append(destParam).AppendLine(";");
-        sb.AppendLine("        int length = dst.Length;");
+        // The kernel's parameters are the canonical names x0..x{k-1}, s0..s{m-1}, dst the emitted expressions read.
+        sb.AppendLine("    [MethodImpl(MethodImplOptions.AggressiveInlining)]");
+        sb.Append("    private static void ").Append(kernel).Append('(');
         for (int i = 0; i < m.InputCount; i++)
         {
-            sb.Append("        ReadOnlySpan<float> x").Append(i).Append(" = ").Append(m.ParamNames[i]).AppendLine(";");
-            sb.Append("        if (x").Append(i).AppendLine(".Length < length) throw new ArgumentException(\"Input span is shorter than destination span.\");");
+            if (i > 0) sb.Append(", ");
+            sb.Append("ReadOnlySpan<float> x").Append(i);
         }
         for (int s = 0; s < m.ScalarCount; s++)
         {
-            sb.Append("        float s").Append(s).Append(" = ").Append(m.ParamNames[m.InputCount + s]).AppendLine(";");
+            sb.Append(", float s").Append(s);
+        }
+        sb.AppendLine(", Span<float> dst)");
+        sb.AppendLine("    {");
+        sb.AppendLine("        int length = dst.Length;");
+        for (int i = 0; i < m.InputCount; i++)
+        {
+            sb.Append("        if (x").Append(i).AppendLine(".Length < length) throw new ArgumentException(\"Input span is shorter than destination span.\");");
         }
 
         sb.AppendLine("        int i = 0;");
@@ -345,10 +382,35 @@ public sealed class FusedKernelGenerator : IIncrementalGenerator
         _ => "internal"
     };
 
-    private static string SanitizeHintName(string name)
+    /// <summary>
+    /// A hint name unique per owner: the namespace and the type, with every character but an ASCII letter, digit or
+    /// '.' written as '_' and its four hex digits. '_' is encoded too, so two distinct identities never meet.
+    /// </summary>
+    private static string HintName(string namespaceName, string typeName)
     {
-        var chars = name.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray();
-        return new string(chars);
+        string identity = string.IsNullOrEmpty(namespaceName) ? typeName : namespaceName + "." + typeName;
+        var sb = new StringBuilder(identity.Length + 8);
+        foreach (char c in identity)
+        {
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.')
+                sb.Append(c);
+            else
+                sb.Append('_').Append(((int)c).ToString("X4", System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsCIdentifier(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        for (int i = 0; i < name.Length; i++)
+        {
+            char c = name[i];
+            bool letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+            bool digit = c >= '0' && c <= '9';
+            if (!letter && !(digit && i > 0)) return false;
+        }
+        return true;
     }
 
     private sealed class RowSuiteSpec : IEquatable<RowSuiteSpec>
