@@ -177,8 +177,11 @@ public sealed class FusionTileIrAndAutotuneTests
             string key = FusionTileArtifactCache.ComputeArtifactKey("extern \"C\" __global__ void k() {}", 8, 9, fastMath: false);
             var payload = new byte[] { 1, 3, 5, 7, 9 };
             FusionTileArtifactCache.StoreArtifact(key, ".ptx", payload);
+            Assert.True(File.Exists(Path.Combine(tempDir, key + ".ptx")));
+            // Drop the in-memory tier so the lookup below must be served from the persisted file.
+            FusionTileArtifactCache.ClearMemoryCache();
             Assert.True(FusionTileArtifactCache.TryLoadArtifact(key, ".ptx", out var loaded));
-            Assert.Equal(payload, loaded);
+            Assert.Equal(new byte[] { 1, 3, 5, 7, 9 }, loaded);
 
             string jsonPath = Path.Combine(tempDir, "direct_ptx_tune.json");
             var shape = new DirectPtxShapeKey(89, TunedKernelOp.Gemm, 128, 256, 64, "gelu");
@@ -209,6 +212,24 @@ public sealed class FusionTileIrAndAutotuneTests
             Assert.True(directCalls >= 4);
             Assert.True(double.IsNaN(standaloneRec.DirectPtxVsVendorRatio));
             Assert.True(File.Exists(jsonPath));
+
+            // A fresh tuner over the same JSON file must return the persisted winner without measuring again.
+            int callsBeforeReload = directCalls;
+            var reloadedTuner = new DirectPtxAutotuner(
+                new DirectPtxAutotunerOptions
+                {
+                    AllowExternalVendorLibraries = false,
+                    WarmupRuns = 1,
+                    MeasuredRuns = 3,
+                    PersistenceFilePath = jsonPath
+                },
+                vendorProvider);
+            Assert.True(reloadedTuner.Records.ContainsKey(shape.ToString()));
+            var winnerReloaded = reloadedTuner.SelectOrTune(shape, directCandidates, out var reloadedRec);
+            Assert.Equal("direct_ptx_tile_128x128", winnerReloaded.CandidateId);
+            Assert.Equal(callsBeforeReload, directCalls);
+            Assert.Equal(0, vendorCalls);
+            Assert.Equal(standaloneRec.CandidateSetSignature, reloadedRec.CandidateSetSignature);
 
             // 2) Vendor comparison mode records unclamped DirectPtxVsVendorRatio and persists to disk.
             string jsonVendorPath = Path.Combine(tempDir, "direct_ptx_vs_vendor.json");
@@ -260,6 +281,255 @@ public sealed class FusionTileIrAndAutotuneTests
         Assert.Equal(new float[] { 0f, 1f, 1f, 1f, 1f, 0f }, topkMask);
     }
 
+    private static FusionTileDescriptor IdentityTile(string name, int inputCount = 1, int scalarCount = 0) =>
+        FusionTileLinker.CreatePrebuiltElementwiseTile(
+            name,
+            inputCount,
+            scalarCount,
+            new[]
+            {
+                new FusionTileInstruction(FusionTileOpCode.LoadInput, 0),
+                new FusionTileInstruction(FusionTileOpCode.StoreOutput, 0, 0)
+            },
+            string.Empty);
+
+    [Fact]
+    public void AdjointBuilder_SumsGradientsAcrossEveryLoadOfAnInputPort()
+    {
+        // A horizontal link keeps one LoadInput(0) per sibling; dX must be the sum of both upstream gradients.
+        var linked = FusionTileLinker.LinkHorizontalSharedInputs(IdentityTile("adj_id_left"), IdentityTile("adj_id_right"));
+        var bwd = FusionTileAdjointBuilder.BuildBackwardTile(linked);
+        Assert.Equal(3, bwd.InputCount);
+        Assert.Equal(1, bwd.OutputCount);
+
+        var dx = new float[2];
+        bwd.CpuExecutor!(
+            new[] { new float[] { 0.5f, -1f }, new float[] { 2f, 1f }, new float[] { 3f, 4f } },
+            Array.Empty<float>(),
+            new[] { dx });
+        Assert.Equal(new float[] { 5f, 5f }, dx);
+    }
+
+    [Fact]
+    public void AdjointBuilder_ZeroInputTile_BackwardWithNoOutputsIsANoOp()
+    {
+        var constTile = FusionTileLinker.CreatePrebuiltElementwiseTile(
+            "adj_const7",
+            inputCount: 0,
+            scalarCount: 0,
+            new[]
+            {
+                new FusionTileInstruction(FusionTileOpCode.Const, immediate: 7f),
+                new FusionTileInstruction(FusionTileOpCode.StoreOutput, 0, 0)
+            },
+            string.Empty);
+        var bwd = FusionTileAdjointBuilder.BuildBackwardTile(constTile);
+        Assert.Equal(0, bwd.OutputCount);
+        bwd.CpuExecutor!(new[] { new float[] { 1f, 2f } }, Array.Empty<float>(), Array.Empty<float[]>());
+    }
+
+    [Fact]
+    public void FusionTileDescriptor_SnapshotsInstructions_SoCallerMutationCannotChangeTheTile()
+    {
+        var insts = new List<FusionTileInstruction>
+        {
+            new FusionTileInstruction(FusionTileOpCode.LoadInput, 0),
+            new FusionTileInstruction(FusionTileOpCode.StoreOutput, 0, 0)
+        };
+        var tile = FusionTileLinker.CreatePrebuiltElementwiseTile("snapshot_identity", 1, 0, insts, string.Empty);
+        string digest = tile.Sha256Digest;
+
+        insts[0] = new FusionTileInstruction(FusionTileOpCode.Const, immediate: 7f);
+
+        Assert.Equal(FusionTileOpCode.LoadInput, tile.Instructions[0].Op);
+        Assert.False(tile.Instructions is List<FusionTileInstruction>);
+        Assert.False(tile.Instructions is FusionTileInstruction[]);
+        Assert.Equal(digest, new FusionTileDescriptor(tile.TileName, tile.Kind, 1, 0, 1, tile.Instructions, string.Empty).Sha256Digest);
+
+        var y = new float[2];
+        tile.CpuExecutor!(new[] { new float[] { 1.5f, -2f } }, Array.Empty<float>(), new[] { y });
+        Assert.Equal(new float[] { 1.5f, -2f }, y);
+
+        var linked = FusionTileLinker.LinkVertical(tile, IdentityTile("snapshot_consumer"));
+        var y2 = new float[2];
+        linked.CpuExecutor!(new[] { new float[] { 1.5f, -2f } }, Array.Empty<float>(), new[] { y2 });
+        Assert.Equal(new float[] { 1.5f, -2f }, y2);
+    }
+
+    [Fact]
+    public void FusionTileLinker_RejectsSpecializedTilesAndNonPointwiseOpcodes()
+    {
+        var flash = FusionTileLinker.CreateTiledFlashAttentionTile(16, isCausal: false);
+        var scan = FusionTileLinker.CreateChunkedLinearScanTile(8);
+        var id1 = IdentityTile("reject_id1");
+        var id3 = IdentityTile("reject_id3", inputCount: 3, scalarCount: 1);
+
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.LinkVertical(flash, id1));
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.LinkVertical(id1, flash));
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.LinkHorizontalSharedInputs(flash, id3));
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.LinkVertical(scan, id1));
+
+        var rowSum = new[]
+        {
+            new FusionTileInstruction(FusionTileOpCode.LoadInput, 0),
+            new FusionTileInstruction(FusionTileOpCode.RowSum, 0),
+            new FusionTileInstruction(FusionTileOpCode.StoreOutput, 1, 0)
+        };
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.CreateCpuExecutor(1, 0, 1, rowSum));
+        Assert.Throws<NotSupportedException>(() => FusionTileLinker.EmitCudaKernelFromInstructions("k", 1, 0, 1, rowSum));
+    }
+
+    [Fact]
+    public void GemmEpilogue_RejectsUnsupportedActivationAndUnexpandedBias_AndReducesDBiasPerColumn()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => FusionTileLinker.CreateGemmBiasActivationResidualEpilogueTile(FusionTileOpCode.Exp));
+        Assert.Throws<ArgumentOutOfRangeException>(() => FusionTileLinker.CreateGemmBiasActivationResidualEpilogueTile(FusionTileOpCode.Add));
+
+        var relu = FusionTileLinker.CreateGemmBiasActivationResidualEpilogueTile(FusionTileOpCode.Relu);
+        var y = new float[4];
+
+        // 2x2 output with a two-element (unexpanded) bias must be rejected rather than read out of range.
+        Assert.Throws<ArgumentException>(() => relu.CpuExecutor!(
+            new[] { new float[] { 1f, 2f, 3f, 4f }, new float[] { 0.5f, 0.5f }, new float[4] },
+            Array.Empty<float>(),
+            new[] { y }));
+
+        // Expanded bias: rows = 2, cols = 2, bias = [0.5, 0.25] repeated per row.
+        var gemmOut = new float[] { 1f, 2f, 3f, 4f };
+        var biasExpanded = new float[] { 0.5f, 0.25f, 0.5f, 0.25f };
+        var residual = new float[] { 1f, 2f, 3f, 4f };
+        relu.CpuExecutor!(new[] { gemmOut, biasExpanded, residual }, Array.Empty<float>(), new[] { y });
+        Assert.Equal(new float[] { 2.5f, 4.25f, 6.5f, 8.25f }, y);
+
+        var bwd = FusionTileAdjointBuilder.BuildBackwardTile(relu);
+        var dGemm = new float[4];
+        var dBiasExpanded = new float[4];
+        var dRes = new float[4];
+        var upstream = new float[] { 1f, 2f, 3f, 4f };
+        bwd.CpuExecutor!(new[] { gemmOut, biasExpanded, residual, upstream }, Array.Empty<float>(), new[] { dGemm, dBiasExpanded, dRes });
+        Assert.Equal(upstream, dGemm);
+        Assert.Equal(upstream, dBiasExpanded);
+        Assert.Equal(upstream, dRes);
+
+        var dBias = new float[2];
+        FusionTileLinker.ReduceExpandedBiasGradient(dBiasExpanded, rows: 2, cols: 2, dBias);
+        Assert.Equal(new float[] { 4f, 6f }, dBias);
+        Assert.Throws<ArgumentException>(() => FusionTileLinker.ReduceExpandedBiasGradient(dBiasExpanded, 3, 2, dBias));
+    }
+
+    [Fact]
+    public void CrossLayerLayerNormKernel_FinishesReadingReducedSumBeforeScratchReuse()
+    {
+        string src = FusionTileLinker.CreateCrossLayerNormResidualRopeTile(useLayerNorm: true).CudaDeviceFragment;
+        int read = src.IndexOf("float total = smem[0];", StringComparison.Ordinal);
+        Assert.True(read >= 0, "block sum must copy smem[0] into a register");
+        int barrier = src.IndexOf("__syncthreads();", read, StringComparison.Ordinal);
+        int ret = src.IndexOf("return total;", read, StringComparison.Ordinal);
+        Assert.True(barrier > read && barrier < ret, "a block barrier must separate the smem[0] read from the return");
+    }
+
+    [Fact]
+    public void FusionTileArtifactCache_KeepsPrivateCopies_AndRepairsEmptyArtifacts()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "aidn_artifact_test_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        string? prev = FusionTileArtifactCache.OverrideCacheDirectory;
+        try
+        {
+            FusionTileArtifactCache.OverrideCacheDirectory = tempDir;
+            string key = FusionTileArtifactCache.ComputeArtifactKey("artifact-copy-" + Guid.NewGuid().ToString("N"), 8, 6, fastMath: true);
+
+            var producer = new byte[] { 10, 20, 30 };
+            FusionTileArtifactCache.StoreArtifact(key, ".cubin", producer);
+            producer[0] = 99; // producer reuses its buffer
+            Assert.True(FusionTileArtifactCache.TryLoadArtifact(key, ".cubin", out var first));
+            Assert.Equal(new byte[] { 10, 20, 30 }, first);
+            first[1] = 77; // reader mutates the returned bytes
+            Assert.True(FusionTileArtifactCache.TryLoadArtifact(key, ".cubin", out var second));
+            Assert.Equal(new byte[] { 10, 20, 30 }, second);
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+
+            // An empty on-disk artifact is a miss and must be replaced by the next successful store.
+            string emptyKey = FusionTileArtifactCache.ComputeArtifactKey("artifact-empty-" + Guid.NewGuid().ToString("N"), 8, 6, fastMath: true);
+            string emptyPath = Path.Combine(tempDir, emptyKey + ".cubin");
+            File.WriteAllBytes(emptyPath, Array.Empty<byte>());
+            Assert.False(FusionTileArtifactCache.TryLoadArtifact(emptyKey, ".cubin", out _));
+            FusionTileArtifactCache.StoreArtifact(emptyKey, ".cubin", new byte[] { 4, 5 });
+            Assert.Equal(new byte[] { 4, 5 }, File.ReadAllBytes(emptyPath));
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+        }
+        finally
+        {
+            FusionTileArtifactCache.OverrideCacheDirectory = prev;
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void DirectPtxAutotuner_RetunesWhenEligibleSetChanges_AndMatchesWinnerByOrigin()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "aidn_autotune_set_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            string jsonPath = Path.Combine(tempDir, "tune.json");
+            var shape = new DirectPtxShapeKey(86, TunedKernelOp.Gemm, 64, 64, 64);
+            int directCalls = 0, vendorCalls = 0;
+            var direct = new[] { new AutotuneExecutableCandidate("shared_id", TunedKernelOrigin.Generated, () => directCalls++) };
+            // The vendor candidate shares the id but is much slower, so the direct candidate wins.
+            var vendor = new FakeVendorProvider(new AutotuneExecutableCandidate("shared_id", TunedKernelOrigin.Vendor, () =>
+            {
+                vendorCalls++;
+                System.Threading.Thread.Sleep(20);
+            }));
+            DirectPtxAutotunerOptions Opts(bool allowVendor) => new()
+            {
+                AllowExternalVendorLibraries = allowVendor,
+                WarmupRuns = 0,
+                MeasuredRuns = 1,
+                PersistenceFilePath = jsonPath
+            };
+
+            _ = new DirectPtxAutotuner(Opts(false), vendor).SelectOrTune(shape, direct, out var standaloneRec);
+            Assert.Equal(0, vendorCalls);
+            Assert.True(double.IsNaN(standaloneRec.DirectPtxVsVendorRatio));
+
+            // Same file, vendors now eligible: the cached direct-only record must not be reused.
+            var withVendor = new DirectPtxAutotuner(Opts(true), vendor);
+            var winner = withVendor.SelectOrTune(shape, direct, out var vendorRec);
+            Assert.Equal(1, vendorCalls);
+            Assert.False(double.IsNaN(vendorRec.DirectPtxVsVendorRatio));
+            Assert.Equal(TunedKernelOrigin.Generated, winner.Origin);
+            Assert.Equal(TunedKernelOrigin.Generated, vendorRec.WinnerOrigin);
+
+            // Unchanged eligible set: cache hit, no measurement, same-origin winner.
+            int directBefore = directCalls;
+            var again = withVendor.SelectOrTune(shape, direct, out _);
+            Assert.Same(direct[0], again);
+            Assert.Equal(directBefore, directCalls);
+            Assert.Equal(1, vendorCalls);
+
+            // Back to direct-only: the record carrying a finite vendor ratio must not be reused.
+            var standaloneAgain = new DirectPtxAutotuner(Opts(false), vendor);
+            _ = standaloneAgain.SelectOrTune(shape, direct, out var directOnlyRec);
+            Assert.True(double.IsNaN(directOnlyRec.DirectPtxVsVendorRatio));
+            Assert.Equal(1, vendorCalls);
+            Assert.Empty(Directory.GetFiles(tempDir, "*.tmp"));
+
+            // Duplicate (origin, id) identities are ambiguous and rejected.
+            var dup = new[]
+            {
+                new AutotuneExecutableCandidate("dup", TunedKernelOrigin.Generated, () => { }),
+                new AutotuneExecutableCandidate("dup", TunedKernelOrigin.Generated, () => { })
+            };
+            Assert.Throws<ArgumentException>(() => standaloneAgain.SelectOrTune(shape, dup, out _));
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
+    }
+
 #if NETCOREAPP
     [Fact]
     public void GpuResidentSchedule_CudaGraphTreePool_And_SegmentedRunner_ShareArenasAndPreservePointers()
@@ -309,13 +579,29 @@ public sealed class FusionTileIrAndAutotuneTests
         // 3) SegmentedBlockCudaGraphRunner shares one block scratch buffer across all segments.
         using var segRunner = new SegmentedBlockCudaGraphRunner(harness.Backend, segmentCount: 2, sharedScratchElements: 512, opts);
         using var segBinding = harness.Backend.AllocateBuffer(64);
+        var seg0Handles = new List<IntPtr>();
+        var seg1Handles = new List<IntPtr>();
         for (int iter = 0; iter < 3; iter++)
         {
-            segRunner.ExecuteSegment(0, scratch => Assert.Equal(512, scratch.Size), new[] { segBinding });
-            segRunner.ExecuteSegment(1, scratch => Assert.Equal(512, scratch.Size), new[] { segBinding });
+            segRunner.ExecuteSegment(0, scratch =>
+            {
+                Assert.Equal(512, scratch.Size);
+                seg0Handles.Add(scratch.Handle);
+            }, new[] { segBinding });
+            segRunner.ExecuteSegment(1, scratch =>
+            {
+                Assert.Equal(512, scratch.Size);
+                seg1Handles.Add(scratch.Handle);
+            }, new[] { segBinding });
         }
         Assert.True(segRunner.GetSegmentScope(0).HasCapturedGraph);
         Assert.True(segRunner.GetSegmentScope(1).HasCapturedGraph);
+        Assert.NotEmpty(seg0Handles);
+        Assert.NotEmpty(seg1Handles);
+        IntPtr sharedScratch = seg0Handles[0];
+        Assert.NotEqual(IntPtr.Zero, sharedScratch);
+        Assert.All(seg0Handles, h => Assert.Equal(sharedScratch, h));
+        Assert.All(seg1Handles, h => Assert.Equal(sharedScratch, h));
     }
 
     private sealed class FakeBuffer : IGpuBuffer
