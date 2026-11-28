@@ -15446,6 +15446,31 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// Generates a specialized backward delegate that writes directly into pre-allocated
     /// gradient buffers using transposed BLAS GEMM and SIMD kernels. No intermediate allocations.
     /// </summary>
+    private static readonly int[] TransposeBackwardAxes = { 1, 0 };
+
+    // Copies a backward temporary into its planned gradient without marking the temporary's storage escaped, so
+    // ReleaseStepTemporary can still hand its buffer back.
+    private static void CopyStepTemporary(Tensor<T> temporary, Tensor<T> destination)
+    {
+        using var temporaryKeep = new KeepAliveScope(temporary);
+        using var destinationKeep = new KeepAliveScope(destination);
+        temporary.AsSpanUnmarked().CopyTo(destination.AsWritableSpanUnmarked());
+    }
+
+    /// <summary>
+    /// Hands back the buffer of a temporary a specialized backward computed and has already copied or added into its
+    /// planned gradient, so the next step's temporary of that size reuses it instead of allocating a fresh one.
+    /// </summary>
+    /// <remarks>Only a pooled host result nothing else can reach is released: the test a <see cref="TensorScope"/>
+    /// applies when it ends (no raw access escaped, this is its only wrapper). A temporary that is one of the step's
+    /// own buffers (an engine may return its input unchanged) is left alone, as is anything arena-, device- or
+    /// caller-owned.</remarks>
+    private static void ReleaseStepTemporary(Tensor<T> temporary, Tensor<T> keep1, Tensor<T> keep2)
+    {
+        if (ReferenceEquals(temporary, keep1) || ReferenceEquals(temporary, keep2)) return;
+        ((IScopedHostTensor)temporary).ReleaseHostFromScope();
+    }
+
     private static unsafe Action<IEngine>? BuildSpecializedBackward(
         CompiledStep<T> step,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
@@ -16107,6 +16132,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var computedKeep1 = new KeepAliveScope(computed);
                 using var gradInKeep1 = new KeepAliveScope(gradIn);
                 computed.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(computed, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -16246,6 +16272,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // gradA += gradOut * inputB
                     var temp = eng.TensorMultiply(gradOut, inputB);
                     eng.TensorAddInto(gradA, gradA, temp);
+                    ReleaseStepTemporary(temp, gradOut, gradA);
                 }
                 else
                     eng.TensorMultiplyInto(gradA, gradOut, inputB);
@@ -16255,6 +16282,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // gradB += gradOut * inputA
                     var temp = eng.TensorMultiply(gradOut, inputA);
                     eng.TensorAddInto(gradB, gradB, temp);
+                    ReleaseStepTemporary(temp, gradOut, gradB);
                 }
                 else
                     eng.TensorMultiplyInto(gradB, gradOut, inputA);
@@ -16517,7 +16545,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 var grad = eng.DropoutBackward(gradOut, dropMask, dropRate);
                 if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
-                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                else CopyStepTemporary(grad, gradIn);
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -16671,11 +16700,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var dstLiveT = gradInputB.GetLiveBackingArrayAllowingPaddingOrNull();
                     if (dstLiveT is null)
                     {
-                        var reducedGeneric = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
-                        if (reducedGeneric._shape.Length != inputBShape.Length)
-                            reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
+                        var reducedGenericSum = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                        var reducedGeneric = reducedGenericSum._shape.Length != inputBShape.Length ? eng.Reshape(reducedGenericSum, inputBShape) : reducedGenericSum;
                         if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
-                        else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                        else CopyStepTemporary(reducedGeneric, gradInputB);
+                        ReleaseStepTemporary(reducedGeneric, gradOut, gradInputB);
+                        if (!ReferenceEquals(reducedGenericSum, reducedGeneric)) ReleaseStepTemporary(reducedGenericSum, gradOut, gradInputB);
                     }
                     else if (typeof(T) == typeof(double))
                     {
@@ -16715,11 +16745,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     else
                     {
-                        var reducedGeneric = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
-                        if (reducedGeneric._shape.Length != inputBShape.Length)
-                            reducedGeneric = eng.Reshape(reducedGeneric, inputBShape);
+                        var reducedGenericSum = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                        var reducedGeneric = reducedGenericSum._shape.Length != inputBShape.Length ? eng.Reshape(reducedGenericSum, inputBShape) : reducedGenericSum;
                         if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reducedGeneric);
-                        else reducedGeneric.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                        else CopyStepTemporary(reducedGeneric, gradInputB);
+                        ReleaseStepTemporary(reducedGeneric, gradOut, gradInputB);
+                        if (!ReferenceEquals(reducedGenericSum, reducedGeneric)) ReleaseStepTemporary(reducedGenericSum, gradOut, gradInputB);
                     }
                 }
                 else if (isPerRowReduce)
@@ -16753,11 +16784,12 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 else
                 {
                     // Generic multi-axis reduce fallback for non-NCHW patterns.
-                    var reduced = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
-                    if (reduced._shape.Length != inputBShape.Length)
-                        reduced = eng.Reshape(reduced, inputBShape);
+                    var reducedSum = eng.ReduceSum(gradOut, reduceAxesArr, keepDims: true);
+                    var reduced = reducedSum._shape.Length != inputBShape.Length ? eng.Reshape(reducedSum, inputBShape) : reducedSum;
                     if (accumB) eng.TensorAddInto(gradInputB, gradInputB, reduced);
-                    else reduced.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    else CopyStepTemporary(reduced, gradInputB);
+                    ReleaseStepTemporary(reduced, gradOut, gradInputB);
+                    if (!ReferenceEquals(reducedSum, reduced)) ReleaseStepTemporary(reducedSum, gradOut, gradInputB);
                 }
                 inputB.Grad = gradInputB;
             };
@@ -16795,7 +16827,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     var grad = eng.MaxPool2DBackwardWithTensorIndices(gradOut, winners, input._shape,
                         recomputePool, recomputeStride);
                     if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
-                    else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                    else CopyStepTemporary(grad, gradIn);
+                    ReleaseStepTemporary(grad, gradOut, gradIn);
                 }
                 input.Grad = gradIn;
             };
@@ -16869,7 +16902,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     ? eng.MaxPool2DBackwardWithTensorIndices(gradOut, tensorIndices, capInShape, poolSize, poolStride)
                     : eng.MaxPool2DBackward(gradOut, maxIndices!, capInShape, poolSize, poolStride);
                 if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
-                else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                else CopyStepTemporary(grad, gradIn);
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -16917,7 +16951,8 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     var grad = eng.AvgPool2DBackward(gradOut, capInShape, poolSize, poolStride, poolPad, countIncludePad);
                     if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
-                    else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                    else CopyStepTemporary(grad, gradIn);
+                    ReleaseStepTemporary(grad, gradOut, gradIn);
                 }
                 input.Grad = gradIn;
             };
@@ -16961,6 +16996,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep1 = new KeepAliveScope(grad);
                 using var gradInKeep4 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -16979,6 +17015,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep2 = new KeepAliveScope(grad);
                 using var gradInKeep5 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17010,10 +17047,18 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var gradIn = gradMap[input];
             return eng =>
             {
+                if (gradIn.IsContiguous && gradOut.Rank == 2)
+                {
+                    // Straight into the planned gradient: no per-step transposed temporary to copy out of.
+                    eng.TransposeInto(gradIn, gradOut, TransposeBackwardAxes);
+                    input.Grad = gradIn;
+                    return;
+                }
                 var grad = eng.TensorTranspose(gradOut);
                 using var gradKeep3 = new KeepAliveScope(grad);
                 using var gradInKeep7 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17045,7 +17090,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     eng.TensorAddInto(gradA, gradA, gA);
                 else
                     gA.AsSpanUnmarked().CopyTo(gradA.AsWritableSpanUnmarked());
-                var negGradTimesA = eng.TensorNegate(eng.TensorMultiply(gradOut, inputA));
+                ReleaseStepTemporary(gA, gradOut, gradA);
+                var gradTimesA = eng.TensorMultiply(gradOut, inputA);
+                var negGradTimesA = eng.TensorNegate(gradTimesA);
+                ReleaseStepTemporary(gradTimesA, gradOut, gradB);
                 var bSquared = eng.TensorMultiply(inputB, inputB);
                 var gB = eng.TensorDivide(negGradTimesA, bSquared);
                 using var gBKeep1 = new KeepAliveScope(gB);
@@ -17054,6 +17102,9 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     eng.TensorAddInto(gradB, gradB, gB);
                 else
                     gB.AsSpanUnmarked().CopyTo(gradB.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(negGradTimesA, gradOut, gradB);
+                ReleaseStepTemporary(bSquared, gradOut, gradB);
+                ReleaseStepTemporary(gB, gradOut, gradB);
                 inputA.Grad = gradA;
                 inputB.Grad = gradB;
             };
@@ -17074,6 +17125,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep4 = new KeepAliveScope(grad);
                 using var gradInKeep8 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17090,6 +17142,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep5 = new KeepAliveScope(grad);
                 using var gradInKeep9 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17107,6 +17160,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep6 = new KeepAliveScope(grad);
                 using var gradInKeep10 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17123,6 +17177,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep7 = new KeepAliveScope(grad);
                 using var gradInKeep11 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
@@ -17140,6 +17195,7 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 using var gradKeep8 = new KeepAliveScope(grad);
                 using var gradInKeep12 = new KeepAliveScope(gradIn);
                 grad.AsSpanUnmarked().CopyTo(gradIn.AsWritableSpanUnmarked());
+                ReleaseStepTemporary(grad, gradOut, gradIn);
                 input.Grad = gradIn;
             };
         }
