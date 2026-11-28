@@ -273,6 +273,9 @@ internal static class FusedRowPatternTemplates
 
         bool writeMean = !meanOut.IsEmpty;
         bool writeInvStd = !invStdOut.IsEmpty;
+        // Checked before any row is written: a short statistic span must not leave earlier rows half-written.
+        if ((writeMean && meanOut.Length < rows) || (writeInvStd && invStdOut.Length < rows))
+            throw new ArgumentException(""meanOut and invStdOut must be empty or hold one value per row."");
         float invCols = 1.0f / cols;
 
         for (int r = 0; r < rows; r++)
@@ -384,6 +387,8 @@ internal static class FusedRowPatternTemplates
 
         bool hasGammaGrad = !gradGamma.IsEmpty;
         bool hasBetaGrad = !gradBeta.IsEmpty;
+        if ((hasGammaGrad && gradGamma.Length < cols) || (hasBetaGrad && gradBeta.Length < cols))
+            throw new ArgumentException(""gradGamma and gradBeta must be empty or hold one value per column."");
         if (hasGammaGrad) gradGamma.Slice(0, cols).Clear();
         if (hasBetaGrad) gradBeta.Slice(0, cols).Clear();
         float invCols = 1.0f / cols;
@@ -454,7 +459,7 @@ internal static class FusedRowPatternTemplates
                         global::AiDotNet.Tensors.Engines.Simd.SimdKernels.ReadVector256(bias, c));
                     Vector256<float> res = activationKind switch
                     {
-                        1 => Avx.Max(Vector256<float>.Zero, z),
+                        1 => Avx.Max(z, Vector256<float>.Zero),   // NaN -> 0, as ReluScalar and fmaxf(0, z)
                         2 => GeneratedKernelSimdMath.Gelu256(z),
                         3 => GeneratedKernelSimdMath.Swish256(z),
                         4 => global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastSigmoid256(z),
@@ -505,7 +510,7 @@ internal static class FusedRowPatternTemplates
         int total = checked(outerCount * seqLen * headDim);
         if (input.Length < total || output.Length < total)
             throw new ArgumentException(""Input/output buffers are smaller than outerCount * seqLen * headDim."");
-        int trigStride = cos.Length >= seqLen * headDim ? headDim : halfDim;
+        int trigStride = cos.Length >= seqLen * headDim && sin.Length >= seqLen * headDim ? headDim : halfDim;
         if (cos.Length < seqLen * halfDim || sin.Length < seqLen * halfDim)
             throw new ArgumentException(""cos/sin tables are smaller than seqLen * (headDim / 2)."");
 
@@ -563,6 +568,9 @@ internal static class FusedRowPatternTemplates
     /// Compile-time generated fused LogSoftmax + Cross-Entropy forward &amp; optional fused gradient:
     /// computes exact row max and log-sum-exp without materializing an intermediate [rows, cols] log-softmax tensor.
     /// Returns mean cross-entropy loss across active rows (target row mass &gt; 0).
+    /// The statistics stay in shifted coordinates: <paramref name=""rowMaxOut""/> holds m = max(z) and
+    /// <paramref name=""rowLogSumExpOut""/> holds log(sum(exp(z - m))), and every log-probability is
+    /// (z - m) - log(sum(exp(z - m))). Adding the two (m + log 2 for m = 1e8) rounds back to m in float.
     /// </summary>
     public static float LogSoftmaxCrossEntropyForward(
         ReadOnlySpan<float> logits,
@@ -580,6 +588,8 @@ internal static class FusedRowPatternTemplates
             throw new ArgumentException(""logits and targetProbs must contain at least rows * cols elements."");
 
         bool saveStats = !rowMaxOut.IsEmpty && !rowLogSumExpOut.IsEmpty;
+        if (saveStats && (rowMaxOut.Length < rows || rowLogSumExpOut.Length < rows))
+            throw new ArgumentException(""rowMaxOut and rowLogSumExpOut must hold one value per row."");
         double totalLoss = 0.0;
 
         for (int r = 0; r < rows; r++)
@@ -615,11 +625,11 @@ internal static class FusedRowPatternTemplates
                 sumExp += GeneratedKernelSimdMath.ExpScalar(zRow[k] - rowMax);
             }
 
-            float lse = rowMax + GeneratedKernelSimdMath.LogScalar(sumExp);
+            float lseShifted = GeneratedKernelSimdMath.LogScalar(sumExp);
             if (saveStats)
             {
                 rowMaxOut[r] = rowMax;
-                rowLogSumExpOut[r] = lse;
+                rowLogSumExpOut[r] = lseShifted;
             }
 
             float rowMass = 0.0f;
@@ -630,7 +640,7 @@ internal static class FusedRowPatternTemplates
                 if (t != 0.0f)
                 {
                     rowMass += Math.Abs(t);
-                    rowLoss -= t * (zRow[c] - lse);
+                    rowLoss -= t * ((zRow[c] - rowMax) - lseShifted);
                 }
             }
 
@@ -647,35 +657,45 @@ internal static class FusedRowPatternTemplates
 
     /// <summary>
     /// Fused backward for LogSoftmax + Cross-Entropy:
-    /// gradLogits[r, c] = (gradLoss / denom) * (rowTargetSum[r] * exp(logits[r, c] - lse[r]) - targetProbs[r, c]).
+    /// gradLogits[r, c] = gradScale * (rowTargetSum[r] * softmax[r, c] - targetProbs[r, c]), with
+    /// softmax = exp((logits - rowMax) - rowLogSumExpShifted) from the forward's shifted statistics.
+    /// <paramref name=""gradScale""/> is the final factor (upstream gradient times the loss scale), applied once.
+    /// A row is zero only when every target is zero: signed targets summing to zero still have gradient -t.
     /// </summary>
     public static void LogSoftmaxCrossEntropyBackward(
-        float gradLoss,
+        float gradScale,
         ReadOnlySpan<float> logits,
         ReadOnlySpan<float> targetProbs,
-        ReadOnlySpan<float> rowLogSumExp,
-        int activeRows,
+        ReadOnlySpan<float> rowMax,
+        ReadOnlySpan<float> rowLogSumExpShifted,
         Span<float> gradLogits,
         int rows,
         int cols)
     {
         if (rows <= 0 || cols <= 0) return;
         int total = checked(rows * cols);
-        if (logits.Length < total || targetProbs.Length < total || gradLogits.Length < total || rowLogSumExp.Length < rows)
+        if (logits.Length < total || targetProbs.Length < total || gradLogits.Length < total
+            || rowMax.Length < rows || rowLogSumExpShifted.Length < rows)
             throw new ArgumentException(""Buffer lengths do not match [rows, cols] for LogSoftmaxCrossEntropyBackward."");
 
-        float scale = gradLoss / (activeRows > 0 ? activeRows : 1);
+        float scale = gradScale;
         for (int r = 0; r < rows; r++)
         {
             int rowOffset = r * cols;
             var zRow = logits.Slice(rowOffset, cols);
             var tRow = targetProbs.Slice(rowOffset, cols);
             var gRow = gradLogits.Slice(rowOffset, cols);
-            float lse = rowLogSumExp[r];
+            float m = rowMax[r];
+            float lse = rowLogSumExpShifted[r];
 
             float targetSum = 0.0f;
-            for (int c = 0; c < cols; c++) targetSum += tRow[c];
-            if (targetSum == 0.0f)
+            bool anyTarget = false;
+            for (int c = 0; c < cols; c++)
+            {
+                targetSum += tRow[c];
+                anyTarget |= tRow[c] != 0.0f;
+            }
+            if (!anyTarget)
             {
                 gRow.Clear();
                 continue;
@@ -685,14 +705,15 @@ internal static class FusedRowPatternTemplates
 #if NET8_0_OR_GREATER
             if (Avx.IsSupported && Avx2.IsSupported && cols >= 8)
             {
+                var vMax = Vector256.Create(m);
                 var vLse = Vector256.Create(lse);
                 var vScale = Vector256.Create(scale);
                 var vTSum = Vector256.Create(targetSum);
                 int simdCols = cols & ~7;
                 for (; k < simdCols; k += 8)
                 {
-                    var prob = global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastExp256(
-                        Avx.Subtract(global::AiDotNet.Tensors.Engines.Simd.SimdKernels.ReadVector256(zRow, k), vLse));
+                    var prob = global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastExp256(Avx.Subtract(
+                        Avx.Subtract(global::AiDotNet.Tensors.Engines.Simd.SimdKernels.ReadVector256(zRow, k), vMax), vLse));
                     var tv = global::AiDotNet.Tensors.Engines.Simd.SimdKernels.ReadVector256(tRow, k);
                     var diff = Avx.Subtract(Avx.Multiply(vTSum, prob), tv);
                     global::AiDotNet.Tensors.Engines.Simd.SimdKernels.WriteVector256(gRow, k, Avx.Multiply(vScale, diff));
@@ -701,7 +722,7 @@ internal static class FusedRowPatternTemplates
 #endif
             for (; k < cols; k++)
             {
-                float prob = GeneratedKernelSimdMath.ExpScalar(zRow[k] - lse);
+                float prob = GeneratedKernelSimdMath.ExpScalar((zRow[k] - m) - lse);
                 gRow[k] = scale * (targetSum * prob - tRow[k]);
             }
         }
@@ -748,7 +769,11 @@ __device__ __forceinline__ float aidn_block_reduce_sum(float val, float* shared)
     if (wid == 0) val = aidn_warp_reduce_sum(val);
     if (threadIdx.x == 0) shared[0] = val;
     __syncthreads();
-    return shared[0];
+    // Every thread reads the result, then the block syncs again: otherwise warp 0 can enter the next reduction and
+    // overwrite shared[0] before a slower warp has read this one.
+    float result = shared[0];
+    __syncthreads();
+    return result;
 }
 
 __device__ __forceinline__ float aidn_block_reduce_max(float val, float* shared) {
@@ -762,7 +787,9 @@ __device__ __forceinline__ float aidn_block_reduce_max(float val, float* shared)
     if (wid == 0) val = aidn_warp_reduce_max(val);
     if (threadIdx.x == 0) shared[0] = val;
     __syncthreads();
-    return shared[0];
+    float result = shared[0];
+    __syncthreads();
+    return result;
 }
 
 extern """"C"""" __global__ void fused_rmsnorm_residual_f32(
@@ -838,11 +865,11 @@ extern """"C"""" __global__ void fused_bias_activation_row_f32(
     int cols,
     int act_kind)
 {
-    int total = rows * cols;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int idx = tid; idx < total; idx += stride) {
-        int c = idx % cols;
+    long long total = (long long)rows * cols;
+    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long stride = (long long)blockDim.x * gridDim.x;
+    for (long long idx = tid; idx < total; idx += stride) {
+        int c = (int)(idx % cols);
         float z = x[idx] + bias[c];
         float y = z;
         if (act_kind == 1) y = fmaxf(0.0f, z);
@@ -888,6 +915,7 @@ extern """"C"""" __global__ void fused_rope_splithalf_f32(
 extern """"C"""" __global__ void fused_logsoftmax_ce_fwd_f32(
     const float* __restrict__ logits,
     const float* __restrict__ target_probs,
+    float* __restrict__ row_max,
     float* __restrict__ row_lse,
     float* __restrict__ row_losses,
     float* __restrict__ row_active,
@@ -905,17 +933,20 @@ extern """"C"""" __global__ void fused_logsoftmax_ce_fwd_f32(
     float localExp = 0.0f;
     for (int c = threadIdx.x; c < cols; c += blockDim.x)
         localExp += expf(logits[baseIdx + c] - rmax);
-    float lse = rmax + logf(aidn_block_reduce_sum(localExp, sdata));
+    // Shifted coordinates: rmax + log(sum) rounds back to rmax for large equal logits.
+    float lse = logf(aidn_block_reduce_sum(localExp, sdata));
     float localLoss = 0.0f;
     float localMass = 0.0f;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
         float t = target_probs[baseIdx + c];
+        if (t == 0.0f) continue;   // a masked class (logit -inf) must not add 0 * -inf
         localMass += fabsf(t);
-        localLoss -= t * (logits[baseIdx + c] - lse);
+        localLoss -= t * ((logits[baseIdx + c] - rmax) - lse);
     }
     float rowLoss = aidn_block_reduce_sum(localLoss, sdata);
     float rowMass = aidn_block_reduce_sum(localMass, sdata);
     if (threadIdx.x == 0) {
+        row_max[row] = rmax;
         row_lse[row] = lse;
         row_losses[row] = (rowMass > 0.0f) ? rowLoss : 0.0f;
         row_active[row] = (rowMass > 0.0f) ? 1.0f : 0.0f;
@@ -925,6 +956,7 @@ extern """"C"""" __global__ void fused_logsoftmax_ce_fwd_f32(
 extern """"C"""" __global__ void fused_logsoftmax_ce_bwd_f32(
     const float* __restrict__ logits,
     const float* __restrict__ target_probs,
+    const float* __restrict__ row_max,
     const float* __restrict__ row_lse,
     float* __restrict__ grad_logits,
     int rows,
@@ -936,15 +968,22 @@ extern """"C"""" __global__ void fused_logsoftmax_ce_bwd_f32(
     if (row >= rows) return;
     int baseIdx = row * cols;
     float localTargetSum = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x)
-        localTargetSum += target_probs[baseIdx + c];
+    float localMass = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float t = target_probs[baseIdx + c];
+        localTargetSum += t;
+        localMass += fabsf(t);
+    }
     float targetSum = aidn_block_reduce_sum(localTargetSum, sdata);
+    // Zero only when every target is zero: signed targets summing to zero still have gradient -t.
+    float mass = aidn_block_reduce_sum(localMass, sdata);
+    float rmax = row_max[row];
     float lse = row_lse[row];
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
-        if (targetSum == 0.0f) {
+        if (mass == 0.0f) {
             grad_logits[baseIdx + c] = 0.0f;
         } else {
-            float prob = expf(logits[baseIdx + c] - lse);
+            float prob = expf((logits[baseIdx + c] - rmax) - lse);
             grad_logits[baseIdx + c] = scale * (targetSum * prob - target_probs[baseIdx + c]);
         }
     }

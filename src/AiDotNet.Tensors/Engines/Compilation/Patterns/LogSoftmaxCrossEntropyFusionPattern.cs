@@ -225,8 +225,8 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
 
         var rowMaxState = new float[rows];
         var rowLseState = new float[rows];
-        int capturedActiveRows = rows;
-        bool isExactMeanOverRows = Math.Abs(overallScale - (1.0f / rows)) <= 1e-7f;
+        // Set by the fused forward: the backward's fused path reads its row statistics, so it runs only after it.
+        bool statsFromFusedForward = false;
 
         var node = new LazyNode<float>(
             LazyNodeType.Custom,
@@ -248,7 +248,7 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
                         rows,
                         cols,
                         out int active);
-                    capturedActiveRows = active;
+                    statsFromFusedForward = true;
                     // Recover exact total NLL = activeMean * max(1, active) and multiply by overallScale.
                     double totalNll = (double)activeMean * (active > 0 ? active : 1);
                     float finalLoss = (float)(totalNll * overallScale);
@@ -258,13 +258,10 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
                     return;
                 }
 
-                if (isExactMeanOverRows && eng.Is<DirectGpuTensorEngine>())
-                {
-                    var gpuLoss = eng.TensorSoftmaxCrossEntropy(logits, target);
-                    DirectGpuTensorEngine.CopyResultInto(eng, gpuLoss, output);
-                    return;
-                }
-
+                // Exactly the recorded loss on every other engine: overallScale * -sum(target * logSoftmax(logits)).
+                // (No TensorSoftmaxCrossEntropy shortcut: it averages over supervised rows only, and its 1/rows test
+                // also matched custom scales close to 1/rows.)
+                statsFromFusedForward = false;
                 var lp = eng.TensorLogSoftmax(logits, classAxis);
                 var prod = eng.TensorMultiply(target, lp);
                 var allAxes = new int[logits.Rank];
@@ -282,7 +279,8 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
                 if (!needZ && !needT)
                     return;
 
-                if (!engine.Is<DirectGpuTensorEngine>()
+                if (statsFromFusedForward
+                    && !engine.Is<DirectGpuTensorEngine>()
                     && z.IsContiguous
                     && t.IsContiguous
                     && gradOutput.IsContiguous)
@@ -292,15 +290,13 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
                     if (needZ)
                     {
                         var dZ = TensorAllocator.Rent<float>(z._shape);
-                        int denomActive = capturedActiveRows > 0 ? capturedActiveRows : 1;
-                        // LogSoftmaxCrossEntropyBackward divides by denomActive, so pass upstream * overallScale * denomActive.
-                        float effectiveGradLoss = upstream * overallScale * denomActive;
+                        // The final factor, applied once (no multiply by the active-row count and divide back).
                         CompiledFusedKernels.LogSoftmaxCrossEntropyBackward(
-                            effectiveGradLoss,
+                            upstream * overallScale,
                             z.AsSpan(),
                             t.AsSpan(),
+                            rowMaxState,
                             rowLseState,
-                            denomActive,
                             dZ.AsWritableSpan(),
                             rows,
                             cols);
@@ -315,11 +311,13 @@ internal sealed class LogSoftmaxCrossEntropyFusionPattern : IFusionPattern
                         float tScale = -upstream * overallScale;
                         for (int r = 0; r < rows; r++)
                         {
+                            float m = rowMaxState[r];
                             float lse = rowLseState[r];
                             int baseIdx = r * cols;
                             for (int c = 0; c < cols; c++)
                             {
-                                dTSpan[baseIdx + c] = tScale * (zSpan[baseIdx + c] - lse);
+                                // log-softmax in shifted coordinates, as the forward saved it.
+                                dTSpan[baseIdx + c] = tScale * ((zSpan[baseIdx + c] - m) - lse);
                             }
                         }
                         dT.IncrementVersion();
