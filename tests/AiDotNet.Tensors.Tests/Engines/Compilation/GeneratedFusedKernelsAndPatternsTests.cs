@@ -183,26 +183,13 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(lossEager, new[] { x, res, gamma });
         }
 
-        // A training plan keeps the residual add and the RMSNorm: the fused node never writes the residual sum,
-        // which a training caller can still read after Step().
-        List<ILazyNode> trainingNodes;
-        using (var scope = GraphMode.Enable())
-        {
-            var sumLazy = engine.TensorAdd(x, res);
-            var normLazy = engine.RMSNorm(sumLazy, gamma, eps, out _);
-            _ = engine.ReduceSum(engine.TensorMultiply(normLazy, normLazy), new[] { 0, 1 }, keepDims: false);
-            trainingNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
-        }
-        Assert.DoesNotContain(trainingNodes, n => n.OpName == "FusedRmsNormResidual");
-        Assert.Contains(trainingNodes, n => n.OpName == "RMSNorm");
-
         List<ILazyNode> compiledNodes;
         using (var scope = GraphMode.Enable())
         {
             var sumLazy = engine.TensorAdd(x, res);
             var normLazy = engine.RMSNorm(sumLazy, gamma, eps, out _);
             _ = engine.ReduceSum(engine.TensorMultiply(normLazy, normLazy), new[] { 0, 1 }, keepDims: false);
-            compiledNodes = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
+            compiledNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
         }
 
         Assert.Contains(compiledNodes, n => n.OpName == "FusedRmsNormResidual");
@@ -228,11 +215,11 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
     [InlineData("LayerNorm")]
     [InlineData("RMSNorm")]
     [InlineData("RMSNormRope")]
-    public void ResidualNormTrainingPlan_WritesTheResidualSumTheCallerReadsAfterStep(string norm)
+    public void ResidualNormTrainingPlan_FusesAndStillWritesADeclaredResidualSum(string norm)
     {
         // A residual add feeding a norm (and, for the cross-layer form, split-half RoPE) inside a compiled training
-        // plan. The caller holds the residual sum and reads it after Step(); a fusion that removed the add left it
-        // unwritten (freed storage or zeros).
+        // plan. Undeclared, the add folds into the fused norm step. Declared (GradientRecording.RetainOutput), the
+        // caller reads the residual sum after Step(), so the add must still run and write it.
         var engine = new CpuEngine();
         var rng = new Random(909);
         const int rows = 2, seqLen = 4, headDim = 16, halfDim = headDim / 2;
@@ -244,12 +231,19 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         var cos = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1f, 1f), new[] { 1, seqLen, halfDim });
         var sin = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1f, 1f), new[] { 1, seqLen, halfDim });
         var expectedSum = engine.TensorAdd(x, res).ToArray();
-
-        Tensor<float> sum;
-        ICompiledTrainingPlan<float> plan;
-        using (var scope = GraphMode.Enable())
+        string fusedName = norm switch
         {
+            "LayerNorm" => "FusedLayerNormResidual",
+            "RMSNorm" => "FusedRmsNormResidual",
+            _ => "FusedRmsNormResidualRope",
+        };
+
+        CompiledTrainingPlan<float> Build(bool declare, out Tensor<float> sum)
+        {
+            var parameters = new[] { x, res, gamma };
+            using var scope = GraphMode.EnableTraining(parameters);
             sum = engine.TensorAdd(x, res);
+            if (declare) GradientRecording.RetainOutput(sum);
             Tensor<float> output;
             if (norm == "LayerNorm")
             {
@@ -272,14 +266,16 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
                 }
             }
             engine.ReduceSum(engine.TensorMultiply(output, output), null);
-            plan = scope.CompileTraining(new[] { x, res, gamma });
+            return Assert.IsType<CompiledTrainingPlan<float>>(scope.CompileTraining(parameters));
         }
 
-        using (plan)
-        {
-            plan.Step();
-            AssertClose(expectedSum, sum.AsSpan(), 1e-6f);
-        }
+        using (var fusedPlan = Build(declare: false, out _))
+            Assert.Contains(fusedPlan.BackwardStepKinds, kind => kind.IndexOf(fusedName, StringComparison.Ordinal) >= 0);
+
+        using var plan = Build(declare: true, out var declaredSum);
+        Assert.DoesNotContain(plan.BackwardStepKinds, kind => kind.IndexOf(fusedName, StringComparison.Ordinal) >= 0);
+        plan.Step();
+        AssertClose(expectedSum, declaredSum.AsSpan(), 1e-6f);
     }
 
     [Fact]
@@ -303,26 +299,13 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(lossEager, new[] { x, res, gamma, beta });
         }
 
-        // A training plan keeps the residual add and the LayerNorm: the fused node never writes the residual sum,
-        // which a training caller can still read after Step().
-        List<ILazyNode> trainingNodes;
-        using (var scope = GraphMode.Enable())
-        {
-            var sumLazy = engine.TensorAdd(x, res);
-            var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
-            _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
-            trainingNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
-        }
-        Assert.DoesNotContain(trainingNodes, n => n.OpName == "FusedLayerNormResidual");
-        Assert.Contains(trainingNodes, n => n.OpName == "LayerNorm");
-
         List<ILazyNode> compiledNodes;
         using (var scope = GraphMode.Enable())
         {
             var sumLazy = engine.TensorAdd(x, res);
             var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
             _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
-            compiledNodes = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
+            compiledNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
         }
 
         Assert.Contains(compiledNodes, n => n.OpName == "FusedLayerNormResidual");

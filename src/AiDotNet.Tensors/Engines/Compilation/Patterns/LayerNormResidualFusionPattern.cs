@@ -20,10 +20,10 @@ internal sealed class LayerNormResidualFusionPattern : IHostTrainingFusionPatter
 {
     public string Name => "LayerNormResidual";
 
-    // Inference only. The fused node never writes the residual sum, and a training plan's caller reads that sum after
-    // Step() (the LayerNorm input of an embedding -> linear -> residual -> LayerNorm block came back as freed storage).
-    // The fused backward stays exact, so the node is still correct wherever an inference plan runs it.
-    public bool IsDifferentiable => false;
+    // Training plans fuse too. The fused node does not write the residual (or pre-activation) sum: a caller that
+    // reads it after Step() declares it (GradientRecording.RetainOutput), and CpuFusionPass keeps a declared node
+    // out of every fusion in a training plan.
+    public bool IsDifferentiable => true;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,
