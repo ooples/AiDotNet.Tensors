@@ -50,6 +50,26 @@ public sealed class GeneratedRowKernelEdgeCaseTests
     }
 
     [Fact]
+    public void CrossEntropy_LargeUpstreamGradient_IsAppliedOnceAndStaysFinite()
+    {
+        // The scale was multiplied by the active-row count and divided back: 1e38 * 4 overflowed first.
+        float[] logits = { 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f };
+        float[] target = { 1f, 0f, 1f, 0f, 1f, 0f, 1f, 0f };
+        var rowMax = new float[4];
+        var rowLse = new float[4];
+        CompiledFusedKernels.LogSoftmaxCrossEntropyForward(logits, target, rowMax, rowLse, 4, 2, out _);
+
+        var grad = new float[8];
+        CompiledFusedKernels.LogSoftmaxCrossEntropyBackward(1e38f, logits, target, rowMax, rowLse, grad, 4, 2);
+
+        for (int r = 0; r < 4; r++)
+        {
+            Assert.Equal(-5e37f, grad[2 * r], 1e31f);
+            Assert.Equal(5e37f, grad[2 * r + 1], 1e31f);
+        }
+    }
+
+    [Fact]
     public void CrossEntropy_MaskedClassAtNegativeInfinity_AddsNoNaN()
     {
         float[] logits = { 0f, float.NegativeInfinity };
