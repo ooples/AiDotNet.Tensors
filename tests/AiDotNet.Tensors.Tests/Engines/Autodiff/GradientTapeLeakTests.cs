@@ -1287,7 +1287,7 @@ public class GradientTapeLeakTests
 
     /// <summary>
     /// Issue AiDotNet#1340 — 2-encoder-block Transformer chain (mirroring the
-    /// PAPER-A Path B consumer config: dModel=128, dFf=256, heads=2, ctxLen=64,
+    /// downstream consumer config: dModel=128, dFf=256, heads=2, ctxLen=64,
     /// V=256, 164k params) does NOT leak more than 20 KB/call after 500 Train()
     /// iterations under <c>GradientTapeOptions.Default</c> (Persistent=true).
     ///

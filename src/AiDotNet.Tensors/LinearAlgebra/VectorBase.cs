@@ -390,6 +390,21 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner, Engines.DirectGpu.
     }
 
     /// <summary>
+    /// Gives up this vector's host array, which its owner is recycling: the vector reverts to having no host storage and
+    /// every later read or write throws <paramref name="message"/> instead of reaching an array a new result now owns.
+    /// The state is this vector's own, not the array's, so the array's next owner cannot clear the mark.
+    /// </summary>
+    internal void ReleaseHostStorage(string message)
+    {
+        using var keepThis = new KeepAliveScope(this);   // holds this while its storage is in use
+        _hostSync = Helpers.HostSync.CreateUnshared();
+        _ownDeviceState = null;
+        _memory = Memory<T>.Empty;
+        _cachedArray = null;
+        Helpers.HostSync.Release(this, message);
+    }
+
+    /// <summary>
     /// Returns true if this vector has no CPU backing (GPU-resident with lazy allocation).
     /// </summary>
     internal bool IsLazyAllocated => _memory.Length == 0 && _logicalLength > 0;

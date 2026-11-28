@@ -3655,7 +3655,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Add);
         }
         else
         {
@@ -5268,7 +5268,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep10 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            Simd.SimdKernels.Mish(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, MishDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5325,7 +5325,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
-            unsafe { Simd.SimdKernels.LeakyReLUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, alphaF); }
+            unsafe { LeakyReLUDispatch((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, alphaF); }
         }
         else if (typeof(T) == typeof(double))
         {
@@ -5334,7 +5334,10 @@ public partial class CpuEngine : ITensorLevelEngine
             using var destinationDataKeep12 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
-            Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
+            unsafe
+            {
+                fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) LeakyReLUDispatch(pS, pD, srcSpan.Length, alphaD);
+            }
         }
         else
         {
@@ -5827,6 +5830,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
+        // Same shapes: nothing to broadcast. The elementwise Into computes the same per-element kernel across the
+        // pool, so it is bit-identical, and skips the broadcast result this path would allocate and copy.
+        if (ShapesMatch(a._shape, b._shape) && ShapesMatch(a._shape, destination._shape))
+        {
+            TensorMultiplyInto(destination, a, b);
+            return;
+        }
+
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             TrailingRepeatBinary(a, b, destination, bTileSize, multiply: true);
@@ -5861,6 +5872,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
 
+        // Same shapes: nothing to broadcast. The elementwise Into computes the same per-element kernel across the
+        // pool, so it is bit-identical, and skips the broadcast result this path would allocate and copy.
+        if (ShapesMatch(a._shape, b._shape) && ShapesMatch(a._shape, destination._shape))
+        {
+            TensorAddInto(destination, a, b);
+            return;
+        }
+
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             TrailingRepeatBinary(a, b, destination, bTileSize, multiply: false);
@@ -5888,6 +5907,37 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination.Length != a.Length)
             throw new ArgumentException(
                 $"Destination length ({destination.Length}) must equal a.Length ({a.Length}).");
+
+        if (typeof(T) == typeof(float) && a.IsContiguous)
+        {
+            using var aKeepF = new KeepAliveScope(a);
+            using var destinationKeepF = new KeepAliveScope(destination);
+            var fSrc = ((Tensor<float>)(object)a).AsSpanUnmarked();
+            var fDst = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
+            float scalarF = scalar is float sf ? sf : 0f;
+            unsafe
+            {
+                fixed (float* pS = fSrc)
+                fixed (float* pD = fDst)
+                    AddScalarDispatch(pS, pD, fSrc.Length, scalarF);
+            }
+            return;
+        }
+        if (typeof(T) == typeof(double) && a.IsContiguous)
+        {
+            using var aKeepD = new KeepAliveScope(a);
+            using var destinationKeepD = new KeepAliveScope(destination);
+            var dSrc = ((Tensor<double>)(object)a).AsSpanUnmarked();
+            var dDst = ((Tensor<double>)(object)destination).AsWritableSpanUnmarked();
+            double scalarD = scalar is double sd ? sd : 0d;
+            unsafe
+            {
+                fixed (double* pS = dSrc)
+                fixed (double* pD = dDst)
+                    AddScalarDispatch(pS, pD, dSrc.Length, scalarD);
+            }
+            return;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         if (a.IsContiguous)
@@ -5954,7 +6004,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorSubtractUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+            // Split across the pool like TensorAddInto; the same per-element kernel, so bit-identical.
+            JitBinaryDispatch((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length, JitBinaryOp.Subtract);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -5967,7 +6018,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorSubtractUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Subtract);
         }
         else
         {
@@ -6000,7 +6051,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorDivideUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+            // Split across the pool like TensorAddInto; the same per-element kernel, so bit-identical.
+            JitBinaryDispatch((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length, JitBinaryOp.Divide);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -6013,7 +6065,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorDivideUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Divide);
         }
         else
         {
@@ -6119,7 +6171,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep30 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Sqrt(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, SqrtDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6177,7 +6229,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // at large arguments).
             var fSrc = ((Tensor<float>)(object)input).AsSpanUnmarked();
             var fDst = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
-            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+            // The same MathF loop per element, split across the pool.
+            fixed (float* pS = fSrc)
+            fixed (float* pD = fDst)
+                ParallelComputeBound(pS, pD, fSrc.Length, MathFSinKernel);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -6186,7 +6241,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep34 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Sin(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, SinDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6208,7 +6263,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Spans, not leased arrays (see TensorSinInto).
             var fSrc = ((Tensor<float>)(object)input).AsSpanUnmarked();
             var fDst = ((Tensor<float>)(object)destination).AsWritableSpanUnmarked();
-            for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+            // The same MathF loop per element, split across the pool.
+            fixed (float* pS = fSrc)
+            fixed (float* pD = fDst)
+                ParallelComputeBound(pS, pD, fSrc.Length, MathFCosKernel);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -6217,7 +6275,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep36 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Cos(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, CosDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6711,7 +6769,8 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length);
+            // Split across the pool like TensorAddInto; the same per-element kernel, so bit-identical.
+            JitBinaryDispatch((float*)pinA.Pointer, (float*)pinB.Pointer, (float*)pinR.Pointer, length, JitBinaryOp.Multiply);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -6724,7 +6783,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Multiply);
         }
         else
         {
@@ -13604,7 +13663,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
+            ELUDispatch((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -25707,6 +25766,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Each row is independent: max → subtract → exp → sum → divide.
     /// Parallelized across rows for large tensors.
     /// </summary>
+    /// <summary>Test hook: runs on the calling thread after the float GroupNorm has decided its chunking.</summary>
+    internal static Action? GroupNormDegreeDecidedForTests;
+
     /// <summary>
     /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
     /// and parallelizes across batch*groups using PersistentParallelExecutor.
@@ -25728,13 +25790,16 @@ public partial class CpuEngine : ITensorLevelEngine
         var meanLocal = meanArr;
         var varLocal = varArr;
 
-        // Parallelize across batch*groups — each group is independent
+        // Parallelize across batch*groups — each group is independent. The degree of parallelism is a process-wide
+        // setting another thread may change at any time, so it is read once: the chunk count and the chunk size must
+        // come from the same value, or a change between two reads leaves groups no chunk covers.
+        int workers = Math.Max(1, Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism));
+        int chunkSize = (totalGroups + workers - 1) / workers;
+        GroupNormDegreeDecidedForTests?.Invoke();
         PersistentParallelExecutor.Instance.Execute(
-            Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism),
+            workers,
             [MethodImpl(Hot)] (chunk) =>
             {
-                int chunkSize = (totalGroups + Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism) - 1)
-                    / Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism);
                 int startIdx = chunk * chunkSize;
                 int endIdx = Math.Min(startIdx + chunkSize, totalGroups);
 
@@ -25924,9 +25989,11 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var gOutF = gOutF0.Length == total ? gOutF0 : (float[])(object)gradOutput.ToArray();
             var outF = outF0.Length == total ? outF0 : (float[])(object)output.ToArray();
-            var gInF = new float[total];
+            var gInTensor = TensorAllocator.RentUninitialized<float>(output._shape);
+            using var gInLease = gInTensor.LeaseArray();
+            var gInF = gInLease.Array;
             SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInF);
+            return (Tensor<T>)(object)gInTensor;
         }
 #endif
         // Double primitive fast path for last-axis softmax backward.
@@ -25941,7 +26008,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var gOutD = gOutD0.Length == total ? gOutD0 : (double[])(object)gradOutput.ToArray();
             var outD = outD0.Length == total ? outD0 : (double[])(object)output.ToArray();
-            var gInD = new double[total];
+            var gInTensorD = TensorAllocator.RentUninitialized<double>(output._shape);
+            using var gInLeaseD = gInTensorD.LeaseArray();
+            var gInD = gInLeaseD.Array;
             bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
             int axisSz = axisSize;
             Action<int> rowKernel = row => SoftmaxBackwardDoubleRow(gOutD, outD, gInD, row, axisSz);
@@ -25949,7 +26018,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, rowKernel);
             else
                 for (int row = 0; row < outerSize; row++) rowKernel(row);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInD);
+            return (Tensor<T>)(object)gInTensorD;
         }
 
         // Generic fallback
@@ -48802,7 +48871,11 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         ValidateElementwisePair("SwishBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new T[gradOutput.Length];
+        // A pooled result, so a caller that is done with it (a compiled backward copies it into its planned gradient)
+        // can hand the buffer to the next one instead of each call allocating a fresh activation-sized array.
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput.Shape.ToArray());
+        using var resultLease = resultTensor.LeaseArray();
+        var result = resultLease.Array;
         using var gDataLease = gradOutput.LeaseArray();
         var gData = gDataLease.Array;
         using var iDataLease = input.LeaseArray();
@@ -48862,7 +48935,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
             }
         }
-        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        return resultTensor;
     }
 
     /// <inheritdoc/>
@@ -49060,7 +49133,11 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new T[gradOutput.Length];
+        // A pooled result, so a caller that is done with it (a compiled backward copies it into its planned gradient)
+        // can hand the buffer to the next one instead of each call allocating a fresh activation-sized array.
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput.Shape.ToArray());
+        using var resultLease = resultTensor.LeaseArray();
+        var result = resultLease.Array;
         using var gDataLease = gradOutput.LeaseArray();
         var gData = gDataLease.Array;
         using var iDataLease = input.LeaseArray();
@@ -49075,7 +49152,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double deriv = x > 0 ? 1.0 : numOps.ToDouble(oData[i]) + alpha;
             result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
         }
-        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        return resultTensor;
     }
 
     /// <inheritdoc/>
@@ -50327,14 +50404,70 @@ public partial class CpuEngine : ITensorLevelEngine
     /// chunks, with <see cref="SimdKernels.ReLUUnsafe"/> (see <see cref="JitBinaryDispatch"/>).
     /// </summary>
     // Float ELU split across threads in elementwise-grain chunks (#653), as JitUnaryDispatch does for ReLU.
+    // Float LeakyReLU split across threads in elementwise-grain chunks, as ELUDispatch does for ELU.
+    private static unsafe void LeakyReLUDispatch(float* pSrc, float* pDst, int length, float alpha)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.LeakyReLUUnsafe(pSrc, pDst, length, alpha);
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.LeakyReLUUnsafe(pSrc + start, pDst + start, count, alpha);
+        }, deterministicSafe: true);
+    }
+
+    // Float x + scalar split across threads in elementwise-grain chunks, with the same SIMD kernel per chunk.
+    private static unsafe void AddScalarDispatch(float* pSrc, float* pDst, int length, float scalar)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.AddScalar(new ReadOnlySpan<float>(pSrc, length), scalar, new Span<float>(pDst, length));
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.AddScalar(new ReadOnlySpan<float>(pSrc + start, count), scalar, new Span<float>(pDst + start, count));
+        }, deterministicSafe: true);
+    }
+
+    // Scalar MathF.Sin / MathF.Cos over a range (SimdKernels.Sin's float range reduction loses accuracy at large
+    // arguments, so the float Into ops keep MathF and gain only the split).
+    private static unsafe void MathFSinKernel(float* input, float* output, int length)
+    {
+        for (int i = 0; i < length; i++) output[i] = MathF.Sin(input[i]);
+    }
+
+    private static unsafe void MathFCosKernel(float* input, float* output, int length)
+    {
+        for (int i = 0; i < length; i++) output[i] = MathF.Cos(input[i]);
+    }
+
     private static unsafe void ELUDispatch(float* pSrc, float* pDst, int length, float alpha)
     {
         int numChunks = ElementwiseChunks(length);
         if (numChunks < 2)
         {
+            t_lastElementwiseDispatchChunks = 0;
             SimdKernels.ELUUnsafe(pSrc, pDst, length, alpha);
             return;
         }
+        t_lastElementwiseDispatchChunks = numChunks;
         int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
         {
@@ -50774,6 +50907,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Shared elementwise grain (CpuParallelSettings.ElementwiseGrainSize); the old 256K threshold and
         // 16-chunk cap left a 1M-element activation on at most 16 threads and anything below 256K serial.
         int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        t_lastElementwiseDispatchChunks = nChunks >= 2 ? nChunks : 0;
         if (nChunks >= 2)
         {
             int chunkSize = (length + nChunks - 1) / nChunks;
@@ -50805,11 +50939,118 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     private unsafe delegate void UnsafeUnaryKernelDouble(double* input, double* output, int length);
 
+    // Span-only double SIMD kernels in the pointer form ParallelComputeBound splits; one chunk computes exactly what the
+    // whole-array call computed for those elements.
+    private static unsafe void SqrtDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Sqrt(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void SinDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Sin(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void CosDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Cos(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void MishDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Mish(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+
+    // Chunk starts on a 16-double boundary: every chunk but the last is a whole number of the kernels' widest unrolled
+    // step, so each element takes the same vector or scalar path it takes in one whole-array call.
+    private static int AlignDoubleChunk(int elements) => (elements + 15) & ~15;
+
+    /// <summary>
+    /// Runs a double binary elementwise op (Add / Subtract / Multiply / Divide) split across threads at the shared
+    /// elementwise grain, as <see cref="JitBinaryDispatch"/> does for float, with the same per-element SIMD kernel.
+    /// </summary>
+    private static unsafe void DoubleBinaryDispatch(double* pA, double* pB, double* pR, int length, JitBinaryOp op)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            RunBinaryDouble(pA, pB, pR, length, op);
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        DoubleBinaryChunks(pA, pB, pR, length, numChunks, op);
+    }
+
+    // The split itself, apart from the serial path above so a serial call does not allocate the closure.
+    private static unsafe void DoubleBinaryChunks(double* pA, double* pB, double* pR, int length, int numChunks, JitBinaryOp op)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                RunBinaryDouble(pA + start, pB + start, pR + start, count, op);
+        }, deterministicSafe: true);
+    }
+
+    private static unsafe void RunBinaryDouble(double* a, double* b, double* r, int count, JitBinaryOp op)
+    {
+        if (ReferenceEquals(op, JitBinaryOp.Add)) SimdKernels.VectorAddUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Subtract)) SimdKernels.VectorSubtractUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Multiply)) SimdKernels.VectorMultiplyUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Divide)) SimdKernels.VectorDivideUnsafe(a, b, r, count);
+        else throw new ArgumentOutOfRangeException(nameof(op));
+    }
+
+    // Double x + scalar split across threads in elementwise-grain chunks, with the same SIMD kernel per chunk.
+    private static unsafe void AddScalarDispatch(double* pSrc, double* pDst, int length, double scalar)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.AddScalar(new ReadOnlySpan<double>(pSrc, length), scalar, new Span<double>(pDst, length));
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        AddScalarDoubleChunks(pSrc, pDst, length, numChunks, scalar);
+    }
+
+    private static unsafe void AddScalarDoubleChunks(double* pSrc, double* pDst, int length, int numChunks, double scalar)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.AddScalar(new ReadOnlySpan<double>(pSrc + start, count), scalar, new Span<double>(pDst + start, count));
+        }, deterministicSafe: true);
+    }
+
+    // Double LeakyReLU split across threads in elementwise-grain chunks, with the same SIMD kernel per chunk.
+    private static unsafe void LeakyReLUDispatch(double* pSrc, double* pDst, int length, double alpha)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.LeakyReLU(new ReadOnlySpan<double>(pSrc, length), alpha, new Span<double>(pDst, length));
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        LeakyReLUDoubleChunks(pSrc, pDst, length, numChunks, alpha);
+    }
+
+    private static unsafe void LeakyReLUDoubleChunks(double* pSrc, double* pDst, int length, int numChunks, double alpha)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.LeakyReLU(new ReadOnlySpan<double>(pSrc + start, count), alpha, new Span<double>(pDst + start, count));
+        }, deterministicSafe: true);
+    }
+
     private static unsafe void ParallelComputeBound(double* input, double* output, int length, UnsafeUnaryKernelDouble kernel)
     {
         // 256K doubles = 2 MB. Same threshold rationale as the float variant —
         // below this size, persistent-pool dispatch is overhead-dominated.
         int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        t_lastElementwiseDispatchChunks = nChunks >= 2 ? nChunks : 0;
         if (nChunks >= 2)
         {
             int chunkSize = (length + nChunks - 1) / nChunks;
@@ -50817,22 +51058,25 @@ public partial class CpuEngine : ITensorLevelEngine
             // doesn't hit unaligned tail in the AVX2 4× unrolled (16 doubles/iter) path.
             chunkSize = (chunkSize + 15) & ~15;
 
-            IntPtr pIn = (IntPtr)input;
-            IntPtr pOut = (IntPtr)output;
-            int totalLength = length;
-
-            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
-            {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, totalLength - start);
-                if (count > 0)
-                    kernel((double*)pIn + start, (double*)pOut + start, count);
-            });
+            ParallelComputeBoundChunks((IntPtr)input, (IntPtr)output, length, nChunks, chunkSize, kernel);
         }
         else
         {
             kernel(input, output, length);
         }
+    }
+
+    // The pool dispatch, apart from the serial path above so a serial call does not allocate the closure.
+    private static unsafe void ParallelComputeBoundChunks(IntPtr pIn, IntPtr pOut, int totalLength, int nChunks, int chunkSize,
+        UnsafeUnaryKernelDouble kernel)
+    {
+        Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, totalLength - start);
+            if (count > 0)
+                kernel((double*)pIn + start, (double*)pOut + start, count);
+        });
     }
 
     /// <summary>

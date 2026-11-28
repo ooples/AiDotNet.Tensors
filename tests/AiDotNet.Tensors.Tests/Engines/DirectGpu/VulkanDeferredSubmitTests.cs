@@ -179,11 +179,16 @@ void main() {
                 return peak;
             }
 
-            // Without a budget the chain parks far more than the bounded run may: the test can tell the two apart.
-            long unbounded = Chain(long.MaxValue);
-            Assert.True(unbounded > 32 * bufferBytes, $"only {unbounded} bytes were parked without a budget");
-
             const long budget = 8 * bufferBytes;
+
+            // Without a budget the chain parks more than the bounded run may: the test can tell the two apart. Only
+            // the open command buffer's releases are certain to be parked, since nothing submitted them yet; how many
+            // submitted ones are still waiting depends on whether the device keeps up with the host.
+            long unbounded = Chain(long.MaxValue);
+            long certain = (Device.CoalescedDispatchLimit - 1) * bufferBytes;
+            Assert.True(certain > budget + bufferBytes, $"a coalescing limit of {Device.CoalescedDispatchLimit} cannot exceed the budget");
+            Assert.True(unbounded >= certain, $"only {unbounded} bytes were parked without a budget");
+
             long bounded = Chain(budget);
             // One release past the budget can be waiting when the dispatch that enforces it has not been recorded yet.
             Assert.True(bounded <= budget + bufferBytes, $"{bounded} bytes parked with a budget of {budget}");

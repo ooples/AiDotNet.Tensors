@@ -131,35 +131,42 @@ public class ArenaWithheldGradientsTests
         Exception? failure = null;
         var thread = new Thread(() =>
         {
-            try { counts = RunSteps(callerArenaPerStep, steps: 6); }
+            try { counts = RunSteps(callerArenaPerStep, steps: 8); }
             catch (Exception e) { failure = e; }
         });
         thread.Start();
         thread.Join();
         if (failure is not null) throw new InvalidOperationException("The training steps threw.", failure);
 
-        // One step's handed-over gradients may be withheld at a time; later steps must not add to them. A step hands
-        // over its two gradients (w1, w2), so that is the bound for a caller's arena. The first step's count is not: only gradients the arena
-        // itself issued are withheld, and whether it issues one depends on process-wide pool state that tests running
-        // in parallel change, so an early step can withhold fewer (measured [1, 0, 2, 2, 2, 2] under a full run). The
-        // leak this guards (AiDotNet#2322) adds a set per step: [2, 4, 6, ...].
-        // A tape-owned arena also keeps the step's pooled forward buffers until they are collected: one step's worth,
-        // which must not grow. That steady count is the most any of the first three steps holds, not the second
-        // step's: the same process-wide pool state that lets the first step retain fewer can do so for the second
-        // (CI measured [5, 6, 7, 7, 7, 7] under a full parallel run - flat from the third step, no leak - which a
-        // bound taken from the second step alone reported as growth). The leak still fails: it adds a set every step,
-        // so the fourth step exceeds whatever the first three held.
-        int gradientsPerStep = callerArenaPerStep
-            ? 2
-            : (counts is { Length: > 2 } ? Math.Max(counts[0], Math.Max(counts[1], counts[2])) : 0);
+        // One step's handed-over gradients may be held at a time; later steps must not add to them. The leak this guards
+        // (AiDotNet#2322) adds a set per step: [2, 4, 6, ...] for a caller's arena, +2 a step for a tape-owned one.
+        //
+        // The early steps are not a bound. What a step retains depends on process-wide pool state that tests running in
+        // parallel change, so the first steps can hold fewer than the steady state: measured [1, 0, 2, 2, 2, 2] for a
+        // caller's arena, and [5, 6, 6, 7, 7, 7] for a tape-owned one, which a bound taken from the first three steps
+        // reported as growth. A tape-owned arena's steady count is 7 on this model: the step's own pooled forward
+        // buffers (3 x 131072 + 2 x 65536 floats), quarantined until their readers are collected, plus the previous
+        // step's two gradients (2 x 131072), which the caller still referenced at the last sweep and which leave at the
+        // next. So the test checks growth: from the fourth step on, the count stays flat and never exceeds the fourth
+        // step's.
         Assert.NotNull(counts);
         if (counts is null) return;
-        // Not vacuous: a run that never withheld anything would pass the bound without testing it. The steady state
-        // withholds the step's arena-issued gradients, so some step must hold at least one.
-        Assert.True(Array.Exists(counts, count => count > 0),
-            $"Withheld arrays per step: [{string.Join(", ", counts)}]; no step withheld a gradient, so the bound was not exercised.");
-        for (int step = 0; step < counts.Length; step++)
-            Assert.True(counts[step] <= gradientsPerStep,
-                $"Withheld arrays per step: [{string.Join(", ", counts)}]; step {step} holds {counts[step]}, more than the {gradientsPerStep} of one step.");
+        string seen = $"Retained arrays per step: [{string.Join(", ", counts)}]";
+        // Not vacuous: a run that never withheld anything would pass the bound without testing it.
+        Assert.True(Array.Exists(counts, count => count > 0), $"{seen}; no step retained a gradient, so the bound was not exercised.");
+        // A caller's arena withholds at most the two gradients (w1, w2) a step hands over.
+        if (callerArenaPerStep)
+            for (int step = 0; step < counts.Length; step++)
+                Assert.True(counts[step] <= 2, $"{seen}; step {step} holds {counts[step]}, more than the 2 gradients of one step.");
+        int steady = counts[3];
+        for (int step = 3; step < counts.Length; step++)
+            Assert.True(counts[step] <= steady, $"{seen}; step {step} holds {counts[step]}, more than the {steady} of step 3.");
+        int lastMin = int.MaxValue, lastMax = int.MinValue;
+        for (int step = counts.Length - 4; step < counts.Length; step++)
+        {
+            lastMin = Math.Min(lastMin, counts[step]);
+            lastMax = Math.Max(lastMax, counts[step]);
+        }
+        Assert.True(lastMin == lastMax, $"{seen}; the last four steps are not flat.");
     }
 }
