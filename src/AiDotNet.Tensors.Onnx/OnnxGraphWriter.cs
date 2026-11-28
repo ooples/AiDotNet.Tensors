@@ -55,7 +55,7 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
             _dynamicStorages.Add(pair.Value._storage);
             _graph.Input.Add(ValueInfo(name, pair.Value._shape, elementType));
         }
-        steps = LiveSteps(steps, outputs.Values);
+        steps = LiveSteps(ExpandFusedSteps(steps), outputs.Values);
         // Every buffer a step writes is runtime data, never an initializer, whichever tensor object views it.
         foreach (var step in steps) _dynamicStorages.Add(step.OutputBuffer._storage);
         IndexReaders(steps, outputs.Values);
@@ -95,6 +95,31 @@ internal sealed class OnnxGraphWriter<T> where T : unmanaged
         };
         model.OpsetImport.Add(new OperatorSetIdProto { Domain = string.Empty, Version = Opset });
         return model;
+    }
+
+    /// <summary>
+    /// Replaces every fused step that saved the operations it replaced (<see cref="FusedStepComponents{T}"/>) with those
+    /// operations, so a generated kernel with no ONNX form exports as the chain it computes.
+    /// </summary>
+    private static CompiledStep<T>[] ExpandFusedSteps(CompiledStep<T>[] steps)
+    {
+        List<CompiledStep<T>>? expanded = null;
+        for (int i = 0; i < steps.Length; i++)
+        {
+            var components = FusedStepComponents<T>.Of(steps[i]);
+            if (components is null)
+            {
+                expanded?.Add(steps[i]);
+                continue;
+            }
+            if (expanded is null)
+            {
+                expanded = new List<CompiledStep<T>>(steps.Length + components.Length);
+                for (int j = 0; j < i; j++) expanded.Add(steps[j]);
+            }
+            expanded.AddRange(ExpandFusedSteps(components));
+        }
+        return expanded?.ToArray() ?? steps;
     }
 
     /// <summary>

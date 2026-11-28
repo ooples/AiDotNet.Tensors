@@ -131,7 +131,8 @@ internal sealed class ElementwiseChainFusionPattern : IFusionPattern
                 capturedChain[capturedChain.Length - 1].Execute(eng, output);
             },
             null,
-            null)
+            // The chain's own operations, for consumers that translate per operation (ONNX export).
+            new object[] { new FusedStepComponents<float>(capturedChain) })
         {
             RecordingEngine = terminal.RecordingEngine
         };

@@ -207,7 +207,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     }
                 }
             },
-            null)
+            // The activation, as FusedLinear saves it, for consumers that translate the add and activation (ONNX export).
+            new object[] { fusedActType })
         {
             RecordingEngine = actNode.RecordingEngine
         };

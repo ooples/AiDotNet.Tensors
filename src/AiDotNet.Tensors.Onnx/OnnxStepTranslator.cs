@@ -30,6 +30,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
         "TensorSlice", "TensorSplit", "Concat", "Concatenate", "Gather",
         "Conv2D", "ConvTranspose2D", "MaxPool2D", "AvgPool2D", "Pad",
         "BatchNormInference", "LayerNorm", "LayerNorm[0]", "ReduceSum", "ReduceMean", "FusedLinear",
+        "FusedAddActivation", "FusedBiasActivation",
     };
 
     /// <summary>Pads folded into the conv or pool that reads them: the padded tensor, its source and the padding.</summary>
@@ -53,8 +54,12 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
     {
         if (!Supported.Contains(step.OpName)) return false;
         if (step.OpName == "Tile") return IsBroadcastTile(step);
-        // A fused linear translates when its activation has an exact ONNX form without parameters.
-        return step.OpName != "FusedLinear" || FusedActivation(step) is
+        // A fused add + activation translates only when it saved its activation.
+        if (step.OpName is "FusedAddActivation" or "FusedBiasActivation"
+            && !(step.SavedState is { Length: > 0 } saved && saved[0] is FusedActivationType))
+            return false;
+        // A fused linear or add translates when its activation has an exact ONNX form without parameters.
+        return step.OpName is not ("FusedLinear" or "FusedAddActivation" or "FusedBiasActivation") || FusedActivation(step) is
             FusedActivationType.None or FusedActivationType.ReLU or FusedActivationType.Sigmoid or
             FusedActivationType.Tanh or FusedActivationType.GELU or FusedActivationType.Softmax or
             FusedActivationType.Swish;
@@ -231,6 +236,8 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             case "ReduceSum":
             case "ReduceMean": Reduce(step, inputs, output); return;
             case "FusedLinear": FusedLinear(step, inputs, output); return;
+            case "FusedAddActivation":
+            case "FusedBiasActivation": FusedAddActivation(step, inputs, output); return;
         }
         throw new NotSupportedException($"No ONNX translation for '{step.OpName}'.");
     }
@@ -396,6 +403,21 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
             pre = activation == FusedActivationType.None ? output : _w.NewName("biased");
             _w.AddNode("Add", new[] { linear, inputs[2] }, new[] { pre });
         }
+        Activation("FusedLinear", activation, pre, output);
+    }
+
+    /// <summary>a + b (b broadcast along the trailing axis for the bias form), then the activation.</summary>
+    private void FusedAddActivation(CompiledStep<T> step, string[] inputs, string output)
+    {
+        var activation = FusedActivation(step) ?? throw new NotSupportedException($"{step.OpName} saved no activation.");
+        string pre = activation == FusedActivationType.None ? output : _w.NewName("sum");
+        _w.AddNode("Add", new[] { inputs[0], inputs[1] }, new[] { pre });
+        Activation(step.OpName, activation, pre, output);
+    }
+
+    /// <summary>The fused activation's ONNX operator from <paramref name="pre"/> to <paramref name="output"/>.</summary>
+    private void Activation(string opName, FusedActivationType activation, string pre, string output)
+    {
         switch (activation)
         {
             case FusedActivationType.None: return;
@@ -414,7 +436,7 @@ internal sealed class OnnxStepTranslator<T> where T : unmanaged
                 return;
             }
         }
-        throw new NotSupportedException($"FusedLinear activation {activation} has no ONNX translation.");
+        throw new NotSupportedException($"{opName} activation {activation} has no ONNX translation.");
     }
 
     private void Conv(CompiledStep<T> step, string[] inputs, string output)
