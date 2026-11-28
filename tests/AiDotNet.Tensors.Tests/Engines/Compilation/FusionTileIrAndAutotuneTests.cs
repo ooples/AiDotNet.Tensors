@@ -64,7 +64,8 @@ public sealed class FusionTileIrAndAutotuneTests
         using (var scope = GraphMode.Enable())
         {
             _ = ApplyCrossLayerChain(x, res, gamma);
-            Assert.Equal(11, scope.Nodes.Count);
+            // 11 compute nodes plus the RMSNorm rms statistic node, which the fused node absorbs.
+            Assert.Equal(12, scope.Nodes.Count);
             compiled = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
         }
 

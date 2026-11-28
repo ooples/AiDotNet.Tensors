@@ -31354,8 +31354,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = gamma; double ce = epsilon;
-                rms = new Tensor<T>(batchShape);
-                var capturedRms = rms;
+                // The RMSNorm node (or a fused replacement) refreshes capturedRms each step; the caller's rms is a lazy
+                // node downstream of it, so reading or consuming rms schedules the RMSNorm node first.
+                var capturedRms = new Tensor<T>(batchShape);
                 var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, input._shape,
                     (eng, output) =>
                     {
@@ -31364,6 +31365,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { capturedRms, epsilon });
+                rms = BatchStatisticOutput(scope, lazyResult, capturedRms, "RMSNormRms");
+                // The statistic is an auxiliary output: an implicitly compiled forward still returns the normalized
+                // result when this statistic is the last node recorded.
+                if (rms.LazySource is LazyNode<T> rmsNode) rmsNode.PrimaryOutput = lazyResult;
                 return lazyResult;
             }
         }

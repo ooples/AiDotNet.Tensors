@@ -56,8 +56,26 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
 
         if (rmsNode is null || rmsNode.Input1 is null)
             return false;
-        // RMSNorm output must feed ONLY the two half-slices of split-half RoPE (consumer count == 2).
-        if (!consumerCounts.TryGetValue(rmsNode, out int rmsConsumers) || rmsConsumers != 2)
+        // RMSNorm records its per-row rms as an "RMSNormRms" statistic node reading the RMSNorm output. The fused node
+        // refreshes the same rms buffer, but it drops the RMSNorm output's producer edge, so the statistic is absorbed
+        // only when nothing reads it; a blocked (retained/observed) or consumed statistic declines the fusion.
+        LazyNode<float>? rmsStat = null;
+        int statEnd = Math.Min(nodes.Count - 1, rmsIdx + 2);
+        for (int j = rmsIdx + 1; j <= statEnd; j++)
+        {
+            if (nodes[j] is LazyNode<float> stat && stat.OpName == "RMSNormRms" && ReferenceEquals(stat.Input0, rmsNode.Output))
+            {
+                if (alreadyRemoved.Contains(stat)) return false;
+                if (consumerCounts.TryGetValue(stat, out int statConsumers) && statConsumers > 0) return false;
+                rmsStat = stat;
+                break;
+            }
+        }
+
+        // RMSNorm output must feed ONLY the two half-slices of split-half RoPE (consumer count == 2), besides an
+        // absorbed rms statistic.
+        int expectedRmsConsumers = rmsStat is null ? 2 : 3;
+        if (!consumerCounts.TryGetValue(rmsNode, out int rmsConsumers) || rmsConsumers != expectedRmsConsumers)
             return false;
 
         int rank = rmsNode.Output.Rank;
@@ -250,6 +268,11 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
         }
         alreadyRemoved.Add(addNode);
         alreadyRemoved.Add(rmsNode);
+        if (rmsStat is not null)
+        {
+            rmsStat.Output.LazySource = null;
+            alreadyRemoved.Add(rmsStat);
+        }
         return true;
     }
 }

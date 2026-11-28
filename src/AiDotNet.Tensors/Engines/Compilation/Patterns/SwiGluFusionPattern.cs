@@ -1,6 +1,7 @@
 // Copyright (c) CrowdTrainer LLC. All rights reserved.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
@@ -22,6 +23,11 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// </summary>
 internal sealed class SwiGluFusionPattern : IFusionPattern
 {
+    // One forward graph per (activation, shape): the GPU engine caches compiled kernels by graph identity, so every
+    // rebuild of the same gated unit reuses the same graph and kernel instead of adding a new cache entry per build.
+    // Bounded by the distinct FFN shapes a process traces.
+    private static readonly ConcurrentDictionary<(bool IsGelu, string Shape), CodegenGraph> ForwardGraphs = new();
+
     public string Name => "SwiGluGatedActivation";
 
     public bool IsDifferentiable => true;
@@ -122,7 +128,7 @@ internal sealed class SwiGluFusionPattern : IFusionPattern
         IEngine recordingEngine)
     {
         var shapeClone = (int[])finalOutput._shape.Clone();
-        var fwdGraph = CreateForwardCodegenGraph(shapeClone, isGelu);
+        var fwdGraph = GetForwardCodegenGraph(shapeClone, isGelu);
         string opName = isGelu ? "FusedGeGlu" : "FusedSwiGlu";
 
         return new LazyNode<float>(
@@ -209,6 +215,15 @@ internal sealed class SwiGluFusionPattern : IFusionPattern
         {
             RecordingEngine = recordingEngine
         };
+    }
+
+    internal static CodegenGraph GetForwardCodegenGraph(int[] shape, bool isGelu)
+    {
+        var key = (isGelu, string.Join(",", shape));
+        if (ForwardGraphs.TryGetValue(key, out var cached))
+            return cached;
+        var ownedShape = (int[])shape.Clone();
+        return ForwardGraphs.GetOrAdd(key, _ => CreateForwardCodegenGraph(ownedShape, isGelu));
     }
 
     private static CodegenGraph CreateForwardCodegenGraph(int[] shape, bool isGelu)
