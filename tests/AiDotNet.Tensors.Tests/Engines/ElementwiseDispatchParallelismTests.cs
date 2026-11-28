@@ -152,4 +152,84 @@ public class ElementwiseDispatchParallelismTests
         }
         finally { CpuParallelSettings.MaxDegreeOfParallelism = previousDop; }
     }
+
+    // The same gap on the double paths: these called their SIMD kernel on one thread whatever the size.
+    public static TheoryData<string> DoubleIntoOps() => new()
+    {
+        "addInto", "subtractInto", "multiplyInto", "divideInto", "addScalarInto", "broadcastAddInto",
+        "broadcastMultiplyInto", "sqrtInto", "sinInto", "cosInto", "mishInto", "leakyReluInto",
+    };
+
+    private static Tensor<double> RunInto(CpuEngine engine, string op, Tensor<double> a, Tensor<double> b)
+    {
+        var dst = new Tensor<double>(a._shape);
+        switch (op)
+        {
+            case "addInto": engine.TensorAddInto(dst, a, b); break;
+            case "subtractInto": engine.TensorSubtractInto(dst, a, b); break;
+            case "multiplyInto": engine.TensorMultiplyInto(dst, a, b); break;
+            case "divideInto": engine.TensorDivideInto(dst, a, b); break;
+            case "addScalarInto": engine.TensorAddScalarInto(dst, a, 0.375); break;
+            case "broadcastAddInto": engine.TensorBroadcastAddInto(dst, a, b); break;
+            case "broadcastMultiplyInto": engine.TensorBroadcastMultiplyInto(dst, a, b); break;
+            case "sqrtInto": engine.TensorSqrtInto(dst, a); break;
+            case "sinInto": engine.TensorSinInto(dst, a); break;
+            case "cosInto": engine.TensorCosInto(dst, a); break;
+            case "mishInto": engine.MishInto(dst, a); break;
+            default: engine.LeakyReLUInto(dst, a, 0.01); break;
+        }
+        return dst;
+    }
+
+    [Theory]
+    [MemberData(nameof(DoubleIntoOps))]
+    public void LargeDoubleIntoOps_FanOut_AndMatchASingleThreadedRunBitForBit(string op)
+    {
+        int previousDop = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            var engine = new CpuEngine();
+            foreach (var (n, expectParallel) in new[] { (2 * 1024 * 1024 + 7, true), (1003, false) })
+            {
+                var a = new Tensor<double>(new[] { n }); var b = new Tensor<double>(new[] { n });
+                for (int i = 0; i < n; i++) { a[i] = ((i * 37) % 997) / 50.0 - 9.9; b[i] = (i % 13) + 1.5; }
+                a[1] = -0.0; a[2] = double.NaN; a[3] = 4.0;
+
+                CpuParallelSettings.MaxDegreeOfParallelism = 1;
+                var serial = RunInto(engine, op, a, b);
+
+                CpuParallelSettings.MaxDegreeOfParallelism = 8;
+                CpuEngine.t_lastElementwiseDispatchChunks = -1;
+                var split = RunInto(engine, op, a, b);
+                int chunks = CpuEngine.t_lastElementwiseDispatchChunks;
+                if (expectParallel) Assert.True(chunks >= 2, $"{op} n={n}: dispatched to {chunks} chunk(s), expected a fan-out");
+                else Assert.Equal(0, chunks);
+
+                for (int i = 0; i < n; i++)
+                {
+                    if (BitConverter.DoubleToInt64Bits(split[i]) != BitConverter.DoubleToInt64Bits(serial[i]))
+                        Assert.Fail($"{op} n={n} element {i}: split {split[i]:R} vs single-threaded {serial[i]:R}");
+                }
+                // The exactly-rounded ops also match their scalar definition.
+                foreach (int i in new[] { 0, 1, 2, 3, n / 2, n - 1 })
+                {
+                    double x = a[i], y = b[i];
+                    double? expected = op switch
+                    {
+                        "addInto" or "broadcastAddInto" => x + y,
+                        "subtractInto" => x - y,
+                        "multiplyInto" or "broadcastMultiplyInto" => x * y,
+                        "divideInto" => x / y,
+                        "addScalarInto" => x + 0.375,
+                        "sqrtInto" => Math.Sqrt(x),
+                        _ => null,
+                    };
+                    if (expected is double e)
+                        Assert.True(BitConverter.DoubleToInt64Bits(e) == BitConverter.DoubleToInt64Bits(split[i]),
+                            $"{op} element {i}: expected {e:R}, got {split[i]:R}");
+                }
+            }
+        }
+        finally { CpuParallelSettings.MaxDegreeOfParallelism = previousDop; }
+    }
 }
