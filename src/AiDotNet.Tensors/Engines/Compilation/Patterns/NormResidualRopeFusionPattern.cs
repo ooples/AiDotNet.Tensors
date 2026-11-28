@@ -111,6 +111,8 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
         int outerCount = rmsNode.Output.Length / (seqLen * headDim);
         int rows = outerCount * seqLen;
         var rmsHolder = savedRmsTensor ?? new Tensor<float>(new[] { rows });
+        int trigStride = cosTensor._shape[cosTensor.Rank - 1];
+        var ropeInput = ropeInputs[0];
 
         addNode.Output.LazySource = null;
         rmsNode.Output.LazySource = null;
@@ -185,8 +187,10 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
                 var sum = eng.TensorAdd(xInput, resInput);
                 var normed = eng.RMSNorm(sum, gamma, epsilon, out var freshRms);
                 DirectGpuTensorEngine.CopyResultInto(eng, freshRms, rmsHolder);
+                // The RoPE node reads the RMSNorm output tensor, whose producer this fusion removed: give it this
+                // forward's normalized values before it runs.
+                DirectGpuTensorEngine.CopyResultInto(eng, normed, ropeInput);
                 ropeFused.Execute(eng, output);
-                _ = normed;
             },
             (gradOutput, inputs, _, _, engine, grads) =>
             {
@@ -198,14 +202,48 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
                 bool needX = DifferentiableOps.IsGradientRequired(x);
                 bool needRes = DifferentiableOps.IsGradientRequired(res);
                 bool needGamma = DifferentiableOps.IsGradientRequired(g);
+                bool needCos = DifferentiableOps.IsGradientRequired(cos);
+                bool needSin = DifferentiableOps.IsGradientRequired(sin);
+                if (!needX && !needRes && !needGamma && !needCos && !needSin)
+                    return;
+
+                // Logical-order operands: a strided view (a transpose) has no flat span.
+                var xc = x.Contiguous();
+                var resc = res.Contiguous();
+                var gc = g.Contiguous();
+                var cosc = cos.Contiguous();
+                var sinc = sin.Contiguous();
+                var gOut = gradOutput.Contiguous();
+
+                // The RMS (and the RoPE input) recomputed from this step's inputs: the single-kernel CUDA forward
+                // writes no statistics, so a holder could still carry an earlier step's values.
+                var normed = TensorAllocator.Rent<float>(x._shape);
+                var rms = new float[rows];
+                CompiledFusedKernels.RmsNormResidualForward(
+                    xc.AsSpan(), resc.AsSpan(), gc.AsSpan(), normed.AsWritableSpan(), Span<float>.Empty, rms,
+                    rows, headDim, epsilon);
+
+                if (needCos || needSin)
+                {
+                    var dCos = needCos ? TensorAllocator.Rent<float>(cos._shape) : null;
+                    var dSin = needSin ? TensorAllocator.Rent<float>(sin._shape) : null;
+                    RotaryPositionEmbeddingFusionPattern.TableGradients(
+                        gOut.AsSpan(), normed.AsSpan(),
+                        dCos is not null ? dCos.AsWritableSpan() : Span<float>.Empty,
+                        dSin is not null ? dSin.AsWritableSpan() : Span<float>.Empty,
+                        outerCount, seqLen, headDim, trigStride);
+                    if (dCos is not null) { dCos.IncrementVersion(); DifferentiableOps.AccumulateGrad(grads, cos, dCos, engine); }
+                    if (dSin is not null) { dSin.IncrementVersion(); DifferentiableOps.AccumulateGrad(grads, sin, dSin, engine); }
+                }
+
                 if (!needX && !needRes && !needGamma)
                     return;
 
                 var dNorm = TensorAllocator.Rent<float>(x._shape);
                 CompiledFusedKernels.RotaryPositionEmbeddingSplitHalf(
-                    gradOutput.AsSpan(),
-                    cos.AsSpan(),
-                    sin.AsSpan(),
+                    gOut.AsSpan(),
+                    cosc.AsSpan(),
+                    sinc.AsSpan(),
                     dNorm.AsWritableSpan(),
                     outerCount,
                     seqLen,
@@ -217,10 +255,10 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
                 var gammaGrad = needGamma ? TensorAllocator.Rent<float>(g._shape) : null;
                 CompiledFusedKernels.RmsNormResidualBackward(
                     dNorm.AsSpan(),
-                    x.AsSpan(),
-                    res.AsSpan(),
-                    g.AsSpan(),
-                    rmsHolder.AsSpan(),
+                    xc.AsSpan(),
+                    resc.AsSpan(),
+                    gc.AsSpan(),
+                    rms,
                     sharedGrad.AsWritableSpan(),
                     gammaGrad is not null ? gammaGrad.AsWritableSpan() : Span<float>.Empty,
                     rows,

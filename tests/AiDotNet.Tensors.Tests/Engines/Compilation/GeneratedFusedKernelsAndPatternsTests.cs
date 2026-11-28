@@ -345,7 +345,7 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         {
             expectedOut = ApplyDecomposedRope(x);
             var loss = engine.ReduceSum(engine.TensorMultiply(expectedOut, expectedOut), new[] { 0, 1, 2 }, keepDims: false);
-            expectedGrads = tape.ComputeGradients(loss, new[] { x });
+            expectedGrads = tape.ComputeGradients(loss, new[] { x, cos, sin });
         }
 
         List<ILazyNode> compiled;
@@ -368,6 +368,8 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         var fusedGrads = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
         fusedNode.BackwardFn?.Invoke(upstream, fusedNode.GetInputsArray(), fusedOut, fusedNode.SavedState ?? Array.Empty<object>(), engine, fusedGrads);
         AssertClose(expectedGrads[x].AsSpan(), fusedGrads[x].AsSpan(), 1e-5f);
+        AssertClose(expectedGrads[cos].AsSpan(), fusedGrads[cos].AsSpan(), 1e-4f);
+        AssertClose(expectedGrads[sin].AsSpan(), fusedGrads[sin].AsSpan(), 1e-4f);
     }
 
     [Fact]

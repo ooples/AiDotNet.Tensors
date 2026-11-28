@@ -57,7 +57,7 @@ public sealed class FusionTileIrAndAutotuneTests
         {
             expectedOut = ApplyCrossLayerChain(x, res, gamma);
             var loss = engine.ReduceSum(engine.TensorMultiply(expectedOut, expectedOut), new[] { 0, 1, 2 }, keepDims: false);
-            expectedGrads = tape.ComputeGradients(loss, new[] { x, res, gamma });
+            expectedGrads = tape.ComputeGradients(loss, new[] { x, res, gamma, cos, sin });
         }
 
         List<ILazyNode> compiled;
@@ -84,6 +84,69 @@ public sealed class FusionTileIrAndAutotuneTests
         AssertClose(expectedGrads[x].AsSpan(), fusedGrads[x].AsSpan(), 3e-4f);
         AssertClose(expectedGrads[res].AsSpan(), fusedGrads[res].AsSpan(), 3e-4f);
         AssertClose(expectedGrads[gamma].AsSpan(), fusedGrads[gamma].AsSpan(), 3e-4f);
+        // The RoPE tables are trainable inputs too: their gradients sum over the broadcast batch-heads axis.
+        AssertClose(expectedGrads[cos].AsSpan(), fusedGrads[cos].AsSpan(), 3e-4f);
+        AssertClose(expectedGrads[sin].AsSpan(), fusedGrads[sin].AsSpan(), 3e-4f);
+    }
+
+    [Fact]
+    public void NormResidualRopeFusionPattern_StridedInput_RunsTheFallbackAndBackwardWithoutAPriorForward()
+    {
+        var engine = new CpuEngine();
+        var rng = new Random(709);
+        int batchHeads = 2, seqLen = 4, headDim = 8, halfDim = headDim / 2;
+        const double eps = 1e-5;
+
+        // A transposed view: not contiguous, so the forward takes the engine fallback and the backward needs
+        // logical-order reads.
+        var x = new Tensor<float>(RandomArray(rng, batchHeads * seqLen * headDim, -1.0f, 1.0f), new[] { batchHeads, headDim, seqLen })
+            .Transpose(new[] { 0, 2, 1 });
+        Assert.False(x.IsContiguous);
+        var res = new Tensor<float>(RandomArray(rng, batchHeads * seqLen * headDim, -1.0f, 1.0f), new[] { batchHeads, seqLen, headDim });
+        var gamma = new Tensor<float>(RandomArray(rng, headDim, 0.5f, 1.5f), new[] { headDim });
+        var cos = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1.0f, 1.0f), new[] { 1, seqLen, halfDim });
+        var sin = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1.0f, 1.0f), new[] { 1, seqLen, halfDim });
+
+        Tensor<float> Chain()
+        {
+            var norm = engine.RMSNorm(engine.TensorAdd(x, res), gamma, eps, out _);
+            var x0 = engine.TensorSlice(norm, new[] { 0, 0, 0 }, new[] { batchHeads, seqLen, halfDim });
+            var x1 = engine.TensorSlice(norm, new[] { 0, 0, halfDim }, new[] { batchHeads, seqLen, halfDim });
+            var y0 = engine.TensorSubtract(engine.TensorBroadcastMultiply(x0, cos), engine.TensorBroadcastMultiply(x1, sin));
+            var y1 = engine.TensorAdd(engine.TensorBroadcastMultiply(x1, cos), engine.TensorBroadcastMultiply(x0, sin));
+            return engine.Concat(new[] { y0, y1 }, 2);
+        }
+
+        Tensor<float> expectedOut;
+        Dictionary<Tensor<float>, Tensor<float>> expectedGrads;
+        using (var tape = new GradientTape<float>())
+        {
+            expectedOut = Chain();
+            var loss = engine.ReduceSum(engine.TensorMultiply(expectedOut, expectedOut), new[] { 0, 1, 2 }, keepDims: false);
+            expectedGrads = tape.ComputeGradients(loss, new[] { x, res, gamma, cos, sin });
+        }
+
+        List<ILazyNode> compiled;
+        using (var scope = GraphMode.Enable())
+        {
+            _ = Chain();
+            compiled = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+        var fusedNode = (LazyNode<float>)Assert.Single(compiled);
+        Assert.Equal("FusedRmsNormResidualRope", fusedNode.OpName);
+
+        // Backward first: a forward route that writes no statistics (the single-kernel CUDA one) leaves nothing
+        // behind, so the backward must not depend on one.
+        var upstream = engine.TensorMultiplyScalar(expectedOut, 2.0f);
+        var fusedGrads = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+        fusedNode.BackwardFn?.Invoke(upstream, fusedNode.GetInputsArray(), expectedOut, fusedNode.SavedState ?? Array.Empty<object>(), engine, fusedGrads);
+        foreach (var t in new[] { x, res, gamma, cos, sin })
+            AssertClose(expectedGrads[t].Contiguous().AsSpan(), fusedGrads[t].Contiguous().AsSpan(), 3e-4f);
+
+        // The fallback forward applies RoPE to this step's normalized values, not to a stale RMSNorm output.
+        var fusedOut = new Tensor<float>(expectedOut._shape);
+        fusedNode.Execute(engine, fusedOut);
+        AssertClose(expectedOut.AsSpan(), fusedOut.AsSpan(), 1e-5f);
     }
 
     [Fact]

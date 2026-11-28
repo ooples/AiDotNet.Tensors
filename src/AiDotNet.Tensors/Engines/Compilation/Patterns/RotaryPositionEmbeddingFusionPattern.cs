@@ -210,6 +210,19 @@ internal sealed class RotaryPositionEmbeddingFusionPattern : IFusionPattern
                 var x = inputs[0];
                 var cos = inputs[1];
                 var sin = inputs[2];
+                bool needCos = DifferentiableOps.IsGradientRequired(cos);
+                bool needSin = DifferentiableOps.IsGradientRequired(sin);
+                if (needCos || needSin)
+                {
+                    var dCos = needCos ? TensorAllocator.Rent<float>(cos._shape) : null;
+                    var dSin = needSin ? TensorAllocator.Rent<float>(sin._shape) : null;
+                    TableGradients(gradOutput.Contiguous().AsSpan(), x.Contiguous().AsSpan(),
+                        dCos is not null ? dCos.AsWritableSpan() : Span<float>.Empty,
+                        dSin is not null ? dSin.AsWritableSpan() : Span<float>.Empty,
+                        outerCount, seqLen, headDim, trigStride);
+                    if (dCos is not null) { dCos.IncrementVersion(); DifferentiableOps.AccumulateGrad(grads, cos, dCos, engine); }
+                    if (dSin is not null) { dSin.IncrementVersion(); DifferentiableOps.AccumulateGrad(grads, sin, dSin, engine); }
+                }
                 if (!DifferentiableOps.IsGradientRequired(x))
                     return;
 
@@ -258,6 +271,49 @@ internal sealed class RotaryPositionEmbeddingFusionPattern : IFusionPattern
         }
         alreadyRemoved.Add(concatNode);
         return true;
+    }
+
+    /// <summary>
+    /// Gradients of split-half RoPE with respect to its tables, summed over the broadcast outer axis:
+    /// y0 = a*cos - b*sin and y1 = b*cos + a*sin give dCos += g0*a + g1*b and dSin += g1*a - g0*b, where a and b are
+    /// the two halves of the RoPE input. A table with the headDim stride gets zero in its unused second half.
+    /// An empty span skips that table.
+    /// </summary>
+    internal static void TableGradients(
+        ReadOnlySpan<float> gradOutput,
+        ReadOnlySpan<float> ropeInput,
+        Span<float> dCos,
+        Span<float> dSin,
+        int outerCount,
+        int seqLen,
+        int headDim,
+        int trigStride)
+    {
+        int halfDim = headDim >> 1;
+        int total = checked(outerCount * seqLen * headDim);
+        int tableLength = checked(seqLen * trigStride);
+        if (gradOutput.Length < total || ropeInput.Length < total
+            || (!dCos.IsEmpty && dCos.Length < tableLength) || (!dSin.IsEmpty && dSin.Length < tableLength))
+            throw new ArgumentException("RoPE table gradient buffers do not match [outer, seqLen, headDim].");
+        if (!dCos.IsEmpty) dCos.Clear();
+        if (!dSin.IsEmpty) dSin.Clear();
+        for (int o = 0; o < outerCount; o++)
+        {
+            for (int t = 0; t < seqLen; t++)
+            {
+                int baseIdx = (o * seqLen + t) * headDim;
+                int trigIdx = t * trigStride;
+                for (int i = 0; i < halfDim; i++)
+                {
+                    float g0 = gradOutput[baseIdx + i];
+                    float g1 = gradOutput[baseIdx + halfDim + i];
+                    float a = ropeInput[baseIdx + i];
+                    float b = ropeInput[baseIdx + halfDim + i];
+                    if (!dCos.IsEmpty) dCos[trigIdx + i] += g0 * a + g1 * b;
+                    if (!dSin.IsEmpty) dSin[trigIdx + i] += g1 * a - g0 * b;
+                }
+            }
+        }
     }
 
     private static bool IsTrailingHalfSlice(LazyNode<float> slice, int[] fullShape, int expectedStart, int halfDim)
