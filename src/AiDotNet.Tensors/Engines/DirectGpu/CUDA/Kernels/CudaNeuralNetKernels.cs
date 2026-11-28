@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string GetSource()
         {
-            return ExactFloatKernels.Cuda + @"
+            return ExactFloatKernels.Cuda + global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@"
 #include <math.h>
 
 // 1 - beta^t for the optimizer bias corrections, without cancellation. These modules compile with --use_fast_math,
@@ -2947,7 +2947,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
 
     gradInput[idx] = sum;
 }
-";
+"u8);
         }
 
         public static string[] GetKernelNames()

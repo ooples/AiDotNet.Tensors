@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     {
         public static string GetSource()
         {
-            return ExactFloatKernels.Cuda + @"
+            return ExactFloatKernels.Cuda + global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@"
 #include <math.h>
 
 // NaN-preserving ReLU. A plain (x > 0 ? x : 0) maps NaN to 0 because every
@@ -1675,7 +1675,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     c.x = xf_maxf(a.x, b.x); c.y = xf_maxf(a.y, b.y); c.z = xf_maxf(a.z, b.z); c.w = xf_maxf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
-" + KernelSourceResources.Read("CudaChannelEpilogue.c");
+"u8) + KernelSourceResources.Read("CudaChannelEpilogue.c");
         }
 
         public static string[] GetKernelNames()

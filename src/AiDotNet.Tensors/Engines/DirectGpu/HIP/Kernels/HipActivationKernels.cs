@@ -10,7 +10,7 @@ internal static class HipActivationKernels
     {
         // Note: hiprtc provides device intrinsics built-in, no includes needed
         // blockIdx, blockDim, threadIdx, expf, tanhf, etc. are all available
-        return ExactFloatKernels.Cuda + @"
+        return ExactFloatKernels.Cuda + global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@"
 // HIP RTC Compatibility - no includes needed, device intrinsics are built-in
 #ifndef INFINITY
 #define INFINITY __builtin_huge_valf()
@@ -1465,7 +1465,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
     c.x = xf_maxf(a.x, b.x); c.y = xf_maxf(a.y, b.y); c.z = xf_maxf(a.z, b.z); c.w = xf_maxf(a.w, b.w);
     reinterpret_cast<float4*>(C)[idx] = c;
 }
-";
+"u8);
     }
 
     public static string[] GetKernelNames()
