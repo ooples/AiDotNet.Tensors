@@ -51,9 +51,39 @@ internal static class GeneratedKernelSimdMath
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Vector256<float> Fma256(Vector256<float> a, Vector256<float> b, Vector256<float> c)
     {
-        return Fma.IsSupported
-            ? Fma.MultiplyAdd(a, b, c)
-            : Avx.Add(Avx.Multiply(a, b), c);
+        if (Fma.IsSupported)
+            return Fma.MultiplyAdd(a, b, c);
+        // No FMA unit: a multiply then an add would round the product first. Fuse each lane instead.
+        return Vector256.Create(
+            FmaScalar(a.GetElement(0), b.GetElement(0), c.GetElement(0)),
+            FmaScalar(a.GetElement(1), b.GetElement(1), c.GetElement(1)),
+            FmaScalar(a.GetElement(2), b.GetElement(2), c.GetElement(2)),
+            FmaScalar(a.GetElement(3), b.GetElement(3), c.GetElement(3)),
+            FmaScalar(a.GetElement(4), b.GetElement(4), c.GetElement(4)),
+            FmaScalar(a.GetElement(5), b.GetElement(5), c.GetElement(5)),
+            FmaScalar(a.GetElement(6), b.GetElement(6), c.GetElement(6)),
+            FmaScalar(a.GetElement(7), b.GetElement(7), c.GetElement(7)));
+    }
+
+    /// <summary>Negates by flipping each sign bit, so +0 becomes -0 exactly as scalar negation does.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector256<float> Negate256(Vector256<float> x) => Avx.Xor(x, Vector256.Create(-0.0f));
+
+    /// <summary>The device maximum (fmaxf): a NaN operand yields the other one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector256<float> Max256(Vector256<float> a, Vector256<float> b)
+    {
+        // Avx.Max returns its second operand when either is NaN: right for a NaN a, so only a NaN b needs a.
+        var max = Avx.Max(a, b);
+        return Avx.BlendVariable(max, a, Avx.CompareUnordered(b, b));
+    }
+
+    /// <summary>The device minimum (fminf): a NaN operand yields the other one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector256<float> Min256(Vector256<float> a, Vector256<float> b)
+    {
+        var min = Avx.Min(a, b);
+        return Avx.BlendVariable(min, a, Avx.CompareUnordered(b, b));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -103,6 +133,46 @@ internal static class GeneratedKernelSimdMath
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float ReluScalar(float x) => x > 0.0f ? x : 0.0f;
+
+    /// <summary>ReLU over a portable vector, NaN to 0 like <see cref="ReluScalar"/> and the device's fmaxf(0, x).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector<float> ReluPortable(Vector<float> x)
+        => Vector.ConditionalSelect(Vector.GreaterThan(x, Vector<float>.Zero), x, Vector<float>.Zero);
+
+    /// <summary>The device maximum over a portable vector: a NaN operand yields the other one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector<float> MaxPortable(Vector<float> a, Vector<float> b)
+        => Vector.ConditionalSelect(Vector.Equals(a, a),
+            Vector.ConditionalSelect(Vector.Equals(b, b), Vector.ConditionalSelect(Vector.GreaterThan(b, a), b, a), a), b);
+
+    /// <summary>The device minimum over a portable vector: a NaN operand yields the other one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector<float> MinPortable(Vector<float> a, Vector<float> b)
+        => Vector.ConditionalSelect(Vector.Equals(a, a),
+            Vector.ConditionalSelect(Vector.Equals(b, b), Vector.ConditionalSelect(Vector.LessThan(b, a), b, a), a), b);
+
+    /// <summary>The device maximum (fmaxf): a NaN operand yields the other one, so a NaN never wins.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float MaxScalar(float a, float b) => float.IsNaN(a) ? b : float.IsNaN(b) ? a : (b > a ? b : a);
+
+    /// <summary>The device minimum (fminf): a NaN operand yields the other one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float MinScalar(float a, float b) => float.IsNaN(a) ? b : float.IsNaN(b) ? a : (b < a ? b : a);
+
+    /// <summary>
+    /// a * b + c with one rounding, as the device's fmaf. Without MathF.FusedMultiplyAdd the product is formed exactly
+    /// in double (24 + 24 bits fit 53) and the sum is rounded to double and then to float; that second rounding can
+    /// differ from a true FMA only in a halfway case of the double sum.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static float FmaScalar(float a, float b, float c)
+    {
+#if NETCOREAPP3_0_OR_GREATER
+        return MathF.FusedMultiplyAdd(a, b, c);
+#else
+        return (float)((double)a * b + c);
+#endif
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float ExpScalar(float x)

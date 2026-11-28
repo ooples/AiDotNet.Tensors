@@ -62,7 +62,8 @@ internal sealed class ExprNode
             case ExprNodeKind.Binary:
                 return Children[0].SupportsPortableVector() && Children[1].SupportsPortableVector();
             case ExprNodeKind.Intrinsic:
-                if (IntrinsicName is not ("relu" or "abs" or "sqrt" or "rsqrt" or "max" or "min" or "fma"))
+                // fma has no single-rounding portable-vector form before .NET 9: such expressions use the scalar path.
+                if (IntrinsicName is not ("relu" or "abs" or "sqrt" or "rsqrt" or "max" or "min"))
                     return false;
                 for (int i = 0; i < Children.Count; i++)
                 {
@@ -102,7 +103,7 @@ internal static class FusedExpressionParser
             case ExprNodeKind.Literal:
                 return $"Vector256.Create({FormatFloat(node.Value)})";
             case ExprNodeKind.Negate:
-                return $"Avx.Subtract(Vector256<float>.Zero, {EmitAvx2Expr(node.Children[0], offsetExpr)})";
+                return $"GeneratedKernelSimdMath.Negate256({EmitAvx2Expr(node.Children[0], offsetExpr)})";
             case ExprNodeKind.Binary:
             {
                 string lhs = EmitAvx2Expr(node.Children[0], offsetExpr);
@@ -122,7 +123,8 @@ internal static class FusedExpressionParser
                 switch (node.IntrinsicName)
                 {
                     case "relu":
-                        return $"Avx.Max(Vector256<float>.Zero, {a0})";
+                        // Avx.Max returns its second operand on NaN: x first, so ReLU(NaN) = 0 as on the device.
+                        return $"Avx.Max({a0}, Vector256<float>.Zero)";
                     case "sigmoid":
                         return $"global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastSigmoid256({a0})";
                     case "swish":
@@ -143,9 +145,9 @@ internal static class FusedExpressionParser
                     case "abs":
                         return $"Avx.And({a0}, Vector256.Create(int.MaxValue).AsSingle())";
                     case "max":
-                        return $"Avx.Max({a0}, {EmitAvx2Expr(node.Children[1], offsetExpr)})";
+                        return $"GeneratedKernelSimdMath.Max256({a0}, {EmitAvx2Expr(node.Children[1], offsetExpr)})";
                     case "min":
-                        return $"Avx.Min({a0}, {EmitAvx2Expr(node.Children[1], offsetExpr)})";
+                        return $"GeneratedKernelSimdMath.Min256({a0}, {EmitAvx2Expr(node.Children[1], offsetExpr)})";
                     case "fma":
                         return $"GeneratedKernelSimdMath.Fma256({a0}, {EmitAvx2Expr(node.Children[1], offsetExpr)}, {EmitAvx2Expr(node.Children[2], offsetExpr)})";
                     default:
@@ -176,13 +178,12 @@ internal static class FusedExpressionParser
                 string a0 = EmitPortableVectorExpr(node.Children[0], vecIndex);
                 return node.IntrinsicName switch
                 {
-                    "relu" => $"global::System.Numerics.Vector.Max(global::System.Numerics.Vector<float>.Zero, {a0})",
+                    "relu" => $"GeneratedKernelSimdMath.ReluPortable({a0})",
                     "abs" => $"global::System.Numerics.Vector.Abs({a0})",
                     "sqrt" => $"global::System.Numerics.Vector.SquareRoot({a0})",
                     "rsqrt" => $"(new global::System.Numerics.Vector<float>(1.0f) / global::System.Numerics.Vector.SquareRoot({a0}))",
-                    "max" => $"global::System.Numerics.Vector.Max({a0}, {EmitPortableVectorExpr(node.Children[1], vecIndex)})",
-                    "min" => $"global::System.Numerics.Vector.Min({a0}, {EmitPortableVectorExpr(node.Children[1], vecIndex)})",
-                    "fma" => $"(({a0} * {EmitPortableVectorExpr(node.Children[1], vecIndex)}) + {EmitPortableVectorExpr(node.Children[2], vecIndex)})",
+                    "max" => $"GeneratedKernelSimdMath.MaxPortable({a0}, {EmitPortableVectorExpr(node.Children[1], vecIndex)})",
+                    "min" => $"GeneratedKernelSimdMath.MinPortable({a0}, {EmitPortableVectorExpr(node.Children[1], vecIndex)})",
                     _ => throw new InvalidOperationException($"Intrinsic '{node.IntrinsicName}' is not supported on portable Vector<float>.")
                 };
             }
@@ -220,9 +221,9 @@ internal static class FusedExpressionParser
                     "sqrt" => $"GeneratedKernelSimdMath.SqrtScalar({a0})",
                     "rsqrt" => $"(1.0f / GeneratedKernelSimdMath.SqrtScalar({a0}))",
                     "abs" => $"Math.Abs({a0})",
-                    "max" => $"Math.Max({a0}, {EmitScalarCsExpr(node.Children[1], indexExpr)})",
-                    "min" => $"Math.Min({a0}, {EmitScalarCsExpr(node.Children[1], indexExpr)})",
-                    "fma" => $"(({a0} * {EmitScalarCsExpr(node.Children[1], indexExpr)}) + {EmitScalarCsExpr(node.Children[2], indexExpr)})",
+                    "max" => $"GeneratedKernelSimdMath.MaxScalar({a0}, {EmitScalarCsExpr(node.Children[1], indexExpr)})",
+                    "min" => $"GeneratedKernelSimdMath.MinScalar({a0}, {EmitScalarCsExpr(node.Children[1], indexExpr)})",
+                    "fma" => $"GeneratedKernelSimdMath.FmaScalar({a0}, {EmitScalarCsExpr(node.Children[1], indexExpr)}, {EmitScalarCsExpr(node.Children[2], indexExpr)})",
                     _ => throw new InvalidOperationException($"Unsupported intrinsic '{node.IntrinsicName}'.")
                 };
             }
@@ -252,7 +253,7 @@ internal static class FusedExpressionParser
                 {
                     "relu" => $"fmaxf(0.0f, {a0})",
                     "sigmoid" => $"(1.0f / (1.0f + expf(-({a0}))))",
-                    "swish" or "silu" => $"({a0} / (1.0f + expf(-({a0}))))",
+                    "swish" or "silu" => $"aidn_swish({a0})",
                     "tanh" => $"tanhf({a0})",
                     "gelu" => $"aidn_gelu({a0})",
                     "exp" => $"expf({a0})",
@@ -277,6 +278,9 @@ internal static class FusedExpressionParser
         sb.AppendLine("__device__ __forceinline__ float aidn_gelu(float x) {");
         sb.AppendLine("    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));");
         sb.AppendLine("}");
+        sb.AppendLine("__device__ __forceinline__ float aidn_swish(float x) {");
+        sb.AppendLine("    return x / (1.0f + expf(-x));");
+        sb.AppendLine("}");
         sb.Append("extern \"C\" __global__ void ").Append(kernelName).Append('(');
         for (int i = 0; i < inputCount; i++)
         {
@@ -295,11 +299,12 @@ internal static class FusedExpressionParser
             sb.Append(" && (((unsigned long long)x").Append(i).Append(") & 15ULL) == 0ULL");
         }
         sb.AppendLine(";");
-        sb.AppendLine("    int tid = blockIdx.x * blockDim.x + threadIdx.x;");
-        sb.AppendLine("    int stride = blockDim.x * gridDim.x;");
+        // 64-bit indices: (vecCount << 2) + tid and idx += stride overflow int for n near int.MaxValue.
+        sb.AppendLine("    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;");
+        sb.AppendLine("    long long stride = (long long)blockDim.x * gridDim.x;");
         sb.AppendLine("    if (aligned && n >= 4) {");
-        sb.AppendLine("        int vecCount = n >> 2;");
-        sb.AppendLine("        for (int vecIdx = tid; vecIdx < vecCount; vecIdx += stride) {");
+        sb.AppendLine("        long long vecCount = n >> 2;");
+        sb.AppendLine("        for (long long vecIdx = tid; vecIdx < vecCount; vecIdx += stride) {");
         for (int i = 0; i < inputCount; i++)
         {
             sb.Append("            float4 v").Append(i).Append(" = reinterpret_cast<const float4*>(x").Append(i).AppendLine(")[vecIdx];");
@@ -311,11 +316,11 @@ internal static class FusedExpressionParser
         sb.Append("            out4.w = ").Append(EmitCudaScalarExpr(ast, "w")).AppendLine(";");
         sb.AppendLine("            reinterpret_cast<float4*>(dst)[vecIdx] = out4;");
         sb.AppendLine("        }");
-        sb.AppendLine("        for (int idx = (vecCount << 2) + tid; idx < n; idx += stride) {");
+        sb.AppendLine("        for (long long idx = (vecCount << 2) + tid; idx < n; idx += stride) {");
         sb.Append("            dst[idx] = ").Append(EmitCudaScalarExpr(ast, string.Empty)).AppendLine(";");
         sb.AppendLine("        }");
         sb.AppendLine("    } else {");
-        sb.AppendLine("        for (int idx = tid; idx < n; idx += stride) {");
+        sb.AppendLine("        for (long long idx = tid; idx < n; idx += stride) {");
         sb.Append("            dst[idx] = ").Append(EmitCudaScalarExpr(ast, string.Empty)).AppendLine(";");
         sb.AppendLine("        }");
         sb.AppendLine("    }");
@@ -335,6 +340,9 @@ internal static class FusedExpressionParser
         int EmitInst(string opCodeName, int s0 = -1, int s1 = -1, int s2 = -1, float imm = 0.0f)
         {
             int idx = instLines.Count;
+            if (idx > short.MaxValue || s0 > short.MaxValue || s1 > short.MaxValue || s2 > short.MaxValue)
+                throw new FormatException(
+                    $"Fused expression needs more than {short.MaxValue + 1} tile instructions; split it into smaller kernels.");
             instLines.Add(
                 $"new global::AiDotNet.Tensors.Engines.Compilation.FusionTileIr.FusionTileInstruction(" +
                 $"global::AiDotNet.Tensors.Engines.Compilation.FusionTileIr.FusionTileOpCode.{opCodeName}, " +
@@ -535,6 +543,9 @@ internal static class FusedExpressionParser
                     Position++;
                 if (!float.TryParse(numSlice, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed))
                     throw new FormatException($"Invalid float literal '{numSlice}' at offset {start}.");
+                // Newer runtimes parse an out-of-range literal (1e100) to infinity and report success.
+                if (float.IsInfinity(parsed) || float.IsNaN(parsed))
+                    throw new FormatException($"Float literal '{numSlice}' at offset {start} is not a finite float.");
                 return ExprNode.Literal(parsed);
             }
 

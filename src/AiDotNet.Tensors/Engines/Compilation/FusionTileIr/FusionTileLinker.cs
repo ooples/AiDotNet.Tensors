@@ -469,7 +469,7 @@ internal static class FusionTileLinker
                         FusionTileOpCode.Mul => regs[inst.Src0] * regs[inst.Src1],
                         FusionTileOpCode.Div => regs[inst.Src0] / regs[inst.Src1],
                         FusionTileOpCode.Negate => -regs[inst.Src0],
-                        FusionTileOpCode.Fma => regs[inst.Src0] * regs[inst.Src1] + regs[inst.Src2],
+                        FusionTileOpCode.Fma => GeneratedKernelSimdMath.FmaScalar(regs[inst.Src0], regs[inst.Src1], regs[inst.Src2]),
                         FusionTileOpCode.Relu => GeneratedKernelSimdMath.ReluScalar(regs[inst.Src0]),
                         FusionTileOpCode.ReluStep => regs[inst.Src0] > 0.0f ? 1.0f : 0.0f,
                         FusionTileOpCode.Sigmoid => GeneratedKernelSimdMath.SigmoidScalar(regs[inst.Src0]),
@@ -481,8 +481,8 @@ internal static class FusionTileLinker
                         FusionTileOpCode.Sqrt => GeneratedKernelSimdMath.SqrtScalar(regs[inst.Src0]),
                         FusionTileOpCode.Rsqrt => 1.0f / GeneratedKernelSimdMath.SqrtScalar(regs[inst.Src0]),
                         FusionTileOpCode.Abs => Math.Abs(regs[inst.Src0]),
-                        FusionTileOpCode.Max => Math.Max(regs[inst.Src0], regs[inst.Src1]),
-                        FusionTileOpCode.Min => Math.Min(regs[inst.Src0], regs[inst.Src1]),
+                        FusionTileOpCode.Max => GeneratedKernelSimdMath.MaxScalar(regs[inst.Src0], regs[inst.Src1]),
+                        FusionTileOpCode.Min => GeneratedKernelSimdMath.MinScalar(regs[inst.Src0], regs[inst.Src1]),
                         _ => 0.0f
                     };
                 }
