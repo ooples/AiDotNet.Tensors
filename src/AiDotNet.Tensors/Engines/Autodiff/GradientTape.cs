@@ -637,6 +637,12 @@ public sealed class GradientTape<T> : IDisposable
     /// gradient contribution gets no callback (mirrors <see cref="ComputeGradients"/>
     /// omitting it from the returned dictionary).
     /// </para>
+    /// <para>
+    /// Embedding-table gradients reach the callback dense, and no sparse rows are recorded while this backward runs:
+    /// <see cref="DifferentiableOps.IsCollectingSparseEmbeddingGrads"/> is <c>false</c> and
+    /// <see cref="DifferentiableOps.GetSparseEmbeddingGradsFor{TElement}"/> returns <c>null</c> inside the callback.
+    /// A consumer that needs only the accessed rows uses <see cref="ComputeGradientsStreamingTyped"/>.
+    /// </para>
     /// </remarks>
     /// <param name="loss">The scalar loss tensor to differentiate. Must be
     /// tape-connected (non-null <c>GradFn</c>).</param>
