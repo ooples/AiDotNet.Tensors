@@ -135,7 +135,7 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         if (biasEmitted.Source is not null)
         {
             Assert.Contains("int cols", biasEmitted.Source);
-            Assert.Contains("int col = idx % cols;", biasEmitted.Source);
+            Assert.Contains("long long col = idx % (long long)cols;", biasEmitted.Source);
             Assert.Contains("in_2[col]", biasEmitted.Source);
             Assert.Contains("in_0[idx]", biasEmitted.Source);
             Assert.DoesNotContain("float4", biasEmitted.Source);
