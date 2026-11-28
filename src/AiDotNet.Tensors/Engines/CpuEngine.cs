@@ -25989,9 +25989,11 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var gOutF = gOutF0.Length == total ? gOutF0 : (float[])(object)gradOutput.ToArray();
             var outF = outF0.Length == total ? outF0 : (float[])(object)output.ToArray();
-            var gInF = new float[total];
+            var gInTensor = TensorAllocator.RentUninitialized<float>(output._shape);
+            using var gInLease = gInTensor.LeaseArray();
+            var gInF = gInLease.Array;
             SoftmaxBackwardFloat(gOutF, outF, gInF, outerSize, axisSize);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInF);
+            return (Tensor<T>)(object)gInTensor;
         }
 #endif
         // Double primitive fast path for last-axis softmax backward.
@@ -26006,7 +26008,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var gOutD = gOutD0.Length == total ? gOutD0 : (double[])(object)gradOutput.ToArray();
             var outD = outD0.Length == total ? outD0 : (double[])(object)output.ToArray();
-            var gInD = new double[total];
+            var gInTensorD = TensorAllocator.RentUninitialized<double>(output._shape);
+            using var gInLeaseD = gInTensorD.LeaseArray();
+            var gInD = gInLeaseD.Array;
             bool useParallel = outerSize >= 4 && (long)outerSize * axisSize >= 32768;
             int axisSz = axisSize;
             Action<int> rowKernel = row => SoftmaxBackwardDoubleRow(gOutD, outD, gInD, row, axisSz);
@@ -26014,7 +26018,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)outerSize * axisSize, rowKernel);
             else
                 for (int row = 0; row < outerSize; row++) rowKernel(row);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(output._shape, (T[])(object)gInD);
+            return (Tensor<T>)(object)gInTensorD;
         }
 
         // Generic fallback
@@ -48873,7 +48877,11 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         ValidateElementwisePair("SwishBackward", gradOutput, input);
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new T[gradOutput.Length];
+        // A pooled result, so a caller that is done with it (a compiled backward copies it into its planned gradient)
+        // can hand the buffer to the next one instead of each call allocating a fresh activation-sized array.
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput.Shape.ToArray());
+        using var resultLease = resultTensor.LeaseArray();
+        var result = resultLease.Array;
         using var gDataLease = gradOutput.LeaseArray();
         var gData = gDataLease.Array;
         using var iDataLease = input.LeaseArray();
@@ -48933,7 +48941,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
             }
         }
-        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        return resultTensor;
     }
 
     /// <inheritdoc/>
@@ -49131,7 +49139,11 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> EluBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> output, double alpha)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = new T[gradOutput.Length];
+        // A pooled result, so a caller that is done with it (a compiled backward copies it into its planned gradient)
+        // can hand the buffer to the next one instead of each call allocating a fresh activation-sized array.
+        var resultTensor = TensorAllocator.RentUninitialized<T>(gradOutput.Shape.ToArray());
+        using var resultLease = resultTensor.LeaseArray();
+        var result = resultLease.Array;
         using var gDataLease = gradOutput.LeaseArray();
         var gData = gDataLease.Array;
         using var iDataLease = input.LeaseArray();
@@ -49146,7 +49158,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double deriv = x > 0 ? 1.0 : numOps.ToDouble(oData[i]) + alpha;
             result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
         }
-        return new Tensor<T>(result, gradOutput.Shape.ToArray());
+        return resultTensor;
     }
 
     /// <inheritdoc/>
