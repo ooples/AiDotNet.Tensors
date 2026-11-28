@@ -20,7 +20,10 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
 {
     public string Name => "LayerNormResidual";
 
-    public bool IsDifferentiable => true;
+    // Inference only. The fused node never writes the residual sum, and a training plan's caller reads that sum after
+    // Step() (the LayerNorm input of an embedding -> linear -> residual -> LayerNorm block came back as freed storage).
+    // The fused backward stays exact, so the node is still correct wherever an inference plan runs it.
+    public bool IsDifferentiable => false;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,
@@ -61,7 +64,10 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
 
         // Inspect optional auxiliary LayerNormMean / LayerNormVariance nodes recorded right after LayerNorm.
         // Only fuse when those auxiliary statistic nodes themselves have zero downstream consumers, so we can
-        // drop them cleanly without forcing extra variance conversions.
+        // drop them cleanly without forcing extra variance conversions. A statistic node the fusion pass handed in
+        // as already removed is a blocked one (retained/observable in training, realized, or in-place ordered): it
+        // stays in the plan and its delegate copies from the LayerNorm writer's state, so removing that writer
+        // would leave it reading nothing. Decline in that case.
         LazyNode<float>? meanAux = null;
         LazyNode<float>? varAux = null;
         int statEnd = Math.Min(nodes.Count - 1, lnIndex + 3);
@@ -69,10 +75,11 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
         {
             if (nodes[j] is LazyNode<float> statNode && ReferenceEquals(statNode.Input0, lnNode.Output))
             {
-                // Retained (blocked, so already in the removed set) or read: the statistic needs the LayerNorm
-                // writer this fusion would remove.
-                if ((statNode.OpName is "LayerNormMean" or "LayerNormVariance") && alreadyRemoved.Contains(statNode))
-                    return false;
+                if (alreadyRemoved.Contains(statNode))
+                {
+                    if (statNode.OpName is "LayerNormMean" or "LayerNormVariance") return false;
+                    continue;
+                }
                 if (statNode.OpName == "LayerNormMean")
                 {
                     if (consumerCounts.TryGetValue(statNode, out int mc) && mc > 0) return false;

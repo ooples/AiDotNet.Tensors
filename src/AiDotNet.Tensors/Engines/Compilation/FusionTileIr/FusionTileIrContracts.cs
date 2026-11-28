@@ -147,10 +147,15 @@ internal sealed class FusionTileDescriptor
         InputCount = inputCount;
         ScalarCount = scalarCount;
         OutputCount = outputCount;
-        Instructions = instructions ?? throw new ArgumentNullException(nameof(instructions));
+        if (instructions is null) throw new ArgumentNullException(nameof(instructions));
+        // Take one immutable snapshot so later mutation of the caller's list cannot desynchronize
+        // the instructions, the digest, and any executor built from the same snapshot.
+        var snapshot = new FusionTileInstruction[instructions.Count];
+        for (int i = 0; i < snapshot.Length; i++) snapshot[i] = instructions[i];
+        Instructions = Array.AsReadOnly(snapshot);
         CudaDeviceFragment = cudaDeviceFragment ?? string.Empty;
         CpuExecutor = cpuExecutor;
-        Sha256Digest = ComputeDigest(tileName, kind, inputCount, scalarCount, outputCount, instructions, CudaDeviceFragment);
+        Sha256Digest = ComputeDigest(tileName, kind, inputCount, scalarCount, outputCount, Instructions, CudaDeviceFragment);
     }
 
     private static string ComputeDigest(

@@ -97,7 +97,7 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         Assert.Contains("fused_logsoftmax_ce_fwd_f32", CompiledFusedKernels.UniversalRowFusedCudaSource);
         Assert.Contains("__shfl_down_sync", CompiledFusedKernels.UniversalRowFusedCudaSource);
 
-        // Verify NvrtcGraphEmitter lowers a 3-op SwiGLU + Bias chain to vectorized CUDA C.
+        // Verify NvrtcGraphEmitter lowers a same-shape Swish(gate) * up chain to vectorized (float4) CUDA C.
         var graph = new CodegenGraph();
         int inGate = graph.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, new[] { 4, 64 }, 0));
         int inUp = graph.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, new[] { 4, 64 }, 1));
@@ -114,7 +114,52 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         {
             Assert.Contains("extern \"C\" __global__ void aidn_nvrtc_fused_", emitted.Source);
             Assert.Contains("reinterpret_cast<const float4*>", emitted.Source);
+            Assert.DoesNotContain("int cols", emitted.Source);
         }
+
+        // SwiGLU + trailing [64] bias: the bias input is indexed by column, so the emitter takes the scalar
+        // broadcast path with a cols parameter instead of the float4 path.
+        var biasGraph = new CodegenGraph();
+        int bGate = biasGraph.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, new[] { 4, 64 }, 0));
+        int bUp = biasGraph.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, new[] { 4, 64 }, 1));
+        int bBias = biasGraph.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, new[] { 64 }, 2));
+        int bSwish = biasGraph.AddNode(new CodegenNode(CodegenOpKind.Swish, new[] { bGate }, CodegenElementType.Float32, new[] { 4, 64 }));
+        int bMul = biasGraph.AddNode(new CodegenNode(CodegenOpKind.Mul, new[] { bSwish, bUp }, CodegenElementType.Float32, new[] { 4, 64 }));
+        int bAdd = biasGraph.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { bMul, bBias }, CodegenElementType.Float32, new[] { 4, 64 }));
+        biasGraph.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { bAdd }, CodegenElementType.Float32, new[] { 4, 64 }, 0));
+
+        var biasEmitted = emitter.Emit(biasGraph, CodegenElementType.Float32);
+        Assert.False(biasEmitted.Declined);
+        Assert.NotNull(biasEmitted.Kernel);
+        Assert.NotNull(biasEmitted.Source);
+        if (biasEmitted.Source is not null)
+        {
+            Assert.Contains("int cols", biasEmitted.Source);
+            Assert.Contains("int col = idx % cols;", biasEmitted.Source);
+            Assert.Contains("in_2[col]", biasEmitted.Source);
+            Assert.Contains("in_0[idx]", biasEmitted.Source);
+            Assert.DoesNotContain("float4", biasEmitted.Source);
+        }
+    }
+
+    [Fact]
+    public void BiasActivationRowKernels_ShareOneActivationProtocol()
+    {
+        // The CUDA kernel's activation codes are emitted from the same table as the CPU enum.
+        foreach (var (name, kind) in new[]
+        {
+            ("NONE", CompiledFusedKernels.RowActivationKind.None),
+            ("RELU", CompiledFusedKernels.RowActivationKind.ReLU),
+            ("GELU", CompiledFusedKernels.RowActivationKind.GELU),
+            ("SWISH", CompiledFusedKernels.RowActivationKind.Swish),
+            ("SIGMOID", CompiledFusedKernels.RowActivationKind.Sigmoid),
+            ("TANH", CompiledFusedKernels.RowActivationKind.Tanh),
+        })
+        {
+            Assert.Contains($"#define AIDN_ROW_ACT_{name} {(int)kind}\n",CompiledFusedKernels.UniversalRowFusedCudaSource);
+        }
+        Assert.Contains("act_kind == AIDN_ROW_ACT_RELU", CompiledFusedKernels.UniversalRowFusedCudaSource);
+        Assert.Contains("act_kind == AIDN_ROW_ACT_TANH", CompiledFusedKernels.UniversalRowFusedCudaSource);
     }
 
     [Fact]
@@ -192,13 +237,26 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(lossEager, new[] { x, res, gamma, beta });
         }
 
+        // A training plan keeps the residual add and the LayerNorm: the fused node never writes the residual sum,
+        // which a training caller can still read after Step().
+        List<ILazyNode> trainingNodes;
+        using (var scope = GraphMode.Enable())
+        {
+            var sumLazy = engine.TensorAdd(x, res);
+            var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
+            _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
+            trainingNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+        Assert.DoesNotContain(trainingNodes, n => n.OpName == "FusedLayerNormResidual");
+        Assert.Contains(trainingNodes, n => n.OpName == "LayerNorm");
+
         List<ILazyNode> compiledNodes;
         using (var scope = GraphMode.Enable())
         {
             var sumLazy = engine.TensorAdd(x, res);
             var lnLazy = engine.LayerNorm(sumLazy, gamma, beta, eps, out _, out _);
             _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
-            compiledNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+            compiledNodes = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
         }
 
         Assert.Contains(compiledNodes, n => n.OpName == "FusedLayerNormResidual");
@@ -238,29 +296,109 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(loss, new[] { gate, up });
         }
 
-        // Decomposed 3-node (Sigmoid -> Mul -> Mul) collapses to 1 FusedSwiGlu node!
-        List<ILazyNode> compiledDecomposed;
+        // Decomposed 3-node (Sigmoid -> Mul -> Mul) and direct 2-node (Swish -> Mul) both collapse to 1 FusedSwiGlu node.
+        var variants = new (string Name, Action Record)[]
+        {
+            ("decomposed", () =>
+            {
+                var sig = engine.Sigmoid(gate);
+                var swish = engine.TensorMultiply(gate, sig);
+                _ = engine.TensorMultiply(swish, up);
+            }),
+            ("direct", () => _ = engine.TensorMultiply(engine.Swish(gate), up)),
+        };
+
+        foreach (var (name, record) in variants)
+        {
+            List<ILazyNode> compiled;
+            using (var scope = GraphMode.Enable())
+            {
+                record();
+                compiled = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+            }
+
+            Assert.True(compiled.Count == 1, $"{name}: expected 1 fused node, got {compiled.Count}.");
+            Assert.Equal("FusedSwiGlu", compiled[0].OpName);
+
+            var fusedNode = (LazyNode<float>)compiled[0];
+            var fusedOut = new Tensor<float>(expectedOut._shape);
+            fusedNode.Execute(engine, fusedOut);
+            AssertClose(expectedOut.AsSpan(), fusedOut.AsSpan(), 3e-4f);
+
+            var ones = new Tensor<float>(Enumerable.Repeat(1.0f, expectedOut.Length).ToArray(), expectedOut._shape);
+            var fusedGrads = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
+            Assert.NotNull(fusedNode.BackwardFn);
+            fusedNode.BackwardFn?.Invoke(ones, fusedNode.GetInputsArray(), fusedOut, fusedNode.SavedState ?? Array.Empty<object>(), engine, fusedGrads);
+            AssertClose(expectedGrads[gate].AsSpan(), fusedGrads[gate].AsSpan(), 5e-4f);
+            AssertClose(expectedGrads[up].AsSpan(), fusedGrads[up].AsSpan(), 5e-4f);
+        }
+    }
+
+    [Fact]
+    public void SwiGluFusionPattern_RebuildsOfOneShapeShareOneForwardGraph()
+    {
+        // The GPU engine caches compiled kernels by graph identity: rebuilding the same unit must not add entries.
+        var first = SwiGluFusionPattern.GetForwardCodegenGraph(new[] { 4, 48 }, isGelu: false);
+        Assert.Same(first, SwiGluFusionPattern.GetForwardCodegenGraph(new[] { 4, 48 }, isGelu: false));
+        Assert.NotSame(first, SwiGluFusionPattern.GetForwardCodegenGraph(new[] { 4, 48 }, isGelu: true));
+        Assert.NotSame(first, SwiGluFusionPattern.GetForwardCodegenGraph(new[] { 8, 48 }, isGelu: false));
+    }
+
+    [Fact]
+    public void LayerNormResidualFusionPattern_DeclinesWhenATrainingTraceRetainsAStatistic()
+    {
+        var engine = new CpuEngine();
+        var rng = new Random(212);
+        var x = new Tensor<float>(RandomArray(rng, 5 * 40, -1.5f, 1.5f), new[] { 5, 40 });
+        var res = new Tensor<float>(RandomArray(rng, 5 * 40, -1.5f, 1.5f), new[] { 5, 40 });
+        var gamma = new Tensor<float>(RandomArray(rng, 40, 0.5f, 1.5f), new[] { 40 });
+        var beta = new Tensor<float>(RandomArray(rng, 40, -0.5f, 0.5f), new[] { 40 });
+        const double eps = 1e-5;
+
+        engine.LayerNorm(engine.TensorAdd(x, res), gamma, beta, eps, out var expectedMean, out _);
+
+        List<ILazyNode> compiledNodes;
+        Tensor<float> mean;
         using (var scope = GraphMode.Enable())
         {
-            var sig = engine.Sigmoid(gate);
-            var swish = engine.TensorMultiply(gate, sig);
-            _ = engine.TensorMultiply(swish, up);
-            compiledDecomposed = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+            var lnLazy = engine.LayerNorm(engine.TensorAdd(x, res), gamma, beta, eps, out mean, out _);
+            _ = engine.ReduceSum(engine.TensorMultiply(lnLazy, lnLazy), new[] { 0, 1 }, keepDims: false);
+            // The caller retains the mean: the training fusion pass blocks that node.
+            var observable = new HashSet<ILazyNode> { mean.LazySource! };
+            compiledNodes = new LazyGraphCompiler(forTraining: true, observable).Compile(scope.Nodes);
         }
 
-        Assert.Single(compiledDecomposed);
-        Assert.Equal("FusedSwiGlu", compiledDecomposed[0].OpName);
+        Assert.DoesNotContain(compiledNodes, n => n.OpName == "FusedLayerNormResidual");
+        Assert.Contains(compiledNodes, n => n.OpName == "LayerNorm");
+        Assert.Contains(compiledNodes, n => n.OpName == "LayerNormMean");
 
-        var fusedNode = (LazyNode<float>)compiledDecomposed[0];
-        var fusedOut = new Tensor<float>(expectedOut._shape);
-        fusedNode.Execute(engine, fusedOut);
-        AssertClose(expectedOut.AsSpan(), fusedOut.AsSpan(), 3e-4f);
+        // The retained statistic still gets its values from the LayerNorm writer.
+        foreach (var node in compiledNodes.OfType<LazyNode<float>>())
+            node.Execute(engine, node.Output);
+        AssertClose(expectedMean.AsSpan(), mean.AsSpan(), 1e-5f);
+    }
 
-        var ones = new Tensor<float>(Enumerable.Repeat(1.0f, expectedOut.Length).ToArray(), expectedOut._shape);
-        var fusedGrads = new Dictionary<Tensor<float>, Tensor<float>>(ReferenceEqualityComparer<Tensor<float>>.Instance);
-        fusedNode.BackwardFn?.Invoke(ones, fusedNode.GetInputsArray(), fusedOut, fusedNode.SavedState ?? Array.Empty<object>(), engine, fusedGrads);
-        AssertClose(expectedGrads[gate].AsSpan(), fusedGrads[gate].AsSpan(), 5e-4f);
-        AssertClose(expectedGrads[up].AsSpan(), fusedGrads[up].AsSpan(), 5e-4f);
+    [Fact]
+    public void RmsNormGraphMode_RmsOutputDependsOnTheRmsNormNode()
+    {
+        var engine = new CpuEngine();
+        var x = new Tensor<float>(new[] { 3.0f, 4.0f }, new[] { 1, 2 });
+        var gamma = new Tensor<float>(new[] { 1.0f, 1.0f }, new[] { 2 });
+
+        Tensor<float> rms;
+        Tensor<float> consumer;
+        using (var scope = GraphMode.Enable())
+        {
+            _ = engine.RMSNorm(x, gamma, 0.0, out rms);
+            // A consumer of rms alone must schedule the RMSNorm node without anything reading its normalized output.
+            consumer = engine.TensorMultiplyScalar(rms, 2.0f);
+            Assert.NotNull(rms.LazySource);
+            Assert.Contains(rms.LazySource!.GetInputNodes(), n => n.OpName == "RMSNorm");
+        }
+
+        float expectedRms = (float)Math.Sqrt(12.5);
+        Assert.Equal(2.0f * expectedRms, consumer.AsSpan()[0], 4);
+        Assert.Equal(expectedRms, rms.AsSpan()[0], 4);
     }
 
     [Fact]

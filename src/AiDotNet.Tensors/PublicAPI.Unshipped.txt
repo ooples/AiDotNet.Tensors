@@ -1385,6 +1385,8 @@ AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptio
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.StaticShapeCudaGraphOptions() -> void
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.MaxCaptureFailuresBeforeFallback.get -> int
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.MaxCaptureFailuresBeforeFallback.init -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.StepBodyIsReplayable.get -> bool
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.StepBodyIsReplayable.init -> void
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.SynchronizeOnReplay.get -> bool
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.SynchronizeOnReplay.init -> void
 AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.WarmupIterations.get -> int

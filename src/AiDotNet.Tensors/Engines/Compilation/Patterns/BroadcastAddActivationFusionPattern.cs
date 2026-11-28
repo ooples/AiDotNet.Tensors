@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.Compilation.GeneratedKernels;
 using AiDotNet.Tensors.LinearAlgebra;
+using RowActivationKind = AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.CompiledFusedKernels.RowActivationKind;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
 
@@ -18,7 +19,11 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
 {
     public string Name => "AddAndBiasActivation";
 
-    public bool IsDifferentiable => true;
+    // Inference only. In a training plan the fused node replaced the add's own backward -- the specialized writer that
+    // claims the first write of a multi-consumer gradient, so the step skips zeroing it -- with a generic accumulate,
+    // and erased the pre-activation sum a caller can still read after Step() (a declared matmul result's consumer sum
+    // came back as freed storage). Training keeps the add and the activation as their own steps.
+    public bool IsDifferentiable => false;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,
@@ -80,6 +85,14 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
         var actKind = MapActivationKind(actNode.OpType, out CodegenOpKind codegenOp);
         if (actKind == RowActivationKind.None)
             return false;
+        var fusedActType = actKind switch
+        {
+            RowActivationKind.ReLU => FusedActivationType.ReLU,
+            RowActivationKind.GELU => FusedActivationType.GELU,
+            RowActivationKind.Swish => FusedActivationType.Swish,
+            RowActivationKind.Sigmoid => FusedActivationType.Sigmoid,
+            _ => FusedActivationType.Tanh,
+        };
 
         var outShape = (int[])actNode.Output._shape.Clone();
         var fwdGraph = BuildCodegenGraph(mainInput._shape, biasInput._shape, outShape, codegenOp);
@@ -114,13 +127,13 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                         return;
                     }
 
-                    if (actKind == RowActivationKind.Relu)
+                    if (actKind == RowActivationKind.ReLU)
                     {
                         CompiledFusedKernels.AddRelu(mainInput.AsSpan(), biasInput.AsSpan(), output.AsWritableSpan());
                         output.IncrementVersion();
                         return;
                     }
-                    if (actKind == RowActivationKind.Gelu)
+                    if (actKind == RowActivationKind.GELU)
                     {
                         CompiledFusedKernels.AddGelu(mainInput.AsSpan(), biasInput.AsSpan(), output.AsWritableSpan());
                         output.IncrementVersion();
@@ -179,8 +192,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     }
                     dPre = actKind switch
                     {
-                        RowActivationKind.Relu => engine.ReluBackward(gradOutput, preAct),
-                        RowActivationKind.Gelu => engine.GeluBackward(gradOutput, preAct),
+                        RowActivationKind.ReLU => engine.ReluBackward(gradOutput, preAct),
+                        RowActivationKind.GELU => engine.GeluBackward(gradOutput, preAct),
                         RowActivationKind.Swish => engine.SwishBackward(gradOutput, preAct),
                         _ => gradOutput
                     };
@@ -207,9 +220,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     }
                 }
             },
-            // The activation kind is the step's saved state, so a stored plan rebuilds the same fused op on load.
-            // Stored as its integer value: that is the plan file format.
-            new object[] { (int)actKind })
+            // The activation, as FusedLinear saves it, for consumers that translate the add and activation (ONNX export).
+            new object[] { fusedActType })
         {
             RecordingEngine = actNode.RecordingEngine
         };
@@ -228,20 +240,31 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
     {
         switch (op)
         {
-            case LazyNodeType.ReLU: codegenOp = CodegenOpKind.ReLU; return RowActivationKind.Relu;
-            case LazyNodeType.GELU: codegenOp = CodegenOpKind.GELU; return RowActivationKind.Gelu;
-            case LazyNodeType.Swish: codegenOp = CodegenOpKind.Swish; return RowActivationKind.Swish;
-            case LazyNodeType.Sigmoid: codegenOp = CodegenOpKind.Sigmoid; return RowActivationKind.Sigmoid;
-            case LazyNodeType.Tanh: codegenOp = CodegenOpKind.Tanh; return RowActivationKind.Tanh;
-            default: codegenOp = CodegenOpKind.ReLU; return RowActivationKind.None;
+            case LazyNodeType.ReLU:
+                codegenOp = CodegenOpKind.ReLU;
+                return RowActivationKind.ReLU;
+            case LazyNodeType.GELU:
+                codegenOp = CodegenOpKind.GELU;
+                return RowActivationKind.GELU;
+            case LazyNodeType.Swish:
+                codegenOp = CodegenOpKind.Swish;
+                return RowActivationKind.Swish;
+            case LazyNodeType.Sigmoid:
+                codegenOp = CodegenOpKind.Sigmoid;
+                return RowActivationKind.Sigmoid;
+            case LazyNodeType.Tanh:
+                codegenOp = CodegenOpKind.Tanh;
+                return RowActivationKind.Tanh;
+            default:
+                codegenOp = CodegenOpKind.ReLU;
+                return RowActivationKind.None;
         }
     }
 
-    /// <summary>The unfused activation for a kind; the plan codec rebuilds stored steps with the same mapping.</summary>
-    internal static Tensor<T> ApplyActivationEager<T>(IEngine eng, Tensor<T> x, RowActivationKind actKind) => actKind switch
+    private static Tensor<float> ApplyActivationEager(IEngine eng, Tensor<float> x, RowActivationKind actKind) => actKind switch
     {
-        RowActivationKind.Relu => eng.ReLU(x),
-        RowActivationKind.Gelu => eng.GELU(x),
+        RowActivationKind.ReLU => eng.ReLU(x),
+        RowActivationKind.GELU => eng.GELU(x),
         RowActivationKind.Swish => eng.Swish(x),
         RowActivationKind.Sigmoid => eng.Sigmoid(x),
         RowActivationKind.Tanh => eng.Tanh(x),

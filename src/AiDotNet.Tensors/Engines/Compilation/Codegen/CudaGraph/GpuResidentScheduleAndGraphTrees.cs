@@ -86,6 +86,13 @@ public sealed class GpuResidentScheduleScalars : IDisposable
             throw new ObjectDisposedException(nameof(GpuResidentScheduleScalars));
         if (step < 1)
             throw new ArgumentOutOfRangeException(nameof(step), "Optimizer step index must be >= 1.");
+        // Validate everything before touching _hostStaging: a NaN/Inf or out-of-range beta would otherwise be
+        // uploaded and turn every captured optimizer update into NaN moments and parameters.
+        RequireFinite(learningRate, nameof(learningRate));
+        RequireFinite(weightDecay, nameof(weightDecay));
+        RequireFinite(maxGradNorm, nameof(maxGradNorm));
+        RequireBeta(beta1, nameof(beta1));
+        RequireBeta(beta2, nameof(beta2));
 
         float bc1 = 1.0f - (float)Math.Pow(beta1, step);
         float bc2 = 1.0f - (float)Math.Pow(beta2, step);
@@ -120,6 +127,18 @@ public sealed class GpuResidentScheduleScalars : IDisposable
             throw new InvalidOperationException(
                 "Schedule scalar buffer upload mutated its device pointer, violating the static CUDA Graph contract.");
         }
+    }
+
+    private static void RequireFinite(float value, string paramName)
+    {
+        if (float.IsNaN(value) || float.IsInfinity(value))
+            throw new ArgumentOutOfRangeException(paramName, value, "Schedule value must be finite.");
+    }
+
+    private static void RequireBeta(float value, string paramName)
+    {
+        if (!(value >= 0.0f && value < 1.0f))
+            throw new ArgumentOutOfRangeException(paramName, value, "Beta must be finite and in [0, 1).");
     }
 
     /// <inheritdoc/>
@@ -222,21 +241,47 @@ public sealed class CudaGraphTreePool : IDisposable
         distinct.CopyTo(_sortedBuckets);
         _elementsPerUnit = workspaceElementsPerUnit;
 
+        // Validate everything before allocating, so an invalid argument cannot strand device memory in an
+        // instance the caller never receives and so cannot dispose.
+        StaticShapeCudaGraphOptions.Validate(options ?? StaticShapeCudaGraphOptions.Default, nameof(options));
         int maxBucket = _sortedBuckets[_sortedBuckets.Length - 1];
         int maxArenaElements = checked(maxBucket * _elementsPerUnit);
+
         _sharedArena = _backend.AllocateBuffer(maxArenaElements);
-
         _entries = new Dictionary<int, BucketEntry>(_sortedBuckets.Length);
-        for (int i = 0; i < _sortedBuckets.Length; i++)
+        try
         {
-            int cap = _sortedBuckets[i];
-            int viewLen = checked(cap * _elementsPerUnit);
-            IGpuBuffer view = (_backend is IGpuBufferViews viewBackend
-                ? viewBackend.TryCreateView(_sharedArena, 0, viewLen)
-                : null) ?? new OffsetBufferView(_sharedArena, 0, viewLen);
+            for (int i = 0; i < _sortedBuckets.Length; i++)
+            {
+                int cap = _sortedBuckets[i];
+                int viewLen = checked(cap * _elementsPerUnit);
+                IGpuBuffer view = (_backend is IGpuBufferViews viewBackend
+                    ? viewBackend.TryCreateView(_sharedArena, 0, viewLen)
+                    : null) ?? new OffsetBufferView(_sharedArena, 0, viewLen);
 
-            var scope = new StaticShapeCudaGraphScope(_backend, scopeKind, options);
-            _entries[cap] = new BucketEntry(cap, view, scope);
+                StaticShapeCudaGraphScope scope;
+                try
+                {
+                    scope = new StaticShapeCudaGraphScope(_backend, scopeKind, options);
+                }
+                catch
+                {
+                    view.Dispose();
+                    throw;
+                }
+                _entries[cap] = new BucketEntry(cap, view, scope);
+            }
+        }
+        catch
+        {
+            // Unwind everything acquired so far: the caller never gets an instance to dispose.
+            foreach (var entry in _entries.Values)
+            {
+                entry.Dispose();
+            }
+            _entries.Clear();
+            _sharedArena.Dispose();
+            throw;
         }
     }
 

@@ -6,6 +6,19 @@ namespace AiDotNet.Tensors.Generators;
 
 internal static class FusedRowPatternTemplates
 {
+    // The one definition of the row bias+activation dispatch codes: the generated RowActivationKind enum (CPU kernel
+    // and fusion patterns) and the CUDA #defines the fused_bias_activation_row_f32 kernel switches on are both
+    // emitted from this table, so a new activation changes the protocol here only.
+    private static readonly (string EnumName, string CudaDefine, int Value)[] RowActivations =
+    {
+        ("None", "AIDN_ROW_ACT_NONE", 0),
+        ("ReLU", "AIDN_ROW_ACT_RELU", 1),
+        ("GELU", "AIDN_ROW_ACT_GELU", 2),
+        ("Swish", "AIDN_ROW_ACT_SWISH", 3),
+        ("Sigmoid", "AIDN_ROW_ACT_SIGMOID", 4),
+        ("Tanh", "AIDN_ROW_ACT_TANH", 5),
+    };
+
     public static string EmitRowPatternClass(string namespaceName, string typeName, string accessibility)
     {
         var sb = new StringBuilder(16384);
@@ -423,11 +436,33 @@ internal static class FusedRowPatternTemplates
 ");
     }
 
+    private static void EmitRowActivationKindEnum(StringBuilder sb)
+    {
+        sb.AppendLine("    /// <summary>");
+        sb.AppendLine("    /// Activation codes of the fused row bias + activation kernels (CPU <see cref=\"BiasActivationRowForward\"/> and");
+        sb.AppendLine("    /// CUDA <c>fused_bias_activation_row_f32</c>, whose <c>AIDN_ROW_ACT_*</c> defines carry the same values).");
+        sb.AppendLine("    /// </summary>");
+        sb.AppendLine("    public enum RowActivationKind");
+        sb.AppendLine("    {");
+        foreach (var activation in RowActivations)
+            sb.Append("        ").Append(activation.EnumName).Append(" = ").Append(activation.Value).AppendLine(",");
+        sb.AppendLine("    }");
+        sb.AppendLine();
+    }
+
+    private static string EmitRowActivationCudaDefines()
+    {
+        var defines = new StringBuilder();
+        foreach (var activation in RowActivations)
+            defines.Append("#define ").Append(activation.CudaDefine).Append(' ').Append(activation.Value).Append('\n');
+        return defines.ToString();
+    }
+
     private static void EmitBiasActivationRowCpu(StringBuilder sb)
     {
+        EmitRowActivationKindEnum(sb);
         sb.AppendLine(@"    /// <summary>
     /// Fused row-broadcast bias + activation: output[r, c] = act(input[r, c] + bias[c]).
-    /// <paramref name=""activationKind""/> is the shared RowActivationKind protocol.
     /// </summary>
     public static void BiasActivationRowForward(
         ReadOnlySpan<float> input,
@@ -435,7 +470,7 @@ internal static class FusedRowPatternTemplates
         Span<float> output,
         int rows,
         int cols,
-        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind activationKind)
+        RowActivationKind activationKind)
     {
         if (rows <= 0 || cols <= 0) return;
         int total = checked(rows * cols);
@@ -459,11 +494,11 @@ internal static class FusedRowPatternTemplates
                         global::AiDotNet.Tensors.Engines.Simd.SimdKernels.ReadVector256(bias, c));
                     Vector256<float> res = activationKind switch
                     {
-                        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Relu => Avx.Max(z, Vector256<float>.Zero),   // NaN -> 0, as ReluScalar and fmaxf(0, z)
-                        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Gelu => GeneratedKernelSimdMath.Gelu256(z),
-                        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Swish => GeneratedKernelSimdMath.Swish256(z),
-                        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Sigmoid => global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastSigmoid256(z),
-                        global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Tanh => global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastTanh256(z),
+                        RowActivationKind.ReLU => Avx.Max(z, Vector256<float>.Zero),   // NaN -> 0, as ReluScalar and fmaxf(0, z)
+                        RowActivationKind.GELU => GeneratedKernelSimdMath.Gelu256(z),
+                        RowActivationKind.Swish => GeneratedKernelSimdMath.Swish256(z),
+                        RowActivationKind.Sigmoid => global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastSigmoid256(z),
+                        RowActivationKind.Tanh => global::AiDotNet.Tensors.Engines.Simd.SimdKernels.FastTanh256(z),
                         _ => z
                     };
                     global::AiDotNet.Tensors.Engines.Simd.SimdKernels.WriteVector256(yRow, c, res);
@@ -475,11 +510,11 @@ internal static class FusedRowPatternTemplates
                 float z = xRow[c] + bias[c];
                 yRow[c] = activationKind switch
                 {
-                    global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Relu => GeneratedKernelSimdMath.ReluScalar(z),
-                    global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Gelu => GeneratedKernelSimdMath.GeluScalar(z),
-                    global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Swish => GeneratedKernelSimdMath.SwishScalar(z),
-                    global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Sigmoid => GeneratedKernelSimdMath.SigmoidScalar(z),
-                    global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKind.Tanh => GeneratedKernelSimdMath.TanhScalar(z),
+                    RowActivationKind.ReLU => GeneratedKernelSimdMath.ReluScalar(z),
+                    RowActivationKind.GELU => GeneratedKernelSimdMath.GeluScalar(z),
+                    RowActivationKind.Swish => GeneratedKernelSimdMath.SwishScalar(z),
+                    RowActivationKind.Sigmoid => GeneratedKernelSimdMath.SigmoidScalar(z),
+                    RowActivationKind.Tanh => GeneratedKernelSimdMath.TanhScalar(z),
                     _ => z
                 };
             }
@@ -745,7 +780,8 @@ internal static class FusedRowPatternTemplates
     };
 
     private static string? _lazyUniversalRowFusedCudaSource;
-    public static string UniversalRowFusedCudaSource => _lazyUniversalRowFusedCudaSource ??= global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.RowActivationKindProtocol.CudaDefines + global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@""
+    public static string UniversalRowFusedCudaSource => _lazyUniversalRowFusedCudaSource ??= global::AiDotNet.Tensors.Engines.Compilation.GeneratedKernels.GeneratedKernelUtf8.Decode(@""
+" + EmitRowActivationCudaDefines() + @"
 __device__ __forceinline__ float aidn_warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffffu, val, offset);
@@ -872,11 +908,11 @@ extern """"C"""" __global__ void fused_bias_activation_row_f32(
         int c = (int)(idx % cols);
         float z = x[idx] + bias[c];
         float y = z;
-        if (act_kind == AIDN_ACT_RELU) y = fmaxf(0.0f, z);
-        else if (act_kind == AIDN_ACT_GELU) y = 0.5f * z * (1.0f + tanhf(0.7978845608f * (z + 0.044715f * z * z * z)));
-        else if (act_kind == AIDN_ACT_SWISH) y = z / (1.0f + expf(-z));
-        else if (act_kind == AIDN_ACT_SIGMOID) y = 1.0f / (1.0f + expf(-z));
-        else if (act_kind == AIDN_ACT_TANH) y = tanhf(z);
+        if (act_kind == AIDN_ROW_ACT_RELU) y = fmaxf(0.0f, z);
+        else if (act_kind == AIDN_ROW_ACT_GELU) y = 0.5f * z * (1.0f + tanhf(0.7978845608f * (z + 0.044715f * z * z * z)));
+        else if (act_kind == AIDN_ROW_ACT_SWISH) y = z / (1.0f + expf(-z));
+        else if (act_kind == AIDN_ROW_ACT_SIGMOID) y = 1.0f / (1.0f + expf(-z));
+        else if (act_kind == AIDN_ROW_ACT_TANH) y = tanhf(z);
         out[idx] = y;
     }
 }

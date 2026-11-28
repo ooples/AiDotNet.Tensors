@@ -26,6 +26,9 @@ internal static class FusionTileArtifactCache
         set => s_overrideCacheRoot = value;
     }
 
+    /// <summary>Drops the in-memory tier so tests can prove a lookup is served from the persisted file.</summary>
+    internal static void ClearMemoryCache() => s_memoryCache.Clear();
+
     public static string ComputeArtifactKey(string cudaOrPtxSource, int smMajor, int smMinor, bool fastMath)
     {
         if (cudaOrPtxSource is null) throw new ArgumentNullException(nameof(cudaOrPtxSource));
@@ -54,7 +57,8 @@ internal static class FusionTileArtifactCache
         string memKey = sha256Key + extension;
         if (s_memoryCache.TryGetValue(memKey, out var cached) && cached is not null)
         {
-            artifactBytes = cached;
+            // Hand out a copy so a caller mutating the returned array cannot corrupt later hits.
+            artifactBytes = (byte[])cached.Clone();
             return true;
         }
 
@@ -70,13 +74,17 @@ internal static class FusionTileArtifactCache
                     if (fromDisk.Length > 0)
                     {
                         s_memoryCache[memKey] = fromDisk;
-                        artifactBytes = fromDisk;
+                        artifactBytes = (byte[])fromDisk.Clone();
                         return true;
                     }
                 }
                 catch (IOException)
                 {
                     // Best-effort cache lookup; fall through on concurrent I/O contention.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Unreadable artifact (permissions / sandbox): treat as a cache miss.
                 }
             }
         }
@@ -92,33 +100,63 @@ internal static class FusionTileArtifactCache
         if (artifactBytes is null || artifactBytes.Length == 0)
             return;
 
+        // Keep a private copy so a producer reusing its buffer cannot change what later hits return.
+        byte[] owned = (byte[])artifactBytes.Clone();
         string memKey = sha256Key + extension;
-        s_memoryCache[memKey] = artifactBytes;
+        s_memoryCache[memKey] = owned;
 
         string? dir = ResolveCacheDirectory();
         if (dir is null)
             return;
 
+        string? tempPath = null;
         try
         {
             Directory.CreateDirectory(dir);
             string finalPath = Path.Combine(dir, sha256Key + extension);
-            string tempPath = Path.Combine(dir, sha256Key + "." + Guid.NewGuid().ToString("N") + ".tmp");
-            File.WriteAllBytes(tempPath, artifactBytes);
-            if (File.Exists(finalPath))
-            {
-                try { File.Delete(tempPath); } catch { }
+
+            // Content-addressed: a valid (non-empty) existing artifact already holds these bytes.
+            var existing = new FileInfo(finalPath);
+            if (existing.Exists && existing.Length > 0)
                 return;
+
+            tempPath = Path.Combine(dir, sha256Key + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            File.WriteAllBytes(tempPath, owned);
+
+            if (existing.Exists)
+            {
+                // Replace the empty/invalid entry atomically so later processes stop missing on it.
+#if NETCOREAPP3_0_OR_GREATER
+                File.Move(tempPath, finalPath, overwrite: true);
+#else
+                File.Replace(tempPath, finalPath, destinationBackupFileName: null);
+#endif
             }
-            File.Move(tempPath, finalPath);
+            else
+            {
+                File.Move(tempPath, finalPath);
+            }
         }
         catch (IOException)
         {
-            // Another process/thread wrote the identical content-addressed artifact concurrently.
+            // Another process/thread published the identical content-addressed artifact concurrently.
         }
         catch (UnauthorizedAccessException)
         {
             // Read-only sandbox fallback: memory cache remains populated.
+        }
+        finally
+        {
+            // Remove the staged file if publication did not consume it; never touch the published artifact.
+            if (tempPath is not null)
+            {
+                try
+                {
+                    if (File.Exists(tempPath)) File.Delete(tempPath);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
         }
     }
 

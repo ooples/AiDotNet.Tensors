@@ -151,6 +151,12 @@ internal sealed class DirectPtxAutotuneRecord
     /// leads; <see cref="double.NaN"/> when vendor libraries are disabled or unavailable).
     /// </summary>
     public double DirectPtxVsVendorRatio { get; set; } = double.NaN;
+
+    /// <summary>
+    /// Canonical signature of the eligible candidate set (origin + id of every candidate) this record was measured
+    /// over. A cached record is reused only when the current eligible set has the same signature.
+    /// </summary>
+    public string CandidateSetSignature { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -205,7 +211,12 @@ internal sealed class DirectPtxAutotuner
     public IReadOnlyDictionary<string, DirectPtxAutotuneRecord> Records => _records;
 
     /// <summary>
-    /// Selects (from disk cache or live ABBA-fair warmup + median measurement) the fastest candidate for <paramref name="shape"/>.
+    /// Selects the fastest candidate for <paramref name="shape"/>, either from the cache or by live measurement.
+    /// Live measurement is sequential: each candidate, in order, runs its warmup launches and then all of its measured
+    /// launches (median latency) before the next candidate starts; measurements are not interleaved across candidates.
+    /// A cached record is reused only when it was measured over exactly the current eligible candidate set (same
+    /// origins and ids); otherwise the eligible set is re-measured. Candidate identity is <c>(Origin, CandidateId)</c>
+    /// and must be unique within the eligible set.
     /// Self-contained Direct-PTX candidates are always required; vendor candidates participate only when
     /// <see cref="AllowExternalVendorLibraries"/> is enabled and <see cref="IExternalLibraryCandidateProvider.IsAvailable"/> is true.
     /// </summary>
@@ -232,19 +243,20 @@ internal sealed class DirectPtxAutotuner
             }
         }
 
+        string candidateSetSignature = ComputeCandidateSetSignature(allCandidates);
+
         string key = shape.ToString();
-        if (_records.TryGetValue(key, out var cached))
+        if (_records.TryGetValue(key, out var cached) &&
+            string.Equals(cached.CandidateSetSignature, candidateSetSignature, StringComparison.Ordinal))
         {
-            // When vendor libraries are disallowed, ignore cached vendor winners and re-tune over Direct-PTX only.
-            bool cachedAllowed = _options.AllowExternalVendorLibraries || cached.WinnerOrigin != TunedKernelOrigin.Vendor;
-            if (cachedAllowed)
+            // Same eligible set => the cached comparison (winner + vendor ratio) is still valid.
+            var matched = allCandidates.FirstOrDefault(c =>
+                c.Origin == cached.WinnerOrigin &&
+                string.Equals(c.CandidateId, cached.WinningCandidateId, StringComparison.Ordinal));
+            if (matched is not null)
             {
-                var matched = allCandidates.FirstOrDefault(c => string.Equals(c.CandidateId, cached.WinningCandidateId, StringComparison.Ordinal));
-                if (matched is not null)
-                {
-                    record = cached;
-                    return matched;
-                }
+                record = cached;
+                return matched;
             }
         }
 
@@ -296,7 +308,8 @@ internal sealed class DirectPtxAutotuner
                 WinnerOrigin = bestCandidate.Origin,
                 BestDirectPtxMedianMicroseconds = finalDirectUs,
                 BestVendorMedianMicroseconds = finalVendorUs,
-                DirectPtxVsVendorRatio = ratio
+                DirectPtxVsVendorRatio = ratio,
+                CandidateSetSignature = candidateSetSignature
             };
 
             _records[key] = measuredRecord;
@@ -320,6 +333,27 @@ internal sealed class DirectPtxAutotuner
             .Where(r => !double.IsNaN(r.DirectPtxVsVendorRatio) && r.DirectPtxVsVendorRatio > 1.0)
             .OrderByDescending(r => r.DirectPtxVsVendorRatio)
             .ToList();
+    }
+
+    /// <summary>
+    /// Builds an order-independent signature of the eligible set and rejects duplicate <c>(Origin, CandidateId)</c>
+    /// identities, which would make a cached winner ambiguous. Each identity is length-prefixed so the joined
+    /// form is unambiguous whatever characters the ids contain.
+    /// </summary>
+    private static string ComputeCandidateSetSignature(List<AutotuneExecutableCandidate> candidates)
+    {
+        var identities = new List<string>(candidates.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            var c = candidates[i] ?? throw new ArgumentException("Candidate lists cannot contain null entries.");
+            string identity = string.Concat(((int)c.Origin).ToString(CultureInfo.InvariantCulture), ":", c.CandidateId);
+            if (!seen.Add(identity))
+                throw new ArgumentException($"Duplicate autotune candidate identity '{c.Origin}:{c.CandidateId}' in the eligible candidate set.");
+            identities.Add(identity.Length.ToString(CultureInfo.InvariantCulture) + "#" + identity);
+        }
+        identities.Sort(StringComparer.Ordinal);
+        return string.Join("|", identities);
     }
 
     private static double MeasureCandidateMedianMicroseconds(
@@ -391,6 +425,7 @@ internal sealed class DirectPtxAutotuner
 
         lock (_persistLock)
         {
+            string? tempPath = null;
             try
             {
                 string? dir = Path.GetDirectoryName(path);
@@ -401,17 +436,40 @@ internal sealed class DirectPtxAutotuner
 
                 var snapshot = _records.Values.OrderBy(r => r.Key, StringComparer.Ordinal).ToList();
                 string json = JsonSerializer.Serialize(snapshot, s_jsonOptions);
-                string tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tempPath, json);
+
+                // Atomic publish: the previous tuning file stays intact until the replacement succeeds.
                 if (File.Exists(path))
                 {
-                    File.Delete(path);
+#if NETCOREAPP3_0_OR_GREATER
+                    File.Move(tempPath, path, overwrite: true);
+#else
+                    File.Replace(tempPath, path, destinationBackupFileName: null);
+#endif
                 }
-                File.Move(tempPath, path);
+                else
+                {
+                    File.Move(tempPath, path);
+                }
             }
             catch
             {
                 // Best-effort persistence in read-only environments.
+            }
+            finally
+            {
+                if (tempPath is not null)
+                {
+                    try
+                    {
+                        if (File.Exists(tempPath)) File.Delete(tempPath);
+                    }
+                    catch
+                    {
+                        // Ignore staged-file cleanup failures.
+                    }
+                }
             }
         }
     }

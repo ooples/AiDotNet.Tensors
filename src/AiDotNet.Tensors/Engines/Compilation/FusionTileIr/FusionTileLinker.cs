@@ -35,16 +35,58 @@ internal static class FusionTileLinker
         IReadOnlyList<FusionTileInstruction> instructions,
         string cudaDeviceFragment)
     {
-        var cpu = CreateCpuExecutor(inputCount, scalarCount, 1, instructions);
+        if (instructions is null) throw new ArgumentNullException(nameof(instructions));
+
+        // One snapshot feeds both the CPU executor and the descriptor (instructions + digest), so a caller
+        // mutating its list afterwards cannot make the executor disagree with the digest-keyed IR.
+        var snapshot = new FusionTileInstruction[instructions.Count];
+        for (int i = 0; i < snapshot.Length; i++) snapshot[i] = instructions[i];
+
+        var cpu = CreateCpuExecutor(inputCount, scalarCount, 1, snapshot);
         return new FusionTileDescriptor(
             tileName,
             FusionTileKind.Elementwise,
             inputCount,
             scalarCount,
             1,
-            instructions,
+            snapshot,
             cudaDeviceFragment,
             cpu);
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="op"/> is a per-element opcode that both
+    /// <see cref="CreateCpuExecutor"/> and <see cref="EmitCudaKernelFromInstructions"/> implement exactly.
+    /// Row reductions (<see cref="FusionTileOpCode.RowSum"/>, <see cref="FusionTileOpCode.RowMax"/>) are not pointwise.
+    /// </summary>
+    internal static bool IsPointwiseOpCode(FusionTileOpCode op) => op switch
+    {
+        FusionTileOpCode.LoadInput or FusionTileOpCode.LoadScalar or FusionTileOpCode.Const or
+        FusionTileOpCode.Add or FusionTileOpCode.Sub or FusionTileOpCode.Mul or FusionTileOpCode.Div or
+        FusionTileOpCode.Negate or FusionTileOpCode.Fma or FusionTileOpCode.Relu or FusionTileOpCode.ReluStep or
+        FusionTileOpCode.Sigmoid or FusionTileOpCode.Swish or FusionTileOpCode.Tanh or FusionTileOpCode.Gelu or
+        FusionTileOpCode.Exp or FusionTileOpCode.Log or FusionTileOpCode.Sqrt or FusionTileOpCode.Rsqrt or
+        FusionTileOpCode.Abs or FusionTileOpCode.Max or FusionTileOpCode.Min or FusionTileOpCode.StoreOutput => true,
+        _ => false
+    };
+
+    /// <summary>
+    /// Throws unless <paramref name="tile"/> is fully described by pointwise SSA instructions. Specialized tiles
+    /// (row-norm, RoPE, FlashAttention, linear scan, ...) carry hand-written CUDA kernels whose semantics are NOT
+    /// encoded in their instruction list, so splicing those instructions into a pointwise link would be wrong.
+    /// </summary>
+    private static void EnsureCompletePointwiseIr(FusionTileDescriptor tile, string paramName)
+    {
+        if (tile.Kind != FusionTileKind.Elementwise && tile.Kind != FusionTileKind.GemmEpilogue)
+            throw new NotSupportedException(
+                $"Tile '{tile.TileName}' of kind {tile.Kind} is not described by complete pointwise IR and cannot be linked. (Parameter '{paramName}')");
+        for (int i = 0; i < tile.Instructions.Count; i++)
+        {
+            var op = tile.Instructions[i].Op;
+            if (!IsPointwiseOpCode(op))
+                throw new NotSupportedException(
+                    $"Tile '{tile.TileName}' contains non-pointwise opcode {op} at instruction {i} and cannot be linked. (Parameter '{paramName}')");
+        }
     }
 
     /// <summary>
@@ -63,6 +105,8 @@ internal static class FusionTileLinker
             throw new ArgumentException("Producer tile must declare at least one output.", nameof(producer));
         if (consumerInputPort < 0 || consumerInputPort >= consumer.InputCount)
             throw new ArgumentOutOfRangeException(nameof(consumerInputPort));
+        EnsureCompletePointwiseIr(producer, nameof(producer));
+        EnsureCompletePointwiseIr(consumer, nameof(consumer));
 
         string cacheKey = string.Concat("V|", producer.Sha256Digest, "|", consumer.Sha256Digest, "|", consumerInputPort.ToString(CultureInfo.InvariantCulture));
         return s_linkedCache.GetOrAdd(cacheKey, _ => BuildVerticalLink(producer, consumer, consumerInputPort));
@@ -80,6 +124,8 @@ internal static class FusionTileLinker
         if (right is null) throw new ArgumentNullException(nameof(right));
         if (left.InputCount != right.InputCount || left.ScalarCount != right.ScalarCount)
             throw new ArgumentException("Horizontal shared-input fusion requires matching InputCount and ScalarCount.");
+        EnsureCompletePointwiseIr(left, nameof(left));
+        EnsureCompletePointwiseIr(right, nameof(right));
 
         string cacheKey = string.Concat("H|", left.Sha256Digest, "|", right.Sha256Digest);
         return s_linkedCache.GetOrAdd(cacheKey, _ => BuildHorizontalLink(left, right));
@@ -118,29 +164,39 @@ internal static class FusionTileLinker
     }
 
     /// <summary>
-    /// Builds a fused GEMM epilogue tile (<c>y = act(gemmOut + bias) + residual</c>) and its paired backward
-    /// (<c>dGemmOut</c>, <c>dResidual</c>, and column-reduced <c>dBias</c>).
+    /// Builds a fused GEMM epilogue tile (<c>y = act(gemmOut + bias) + residual</c>).
+    /// <para>
+    /// All three inputs are indexed element-wise, so <c>bias</c> must be passed <b>expanded</b> to the full
+    /// <c>rows x cols</c> output size (the CPU executor rejects shorter inputs). Its auto-differentiated backward
+    /// (<see cref="FusionTileAdjointBuilder.BuildBackwardTile"/>) returns <c>dGemmOut</c>, the per-element gradient
+    /// with respect to the expanded bias, and <c>dResidual</c>; reduce the expanded bias gradient to the
+    /// <c>[cols]</c> bias gradient with <see cref="ReduceExpandedBiasGradient"/>.
+    /// </para>
     /// </summary>
+    /// <param name="activationOp">One of <see cref="FusionTileOpCode.Relu"/>, <see cref="FusionTileOpCode.Gelu"/>,
+    /// <see cref="FusionTileOpCode.Swish"/>, <see cref="FusionTileOpCode.Sigmoid"/> or <see cref="FusionTileOpCode.Tanh"/>.</param>
     public static FusionTileDescriptor CreateGemmBiasActivationResidualEpilogueTile(FusionTileOpCode activationOp)
     {
+        if (activationOp is not (FusionTileOpCode.Relu or FusionTileOpCode.Gelu or FusionTileOpCode.Swish
+            or FusionTileOpCode.Sigmoid or FusionTileOpCode.Tanh))
+        {
+            throw new ArgumentOutOfRangeException(nameof(activationOp), activationOp,
+                "GEMM epilogue activation must be Relu, Gelu, Swish, Sigmoid or Tanh.");
+        }
+
         string key = "GemmEpilogue_BiasActRes_" + (int)activationOp;
         return s_linkedCache.GetOrAdd(key, _ =>
         {
             var insts = new List<FusionTileInstruction>(6)
             {
                 new FusionTileInstruction(FusionTileOpCode.LoadInput, 0), // gemmOut
-                new FusionTileInstruction(FusionTileOpCode.LoadInput, 1), // bias (broadcast or expanded)
+                new FusionTileInstruction(FusionTileOpCode.LoadInput, 1), // bias (expanded to the output size)
                 new FusionTileInstruction(FusionTileOpCode.LoadInput, 2), // residual
                 new FusionTileInstruction(FusionTileOpCode.Add, 0, 1)
             };
-            short preAct = 3;
-            short activated = activationOp is FusionTileOpCode.Relu or FusionTileOpCode.Gelu or FusionTileOpCode.Swish or FusionTileOpCode.Sigmoid or FusionTileOpCode.Tanh
-                ? (short)insts.Count
-                : preAct;
-            if (activated != preAct)
-            {
-                insts.Add(new FusionTileInstruction(activationOp, preAct));
-            }
+            const short preAct = 3;
+            short activated = (short)insts.Count;
+            insts.Add(new FusionTileInstruction(activationOp, preAct));
             short sumRes = (short)insts.Count;
             insts.Add(new FusionTileInstruction(FusionTileOpCode.Add, activated, 2));
             insts.Add(new FusionTileInstruction(FusionTileOpCode.StoreOutput, sumRes, 0));
@@ -150,6 +206,30 @@ internal static class FusionTileLinker
             var cpu = CreateCpuExecutor(3, 0, 1, insts);
             return new FusionTileDescriptor(name, FusionTileKind.GemmEpilogue, 3, 0, 1, insts, cuda, cpu);
         });
+    }
+
+    /// <summary>
+    /// Column-reduces the per-element gradient of an expanded (<c>rows x cols</c>, row-major) bias into the
+    /// <c>[cols]</c> bias gradient: <c>dBias[c] = sum_r expandedBiasGrad[r * cols + c]</c>.
+    /// </summary>
+    public static void ReduceExpandedBiasGradient(float[] expandedBiasGrad, int rows, int cols, float[] dBias)
+    {
+        if (expandedBiasGrad is null) throw new ArgumentNullException(nameof(expandedBiasGrad));
+        if (dBias is null) throw new ArgumentNullException(nameof(dBias));
+        if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (cols < 0) throw new ArgumentOutOfRangeException(nameof(cols));
+        if ((long)rows * cols != expandedBiasGrad.Length)
+            throw new ArgumentException($"Expected {(long)rows * cols} expanded gradient elements, got {expandedBiasGrad.Length}.", nameof(expandedBiasGrad));
+        if (dBias.Length != cols)
+            throw new ArgumentException($"Expected dBias length {cols}, got {dBias.Length}.", nameof(dBias));
+
+        Array.Clear(dBias, 0, cols);
+        for (int r = 0; r < rows; r++)
+        {
+            int rowBase = r * cols;
+            for (int c = 0; c < cols; c++)
+                dBias[c] += expandedBiasGrad[rowBase + c];
+        }
     }
 
     /// <summary>
@@ -416,7 +496,8 @@ internal static class FusionTileLinker
                 FusionTileOpCode.Abs => $"fabsf(r{inst.Src0})",
                 FusionTileOpCode.Max => $"fmaxf(r{inst.Src0}, r{inst.Src1})",
                 FusionTileOpCode.Min => $"fminf(r{inst.Src0}, r{inst.Src1})",
-                _ => "0.0f"
+                _ => throw new NotSupportedException(
+                    $"Opcode {inst.Op} at instruction {i} is not a pointwise opcode and cannot be emitted into an elementwise CUDA kernel.")
             };
             sb.Append("        float r").Append(i).Append(" = ").Append(rhs).AppendLine(";");
         }
@@ -432,8 +513,15 @@ internal static class FusionTileLinker
         int outputCount,
         IReadOnlyList<FusionTileInstruction> instructions)
     {
+        if (instructions is null) throw new ArgumentNullException(nameof(instructions));
         var instArray = new FusionTileInstruction[instructions.Count];
-        for (int i = 0; i < instructions.Count; i++) instArray[i] = instructions[i];
+        for (int i = 0; i < instructions.Count; i++)
+        {
+            instArray[i] = instructions[i];
+            if (!IsPointwiseOpCode(instArray[i].Op))
+                throw new NotSupportedException(
+                    $"Opcode {instArray[i].Op} at instruction {i} is not a pointwise opcode and cannot be executed by the elementwise CPU executor.");
+        }
 
         return (inputs, scalars, outputs) =>
         {
@@ -444,7 +532,23 @@ internal static class FusionTileLinker
             if (scalarCount > 0 && (scalars is null || scalars.Length < scalarCount))
                 throw new ArgumentException($"Expected {scalarCount} scalar values.", nameof(scalars));
 
+            // A tile with no outputs (e.g. the backward of a zero-input constant tile) has nothing to compute.
+            if (outputCount == 0)
+                return;
+
             int n = outputs[0].Length;
+            for (int o = 0; o < outputCount; o++)
+            {
+                if (outputs[o] is null || outputs[o].Length < n)
+                    throw new ArgumentException($"Output array {o} must hold at least {n} elements.", nameof(outputs));
+            }
+            // Every input is indexed element-wise (no implicit broadcast), so each must cover all n elements.
+            for (int p = 0; p < inputCount; p++)
+            {
+                if (inputs[p] is null || inputs[p].Length < n)
+                    throw new ArgumentException(
+                        $"Input array {p} must hold at least {n} elements (broadcast operands must be expanded).", nameof(inputs));
+            }
             Span<float> regs = instArray.Length <= 128 ? stackalloc float[instArray.Length] : new float[instArray.Length];
 
             for (int idx = 0; idx < n; idx++)
@@ -483,7 +587,7 @@ internal static class FusionTileLinker
                         FusionTileOpCode.Abs => Math.Abs(regs[inst.Src0]),
                         FusionTileOpCode.Max => GeneratedKernelSimdMath.MaxScalar(regs[inst.Src0], regs[inst.Src1]),
                         FusionTileOpCode.Min => GeneratedKernelSimdMath.MinScalar(regs[inst.Src0], regs[inst.Src1]),
-                        _ => 0.0f
+                        _ => throw new NotSupportedException($"Opcode {inst.Op} is not a pointwise opcode.")
                     };
                 }
             }
@@ -502,7 +606,11 @@ __device__ __forceinline__ float aidn_block_sum_link(float v, float* smem) {
     v = aidn_warp_sum_link(v); if (lane == 0) smem[wid] = v; __syncthreads();
     int nw = (blockDim.x + 31) >> 5; v = (threadIdx.x < nw) ? smem[lane] : 0.0f;
     if (wid == 0) v = aidn_warp_sum_link(v); if (threadIdx.x == 0) smem[0] = v; __syncthreads();
-    return smem[0];
+    float total = smem[0];
+    // Every thread must finish reading smem[0] before a later reduction (e.g. LayerNorm variance after mean)
+    // reuses the same scratch; the barrier above only orders the writes, not these reads.
+    __syncthreads();
+    return total;
 }
 "u8);
         string body = useLayerNorm

@@ -28,8 +28,10 @@ internal static class FusionTileAdjointBuilder
         var bwd = new List<FusionTileInstruction>(fwdInsts.Count * 3);
 
         // Replay forward SSA values into indices [0 .. fwdCount - 1].
-        var inputSlotToSsa = new int[forward.InputCount];
-        for (int i = 0; i < inputSlotToSsa.Length; i++) inputSlotToSsa[i] = -1;
+        // A port can be loaded more than once (e.g. a horizontal link keeps each sibling's LoadInput), so every
+        // load of a port is recorded and their adjoints are summed when the port's gradient is stored.
+        var inputSlotLoads = new List<int>[forward.InputCount];
+        for (int i = 0; i < inputSlotLoads.Length; i++) inputSlotLoads[i] = new List<int>(1);
 
         var outputStores = new List<(int StoreIndex, int ValueSsa, int OutputPort)>();
         for (int i = 0; i < fwdInsts.Count; i++)
@@ -45,7 +47,7 @@ internal static class FusionTileAdjointBuilder
 
             if (inst.Op == FusionTileOpCode.LoadInput && inst.Src0 >= 0 && inst.Src0 < forward.InputCount)
             {
-                inputSlotToSsa[inst.Src0] = i;
+                inputSlotLoads[inst.Src0].Add(i);
             }
             bwd.Add(inst);
         }
@@ -137,19 +139,8 @@ internal static class FusionTileAdjointBuilder
 
                 case FusionTileOpCode.Relu:
                 {
-                    // Subgradient: x > 0 ? dy : 0, expressed branchlessly when y > 0: since y = max(0, a),
-                    // step(a) via Relu sign approximation or exact scalar/CUDA ternary emitted by linker!
-                    // Using y > 0: max(0, a) == a for a > 0; we compute indicator via step helper in evaluator/CUDA:
-                    // Actually, let's compute exact indicator using Abs: (a > 0) => Relu(a) / max(a, eps)? No —
-                    // Relu derivative at a = 0 is 0; let's handle Relu exact derivative in FusionTileLinker's emitter
-                    // or decompose cleanly: wait — let's check! If a != 0, step(a) = 0.5 * (1 + a / abs(a))? At a == 0, 0/0!
-                    // Instead, let's evaluate Relu grad cleanly: if y > 0 -> dy else 0. Notice:
-                    // In IEEE float, for y = relu(a) >= 0: let's add a tiny helper or evaluate via Relu!
-                    // Even better: let's support exact derivative for Sigmoid/Swish/Tanh/Gelu/Exp/Log/Sqrt/Rsqrt/Relu!
-                    // For Relu: if a <= 0, y == 0. Let's emit Div(Mul(dy, y), Add(y, Const(1e-38f)))? Wait: at y = 1e-38, 0.5!
-                    // No approximations! Let's add a clean Const-tagged Fma or keep exact step:
-                    // Let's check: we own FusionTileOpCode! Adding ReluGrad = 24 to FusionTileOpCode makes Relu backward 100% exact!
-                    short dRelu = Emit(FusionTileOpCode.Mul, dy, EmitReluMask(Emit, a, cZero, cOne));
+                    // d relu(a)/da = ReluStep(a) = (a > 0 ? 1 : 0); the subgradient at a == 0 is 0.
+                    short dRelu = Emit(FusionTileOpCode.Mul, dy, Emit(FusionTileOpCode.ReluStep, a));
                     adjoint[a] = AddAdj(adjoint[a], dRelu);
                     break;
                 }
@@ -233,9 +224,13 @@ internal static class FusionTileAdjointBuilder
         // Emit StoreOutput for each forward input port in order [0 .. forward.InputCount - 1].
         for (int p = 0; p < forward.InputCount; p++)
         {
-            int ssa = inputSlotToSsa[p];
-            short gradSsa = ssa >= 0 && adjoint[ssa] >= 0 ? adjoint[ssa] : cZero;
-            Emit(FusionTileOpCode.StoreOutput, gradSsa, checked((short)p));
+            short gradSsa = -1;
+            foreach (int loadSsa in inputSlotLoads[p])
+            {
+                if (adjoint[loadSsa] >= 0)
+                    gradSsa = AddAdj(gradSsa, adjoint[loadSsa]);
+            }
+            Emit(FusionTileOpCode.StoreOutput, gradSsa >= 0 ? gradSsa : cZero, checked((short)p));
         }
 
         int totalBwdInputs = forward.InputCount + forward.OutputCount;
@@ -253,19 +248,5 @@ internal static class FusionTileAdjointBuilder
             bwd,
             cudaKernel,
             cpuExec);
-    }
-
-    private static short EmitReluMask(
-        Func<FusionTileOpCode, short, short, short, float, short> emit,
-        short a,
-        short cZero,
-        short cOne)
-    {
-        // Exact indicator for normal IEEE floats via Clamp/Step: max(0, min(1, a * +Inf)) would NaN at a == 0!
-        // Instead, compute pos = relu(a); for pos > 0, pos / pos = 1; to avoid 0/0 at pos == 0:
-        // Add tiny positive subnormal/min and subtract: let's add ReluStep opcode to FusionTileOpCode for 100% exact IEEE semantics!
-        _ = cZero;
-        _ = cOne;
-        return emit(FusionTileOpCode.ReluStep, a, -1, -1, 0.0f);
     }
 }

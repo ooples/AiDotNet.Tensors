@@ -98,7 +98,12 @@ public static class CodegenGraphToSpec
         for (int guard = 0; guard <= graph.Count; guard++)
         {
             var node = graph[cursor];
-            if (activation == CodegenActivationKind.None && TryMapActivation(node.Op) is { } mapped)
+            // The spec applies its activation AFTER the bias add: activation(core + bias). Walking up from the output,
+            // an activation is the epilogue only while no bias has been stripped; one found under the bias
+            // (bias + activation(core)) runs before the add, and taking it as the epilogue compiled
+            // activation(core + bias) instead -- a different operator (an x + sigmoid(r) residual read back as
+            // sigmoid(x + r)).
+            if (activation == CodegenActivationKind.None && biasNode is null && TryMapActivation(node.Op) is { } mapped)
             {
                 if (node.Inputs.Length != 1)
                 {

@@ -31,20 +31,35 @@ public sealed class SegmentedBlockCudaGraphRunner : IDisposable
         if (sharedScratchElements <= 0)
             throw new ArgumentOutOfRangeException(nameof(sharedScratchElements));
 
-        _sharedBlockScratch = _backend.AllocateBuffer(sharedScratchElements);
         var effectiveOptions = options ?? new StaticShapeCudaGraphOptions
         {
             WarmupIterations = 2,
             SynchronizeOnReplay = false
         };
+        // Validate before allocating so an invalid option cannot strand the scratch buffer.
+        StaticShapeCudaGraphOptions.Validate(effectiveOptions, nameof(options));
 
+        _sharedBlockScratch = _backend.AllocateBuffer(sharedScratchElements);
         _segmentScopes = new StaticShapeCudaGraphScope[segmentCount];
-        for (int i = 0; i < segmentCount; i++)
+        int created = 0;
+        try
         {
-            _segmentScopes[i] = new StaticShapeCudaGraphScope(
-                _backend,
-                CudaGraphExecutionScopeKind.SegmentedLocalCreditBlock,
-                effectiveOptions);
+            for (; created < segmentCount; created++)
+            {
+                _segmentScopes[created] = new StaticShapeCudaGraphScope(
+                    _backend,
+                    CudaGraphExecutionScopeKind.SegmentedLocalCreditBlock,
+                    effectiveOptions);
+            }
+        }
+        catch
+        {
+            for (int i = 0; i < created; i++)
+            {
+                _segmentScopes[i].Dispose();
+            }
+            _sharedBlockScratch.Dispose();
+            throw;
         }
     }
 
@@ -168,12 +183,19 @@ extern ""C"" __global__ void device_predicated_topk_mask_f32(
     if (row >= rows) return;
     int baseIdx = row * cols;
     int effK = (k < cols) ? k : cols;
+    // Total order: NaN ranks below every number (including -inf); equal keys (and NaN vs NaN) break ties by lower
+    // index, so exactly effK entries are selected per row.
     for (int c = 0; c < cols; c++) {
         float sc = scores[baseIdx + c];
+        bool scNan = isnan(sc);
         int greaterCount = 0;
         for (int j = 0; j < cols; j++) {
             float sj = scores[baseIdx + j];
-            if (sj > sc || (sj == sc && j < c)) greaterCount++;
+            bool sjNan = isnan(sj);
+            bool ranksAbove = sjNan
+                ? (scNan && j < c)
+                : (scNan || sj > sc || (sj == sc && j < c));
+            if (ranksAbove) greaterCount++;
         }
         topk_mask_out[baseIdx + c] = (greaterCount < effK) ? 1.0f : 0.0f;
     }
@@ -262,8 +284,7 @@ extern ""C"" __global__ void device_scalar_adamw_update_f32(
                 int greater = 0;
                 for (int j = 0; j < cols; j++)
                 {
-                    float sj = scores[baseIdx + j];
-                    if (sj > sc || (sj == sc && j < c))
+                    if (RanksAbove(scores[baseIdx + j], j, sc, c))
                     {
                         greater++;
                     }
@@ -271,6 +292,19 @@ extern ""C"" __global__ void device_scalar_adamw_update_f32(
                 maskOut[baseIdx + c] = greater < effK ? 1.0f : 0.0f;
             }
         }
+    }
+
+    /// <summary>
+    /// Total Top-K ordering shared with <c>device_predicated_topk_mask_f32</c>: NaN ranks below every number
+    /// (including negative infinity), and equal keys (NaN vs NaN included) break ties by lower index, so every row
+    /// selects exactly <c>min(k, cols)</c> entries.
+    /// </summary>
+    internal static bool RanksAbove(float sj, int j, float sc, int c)
+    {
+        bool sjNan = float.IsNaN(sj);
+        bool scNan = float.IsNaN(sc);
+        if (sjNan) return scNan && j < c;
+        return scNan || sj > sc || (sj == sc && j < c);
     }
 
     public static void ExecuteDeviceScalarAdamWCpu(

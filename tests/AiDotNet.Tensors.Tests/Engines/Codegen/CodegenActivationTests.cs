@@ -153,6 +153,46 @@ public class CodegenActivationTests
     }
 
     /// <summary>
+    /// An activation under the bias add (<c>x + act(y)</c>, a residual) runs BEFORE the add, so it is not the spec's
+    /// epilogue <c>act(core + bias)</c>. Reading it as one compiled <c>act(x + y)</c>; the front end must decline it.
+    /// The epilogue form <c>act(x + y)</c> still translates.
+    /// </summary>
+    [Theory]
+    [InlineData(CodegenOpKind.Sigmoid, false)]
+    [InlineData(CodegenOpKind.Sigmoid, true)]
+    [InlineData(CodegenOpKind.ReLU, false)]
+    [InlineData(CodegenOpKind.Tanh, true)]
+    public void ActivationUnderTheBiasAdd_IsNotTheEpilogue(CodegenOpKind op, bool inputFirst)
+    {
+        int[] shape = { 8, 16 };
+        var g = new CodegenGraph();
+        int x = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, shape, 0));
+        int r = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, shape, 1));
+        int act = g.AddNode(new CodegenNode(op, new[] { r }, CodegenElementType.Float32, shape));
+        int add = g.AddNode(new CodegenNode(CodegenOpKind.Add, inputFirst ? new[] { x, act } : new[] { act, x },
+            CodegenElementType.Float32, shape));
+        g.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { add }, CodegenElementType.Float32, shape));
+
+        Assert.False(CodegenGraphToSpec.TryTranslate(g, "residual", out _, out string reason));
+        Assert.Contains(op.ToString(), reason, StringComparison.Ordinal);
+
+        var epilogue = new CodegenGraph();
+        int ex = epilogue.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, shape, 0));
+        int ey = epilogue.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(),
+            CodegenElementType.Float32, shape, 1));
+        int eadd = epilogue.AddNode(new CodegenNode(CodegenOpKind.Add, new[] { ex, ey },
+            CodegenElementType.Float32, shape));
+        int eact = epilogue.AddNode(new CodegenNode(op, new[] { eadd }, CodegenElementType.Float32, shape));
+        epilogue.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { eact }, CodegenElementType.Float32, shape));
+        Assert.True(CodegenGraphToSpec.TryTranslate(epilogue, "epilogue", out var spec, out string epilogueReason),
+            epilogueReason);
+        Assert.NotNull(spec!.BiasInput);
+    }
+
+    /// <summary>
     /// Parameterised activations must NOT be mapped. LeakyReLU and ELU carry a slope the
     /// spec has nowhere to store, so accepting them at a default slope would silently
     /// compile a different operator.

@@ -138,20 +138,9 @@ public sealed class GeneratedRowKernelEdgeCaseTests
         for (int i = 0; i < cols; i++) input[i] = float.NaN;
         var output = new float[cols];
 
-        CompiledFusedKernels.BiasActivationRowForward(input, new float[cols], output, 1, cols, activationKind: RowActivationKind.Relu);
+        CompiledFusedKernels.BiasActivationRowForward(input, new float[cols], output, 1, cols, activationKind: CompiledFusedKernels.RowActivationKind.ReLU);
 
         Assert.All(output, v => Assert.Equal(0f, v));
-    }
-
-    [Fact]
-    public void CudaBiasActivation_DispatchesOnTheSharedActivationKindDefines()
-    {
-        string source = CompiledFusedKernels.UniversalRowFusedCudaSource;
-        foreach (RowActivationKind kind in Enum.GetValues(typeof(RowActivationKind)))
-            Assert.Contains($"#define AIDN_ACT_{kind.ToString().ToUpperInvariant()} {(int)kind}\n", source);
-        foreach (var name in new[] { "RELU", "GELU", "SWISH", "SIGMOID", "TANH" })
-            Assert.Contains($"act_kind == AIDN_ACT_{name}", source);
-        Assert.DoesNotContain("act_kind == 1", source);
     }
 
     [Fact]
