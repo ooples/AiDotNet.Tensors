@@ -60,13 +60,24 @@ public sealed class FusionTileIrAndAutotuneTests
             expectedGrads = tape.ComputeGradients(loss, new[] { x, res, gamma });
         }
 
+        // A training plan keeps the residual add and the RMSNorm: the fused node never writes the residual sum,
+        // which a training caller can still read after Step().
+        List<ILazyNode> training;
+        using (var scope = GraphMode.Enable())
+        {
+            _ = ApplyCrossLayerChain(x, res, gamma);
+            training = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+        Assert.DoesNotContain(training, n => n.OpName == "FusedRmsNormResidualRope");
+        Assert.Contains(training, n => n.OpName == "RMSNorm");
+
         List<ILazyNode> compiled;
         using (var scope = GraphMode.Enable())
         {
             _ = ApplyCrossLayerChain(x, res, gamma);
             // 11 compute nodes plus the RMSNorm rms statistic node, which the fused node absorbs.
             Assert.Equal(12, scope.Nodes.Count);
-            compiled = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+            compiled = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
         }
 
         Assert.Single(compiled);

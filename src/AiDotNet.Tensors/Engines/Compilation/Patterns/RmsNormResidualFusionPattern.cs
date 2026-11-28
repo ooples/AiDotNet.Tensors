@@ -19,7 +19,9 @@ internal sealed class RmsNormResidualFusionPattern : IFusionPattern
 {
     public string Name => "RmsNormResidual";
 
-    public bool IsDifferentiable => true;
+    // Inference only, like LayerNormResidualFusionPattern: the fused node never writes the residual sum, and a
+    // training plan's caller can read that sum (the RMSNorm input) after Step(). The fused backward stays exact.
+    public bool IsDifferentiable => false;
 
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes,

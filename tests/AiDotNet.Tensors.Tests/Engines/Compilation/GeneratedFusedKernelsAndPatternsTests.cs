@@ -183,18 +183,26 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
             expectedGrads = tape.ComputeGradients(lossEager, new[] { x, res, gamma });
         }
 
-        // GraphMode compilation (forTraining: true)
-        List<ILazyNode> compiledNodes;
-        Tensor<float> graphLoss;
-        LazyTensorScope scope;
-        using (scope = GraphMode.Enable())
+        // A training plan keeps the residual add and the RMSNorm: the fused node never writes the residual sum,
+        // which a training caller can still read after Step().
+        List<ILazyNode> trainingNodes;
+        using (var scope = GraphMode.Enable())
         {
             var sumLazy = engine.TensorAdd(x, res);
             var normLazy = engine.RMSNorm(sumLazy, gamma, eps, out _);
-            var sq = engine.TensorMultiply(normLazy, normLazy);
-            graphLoss = engine.ReduceSum(sq, new[] { 0, 1 }, keepDims: false);
-            var compiler = new LazyGraphCompiler(forTraining: true);
-            compiledNodes = compiler.Compile(scope.Nodes);
+            _ = engine.ReduceSum(engine.TensorMultiply(normLazy, normLazy), new[] { 0, 1 }, keepDims: false);
+            trainingNodes = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+        Assert.DoesNotContain(trainingNodes, n => n.OpName == "FusedRmsNormResidual");
+        Assert.Contains(trainingNodes, n => n.OpName == "RMSNorm");
+
+        List<ILazyNode> compiledNodes;
+        using (var scope = GraphMode.Enable())
+        {
+            var sumLazy = engine.TensorAdd(x, res);
+            var normLazy = engine.RMSNorm(sumLazy, gamma, eps, out _);
+            _ = engine.ReduceSum(engine.TensorMultiply(normLazy, normLazy), new[] { 0, 1 }, keepDims: false);
+            compiledNodes = new LazyGraphCompiler(forTraining: false).Compile(scope.Nodes);
         }
 
         Assert.Contains(compiledNodes, n => n.OpName == "FusedRmsNormResidual");
@@ -214,6 +222,64 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         AssertClose(expectedGrads[x].AsSpan(), fusedGrads[x].AsSpan(), 2e-4f);
         AssertClose(expectedGrads[res].AsSpan(), fusedGrads[res].AsSpan(), 2e-4f);
         AssertClose(expectedGrads[gamma].AsSpan(), fusedGrads[gamma].AsSpan(), 2e-4f);
+    }
+
+    [Theory]
+    [InlineData("LayerNorm")]
+    [InlineData("RMSNorm")]
+    [InlineData("RMSNormRope")]
+    public void ResidualNormTrainingPlan_WritesTheResidualSumTheCallerReadsAfterStep(string norm)
+    {
+        // A residual add feeding a norm (and, for the cross-layer form, split-half RoPE) inside a compiled training
+        // plan. The caller holds the residual sum and reads it after Step(); a fusion that removed the add left it
+        // unwritten (freed storage or zeros).
+        var engine = new CpuEngine();
+        var rng = new Random(909);
+        const int rows = 2, seqLen = 4, headDim = 16, halfDim = headDim / 2;
+        var shape = new[] { rows, seqLen, headDim };
+        var x = new Tensor<float>(RandomArray(rng, rows * seqLen * headDim, -1f, 1f), shape);
+        var res = new Tensor<float>(RandomArray(rng, rows * seqLen * headDim, -1f, 1f), shape);
+        var gamma = new Tensor<float>(RandomArray(rng, headDim, 0.5f, 1.5f), new[] { headDim });
+        var beta = new Tensor<float>(RandomArray(rng, headDim, -0.5f, 0.5f), new[] { headDim });
+        var cos = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1f, 1f), new[] { 1, seqLen, halfDim });
+        var sin = new Tensor<float>(RandomArray(rng, seqLen * halfDim, -1f, 1f), new[] { 1, seqLen, halfDim });
+        var expectedSum = engine.TensorAdd(x, res).ToArray();
+
+        Tensor<float> sum;
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            sum = engine.TensorAdd(x, res);
+            Tensor<float> output;
+            if (norm == "LayerNorm")
+            {
+                output = engine.LayerNorm(sum, gamma, beta, 1e-5, out _, out _);
+            }
+            else
+            {
+                var normed = engine.RMSNorm(sum, gamma, 1e-5, out _);
+                if (norm == "RMSNorm")
+                {
+                    output = normed;
+                }
+                else
+                {
+                    var x0 = engine.TensorSlice(normed, new[] { 0, 0, 0 }, new[] { rows, seqLen, halfDim });
+                    var x1 = engine.TensorSlice(normed, new[] { 0, 0, halfDim }, new[] { rows, seqLen, halfDim });
+                    var y0 = engine.TensorSubtract(engine.TensorBroadcastMultiply(x0, cos), engine.TensorBroadcastMultiply(x1, sin));
+                    var y1 = engine.TensorAdd(engine.TensorBroadcastMultiply(x1, cos), engine.TensorBroadcastMultiply(x0, sin));
+                    output = engine.Concat(new[] { y0, y1 }, 2);
+                }
+            }
+            engine.ReduceSum(engine.TensorMultiply(output, output), null);
+            plan = scope.CompileTraining(new[] { x, res, gamma });
+        }
+
+        using (plan)
+        {
+            plan.Step();
+            AssertClose(expectedSum, sum.AsSpan(), 1e-6f);
+        }
     }
 
     [Fact]
