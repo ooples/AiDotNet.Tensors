@@ -301,6 +301,94 @@ public class GradientTapeStreamingTests
         Assert.Null(embeddings.Grad);
     }
 
+    // Table [6, 2] read at rows 1, 1 and 4, weighted per element, recorded on the active tape: the dense gradient is
+    // the weights scatter-added into those rows.
+    private (Tensor<float> Table, Tensor<float> Loss, float[] ExpectedGradient) EmbeddingGraph()
+    {
+        var table = new Tensor<float>(new[] { 6, 2 });
+        for (int i = 0; i < table.Length; i++) table.SetFlat(i, 0.25f * (i + 1));
+        var indices = new Tensor<int>(new[] { 1, 1, 4 }, new[] { 3 });
+        var weights = new Tensor<float>(new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 3, 2 });
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(_engine.TensorEmbeddingLookup<float, int>(table, indices), weights), null);
+        var expected = new float[12];
+        expected[2] = 1f + 3f; expected[3] = 2f + 4f;
+        expected[8] = 5f; expected[9] = 6f;
+        return (table, loss, expected);
+    }
+
+    [Fact]
+    public void StreamingDense_EmbeddingGradientArrivesDense_AndNoSparseRowsAreCollected()
+    {
+        using var tape = new GradientTape<float>();
+        var (table, loss, expected) = EmbeddingGraph();
+        bool? collecting = null;
+        IReadOnlyList<SparseEmbeddingGradient<float>>? sparse = null;
+        float[]? dense = null;
+
+        tape.ComputeGradientsStreaming(loss, new[] { table }, (source, gradient) =>
+        {
+            collecting = DifferentiableOps.IsCollectingSparseEmbeddingGrads;
+            sparse = DifferentiableOps.GetSparseEmbeddingGradsFor(source);
+            dense = gradient.ToArray();
+        });
+
+        Assert.False(collecting);
+        Assert.Null(sparse);
+        Assert.Equal(expected, dense);
+        Assert.False(DifferentiableOps.IsCollectingSparseEmbeddingGrads);
+    }
+
+    [Fact]
+    public void StreamingTyped_CollectsSparseRows_AndReportsCollecting()
+    {
+        using var tape = new GradientTape<float>();
+        var (table, loss, expected) = EmbeddingGraph();
+        bool? collecting = null;
+        float[]? materialized = null;
+
+        tape.ComputeGradientsStreamingTyped(loss, new[] { table }, (source, _) =>
+        {
+            collecting = DifferentiableOps.IsCollectingSparseEmbeddingGrads;
+            var sparse = DifferentiableOps.GetSparseEmbeddingGradsFor(source);
+            Assert.NotNull(sparse);
+            var contribution = Assert.Single(sparse);
+            materialized = contribution.ToDense(_engine).ToArray();
+        });
+
+        Assert.True(collecting);
+        Assert.Equal(expected, materialized);
+        Assert.False(DifferentiableOps.IsCollectingSparseEmbeddingGrads);
+    }
+
+    // An optimizer step inside the dense callback asks for sparse rows first, as every sparse-aware optimizer does on
+    // each parameter, and must then fall back to the dense gradient it was handed and apply it.
+    [Fact]
+    public void StreamingDense_OptimizerStepThatProbesForSparseRows_AppliesTheDenseGradient()
+    {
+        using var tape = new GradientTape<float>();
+        var (table, loss, expected) = EmbeddingGraph();
+        var before = table.ToArray();
+        const float LearningRate = 0.5f;
+        bool tookSparsePath = false;
+
+        tape.ComputeGradientsStreaming(loss, new[] { table }, (source, gradient) =>
+        {
+            var sparse = DifferentiableOps.GetSparseEmbeddingGradsFor(source);
+            if (sparse is { Count: > 0 })
+            {
+                tookSparsePath = true;
+                return;
+            }
+            for (int i = 0; i < source.Length; i++)
+                source.SetFlat(i, source.GetFlat(i) - LearningRate * gradient.GetFlat(i));
+        });
+
+        Assert.False(tookSparsePath);
+        var after = table.ToArray();
+        for (int i = 0; i < after.Length; i++)
+            Assert.Equal(before[i] - LearningRate * expected[i], after[i]);
+    }
+
     [Fact]
     public void Float32AccumulationOverridesOnlyTheNestedAdditionAutocastScope()
     {

@@ -161,6 +161,19 @@ internal static class DifferentiableOps
     /// materialization — but the canonical path is sparse-only.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// True while the running backward pass records sparse embedding-table gradients, which only the typed streaming
+    /// backward (<see cref="GradientTape{T}.ComputeGradientsStreamingTyped"/>) and the full backward do.
+    /// </summary>
+    /// <remarks>
+    /// Inside a dense <see cref="GradientTape{T}.ComputeGradientsStreaming(Tensor{T}, System.Collections.Generic.IReadOnlyList{Tensor{T}}, Action{Tensor{T}, Tensor{T}})"/>
+    /// callback this is <c>false</c>: an embedding table's gradient is scattered densely and handed to the callback
+    /// whole, so <see cref="GetSparseEmbeddingGradsFor{T}"/> returns <c>null</c> there. That <c>null</c> means "read
+    /// the dense gradient", not "the table received no gradient". A consumer that needs the accessed rows must run
+    /// the typed streaming backward and can check this flag to tell the two cases apart.
+    /// </remarks>
+    public static bool IsCollectingSparseEmbeddingGrads => _indexedSparseGrads is not null;
+
     /// <summary>True when the current backward pass collects sparse embedding gradients for leaf <paramref name="param"/>.</summary>
     internal static bool IsSparseEmbeddingGradWired<T>(Tensor<T> param)
     {
@@ -195,6 +208,11 @@ internal static class DifferentiableOps
     /// <c>grads</c> dictionary instead). Sparse-aware optimizers call this first;
     /// dense-only optimizers ignore the sparse dict.
     /// </summary>
+    /// <remarks>
+    /// A backward pass that does not record sparse gradients (the dense streaming backward; see
+    /// <see cref="IsCollectingSparseEmbeddingGrads"/>) delivers every embedding-table gradient dense, and this returns
+    /// <c>null</c> for all parameters while it runs.
+    /// </remarks>
     public static System.Collections.Generic.IReadOnlyList<SparseEmbeddingGradient<T>>? GetSparseEmbeddingGradsFor<T>(Tensor<T> param)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));
