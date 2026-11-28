@@ -314,6 +314,7 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         gradOutput = AlignGradRank(engine, gradOutput, output);
+        if (TryHostUnaryBackward(HostUnaryGradient.Exp, gradOutput, inputs[0], output, engine, grads)) return;
         var grad = engine.TensorMultiply(gradOutput, output);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -324,6 +325,7 @@ internal static partial class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         gradOutput = AlignGradRank(engine, gradOutput, inputs[0]);
+        if (TryHostUnaryBackward(HostUnaryGradient.Log, gradOutput, inputs[0], output, engine, grads)) return;
         var grad = engine.TensorDivide(gradOutput, inputs[0]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
@@ -333,6 +335,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryHostUnaryBackward(HostUnaryGradient.Sqrt, gradOutput, inputs[0], output, engine, grads)) return;
         var numOps = MathHelper.GetNumericOperations<T>();
         var two = numOps.FromDouble(2.0);
         var twoOutput = engine.TensorMultiplyScalar(output, two);
@@ -345,6 +348,7 @@ internal static partial class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        if (TryHostUnaryBackward(HostUnaryGradient.Abs, gradOutput, inputs[0], output, engine, grads)) return;
         var signTensor = engine.TensorSign(inputs[0]);
         var grad = engine.TensorMultiply(gradOutput, signTensor);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
@@ -603,6 +607,9 @@ internal static partial class BackwardFunctions<T>
         // d/dx clamp(x, min, max) = 1 if min <= x <= max, else 0
         // Compute via: mask = (x >= min) * (x <= max), then grad * mask
         var numOps = MathHelper.GetNumericOperations<T>();
+        if (TryHostUnaryBackward(HostUnaryGradient.Clamp, gradOutput, inputs[0], output, engine, grads,
+                (double)savedState[0], (double)savedState[1]))
+            return;
         var min = numOps.FromDouble((double)savedState[0]);
         var max = numOps.FromDouble((double)savedState[1]);
 

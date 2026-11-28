@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -12822,6 +12822,91 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// zero-offset dense array. A specialized writer must fall back to the
     /// stride-aware engine path instead of binding a materialized copy.
     /// </summary>
+    // C = A·Bᵀ with A [M,K] and B stored [N,K] (TensorMatMulTransposed): dA = dC·B and dB = dCᵀ·A, each one GEMM
+    // straight into the plan's gradient buffer, overwriting it (beta = 0), so only for operands with one consumer. The
+    // generic MatMulTransposedBackward rented a fresh gradient per operand per step and then added it into the plan's
+    // buffer. An operand no parameter feeds (the data batch) gets no gradient.
+    private static Action<IEngine>? BuildMatMulTransposedBackward(
+        CompiledStep<T> step,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<Tensor<T>, int> consumerCount,
+        HashSet<Tensor<T>>? requiresGrad)
+    {
+        if (step.OpName != "TensorMatMulTransposed" || step.Inputs.Length != 2) return null;
+        var a = step.Inputs[0];
+        var b = step.Inputs[1];
+        var output = step.OutputBuffer;
+        if (ReferenceEquals(a, b) || a.Rank != 2 || b.Rank != 2 || !a.IsContiguous || !b.IsContiguous
+            || !output.IsContiguous)
+            return null;
+        if ((consumerCount.TryGetValue(a, out int consumersA) && consumersA > 1)
+            || (consumerCount.TryGetValue(b, out int consumersB) && consumersB > 1))
+            return null;
+        if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(a, out var gradA)
+            || !gradMap.TryGetValue(b, out var gradB))
+            return null;
+        if (!gradOut.IsContiguous || !gradA.IsContiguous || !gradB.IsContiguous) return null;
+
+        int M = a._shape[0], K = a._shape[1], N = b._shape[0];
+        if (b._shape[1] != K) return null;
+        bool needA = requiresGrad is null || requiresGrad.Contains(a);
+        bool needB = requiresGrad is null || requiresGrad.Contains(b);
+
+        if (typeof(T) == typeof(float))
+        {
+            float[]? dC = null, aData = null, bData = null, dA = null, dB = null;
+            return eng =>
+            {
+                if (dC is null)
+                {
+                    dC = TryGetLiveFloatBacking(gradOut);
+                    aData = TryGetLiveFloatBacking(a);
+                    bData = TryGetLiveFloatBacking(b);
+                    dA = TryGetLiveFloatBacking(gradA);
+                    dB = TryGetLiveFloatBacking(gradB);
+                }
+                if (dC is null || aData is null || bData is null || dA is null || dB is null)
+                {
+                    BackwardFunctions<T>.MatMulTransposedBackward(gradOut, step.Inputs, output,
+                        step.SavedState ?? Array.Empty<object>(), eng, gradMap);
+                    return;
+                }
+                if (needA) BlasProvider.GemmEx(M, K, N, dC, 0, N, false, bData, 0, K, false, dA, 0, K);
+                if (needB) BlasProvider.GemmEx(N, K, M, dC, 0, N, true, aData, 0, K, false, dB, 0, K);
+                a.Grad = gradA;
+                b.Grad = gradB;
+            };
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            double[]? dC = null, aData = null, bData = null, dA = null, dB = null;
+            return eng =>
+            {
+                if (dC is null)
+                {
+                    dC = TryGetLiveDoubleBacking(gradOut);
+                    aData = TryGetLiveDoubleBacking(a);
+                    bData = TryGetLiveDoubleBacking(b);
+                    dA = TryGetLiveDoubleBacking(gradA);
+                    dB = TryGetLiveDoubleBacking(gradB);
+                }
+                if (dC is null || aData is null || bData is null || dA is null || dB is null)
+                {
+                    BackwardFunctions<T>.MatMulTransposedBackward(gradOut, step.Inputs, output,
+                        step.SavedState ?? Array.Empty<object>(), eng, gradMap);
+                    return;
+                }
+                if (needA) BlasProvider.GemmEx(M, K, N, dC, 0, N, false, bData, 0, K, false, dA, 0, K);
+                if (needB) BlasProvider.GemmEx(N, K, M, dC, 0, N, true, aData, 0, K, false, dB, 0, K);
+                a.Grad = gradA;
+                b.Grad = gradB;
+            };
+        }
+
+        return null;
+    }
+
     private static float[]? TryGetLiveFloatBacking(Tensor<T> tensor)
     {
         MaterializeIfGradPlaceholder(tensor);
@@ -15605,6 +15690,10 @@ internal sealed partial class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (sharedOperandBackward is not null)
                 return sharedOperandBackward;
         }
+
+        var transposedMatMulBackward = BuildMatMulTransposedBackward(step, gradMap, consumerCount, requiresGrad);
+        if (transposedMatMulBackward is not null)
+            return transposedMatMulBackward;
 
         // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
         // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
