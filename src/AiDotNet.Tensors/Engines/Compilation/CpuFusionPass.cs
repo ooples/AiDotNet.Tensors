@@ -116,6 +116,9 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             {
                 if (_forTraining && !patterns[p].IsDifferentiable)
                     continue;
+                if (_forTraining && patterns[p] is IHostTrainingFusionPattern
+                    && nodes[i].RecordingEngine.Is<DirectGpuTensorEngine>())
+                    continue;
                 if (patterns[p].TryFuse(nodes, i, consumerCounts, removed, out var fused))
                 {
                     if (fused != null)

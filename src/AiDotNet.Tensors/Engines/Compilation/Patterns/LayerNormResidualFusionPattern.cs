@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// <c>FusedLayerNormResidual</c> node that executes without materializing the intermediate residual-sum tensor
 /// in global memory (using compile-time generated AVX2/FMA SIMD on CPU and warp-shuffle NVRTC CUDA on GPU).
 /// </summary>
-internal sealed class LayerNormResidualFusionPattern : IFusionPattern
+internal sealed class LayerNormResidualFusionPattern : IHostTrainingFusionPattern
 {
     public string Name => "LayerNormResidual";
 
@@ -196,54 +196,58 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
                     && res.IsContiguous
                     && g.IsContiguous)
                 {
-                    var sharedGrad = TensorAllocator.Rent<float>(x._shape);
-                    var gammaGrad = needGamma ? TensorAllocator.Rent<float>(g._shape) : null;
-                    var betaGrad = needBeta ? TensorAllocator.Rent<float>(b._shape) : null;
-                    CompiledFusedKernels.LayerNormResidualBackward(
-                        gradOutput.AsSpan(),
-                        x.AsSpan(),
-                        res.AsSpan(),
-                        g.AsSpan(),
-                        meanHolder.AsSpan(),
-                        invStdHolder.AsSpan(),
-                        sharedGrad.AsWritableSpan(),
-                        gammaGrad is not null ? gammaGrad.AsWritableSpan() : Span<float>.Empty,
-                        betaGrad is not null ? betaGrad.AsWritableSpan() : Span<float>.Empty,
-                        rows,
-                        cols);
-                    sharedGrad.IncrementVersion();
-                    if (needX)
-                        DifferentiableOps.AccumulateGrad(grads, x, sharedGrad, engine);
-                    if (needRes)
-                        DifferentiableOps.AccumulateGrad(grads, res, needX ? sharedGrad.Clone() : sharedGrad, engine);
-                    if (gammaGrad is not null)
+                    // The scratch comes from the shared array pool and each gradient is written straight into its
+                    // accumulator where one exists (stored on the step's first write, added otherwise), as the compiled
+                    // LayerNorm's backward does. Renting fresh tensors handed a new [rows, cols] array to the gradient
+                    // map every step: 135 KB more managed allocation per step on the parity Transformer.
+                    int total = rows * cols;
+                    var pool = System.Buffers.ArrayPool<float>.Shared;
+                    float[] shared = pool.Rent(total);
+                    float[]? gammaScratch = needGamma ? pool.Rent(cols) : null;
+                    float[]? betaScratch = needBeta ? pool.Rent(cols) : null;
+                    try
                     {
-                        gammaGrad.IncrementVersion();
-                        DifferentiableOps.AccumulateGrad(grads, g, gammaGrad, engine);
+                        CompiledFusedKernels.LayerNormResidualBackward(
+                            gradOutput.AsSpan(),
+                            x.AsSpan(),
+                            res.AsSpan(),
+                            g.AsSpan(),
+                            meanHolder.AsSpan(),
+                            invStdHolder.AsSpan(),
+                            shared.AsSpan(0, total),
+                            gammaScratch is not null ? gammaScratch.AsSpan(0, cols) : Span<float>.Empty,
+                            betaScratch is not null ? betaScratch.AsSpan(0, cols) : Span<float>.Empty,
+                            rows,
+                            cols);
+                        // Writing straight into an accumulator is only safe when no two of the targets are one tensor.
+                        bool distinct = !ReferenceEquals(x, res) && !ReferenceEquals(x, g) && !ReferenceEquals(x, b)
+                            && !ReferenceEquals(res, g) && !ReferenceEquals(res, b) && !ReferenceEquals(g, b);
+                        if (needX) WriteGradient(grads, x, shared, total, engine, distinct);
+                        if (needRes) WriteGradient(grads, res, shared, total, engine, distinct);
+                        if (gammaScratch is not null) WriteGradient(grads, g, gammaScratch, cols, engine, distinct);
+                        if (betaScratch is not null) WriteGradient(grads, b, betaScratch, cols, engine, distinct);
                     }
-                    if (betaGrad is not null)
+                    finally
                     {
-                        betaGrad.IncrementVersion();
-                        DifferentiableOps.AccumulateGrad(grads, b, betaGrad, engine);
+                        pool.Return(shared);
+                        if (gammaScratch is not null) pool.Return(gammaScratch);
+                        if (betaScratch is not null) pool.Return(betaScratch);
                     }
                     return;
                 }
 
-                // Device fallback computes true variance from invStdHolder for LayerNormBackward.
-                var varTensor = new Tensor<float>(meanHolder._shape);
-                var invSpan = invStdHolder.AsSpan();
-                var varDst = varTensor.AsWritableSpan();
-                for (int i = 0; i < rows; i++)
-                {
-                    float inv = invSpan[i];
-                    varDst[i] = Math.Max(0.0f, (1.0f / (inv * inv)) - epsilon);
-                }
+                // Engine fallback (the GPU, or a strided operand): recover the variance LayerNormBackward expects from the
+                // saved inverse standard deviation with engine ops, var = max(0, 1 / invStd^2 - eps), so the statistics
+                // stay where the forward wrote them. Reading them on the host downloaded every step and broke CUDA graph
+                // capture.
+                var varTensor = engine.ReLU(engine.TensorAddScalar(
+                    engine.TensorReciprocal(engine.TensorMultiply(invStdHolder, invStdHolder)), -epsilon));
                 var sum = engine.TensorAdd(x, res);
                 var gradSum = engine.LayerNormBackward(gradOutput, sum, g, meanHolder, varTensor, epsilon, out var dGamma, out var dBeta);
                 if (needX)
                     DifferentiableOps.AccumulateGrad(grads, x, gradSum, engine);
                 if (needRes)
-                    DifferentiableOps.AccumulateGrad(grads, res, needX ? gradSum.Clone() : gradSum, engine);
+                    DifferentiableOps.AccumulateGrad(grads, res, gradSum, engine);
                 if (needGamma)
                     DifferentiableOps.AccumulateGrad(grads, g, dGamma, engine);
                 if (needBeta)
@@ -261,6 +265,35 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
         if (meanAux is not null) alreadyRemoved.Add(meanAux);
         if (varAux is not null) alreadyRemoved.Add(varAux);
         return true;
+    }
+
+    /// <summary>
+    /// Hands one input its gradient <paramref name="source"/>[0..length): written straight into the existing host
+    /// accumulator when there is one (stored on the step's first write, added otherwise), else as a new contribution.
+    /// </summary>
+    private static void WriteGradient(
+        Dictionary<Tensor<float>, Tensor<float>> grads, Tensor<float> input, float[] source, int length, IEngine engine,
+        bool distinct)
+    {
+        if (distinct)
+        {
+            var acc = DifferentiableOps.TryGetDirectGradTarget(grads, input, engine, out bool overwrite);
+            int offset = 0;
+            var arr = acc?.GetCpuBackingForContiguousWrite(out offset);
+            if (acc is not null && arr is not null)
+            {
+                var src = new ReadOnlySpan<float>(source, 0, length);
+                var dst = new Span<float>(arr, offset, length);
+                if (overwrite) src.CopyTo(dst);
+                else for (int i = 0; i < length; i++) dst[i] += src[i];
+                acc.IncrementVersion();
+                return;
+            }
+        }
+        var contribution = new Tensor<float>(input._shape);
+        new ReadOnlySpan<float>(source, 0, length).CopyTo(contribution.AsWritableSpan());
+        contribution.IncrementVersion();
+        DifferentiableOps.AccumulateGrad(grads, input, contribution, engine);
     }
 
     private static bool TryExtractLayerNormEpsilon(LazyNode<float> lnNode, out float epsilon)
