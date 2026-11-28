@@ -372,6 +372,40 @@ public sealed class GeneratedFusedKernelsAndPatternsTests
         AssertClose(expectedGrads[sin].AsSpan(), fusedGrads[sin].AsSpan(), 1e-4f);
     }
 
+    [Theory]
+    [InlineData(new[] { 1, 2 }, new[] { 1, 1 }, true)]        // the smallest geometry still fuses
+    [InlineData(new[] { 1, 2 }, new[] { 1, 2 }, false)]       // headDim-wide tables broadcast each half to [1, 2]
+    [InlineData(new[] { 2, 4 }, new[] { 1, 2, 2 }, false)]    // rank-promoted tables make the concat [1, 4, 2]
+    [InlineData(new[] { 0, 4 }, new[] { 0, 2 }, false)]       // zero sequence length
+    public void RotaryPositionEmbeddingFusionPattern_FusesOnlyTheHalfSliceGeometry(int[] inputShape, int[] trigShape, bool fuses)
+    {
+        var engine = new CpuEngine();
+        int rank = inputShape.Length;
+        int halfDim = inputShape[rank - 1] / 2;
+        int trigLength = 1;
+        foreach (int d in trigShape) trigLength *= d;
+        var x = new Tensor<float>(inputShape);
+        var cos = new Tensor<float>(trigShape);
+        var sin = new Tensor<float>(trigShape);
+        var len = (int[])inputShape.Clone();
+        len[rank - 1] = halfDim;
+        var start1 = new int[rank];
+        start1[rank - 1] = halfDim;
+
+        List<ILazyNode> compiled;
+        using (var scope = GraphMode.Enable())
+        {
+            var x0 = engine.TensorSlice(x, new int[rank], len);
+            var x1 = engine.TensorSlice(x, start1, len);
+            var y0 = engine.TensorSubtract(engine.TensorBroadcastMultiply(x0, cos), engine.TensorBroadcastMultiply(x1, sin));
+            var y1 = engine.TensorAdd(engine.TensorBroadcastMultiply(x1, cos), engine.TensorBroadcastMultiply(x0, sin));
+            _ = engine.Concat(new[] { y0, y1 }, rank - 1);
+            compiled = new LazyGraphCompiler(forTraining: true).Compile(scope.Nodes);
+        }
+
+        Assert.Equal(fuses, compiled.Exists(n => n.OpName == "FusedRotaryPositionEmbedding"));
+    }
+
     [Fact]
     public void BroadcastAddActivationAndElementwiseChainFusion_CollapseMultiOpInferenceChains()
     {

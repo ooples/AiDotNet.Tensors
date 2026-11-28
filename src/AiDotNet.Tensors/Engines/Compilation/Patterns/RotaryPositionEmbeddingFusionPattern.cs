@@ -153,13 +153,20 @@ internal sealed class RotaryPositionEmbeddingFusionPattern : IFusionPattern
             return false;
 
         int seqLen = fullInput._shape[rank - 2];
+        if (seqLen <= 0)
+            return false;
         int outerCount = fullInput.Length / (seqLen * headDim);
-        if (seqLen <= 0 || outerCount <= 0)
+        if (outerCount <= 0)
+            return false;
+        // The fused node writes the input's [.., seqLen, headDim] layout: the concat must produce exactly that.
+        if (!PatternHelpers.SameShape(fullInput, concatNode.Output))
             return false;
 
         if (!ValidateTrigShape(cosTensor, seqLen, halfDim, headDim, out int trigStride)
             || !ValidateTrigShape(sinTensor, seqLen, halfDim, headDim, out int sinStride)
-            || sinStride != trigStride)
+            || sinStride != trigStride
+            || cosTensor.Rank > rank
+            || sinTensor.Rank > rank)
         {
             return false;
         }
@@ -354,7 +361,9 @@ internal sealed class RotaryPositionEmbeddingFusionPattern : IFusionPattern
             return false;
         int last = trig._shape[trig.Rank - 1];
         int prev = trig._shape[trig.Rank - 2];
-        if (prev != seqLen || (last != halfDim && last != headDim))
+        // The decomposed graph multiplies each [.., halfDim] half by the table: a wider table broadcasts the half
+        // out to its own width, which the fused kernel does not reproduce.
+        if (prev != seqLen || last != halfDim)
             return false;
         for (int d = 0; d < trig.Rank - 2; d++)
         {
