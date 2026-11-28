@@ -3655,7 +3655,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorAddUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Add);
         }
         else
         {
@@ -5268,7 +5268,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep10 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            Simd.SimdKernels.Mish(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, MishDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -5334,7 +5334,10 @@ public partial class CpuEngine : ITensorLevelEngine
             using var destinationDataKeep12 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
-            Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
+            unsafe
+            {
+                fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) LeakyReLUDispatch(pS, pD, srcSpan.Length, alphaD);
+            }
         }
         else
         {
@@ -5920,6 +5923,21 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             return;
         }
+        if (typeof(T) == typeof(double) && a.IsContiguous)
+        {
+            using var aKeepD = new KeepAliveScope(a);
+            using var destinationKeepD = new KeepAliveScope(destination);
+            var dSrc = ((Tensor<double>)(object)a).AsSpanUnmarked();
+            var dDst = ((Tensor<double>)(object)destination).AsWritableSpanUnmarked();
+            double scalarD = scalar is double sd ? sd : 0d;
+            unsafe
+            {
+                fixed (double* pS = dSrc)
+                fixed (double* pD = dDst)
+                    AddScalarDispatch(pS, pD, dSrc.Length, scalarD);
+            }
+            return;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         if (a.IsContiguous)
@@ -6000,7 +6018,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorSubtractUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Subtract);
         }
         else
         {
@@ -6047,7 +6065,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorDivideUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Divide);
         }
         else
         {
@@ -6153,7 +6171,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep30 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Sqrt(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, SqrtDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6223,7 +6241,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep34 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Sin(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, SinDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6257,7 +6275,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcSpan = AsDoubleReadOnlyMemory(input.ReadOnlyDataUnmarked).Span;
             using var destinationDataKeep36 = new KeepAliveScope(destination);
             var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
-            SimdKernels.Cos(srcSpan, dstSpan);
+            fixed (double* pS = srcSpan) fixed (double* pD = dstSpan) ParallelComputeBound(pS, pD, srcSpan.Length, CosDoubleKernel);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -6765,7 +6783,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
-            Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length);
+            DoubleBinaryDispatch((double*)pinA.Pointer, (double*)pinB.Pointer, (double*)pinR.Pointer, length, JitBinaryOp.Multiply);
         }
         else
         {
@@ -50915,11 +50933,118 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     private unsafe delegate void UnsafeUnaryKernelDouble(double* input, double* output, int length);
 
+    // Span-only double SIMD kernels in the pointer form ParallelComputeBound splits; one chunk computes exactly what the
+    // whole-array call computed for those elements.
+    private static unsafe void SqrtDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Sqrt(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void SinDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Sin(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void CosDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Cos(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+    private static unsafe void MishDoubleKernel(double* src, double* dst, int n)
+        => SimdKernels.Mish(new ReadOnlySpan<double>(src, n), new Span<double>(dst, n));
+
+    // Chunk starts on a 16-double boundary: every chunk but the last is a whole number of the kernels' widest unrolled
+    // step, so each element takes the same vector or scalar path it takes in one whole-array call.
+    private static int AlignDoubleChunk(int elements) => (elements + 15) & ~15;
+
+    /// <summary>
+    /// Runs a double binary elementwise op (Add / Subtract / Multiply / Divide) split across threads at the shared
+    /// elementwise grain, as <see cref="JitBinaryDispatch"/> does for float, with the same per-element SIMD kernel.
+    /// </summary>
+    private static unsafe void DoubleBinaryDispatch(double* pA, double* pB, double* pR, int length, JitBinaryOp op)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            RunBinaryDouble(pA, pB, pR, length, op);
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        DoubleBinaryChunks(pA, pB, pR, length, numChunks, op);
+    }
+
+    // The split itself, apart from the serial path above so a serial call does not allocate the closure.
+    private static unsafe void DoubleBinaryChunks(double* pA, double* pB, double* pR, int length, int numChunks, JitBinaryOp op)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                RunBinaryDouble(pA + start, pB + start, pR + start, count, op);
+        }, deterministicSafe: true);
+    }
+
+    private static unsafe void RunBinaryDouble(double* a, double* b, double* r, int count, JitBinaryOp op)
+    {
+        if (ReferenceEquals(op, JitBinaryOp.Add)) SimdKernels.VectorAddUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Subtract)) SimdKernels.VectorSubtractUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Multiply)) SimdKernels.VectorMultiplyUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Divide)) SimdKernels.VectorDivideUnsafe(a, b, r, count);
+        else throw new ArgumentOutOfRangeException(nameof(op));
+    }
+
+    // Double x + scalar split across threads in elementwise-grain chunks, with the same SIMD kernel per chunk.
+    private static unsafe void AddScalarDispatch(double* pSrc, double* pDst, int length, double scalar)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.AddScalar(new ReadOnlySpan<double>(pSrc, length), scalar, new Span<double>(pDst, length));
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        AddScalarDoubleChunks(pSrc, pDst, length, numChunks, scalar);
+    }
+
+    private static unsafe void AddScalarDoubleChunks(double* pSrc, double* pDst, int length, int numChunks, double scalar)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.AddScalar(new ReadOnlySpan<double>(pSrc + start, count), scalar, new Span<double>(pDst + start, count));
+        }, deterministicSafe: true);
+    }
+
+    // Double LeakyReLU split across threads in elementwise-grain chunks, with the same SIMD kernel per chunk.
+    private static unsafe void LeakyReLUDispatch(double* pSrc, double* pDst, int length, double alpha)
+    {
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks < 2)
+        {
+            t_lastElementwiseDispatchChunks = 0;
+            SimdKernels.LeakyReLU(new ReadOnlySpan<double>(pSrc, length), alpha, new Span<double>(pDst, length));
+            return;
+        }
+        t_lastElementwiseDispatchChunks = numChunks;
+        LeakyReLUDoubleChunks(pSrc, pDst, length, numChunks, alpha);
+    }
+
+    private static unsafe void LeakyReLUDoubleChunks(double* pSrc, double* pDst, int length, int numChunks, double alpha)
+    {
+        int chunkSize = AlignDoubleChunk((length + numChunks - 1) / numChunks);
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.LeakyReLU(new ReadOnlySpan<double>(pSrc + start, count), alpha, new Span<double>(pDst + start, count));
+        }, deterministicSafe: true);
+    }
+
     private static unsafe void ParallelComputeBound(double* input, double* output, int length, UnsafeUnaryKernelDouble kernel)
     {
         // 256K doubles = 2 MB. Same threshold rationale as the float variant —
         // below this size, persistent-pool dispatch is overhead-dominated.
         int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        t_lastElementwiseDispatchChunks = nChunks >= 2 ? nChunks : 0;
         if (nChunks >= 2)
         {
             int chunkSize = (length + nChunks - 1) / nChunks;
@@ -50927,22 +51052,25 @@ public partial class CpuEngine : ITensorLevelEngine
             // doesn't hit unaligned tail in the AVX2 4× unrolled (16 doubles/iter) path.
             chunkSize = (chunkSize + 15) & ~15;
 
-            IntPtr pIn = (IntPtr)input;
-            IntPtr pOut = (IntPtr)output;
-            int totalLength = length;
-
-            Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
-            {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, totalLength - start);
-                if (count > 0)
-                    kernel((double*)pIn + start, (double*)pOut + start, count);
-            });
+            ParallelComputeBoundChunks((IntPtr)input, (IntPtr)output, length, nChunks, chunkSize, kernel);
         }
         else
         {
             kernel(input, output, length);
         }
+    }
+
+    // The pool dispatch, apart from the serial path above so a serial call does not allocate the closure.
+    private static unsafe void ParallelComputeBoundChunks(IntPtr pIn, IntPtr pOut, int totalLength, int nChunks, int chunkSize,
+        UnsafeUnaryKernelDouble kernel)
+    {
+        Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, chunk =>
+        {
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, totalLength - start);
+            if (count > 0)
+                kernel((double*)pIn + start, (double*)pOut + start, count);
+        });
     }
 
     /// <summary>
