@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Compilation.Codegen;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -13,7 +14,10 @@ namespace AiDotNet.Tensors.Engines;
 
 public partial class DirectGpuTensorEngine
 {
-    private readonly ConcurrentDictionary<(INativeGpuCodegenExecutor Executor, CodegenGraph Graph), CodegenKernel?> _compiledCodegenCache = new();
+    // Keyed weakly by the graph: each fused node owns its graph, so an entry (and its compiled kernel) lives exactly as
+    // long as the node that replays it, and a retired plan's graphs no longer pin kernels for the engine's lifetime.
+    // The inner map is per backend executor, since the same graph can be compiled for more than one.
+    private readonly ConditionalWeakTable<CodegenGraph, ConcurrentDictionary<INativeGpuCodegenExecutor, CodegenKernel?>> _compiledCodegenCache = new();
 
     /// <summary>
     /// Executes a fused <see cref="CodegenGraph"/> on the active GPU backend in a single native kernel launch
@@ -28,10 +32,12 @@ public partial class DirectGpuTensorEngine
         if (!TryGetBackend(out var backend) || backend is not INativeGpuCodegenExecutor executor)
             return false;
 
-        var kernel = _compiledCodegenCache.GetOrAdd((executor, graph), static key =>
+        var perExecutor = _compiledCodegenCache.GetValue(graph,
+            static _ => new ConcurrentDictionary<INativeGpuCodegenExecutor, CodegenKernel?>());
+        var kernel = perExecutor.GetOrAdd(executor, e =>
         {
-            var emitted = key.Executor.EmitCodegenKernel(key.Graph, CodegenElementType.Float32);
-            return !emitted.Declined && emitted.Kernel is not null && key.Executor.CanExecuteCodegenKernel(emitted.Kernel)
+            var emitted = e.EmitCodegenKernel(graph, CodegenElementType.Float32);
+            return !emitted.Declined && emitted.Kernel is not null && e.CanExecuteCodegenKernel(emitted.Kernel)
                 ? emitted.Kernel
                 : null;
         });
