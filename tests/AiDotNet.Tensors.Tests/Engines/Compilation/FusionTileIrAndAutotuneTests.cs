@@ -416,6 +416,41 @@ public sealed class FusionTileIrAndAutotuneTests
         FusionTileLinker.ReduceExpandedBiasGradient(dBiasExpanded, rows: 2, cols: 2, dBias);
         Assert.Equal(new float[] { 4f, 6f }, dBias);
         Assert.Throws<ArgumentException>(() => FusionTileLinker.ReduceExpandedBiasGradient(dBiasExpanded, 3, 2, dBias));
+
+        // rows == 1 allows the destination to alias the source; the in-place reduction is the identity.
+        var aliased = new float[] { 7f, -3f };
+        FusionTileLinker.ReduceExpandedBiasGradient(aliased, rows: 1, cols: 2, aliased);
+        Assert.Equal(new float[] { 7f, -3f }, aliased);
+
+        // rows == 0 yields a zero gradient.
+        var zeroRows = new float[] { 9f, 9f };
+        FusionTileLinker.ReduceExpandedBiasGradient(Array.Empty<float>(), rows: 0, cols: 2, zeroRows);
+        Assert.Equal(new float[] { 0f, 0f }, zeroRows);
+    }
+
+    [Fact]
+    public void CudaEmitter_EmitsValidExpressionsForNonFiniteConstants()
+    {
+        var insts = new[]
+        {
+            new FusionTileInstruction(FusionTileOpCode.Const, immediate: float.NaN),
+            new FusionTileInstruction(FusionTileOpCode.Const, immediate: float.PositiveInfinity),
+            new FusionTileInstruction(FusionTileOpCode.Const, immediate: float.NegativeInfinity),
+            new FusionTileInstruction(FusionTileOpCode.Const, immediate: 2f),
+            new FusionTileInstruction(FusionTileOpCode.StoreOutput, 0, 0)
+        };
+        string src = FusionTileLinker.EmitCudaKernelFromInstructions("nonfinite_consts", 0, 0, 1, insts);
+        Assert.Contains("float r0 = __int_as_float(0x7fc00000);", src);
+        Assert.Contains("float r1 = __int_as_float(0x7f800000);", src);
+        Assert.Contains("float r2 = (-__int_as_float(0x7f800000));", src);
+        Assert.Contains("float r3 = 2.0f;", src);
+        Assert.DoesNotContain("NaN", src);
+        Assert.DoesNotContain("Infinity", src);
+
+        // The CPU executor produces the same IEEE values.
+        var y = new float[1];
+        FusionTileLinker.CreateCpuExecutor(0, 0, 1, insts)(Array.Empty<float[]>(), Array.Empty<float>(), new[] { y });
+        Assert.True(float.IsNaN(y[0]));
     }
 
     [Fact]
@@ -524,6 +559,32 @@ public sealed class FusionTileIrAndAutotuneTests
                 new AutotuneExecutableCandidate("dup", TunedKernelOrigin.Generated, () => { })
             };
             Assert.Throws<ArgumentException>(() => standaloneAgain.SelectOrTune(shape, dup, out _));
+
+            // Reverse case: same id, but now the VENDOR candidate is faster and wins. A cache hit must return
+            // the vendor candidate (matched by origin), not the same-id direct candidate, without re-measuring.
+            var vendorShape = new DirectPtxShapeKey(86, TunedKernelOp.Gemm, 128, 128, 128);
+            int slowDirectCalls = 0, fastVendorCalls = 0;
+            var slowDirect = new[]
+            {
+                new AutotuneExecutableCandidate("shared_id", TunedKernelOrigin.Generated, () =>
+                {
+                    slowDirectCalls++;
+                    System.Threading.Thread.Sleep(20);
+                })
+            };
+            var fastVendorCandidate = new AutotuneExecutableCandidate("shared_id", TunedKernelOrigin.Vendor, () => fastVendorCalls++);
+            var vendorWinsTuner = new DirectPtxAutotuner(Opts(true), new FakeVendorProvider(fastVendorCandidate));
+            var vendorWinner = vendorWinsTuner.SelectOrTune(vendorShape, slowDirect, out var vendorWinRec);
+            Assert.Same(fastVendorCandidate, vendorWinner);
+            Assert.Equal(TunedKernelOrigin.Vendor, vendorWinRec.WinnerOrigin);
+            Assert.Equal(1, slowDirectCalls);
+            Assert.Equal(1, fastVendorCalls);
+
+            var vendorHit = vendorWinsTuner.SelectOrTune(vendorShape, slowDirect, out var vendorHitRec);
+            Assert.Same(fastVendorCandidate, vendorHit);
+            Assert.Same(vendorWinRec, vendorHitRec);
+            Assert.Equal(1, slowDirectCalls);
+            Assert.Equal(1, fastVendorCalls);
         }
         finally
         {
