@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -14433,6 +14433,36 @@ public partial class CpuEngine : ITensorLevelEngine
     // Work (M*N*K) at which TensorMatMulTransposed's float path hands the product to the packed BLAS.
     private const long MatMulTransposedBlasMinWork = 1L << 24;
 
+    // C = A·Bᵀ written into a dense host destination (A [M,K], B stored [N,K]), float and double, rank 2 only.
+    private static bool TryMatMulTransposedIntoHost<T>(IEngine engine, Tensor<T> a, Tensor<T> b, Tensor<T> destination)
+    {
+        if (engine.SupportsGpu || a.Rank != 2 || b.Rank != 2 || destination.Rank != 2) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !destination.IsContiguous) return false;
+        if (a._gpuBuffer is not null || b._gpuBuffer is not null || destination._gpuBuffer is not null
+            || a.HasPendingGpuData || b.HasPendingGpuData) return false;
+        int m = a._shape[0], k = a._shape[1], n = b._shape[0];
+        if (b._shape[1] != k || destination._shape[0] != m || destination._shape[1] != n) return false;
+        if (typeof(T) == typeof(float))
+        {
+            var aData = ((Tensor<float>)(object)a).GetLiveBackingArrayAllowingPaddingOrNull();
+            var bData = ((Tensor<float>)(object)b).GetLiveBackingArrayAllowingPaddingOrNull();
+            var cData = ((Tensor<float>)(object)destination).GetLiveBackingArrayAllowingPaddingOrNull();
+            if (aData is null || bData is null || cData is null) return false;
+            Helpers.BlasProvider.GemmEx(m, n, k, aData, 0, k, false, bData, 0, k, true, cData, 0, n);
+            return true;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var aData = ((Tensor<double>)(object)a).GetLiveBackingArrayAllowingPaddingOrNull();
+            var bData = ((Tensor<double>)(object)b).GetLiveBackingArrayAllowingPaddingOrNull();
+            var cData = ((Tensor<double>)(object)destination).GetLiveBackingArrayAllowingPaddingOrNull();
+            if (aData is null || bData is null || cData is null) return false;
+            Helpers.BlasProvider.GemmEx(m, n, k, aData, 0, k, false, bData, 0, k, true, cData, 0, n);
+            return true;
+        }
+        return false;
+    }
+
     [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
     {
@@ -14474,6 +14504,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordBinary(LazyNodeType.MatMul, "TensorMatMulTransposed", a, b, outShape,
                     (eng, output) =>
                     {
+                        // On the host, one GEMM straight into the plan's output: running the eager op and copying
+                        // its result in allocated an output-sized temporary every replay.
+                        if (TryMatMulTransposedIntoHost(eng, capturedA, capturedB, output)) return;
                         var eager = eng.TensorMatMulTransposed(capturedA, capturedB);
                         DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                     },
