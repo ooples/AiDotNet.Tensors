@@ -24,6 +24,8 @@ internal static class InferencePlanWriter
         Tensor<T>[] compiledInputTensors,
         IReadOnlyList<Tensor<T>?>? externals = null)
     {
+        RequireLoadable(steps);
+
         // Write the body to a MemoryStream first so we can hash it (XXHash64
         // is one-shot, not incremental) before streaming to the destination.
         // Hash + body-write both operate directly on the MemoryStream's
@@ -94,6 +96,21 @@ internal static class InferencePlanWriter
         using var footerWriter = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         footerWriter.Write((long)bodyLength);
         footerWriter.Write(checksum); // ulong — reader uses ToUInt64
+    }
+
+    /// <summary>
+    /// Refuses a plan the reader could not rebuild. Writing one anyway produced a file that fails only at load
+    /// ("OpType Unknown is not yet supported"), after a caller had already stored it as a warm target.
+    /// </summary>
+    /// <exception cref="NotSupportedException">A step's op has no plan codec.</exception>
+    private static void RequireLoadable<T>(CompiledStep<T>[] steps)
+    {
+        foreach (var step in steps)
+        {
+            if (!OpSerializationRegistry<T>.HasCodec(step.OpType))
+                throw new NotSupportedException(
+                    $"The plan cannot be saved: step '{step.OpName}' ({step.OpType}) has no plan codec.");
+        }
     }
 
     private static void WriteStep<T>(BinaryWriter writer, CompiledStep<T> step, TensorIdMap<T> tensorMap)

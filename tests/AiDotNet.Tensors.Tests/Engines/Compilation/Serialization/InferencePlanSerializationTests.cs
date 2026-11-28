@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
@@ -140,6 +141,68 @@ public class InferencePlanSerializationTests : IDisposable
 
         original.Dispose();
         loaded.Dispose();
+    }
+
+    // ── Generated fusions round-trip as the same fused step ─────────────────
+    // Both used to save as OpType.Unknown: SaveAsync succeeded and every load then failed.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SaveLoad_GeneratedElementwiseFusions_RunTheSameFusedStep(bool broadcastBias)
+    {
+        var engine = new CpuEngine();
+        var x = Tensor<float>.CreateRandom([6, 8]);
+        var other = broadcastBias ? Tensor<float>.CreateRandom([8]) : Tensor<float>.CreateRandom([6, 8]);
+        var scale = Tensor<float>.CreateRandom([6, 8]);
+
+        CompiledInferencePlan<float> original;
+        using (var scope = GraphMode.Enable())
+        {
+            // add + activation, then a same-shape elementwise chain after it.
+            var act = engine.GELU(engine.TensorBroadcastAdd(x, other));
+            var chain = engine.Tanh(engine.TensorMultiplyScalar(engine.TensorMultiply(act, scale), 0.5f));
+            original = (CompiledInferencePlan<float>)scope.CompileInference(chain, x);
+        }
+        string fusedAdd = broadcastBias ? "FusedBiasActivation" : "FusedAddActivation";
+        var names = original.Steps.Select(step => step.OpName).ToList();
+        Assert.Contains(fusedAdd, names);
+        Assert.Contains("FusedElementwiseChain", names);
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+        var loaded = await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
+        var loadedPlan = Assert.IsType<CompiledInferencePlan<float>>(loaded);
+        Assert.Equal(names, loadedPlan.Steps.Select(step => step.OpName).ToList());
+        var loadedInput = loadedPlan.CompiledInputTensor;
+        Assert.NotNull(loadedInput);
+
+        for (int trial = 0; trial < 3; trial++)
+        {
+            var fresh = Tensor<float>.CreateRandom([6, 8]);
+            fresh.AsSpan().CopyTo(x.AsWritableSpan());
+            x.IncrementVersion();
+            fresh.AsSpan().CopyTo(loadedInput.AsWritableSpan());
+            loadedInput.IncrementVersion();
+
+            var expected = original.Execute().Contiguous().AsSpan().ToArray();
+            var actual = loadedPlan.Execute().Contiguous().AsSpan().ToArray();
+            Assert.Equal(expected.Length, actual.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-6f, $"[{trial}][{i}] {expected[i]} vs {actual[i]}");
+        }
+
+        original.Dispose();
+        loadedPlan.Dispose();
+    }
+
+    // A plan holding an op without a plan codec is refused at save, not written as a file no load can read.
+    [Fact]
+    public void Writer_RefusesAStepWithNoPlanCodec()
+    {
+        Assert.False(OpSerializationRegistry<float>.HasCodec(OpType.Unknown));
+        Assert.True(OpSerializationRegistry<float>.HasCodec(OpType.FusedElementwiseChain));
+        Assert.True(OpSerializationRegistry<float>.HasCodec(OpType.TensorMaskedFill));
     }
 
     // ── Negative: hardware fingerprint mismatch → null ──────────────────────

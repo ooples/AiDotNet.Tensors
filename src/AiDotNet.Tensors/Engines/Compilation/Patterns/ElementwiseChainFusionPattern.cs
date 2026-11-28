@@ -88,8 +88,9 @@ internal sealed class ElementwiseChainFusionPattern : IFusionPattern
                 return false;
         }
 
-        if (!TryBuildCodegenGraph(chain, out var codegenGraph, out var externalInputs))
+        if (!ElementwiseChainProgram.TryEncode(chain, out int[] program, out var externalInputs))
             return false;
+        var codegenGraph = ElementwiseChainProgram.BuildGraph(program, externalInputs, (int[])firstNode.Output._shape.Clone());
 
         CodegenKernel? cpuKernel = CodegenDispatcher.TryEmitCpu(codegenGraph, CodegenElementType.Float32);
         var terminal = chain[chain.Count - 1];
@@ -131,7 +132,8 @@ internal sealed class ElementwiseChainFusionPattern : IFusionPattern
                 capturedChain[capturedChain.Length - 1].Execute(eng, output);
             },
             null,
-            null)
+            // The program is the step's saved state, so a stored plan rebuilds this same fused kernel on load.
+            new object[] { program })
         {
             RecordingEngine = terminal.RecordingEngine
         };
@@ -145,7 +147,7 @@ internal sealed class ElementwiseChainFusionPattern : IFusionPattern
         return true;
     }
 
-    private static bool TryExecuteCpuCodegenKernel(
+    internal static bool TryExecuteCpuCodegenKernel(
         CodegenKernel kernel,
         Tensor<float>[] inputs,
         Tensor<float> output)
@@ -201,103 +203,5 @@ internal sealed class ElementwiseChainFusionPattern : IFusionPattern
             default:
                 return false;
         }
-    }
-
-    private static bool TryBuildCodegenGraph(
-        List<LazyNode<float>> chain,
-        out CodegenGraph graph,
-        out List<Tensor<float>> externalInputs)
-    {
-        graph = new CodegenGraph();
-        externalInputs = new List<Tensor<float>>(4);
-        var tensorToNodeIdx = new Dictionary<Tensor<float>, int>(Autodiff.ReferenceEqualityComparer<Tensor<float>>.Instance);
-        var shape = (int[])chain[0].Output._shape.Clone();
-
-        int ResolveInput(Tensor<float> t, CodegenGraph g, List<Tensor<float>> ext, Dictionary<Tensor<float>, int> map)
-        {
-            if (map.TryGetValue(t, out int existing))
-                return existing;
-            int port = ext.Count;
-            ext.Add(t);
-            int loadIdx = g.AddNode(new CodegenNode(CodegenOpKind.LoadInput, Array.Empty<int>(), CodegenElementType.Float32, (int[])t._shape.Clone(), port));
-            map[t] = loadIdx;
-            return loadIdx;
-        }
-
-        int lastIdx = -1;
-        for (int i = 0; i < chain.Count; i++)
-        {
-            var step = chain[i];
-            int in0 = ResolveInput(step.Input0, graph, externalInputs, tensorToNodeIdx);
-            int created;
-            switch (step.OpType)
-            {
-                case LazyNodeType.Negate:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.Negate, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.ReLU:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.ReLU, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.GELU:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.GELU, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.Sigmoid:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.Sigmoid, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.Tanh:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.Tanh, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.Swish:
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.Swish, new[] { in0 }, CodegenElementType.Float32, shape));
-                    break;
-                case LazyNodeType.ELU:
-                    if (!PatternHelpers.TryGetFloatScalar(step, out float alpha)) return false;
-                    created = graph.AddNode(new CodegenNode(CodegenOpKind.ELU, new[] { in0 }, CodegenElementType.Float32, shape, alpha));
-                    break;
-                case LazyNodeType.AddScalar:
-                case LazyNodeType.MultiplyScalar:
-                case LazyNodeType.DivideScalar:
-                {
-                    if (!PatternHelpers.TryGetFloatScalar(step, out float sVal)) return false;
-                    int cIdx = graph.AddNode(new CodegenNode(CodegenOpKind.Constant, Array.Empty<int>(), CodegenElementType.Float32, shape, sVal));
-                    CodegenOpKind binKind = step.OpType switch
-                    {
-                        LazyNodeType.AddScalar => CodegenOpKind.Add,
-                        LazyNodeType.MultiplyScalar => CodegenOpKind.Mul,
-                        _ => CodegenOpKind.Div
-                    };
-                    created = graph.AddNode(new CodegenNode(binKind, new[] { in0, cIdx }, CodegenElementType.Float32, shape));
-                    break;
-                }
-                case LazyNodeType.Add:
-                case LazyNodeType.Subtract:
-                case LazyNodeType.Multiply:
-                case LazyNodeType.Divide:
-                {
-                    if (step.Input1 is null) return false;
-                    int in1 = ResolveInput(step.Input1, graph, externalInputs, tensorToNodeIdx);
-                    CodegenOpKind opKind = step.OpType switch
-                    {
-                        LazyNodeType.Add => CodegenOpKind.Add,
-                        LazyNodeType.Subtract => CodegenOpKind.Sub,
-                        LazyNodeType.Multiply => CodegenOpKind.Mul,
-                        _ => CodegenOpKind.Div
-                    };
-                    created = graph.AddNode(new CodegenNode(opKind, new[] { in0, in1 }, CodegenElementType.Float32, shape));
-                    break;
-                }
-                default:
-                    return false;
-            }
-
-            tensorToNodeIdx[step.Output] = created;
-            lastIdx = created;
-        }
-
-        if (lastIdx < 0 || externalInputs.Count == 0)
-            return false;
-
-        graph.AddNode(new CodegenNode(CodegenOpKind.StoreOutput, new[] { lastIdx }, CodegenElementType.Float32, shape, 0));
-        return true;
     }
 }

@@ -14,8 +14,52 @@ namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
 /// result to the output buffer. This guarantees the deserialized plan behaves
 /// identically to a freshly compiled one.
 /// </summary>
+/// <summary>Marks the loader's "no plan codec for this op" failure, so the writer can refuse such a plan before saving it.</summary>
+internal static class UnsupportedPlanOp
+{
+    internal const string DataKey = "AiDotNet.Tensors.UnsupportedPlanOp";
+
+    internal static InvalidDataException Create(OpType opType)
+    {
+        var ex = new InvalidDataException(
+            $"OpType {opType} is not yet supported by the plan serialization registry. " +
+            "This plan cannot be deserialized. Re-compile from source instead.");
+        ex.Data[DataKey] = opType;
+        return ex;
+    }
+
+    internal static bool Is(Exception ex) => ex is InvalidDataException && ex.Data.Contains(DataKey);
+}
+
 internal static class OpSerializationRegistry<T>
 {
+    // Per OpType: 0 = not probed, 1 = has a codec, 2 = none.
+    private static readonly int[] s_codecProbe = new int[256];
+
+    /// <summary>
+    /// True when <see cref="RebuildForwardClosure"/> has an arm for <paramref name="opType"/>. Probed once per op with
+    /// empty arguments: an arm may reject those (its argument checks run first), and only the default arm's
+    /// <see cref="UnsupportedPlanOp"/> marker means there is no codec.
+    /// </summary>
+    internal static bool HasCodec(OpType opType)
+    {
+        int known = System.Threading.Volatile.Read(ref s_codecProbe[(byte)opType]);
+        if (known != 0) return known == 1;
+        bool has;
+        try
+        {
+            RebuildForwardClosure(opType, Array.Empty<Tensor<T>>(), new Tensor<T>(new[] { 1 }), null);
+            has = true;
+        }
+        catch (Exception ex)
+        {
+            // The exception is the answer here, not a failure: anything but the marker comes from an arm that exists.
+            has = !UnsupportedPlanOp.Is(ex);
+        }
+        System.Threading.Volatile.Write(ref s_codecProbe[(byte)opType], has ? 1 : 2);
+        return has;
+    }
+
     internal static Action<IEngine, Tensor<T>> RebuildForwardClosure(
         OpType opType,
         Tensor<T>[] inputs,
@@ -100,6 +144,11 @@ internal static class OpSerializationRegistry<T>
             OpType.TensorMultiplyScalar => RebuildTensorMultiplyScalar(inputs, savedState),
             OpType.GroupedQueryAttention => RebuildGroupedQueryAttention(inputs, savedState),
 
+            // ── Generated fusions ───────────────────────────────────────
+            OpType.FusedElementwiseChain => RebuildFusedElementwiseChain(inputs, savedState),
+            OpType.FusedAddActivation => RebuildFusedAddActivation(inputs, savedState, broadcastBias: false),
+            OpType.FusedBiasActivation => RebuildFusedAddActivation(inputs, savedState, broadcastBias: true),
+
             // ── Loss ────────────────────────────────────────────────────
             OpType.CrossEntropyLoss => Binary(inputs, (e, a, b) => e.TensorCrossEntropyLoss(a, b)),
 
@@ -109,9 +158,7 @@ internal static class OpSerializationRegistry<T>
             // treats this as a cache miss and recompiles — a NotSupportedException
             // would escape past the loader's catch clause and surface to the
             // caller, breaking the "load-or-recompile" contract.
-            _ => throw new InvalidDataException(
-                $"OpType {opType} is not yet supported by the plan serialization registry. " +
-                "This plan cannot be deserialized. Re-compile from source instead."),
+            _ => throw UnsupportedPlanOp.Create(opType),
         };
     }
 
@@ -416,6 +463,67 @@ internal static class OpSerializationRegistry<T>
         {
             var r = eng.ScaledDotProductAttention(q, k, v, null, scale, out _);
             AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Generated fusions — rebuilt from the program / activation kind the fused node saved
+    // ════════════════════════════════════════════════════════════════════
+
+    private static Action<IEngine, Tensor<T>> RebuildFusedElementwiseChain(Tensor<T>[] inputs, object[]? savedState)
+    {
+        if (savedState is not { Length: 1 } || savedState[0] is not int[] program)
+            throw new InvalidDataException("FusedElementwiseChain saved state is invalid. The plan file is corrupt.");
+        ElementwiseChainProgram.Validate(program, inputs.Length);
+        if (typeof(T) == typeof(float))
+        {
+            var floatInputs = (Tensor<float>[])(object)inputs;
+            int[] outShape = OutputShapeOf(program, floatInputs);
+            var graph = ElementwiseChainProgram.BuildGraph(program, floatInputs, outShape);
+            var cpuKernel = Codegen.CodegenDispatcher.TryEmitCpu(graph, Codegen.Ir.CodegenElementType.Float32);
+            return (eng, output) =>
+            {
+                var floatOutput = (Tensor<float>)(object)output;
+                if (eng.TryGet<DirectGpuTensorEngine>(out var gpu)
+                    && gpu.TryExecuteCodegenGraphInto(graph, floatInputs, floatOutput))
+                    return;
+                if (!eng.Is<DirectGpuTensorEngine>() && cpuKernel is not null
+                    && ElementwiseChainFusionPattern.TryExecuteCpuCodegenKernel(cpuKernel, floatInputs, floatOutput))
+                    return;
+                DirectGpuTensorEngine.CopyResultInto(eng, ElementwiseChainProgram.Replay(eng, program, inputs), output);
+            };
+        }
+        return (eng, output) =>
+            DirectGpuTensorEngine.CopyResultInto(eng, ElementwiseChainProgram.Replay(eng, program, inputs), output);
+    }
+
+    // Every chain op has the chain's output shape, and the first op's first source is always an external input.
+    private static int[] OutputShapeOf(int[] program, Tensor<float>[] inputs)
+    {
+        int source = program[1];
+        return (int[])inputs[source]._shape.Clone();
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildFusedAddActivation(
+        Tensor<T>[] inputs, object[]? savedState, bool broadcastBias)
+    {
+        RequireInputsInRange(inputs, 2, 2, broadcastBias ? "FusedBiasActivation" : "FusedAddActivation");
+        if (savedState is not { Length: 1 } || savedState[0] is not int actKind || actKind < 1 || actKind > 5)
+            throw new InvalidDataException("Fused add+activation saved state is invalid. The plan file is corrupt.");
+        var main = inputs[0];
+        var bias = inputs[1];
+        return (eng, output) =>
+        {
+            var pre = eng.TensorAdd(main, bias);
+            var result = actKind switch
+            {
+                1 => eng.ReLU(pre),
+                2 => eng.GELU(pre),
+                3 => eng.Swish(pre),
+                4 => eng.Sigmoid(pre),
+                _ => eng.Tanh(pre),
+            };
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
         };
     }
 

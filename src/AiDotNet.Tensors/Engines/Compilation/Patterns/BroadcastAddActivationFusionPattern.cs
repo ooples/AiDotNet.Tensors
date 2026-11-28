@@ -207,7 +207,8 @@ internal sealed class BroadcastAddActivationFusionPattern : IFusionPattern
                     }
                 }
             },
-            null)
+            // The activation kind is the step's saved state, so a stored plan rebuilds the same fused op on load.
+            new object[] { actKind })
         {
             RecordingEngine = actNode.RecordingEngine
         };

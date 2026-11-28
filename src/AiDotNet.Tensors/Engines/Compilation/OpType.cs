@@ -117,6 +117,9 @@ internal enum OpType : byte
     TensorRfftMagnitude,
     // Append only: every existing serialized ordinal remains unchanged.
     GroupedConv2D,
+    FusedElementwiseChain,
+    FusedAddActivation,
+    FusedBiasActivation,
 }
 
 internal static class OpTypeParser
@@ -130,6 +133,9 @@ internal static class OpTypeParser
         "TensorWeightNorm" => OpType.TensorWeightNorm,
         "TensorRfftMagnitude" => OpType.TensorRfftMagnitude,
         "GroupedConv2D" => OpType.GroupedConv2D,
+        "FusedElementwiseChain" => OpType.FusedElementwiseChain,
+        "FusedAddActivation" => OpType.FusedAddActivation,
+        "FusedBiasActivation" => OpType.FusedBiasActivation,
         "TensorAdd" => OpType.TensorAdd,
         "TensorSubtract" => OpType.TensorSubtract,
         "TensorMultiply" => OpType.TensorMultiply,
