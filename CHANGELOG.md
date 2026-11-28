@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.154.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.153.0...v0.154.0) (2026-11-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **gpu:** IDirectGpuBackend.LarsUpdate and GpuOptimizer.TryLarsStep take an epsilon (after trustCoeff), the denominator term and zero-norm threshold of the CPU optimizer (`LarsOptimizer`'s `eps` option here and AiDotNet's `LARSOptimizerOptions.Epsilon`, default 1e-8).
+
+### Features
+
+* add multi-tensor list forms of every dense gpu optimizer step ([e20f8ab](https://github.com/ooples/AiDotNet.Tensors/commit/e20f8ab503f36a80dfa06da3756f8e8d24de2e47))
+* add multi-tensor list forms of every dense gpu optimizer step ([d0fc38b](https://github.com/ooples/AiDotNet.Tensors/commit/d0fc38b75feb544e1e5eada19bf327a535ec2e04))
+* **autodiff:** report whether sparse embedding gradients are being collected ([#1884](https://github.com/ooples/AiDotNet.Tensors/issues/1884)) ([fccae8b](https://github.com/ooples/AiDotNet.Tensors/commit/fccae8b778241c60b032c6d1262f9ec0c0917b41))
+* checkpointed deterministic gated deltanet backward on every non-cuda backend ([97293ce](https://github.com/ooples/AiDotNet.Tensors/commit/97293ce7fdc924cf8c42ed0e6806d727d95aba96))
+* **compilation:** gradient accumulation at the data-parallel exchange (no_sync) ([#1847](https://github.com/ooples/AiDotNet.Tensors/issues/1847)) ([1d8a8a5](https://github.com/ooples/AiDotNet.Tensors/commit/1d8a8a52b644efc3d6ae25c734cb70277a294109))
+* **engines:** box-muller scale order and exact host evaluation ([#1872](https://github.com/ooples/AiDotNet.Tensors/issues/1872)) ([a928bb3](https://github.com/ooples/AiDotNet.Tensors/commit/a928bb3f8dc0533f357717caea766e8433cd35e2))
+* fused soft-shrink engine op on the cpu and all six gpu backends ([#1858](https://github.com/ooples/AiDotNet.Tensors/issues/1858)) ([ba3e05c](https://github.com/ooples/AiDotNet.Tensors/commit/ba3e05c8a4a6aaf9116710423f8cdb7b4a2a2496))
+
+
+### Bug Fixes
+
+* a GPU forward over bf16-stored weights holds no fp32 host copy ([#1843](https://github.com/ooples/AiDotNet.Tensors/issues/1843)) ([5a52978](https://github.com/ooples/AiDotNet.Tensors/commit/5a52978dd139f4d246cfd5d4d8be6ce87128b12a))
+* **api:** add package-validation baseline suppressions for SoftShrink ([#1865](https://github.com/ooples/AiDotNet.Tensors/issues/1865)) ([d85b3f1](https://github.com/ooples/AiDotNet.Tensors/commit/d85b3f1bdac800900ff94562e88b8c8c5e12ff9f))
+* **autodiff:** classify soft-shrink and keep its first-order backward closure-free ([#1861](https://github.com/ooples/AiDotNet.Tensors/issues/1861)) ([fecef6a](https://github.com/ooples/AiDotNet.Tensors/commit/fecef6afd0ca885bba39d667a9105cabf25b8a17))
+* **autodiff:** record create-graph backward for top-k row mix and row-value gather ([#1854](https://github.com/ooples/AiDotNet.Tensors/issues/1854)) ([4413348](https://github.com/ooples/AiDotNet.Tensors/commit/4413348c856f5fb37f9a3be00e064f994d29583f))
+* **compilation:** keep the finiteness verdict across deferred replays, and a per-parameter shared gradient accumulator ([#1864](https://github.com/ooples/AiDotNet.Tensors/issues/1864)) ([b2227f8](https://github.com/ooples/AiDotNet.Tensors/commit/b2227f8583b98d3995f26c34c6b715e8e98d3de8))
+* **cpu:** recycle large results deterministically, and bound the GC fallback ([#1878](https://github.com/ooples/AiDotNet.Tensors/issues/1878)) ([ab6829a](https://github.com/ooples/AiDotNet.Tensors/commit/ab6829ac3b2057add8cb12447378c85c4bfaf83b))
+* **cpu:** the float GroupNorm reads its degree of parallelism once ([#1868](https://github.com/ooples/AiDotNet.Tensors/issues/1868)) ([08d52a7](https://github.com/ooples/AiDotNet.Tensors/commit/08d52a725a26f9a28567cc7ac30cf3c18a2b58c6))
+* GPU prefix-view slices stay on the device ([#1860](https://github.com/ooples/AiDotNet.Tensors/issues/1860)) ([63af4a7](https://github.com/ooples/AiDotNet.Tensors/commit/63af4a7c579df652c579901d946407081fbaa018))
+* **gpu:** list optimizer steps take a parameter only from its current device copy ([#1862](https://github.com/ooples/AiDotNet.Tensors/issues/1862)) ([a3a159e](https://github.com/ooples/AiDotNet.Tensors/commit/a3a159ea32e44beae835fd6453a9695f79ed3a78))
+* **gpu:** the remaining AMD OpenCL failures, compiled pass-through gradients and LARS on every backend ([#1844](https://github.com/ooples/AiDotNet.Tensors/issues/1844)) ([9213eca](https://github.com/ooples/AiDotNet.Tensors/commit/9213ecab49a1a106bae380b8e34a69ab968c4780))
+* main's failing tests - soft-shrink net471 build, list optimizer host refusal ([#1859](https://github.com/ooples/AiDotNet.Tensors/issues/1859)) ([4d5be96](https://github.com/ooples/AiDotNet.Tensors/commit/4d5be96b8360db2ee28078504ff2af8bc01e3890))
+* rename GLSL/WGSL reserved Householder identifiers, guard net471 module-init test, and sync 0.153.0 suppressions ([dc78072](https://github.com/ooples/AiDotNet.Tensors/commit/dc7807225acbbe4ff22f1c7ae5bc0b60097d7a15))
+* TensorScope.Detach and Keep of a traced tensor are no host read ([#1846](https://github.com/ooples/AiDotNet.Tensors/issues/1846)) ([14001ef](https://github.com/ooples/AiDotNet.Tensors/commit/14001efea0d833f340a04c150d4144c3790aa475))
+* tests failing on main ([#1850](https://github.com/ooples/AiDotNet.Tensors/issues/1850)) ([bfdacf8](https://github.com/ooples/AiDotNet.Tensors/commit/bfdacf8dade60617a249c1ebaef71d71d22bfad5))
+* the teardown stage list names the flat exchange buffer stage ([1dc9bf5](https://github.com/ooples/AiDotNet.Tensors/commit/1dc9bf5e5c2ac23ecd0c59dc139fc3d71ab0c65b))
+
+
+### Performance
+
+* allocation-free Clamp/Log/Sqrt/Abs/Exp backward and compiled MatMulTransposed ([#1882](https://github.com/ooples/AiDotNet.Tensors/issues/1882)) ([b81fa1c](https://github.com/ooples/AiDotNet.Tensors/commit/b81fa1c7a50e669661bcacb3254b3c545f5cc073))
+* **codegen:** split and vectorize compiled CPU pointwise kernels; deterministic CompileSpeedup test ([#1873](https://github.com/ooples/AiDotNet.Tensors/issues/1873)) ([7678a06](https://github.com/ooples/AiDotNet.Tensors/commit/7678a06012d48684df1fffaf912b714b8da60d3d))
+* **compile:** stop compiled backwards allocating a fresh temporary per step ([#1881](https://github.com/ooples/AiDotNet.Tensors/issues/1881)) ([97c2700](https://github.com/ooples/AiDotNet.Tensors/commit/97c2700a28a87929a1a927e2f5cbeed2e3e0ef95))
+* **cpu:** split the single-threaded double *Into ops across the pool ([#1879](https://github.com/ooples/AiDotNet.Tensors/issues/1879)) ([4732c47](https://github.com/ooples/AiDotNet.Tensors/commit/4732c47de50524454b63f78cbcef19f5404cf54a))
+* **cpu:** split the single-threaded float *Into ops across the pool ([#1877](https://github.com/ooples/AiDotNet.Tensors/issues/1877)) ([0a92ec3](https://github.com/ooples/AiDotNet.Tensors/commit/0a92ec310a2c9363273bb17ba8c4472e8d055395))
+* **executor:** re-arm one plain-mode Job instead of allocating per dispatch ([#1876](https://github.com/ooples/AiDotNet.Tensors/issues/1876)) ([1b9b5fc](https://github.com/ooples/AiDotNet.Tensors/commit/1b9b5fc6e2f4e194b39bf01854f315cddf37076f))
+* faster, pooled eager MatMulTransposed backward ([#1883](https://github.com/ooples/AiDotNet.Tensors/issues/1883)) ([c87ad68](https://github.com/ooples/AiDotNet.Tensors/commit/c87ad68e59f58037011b8c5f1cc661860f2f0f50))
+* **gpu:** fused Householder/sequence-mixer ops, multi-tensor checkpoint flush, and in-place pointer refresh (2.66x faster than Compiled PyTorch + Triton) ([4cf0768](https://github.com/ooples/AiDotNet.Tensors/commit/4cf076818ea6312d1ad0b465bc5bb59507735a0b))
+* **gpu:** GPU-resident tape broadcast/slice views, O(n) CudaStepArena planner, and warp-register GLA kernels ([0963db6](https://github.com/ooples/AiDotNet.Tensors/commit/0963db6016d71ddf84cafc1399e8718fa7b2b9c8))
+* **gpu:** work-group-per-row argmax/argmin on OpenCL, Vulkan, WebGPU and Metal ([#1845](https://github.com/ooples/AiDotNet.Tensors/issues/1845)) ([6a59958](https://github.com/ooples/AiDotNet.Tensors/commit/6a59958eda4f9f76ba932cfb8c629ad67f689b84))
+
+
+### Refactoring
+
+* remove unreleased sequence-mixer ops ([#1857](https://github.com/ooples/AiDotNet.Tensors/issues/1857)) ([24e5cde](https://github.com/ooples/AiDotNet.Tensors/commit/24e5cde75c6ccd924b3bb14ab20795132a85b0fc))
+
 ## [0.153.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.152.1...v0.153.0) (2026-11-26)
 
 
