@@ -88,7 +88,7 @@ internal sealed class CpuFusionPass : ILazyGraphOptimizationPass
             // BatchNorm+ReLU fusion.
             if (_forTraining && (node.RecordedUnderNoGrad
                 || (node is ISignableLazyNode { BackwardDelegate: null }
-                    && node.OpName is not ("BatchNormBatchMean" or "BatchNormBatchVariance" or "LayerNormMean" or "LayerNormVariance"))
+                    && node.OpName is not ("BatchNormBatchMean" or "BatchNormBatchVariance" or "LayerNormMean" or "LayerNormVariance" or "RMSNormRms"))
                 || node is ISignableLazyNode { DifferentiableInputIndices: not null })) blocked.Add(node);
             if (node is not IInPlaceReadOrdering ordered || ordered.EarlierReaders.Count == 0) continue;
             blocked.Add(node);

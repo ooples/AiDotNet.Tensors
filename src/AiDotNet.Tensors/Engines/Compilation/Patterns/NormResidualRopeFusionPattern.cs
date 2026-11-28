@@ -56,8 +56,20 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
 
         if (rmsNode is null || rmsNode.Input1 is null)
             return false;
-        // RMSNorm output must feed ONLY the two half-slices of split-half RoPE (consumer count == 2).
-        if (!consumerCounts.TryGetValue(rmsNode, out int rmsConsumers) || rmsConsumers != 2)
+        // RMSNorm output must feed ONLY the two half-slices of split-half RoPE, plus its own RMS statistic node when
+        // nothing reads or retains that statistic (the fused node drops it with the RMSNorm).
+        LazyNode<float>? rmsStat = null;
+        for (int j = rmsIdx + 1; j < nodes.Count && j <= rmsIdx + 2; j++)
+        {
+            if (nodes[j] is LazyNode<float> stat && stat.OpName == "RMSNormRms" && ReferenceEquals(stat.Input0, rmsNode.Output))
+            {
+                if (alreadyRemoved.Contains(stat) || (consumerCounts.TryGetValue(stat, out int sc) && sc > 0))
+                    return false;
+                rmsStat = stat;
+                break;
+            }
+        }
+        if (!consumerCounts.TryGetValue(rmsNode, out int rmsConsumers) || rmsConsumers != (rmsStat is null ? 2 : 3))
             return false;
 
         int rank = rmsNode.Output.Rank;
@@ -288,6 +300,11 @@ internal sealed class NormResidualRopeFusionPattern : IFusionPattern
         }
         alreadyRemoved.Add(addNode);
         alreadyRemoved.Add(rmsNode);
+        if (rmsStat is not null)
+        {
+            rmsStat.Output.LazySource = null;
+            alreadyRemoved.Add(rmsStat);
+        }
         return true;
     }
 }

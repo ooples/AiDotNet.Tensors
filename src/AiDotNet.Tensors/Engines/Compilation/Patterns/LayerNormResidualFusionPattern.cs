@@ -67,9 +67,12 @@ internal sealed class LayerNormResidualFusionPattern : IFusionPattern
         int statEnd = Math.Min(nodes.Count - 1, lnIndex + 3);
         for (int j = lnIndex + 1; j <= statEnd; j++)
         {
-            if (alreadyRemoved.Contains(nodes[j])) continue;
             if (nodes[j] is LazyNode<float> statNode && ReferenceEquals(statNode.Input0, lnNode.Output))
             {
+                // Retained (blocked, so already in the removed set) or read: the statistic needs the LayerNorm
+                // writer this fusion would remove.
+                if ((statNode.OpName is "LayerNormMean" or "LayerNormVariance") && alreadyRemoved.Contains(statNode))
+                    return false;
                 if (statNode.OpName == "LayerNormMean")
                 {
                     if (consumerCounts.TryGetValue(statNode, out int mc) && mc > 0) return false;

@@ -31321,8 +31321,8 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ci = input; var cg = gamma; double ce = epsilon;
-                rms = new Tensor<T>(batchShape);
-                var capturedRms = rms;
+                // The replay-time statistics holder the backward reads.
+                var capturedRms = new Tensor<T>(batchShape);
                 var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, input._shape,
                     (eng, output) =>
                     {
@@ -31331,6 +31331,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { capturedRms, epsilon });
+                // The out value is a node of its own that depends on the normalization, like LayerNorm's mean and
+                // variance: reading it (or rooting a plan at it) runs RMSNorm first, so it never holds stale data.
+                rms = scope.RecordUnary(LazyNodeType.Custom, "RMSNormRms", lazyResult, batchShape,
+                    (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, capturedRms, output));
                 return lazyResult;
             }
         }
