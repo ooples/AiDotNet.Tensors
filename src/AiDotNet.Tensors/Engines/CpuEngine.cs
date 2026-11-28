@@ -31223,39 +31223,6 @@ public partial class CpuEngine : ITensorLevelEngine
             return outputs[0];
         }
 
-        if (GraphMode.IsActive)
-        {
-            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
-            if (scope != null)
-            {
-                var ci = input; var cg = gamma; double ce = epsilon;
-                var savedScope = GraphMode.Current;
-                GraphMode.SetCurrent(null);
-                var eagerResult = RMSNorm(ci, cg, ce, out rms);
-                GraphMode.SetCurrent(savedScope);
-                // AiDotNet#1331: refresh rms on every plan.Step (was stale from compile-time).
-                var capturedRms = rms;
-                var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, eagerResult._shape,
-                    (eng, output) =>
-                    {
-                        var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
-                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
-                    },
-                    BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
-                using var eagerResultKeep4 = new KeepAliveScope(eagerResult);
-                using var lazyResultKeep4 = new KeepAliveScope(lazyResult);
-                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
-                return lazyResult;
-            }
-        }
-
-        // Preserve original input ref for tape recording (#257).
-        var inputOrig = input;
-        if (!input.IsContiguous) input = input.Contiguous();
-
-        var numOps = MathHelper.GetNumericOperations<T>();
-        T eps = numOps.FromDouble(epsilon);
         int normalizedDims = gamma._shape.Length;
         int inputRank = input._shape.Length;
 
@@ -31278,6 +31245,33 @@ public partial class CpuEngine : ITensorLevelEngine
             batchShape[i] = input._shape[i];
         }
         if (batchDims == 0) { batchSize = 1; batchShape = [1]; }
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            if (scope != null)
+            {
+                var ci = input; var cg = gamma; double ce = epsilon;
+                rms = new Tensor<T>(batchShape);
+                var capturedRms = rms;
+                var lazyResult = scope.RecordBinary(LazyNodeType.Custom, "RMSNorm", input, gamma, input._shape,
+                    (eng, output) =>
+                    {
+                        var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
+                    },
+                    BackwardFunctions<T>.RMSNormBackward, new object[] { capturedRms, epsilon });
+                return lazyResult;
+            }
+        }
+
+        // Preserve original input ref for tape recording (#257).
+        var inputOrig = input;
+        if (!input.IsContiguous) input = input.Contiguous();
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        T eps = numOps.FromDouble(epsilon);
 
         int featureSize = gamma.Length;
         var inputData = input.GetReadOnlyDataArray();
@@ -41890,7 +41884,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedScalar = scalar;
                 return scope.RecordUnary(LazyNodeType.AddScalar, "TensorAddScalar", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorAddScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.AddScalarBackward);
+                    BackwardFunctions<T>.AddScalarBackward, scalar is not null ? new object[] { scalar } : Array.Empty<object>());
             }
         }
 

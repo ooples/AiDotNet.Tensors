@@ -15,6 +15,8 @@ public sealed partial class CudaBackend
 {
     private readonly Dictionary<string, DirectPtxCodegenKernel> _directPtxCodegenKernels =
         new(StringComparer.Ordinal);
+    private readonly Dictionary<string, IntPtr> _nvrtcCodegenFunctions =
+        new(StringComparer.Ordinal);
 
     /// <inheritdoc/>
     public KernelTuningBackend NativeCodegenBackend => KernelTuningBackend.Cuda;
@@ -27,7 +29,17 @@ public sealed partial class CudaBackend
             ComputeMajor = _ccMajor,
             ComputeMinor = _ccMinor
         };
-        return emitter.Emit(graph, dtype);
+        var ptxResult = emitter.Emit(graph, dtype);
+        if (!ptxResult.Declined)
+        {
+            return ptxResult;
+        }
+
+        // Fall back to NVRTC CUDA C emission for fused pointwise and trailing-broadcast chains
+        // (SwiGLU, GeGLU, Bias+GELU/Swish, multi-op elementwise DAGs) when direct-PTX declines.
+        var nvrtcEmitter = new NvrtcGraphEmitter();
+        var nvrtcResult = nvrtcEmitter.Emit(graph, dtype);
+        return nvrtcResult.Declined ? ptxResult : nvrtcResult;
     }
 
     /// <summary>
@@ -38,8 +50,8 @@ public sealed partial class CudaBackend
 
     /// <inheritdoc/>
     public bool CanExecuteCodegenKernel(CodegenKernel kernel) =>
-        kernel is PtxCodegenKernel ptx &&
-        ptx.ComputeMajor == _ccMajor && ptx.ComputeMinor == _ccMinor;
+        (kernel is PtxCodegenKernel ptx && ptx.ComputeMajor == _ccMajor && ptx.ComputeMinor == _ccMinor)
+        || kernel is NvrtcCodegenKernel;
 
     /// <inheritdoc/>
     public unsafe ValueTask ExecuteCodegenKernelAsync(
@@ -52,8 +64,13 @@ public sealed partial class CudaBackend
         cancellationToken.ThrowIfCancellationRequested();
         if (_disposed) throw new ObjectDisposedException(nameof(CudaBackend));
         if (!IsAvailable) throw new GpuCapabilityUnavailableException("CUDA is not available.");
+        if (kernel is NvrtcCodegenKernel nvrtcKernel)
+        {
+            ExecuteNvrtcCodegenKernel(nvrtcKernel, inputs, outputs, elementCount);
+            return default;
+        }
         if (kernel is not PtxCodegenKernel ptxKernel)
-            throw new ArgumentException("The kernel must contain direct PTX.", nameof(kernel));
+            throw new ArgumentException("The kernel must contain direct PTX or NVRTC CUDA C.", nameof(kernel));
         if (ptxKernel.ComputeMajor != _ccMajor || ptxKernel.ComputeMinor != _ccMinor)
         {
             throw new ArgumentException(
@@ -175,11 +192,84 @@ public sealed partial class CudaBackend
         return BitConverter.ToString(digest).Replace("-", string.Empty);
     }
 
-    private static long GetElementCount(IReadOnlyList<int> shape)
+        private static long GetElementCount(IReadOnlyList<int> shape)
+        {
+            long count = 1;
+            for (int i = 0; i < shape.Count; i++) count = checked(count * shape[i]);
+            return count;
+        }
+
+    private unsafe void ExecuteNvrtcCodegenKernel(
+        NvrtcCodegenKernel kernel,
+        IReadOnlyList<IGpuBuffer> inputs,
+        IReadOnlyList<IGpuBuffer> outputs,
+        int elementCount)
     {
-        long count = 1;
-        for (int i = 0; i < shape.Count; i++) count = checked(count * shape[i]);
-        return count;
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (outputs is null) throw new ArgumentNullException(nameof(outputs));
+        if (inputs.Count != kernel.InputCount)
+            throw new ArgumentException("Input buffer count does not match the generated graph.", nameof(inputs));
+        if (outputs.Count != 1)
+            throw new ArgumentException("Output buffer count does not match the generated graph.", nameof(outputs));
+        if (elementCount <= 0)
+            return;
+
+        for (int i = 0; i < inputs.Count; i++)
+        {
+            long requiredBytes = checked(GetElementCount(kernel.Graph[kernel.Graph.InputNodes[i]].Shape) * sizeof(float));
+            ValidateCodegenBuffer(inputs[i], requiredBytes, nameof(inputs));
+        }
+        ValidateCodegenBuffer(outputs[0], checked((long)elementCount * sizeof(float)), nameof(outputs));
+
+        IntPtr function;
+        lock (_directPtxLock)
+        {
+            if (!_nvrtcCodegenFunctions.TryGetValue(kernel.EntryPoint, out function))
+            {
+                if (IsStreamCapturing())
+                {
+                    throw new InvalidOperationException(
+                        $"NVRTC kernel '{kernel.EntryPoint}' was not warmed up prior to CUDA stream capture.");
+                }
+                using var _ = PushContext();
+                CuBlasNative.CheckCudaResult(CuBlasNative.cuDeviceGet(out int cudaDevice, DeviceOrdinal), "cuDeviceGet(nvrtc codegen)");
+                CompileKernelModule(cudaDevice, kernel.CudaSource, kernel.EntryPoint, new[] { kernel.EntryPoint }, useFastMath: false);
+                function = _kernelCache[kernel.EntryPoint];
+                _nvrtcCodegenFunctions[kernel.EntryPoint] = function;
+            }
+        }
+
+        int totalArgs = kernel.UsesTrailingBroadcast ? inputs.Count + 3 : inputs.Count + 2;
+        IntPtr* handles = stackalloc IntPtr[inputs.Count + 1];
+        void** args = stackalloc void*[totalArgs];
+        for (int i = 0; i < inputs.Count; i++)
+        {
+            handles[i] = inputs[i].Handle;
+            args[i] = &handles[i];
+        }
+        handles[inputs.Count] = outputs[0].Handle;
+        args[inputs.Count] = &handles[inputs.Count];
+
+        int n = elementCount;
+        int cols = kernel.TrailingCols;
+        args[inputs.Count + 1] = &n;
+        if (kernel.UsesTrailingBroadcast)
+        {
+            args[inputs.Count + 2] = &cols;
+        }
+
+        uint blockX = 256;
+        int workItems = !kernel.UsesTrailingBroadcast && elementCount >= 4 ? (elementCount + 3) >> 2 : elementCount;
+        uint gridX = (uint)Math.Min(4096, (workItems + (int)blockX - 1) / (int)blockX);
+        if (gridX == 0) gridX = 1;
+
+        using (PushContext())
+        {
+            lock (GpuDispatchLock)
+            {
+                LaunchKernel3D(function, gridX, 1, 1, blockX, 1, 1, args, 0);
+            }
+        }
     }
 
     private sealed class DirectPtxCodegenKernel : IDisposable

@@ -1,6 +1,6 @@
-using Autotune = AiDotNet.Tensors.Helpers.Autotune;
-
 namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
+
+using Autotune = AiDotNet.Tensors.Helpers.Autotune;
 
 /// <summary>
 /// Version stamp embedded in every serialized plan. Fully qualifies the

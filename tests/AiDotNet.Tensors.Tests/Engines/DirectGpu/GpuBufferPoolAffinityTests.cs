@@ -186,9 +186,11 @@ public sealed class GpuBufferPoolAffinityTests
 
         pool.Return(buffer);
 
-        Assert.True(pool.TryRent(5000, out var smaller));
+        // Under half-step size classes (2^k and 1.5 * 2^k), 5000 routes to bucket 6144 while (6144, 8192] routes to 8192.
+        Assert.False(pool.TryRent(5000, out _));
+        Assert.True(pool.TryRent(6500, out var smaller));
         Assert.Same(buffer, smaller);
-        Assert.Equal(5000, smaller.Size);
+        Assert.Equal(6500, smaller.Size);
         Assert.Equal(8192, smaller.Capacity);
 
         pool.Return(smaller);

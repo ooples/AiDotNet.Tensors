@@ -47,6 +47,14 @@ internal static class FusionPatternRegistry
         Register(new MultiHeadAttentionPackedFusionPattern());
         Register(new LinearMseLossFusionPattern());
         Register(new MseLossFusionPattern());
+        Register(new RotaryPositionEmbeddingFusionPattern());
+        Register(new LogSoftmaxCrossEntropyFusionPattern());
+        Register(new NormResidualRopeFusionPattern());
+        Register(new RmsNormResidualFusionPattern());
+        Register(new LayerNormResidualFusionPattern());
+        Register(new SwiGluFusionPattern());
+        Register(new BroadcastAddActivationFusionPattern());
+        Register(new ElementwiseChainFusionPattern());
     }
 
     /// <summary>

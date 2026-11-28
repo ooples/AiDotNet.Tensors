@@ -1370,3 +1370,67 @@ static AiDotNet.Tensors.Engines.Simd.SimdKernels.SoftShrinkUnsafe(double* input,
 static AiDotNet.Tensors.Engines.Simd.SimdKernels.SoftShrinkUnsafe(float* input, float* output, int length, float lambda) -> void
 virtual AiDotNet.Tensors.Engines.CpuEngine.TensorSoftShrink<T>(AiDotNet.Tensors.LinearAlgebra.Tensor<T>! tensor, T lambda) -> AiDotNet.Tensors.LinearAlgebra.Tensor<T>!
 virtual AiDotNet.Tensors.Engines.Gpu.DelegatingGpuBackend.SoftShrink(AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! input, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer! output, float lambda, int size) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind.InferenceForward = 0 -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind.FullStepForwardBackward = 1 -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind.SegmentedLocalCreditBlock = 2 -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind.MultiTensorOptimizerStep = 3 -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.StaticShapeCudaGraphOptions() -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.MaxCaptureFailuresBeforeFallback.get -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.MaxCaptureFailuresBeforeFallback.init -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.SynchronizeOnReplay.get -> bool
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.SynchronizeOnReplay.init -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.WarmupIterations.get -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.WarmupIterations.init -> void
+static AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions.Default.get -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions!
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.CaptureCount.get -> long
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Dispose() -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.EagerFallbackCount.get -> long
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Execute(System.Action! stepBody, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>! watchedBuffers) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Execute(System.Action! stepBody, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>! watchedBuffers, long shapeAndScalarSignature) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Execute<T>(System.Action! stepBody, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! watchedTensors) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Execute<T>(System.Action! stepBody, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! watchedTensors, long scalarSignature) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.GraphReplayCount.get -> long
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.HasCapturedGraph.get -> bool
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.Invalidate(string! reason = "Explicit caller invalidation.") -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.InvalidationCount.get -> long
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.IsGraphCaptureSupported.get -> bool
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.LastCaptureFailure.get -> string?
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.LastInvalidationReason.get -> string?
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.ScopeKind.get -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.StaticShapeCudaGraphScope(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind scopeKind, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions? options = null) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.WarmupExecutionCount.get -> long
+static AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.ComputeSignature<T>(System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.LinearAlgebra.Tensor<T>!>! tensors, long scalarSeed = 0) -> long
+static AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope.PackScalarSignature(float scalar0, float scalar1 = 0, int intParam0 = 0, float scalar2 = 0, float scalar3 = 0) -> long
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.BucketCount.get -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.CudaGraphTreePool(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, System.Collections.Generic.IReadOnlyList<int>! bucketSizes, int workspaceElementsPerUnit, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind scopeKind = AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphExecutionScopeKind.InferenceForward, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions? options = null) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.Dispose() -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.ExecuteForSize(int requestedUnits, System.Action<int, AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>! bucketStep, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>? externalWatchedBuffers = null, long scalarSignature = 0) -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.GetBucketScope(int bucketCapacity) -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope!
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.ResolveBucket(int requestedUnits) -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.CudaGraphTreePool.SharedArenaCapacityElements.get -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.Buffer.get -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.Dispose() -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.GetSlotValue(int slot) -> float
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.GpuResidentScheduleScalars(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, System.Action<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!, float[]!>? customUploader = null) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.UpdateSchedule(float learningRate, float weightDecay, float beta1, float beta2, int step, float maxGradNorm = 0) -> void
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.Beta1Slot = 2 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.Beta2Slot = 3 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.BiasCorrection1Slot = 4 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.BiasCorrection2Slot = 5 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.LearningRateSlot = 0 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.MaxGradNormSlot = 7 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.SlotCount = 8 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.StepNumberSlot = 6 -> int
+const AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.GpuResidentScheduleScalars.WeightDecaySlot = 1 -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.Dispose() -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.ExecuteSegment(int segmentIndex, System.Action<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>! segmentAction, System.Collections.Generic.IReadOnlyList<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!>! segmentBindings, long segmentSignature = 0) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.GetSegmentScope(int segmentIndex) -> AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphScope!
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.SegmentCount.get -> int
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.SegmentedBlockCudaGraphRunner(AiDotNet.Tensors.Engines.DirectGpu.IDirectGpuBackend! backend, int segmentCount, int sharedScratchElements, AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.StaticShapeCudaGraphOptions? options = null) -> void
+AiDotNet.Tensors.Engines.Compilation.Codegen.CudaGraph.SegmentedBlockCudaGraphRunner.SharedBlockScratch.get -> AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer!
