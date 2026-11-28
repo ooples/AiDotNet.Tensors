@@ -22,6 +22,17 @@ internal sealed class NvrtcCodegenKernel : CodegenKernel
     internal bool UsesTrailingBroadcast { get; }
     internal int TrailingCols { get; }
 
+    /// <summary>
+    /// Number of input pointers the emitted entry point declares, frozen at emission so later mutation of the
+    /// source <see cref="CodegenGraph"/> cannot desynchronize argument packing from the compiled signature.
+    /// </summary>
+    internal int BoundInputCount => _inputRequiredBytes.Length;
+
+    private readonly long[] _inputRequiredBytes;
+
+    /// <summary>Minimum byte size of each bound input buffer, frozen at emission.</summary>
+    internal IReadOnlyList<long> InputRequiredBytes => _inputRequiredBytes;
+
     internal NvrtcCodegenKernel(
         CodegenElementType dtype,
         CodegenGraph graph,
@@ -29,9 +40,11 @@ internal sealed class NvrtcCodegenKernel : CodegenKernel
         string cudaSource,
         int outputElementCount,
         bool usesTrailingBroadcast,
-        int trailingCols)
+        int trailingCols,
+        long[] inputRequiredBytes)
         : base(dtype, graph, CodegenTarget.DirectPtx)
     {
+        _inputRequiredBytes = inputRequiredBytes ?? throw new ArgumentNullException(nameof(inputRequiredBytes));
         EntryPoint = entryPoint;
         CudaSource = cudaSource;
         OutputElementCount = outputElementCount;
@@ -71,6 +84,7 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
         int trailingCols = outNode.Shape.Length > 0 ? outNode.Shape[outNode.Shape.Length - 1] : 1;
 
         var inputIsTrailing1D = new bool[graph.InputNodes.Count];
+        var inputRequiredBytes = new long[graph.InputNodes.Count];
         bool anyTrailingBroadcast = false;
         for (int p = 0; p < graph.InputNodes.Count; p++)
         {
@@ -78,6 +92,7 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
             if (inp.Dtype != CodegenElementType.Float32)
                 return CodegenEmitResult.Decline($"Input {p} must be Float32; got {inp.Dtype}.");
             long inpElems = inp.ElementCount;
+            inputRequiredBytes[p] = checked(inpElems * sizeof(float));
             if (inpElems == totalElements)
             {
                 inputIsTrailing1D[p] = false;
@@ -104,10 +119,20 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
                 return CodegenEmitResult.Decline($"Interior node {n} ({node.Op}) must be Float32.");
             if (!IsSupportedPointwiseOp(node.Op))
                 return CodegenEmitResult.Decline($"Operation {node.Op} is not supported by NvrtcGraphEmitter.");
+            if (node.Op is CodegenOpKind.Constant or CodegenOpKind.LeakyReLU or CodegenOpKind.ELU
+                && node.Attribute is not null)
+            {
+                float attr = Convert.ToSingle(node.Attribute, CultureInfo.InvariantCulture);
+                if (float.IsNaN(attr) || float.IsInfinity(attr))
+                    return CodegenEmitResult.Decline(
+                        $"Node {n} ({node.Op}) has non-finite attribute {attr.ToString("R", CultureInfo.InvariantCulture)}; CUDA C has no literal for it.");
+            }
         }
 
-        string hashSuffix = ComputeGraphSignature(graph);
-        string entryPoint = "aidn_nvrtc_fused_" + hashSuffix;
+        // The entry point is derived from the emitted source itself (with a fixed placeholder name), so any change
+        // that alters the generated code -- including input layout (dense vs trailing broadcast) and the kernel
+        // signature -- yields a distinct cached function, while identical source reuses it.
+        const string EntryPlaceholder = "__AIDN_NVRTC_ENTRY__";
 
         var sb = new StringBuilder(2048);
         sb.AppendLine("__device__ __forceinline__ float aidn_gelu_f32(float x) {");
@@ -116,7 +141,7 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
         sb.AppendLine("__device__ __forceinline__ float aidn_softplus_f32(float x) {");
         sb.AppendLine("    return x > 20.0f ? x : log1pf(expf(x));");
         sb.AppendLine("}");
-        sb.Append("extern \"C\" __global__ void ").Append(entryPoint).Append('(');
+        sb.Append("extern \"C\" __global__ void ").Append(EntryPlaceholder).Append('(');
         for (int p = 0; p < graph.InputNodes.Count; p++)
         {
             sb.Append("const float* __restrict__ in_").Append(p).Append(", ");
@@ -127,8 +152,9 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
             sb.Append(", int cols");
         }
         sb.AppendLine(") {");
-        sb.AppendLine("    int tid = blockIdx.x * blockDim.x + threadIdx.x;");
-        sb.AppendLine("    int stride = blockDim.x * gridDim.x;");
+        // 64-bit index arithmetic: n may be up to int.MaxValue, and idx + stride must never wrap.
+        sb.AppendLine("    long long tid = (long long)blockIdx.x * blockDim.x + threadIdx.x;");
+        sb.AppendLine("    long long stride = (long long)blockDim.x * gridDim.x;");
 
         if (!anyTrailingBroadcast)
         {
@@ -140,8 +166,8 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
             }
             sb.AppendLine(";");
             sb.AppendLine("    if (aligned && n >= 4) {");
-            sb.AppendLine("        int vecCount = n >> 2;");
-            sb.AppendLine("        for (int vecIdx = tid; vecIdx < vecCount; vecIdx += stride) {");
+            sb.AppendLine("        long long vecCount = (long long)(n >> 2);");
+            sb.AppendLine("        for (long long vecIdx = tid; vecIdx < vecCount; vecIdx += stride) {");
             for (int p = 0; p < graph.InputNodes.Count; p++)
             {
                 sb.Append("            float4 vin_").Append(p).Append(" = reinterpret_cast<const float4*>(in_").Append(p).AppendLine(")[vecIdx];");
@@ -153,26 +179,28 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
             EmitLaneBody(sb, graph, inputIsTrailing1D, "w", "            ");
             sb.AppendLine("            reinterpret_cast<float4*>(out_0)[vecIdx] = vout;");
             sb.AppendLine("        }");
-            sb.AppendLine("        for (int idx = (vecCount << 2) + tid; idx < n; idx += stride) {");
+            sb.AppendLine("        for (long long idx = (vecCount << 2) + tid; idx < (long long)n; idx += stride) {");
             EmitScalarBody(sb, graph, inputIsTrailing1D, "            ");
             sb.AppendLine("        }");
             sb.AppendLine("    } else {");
-            sb.AppendLine("        for (int idx = tid; idx < n; idx += stride) {");
+            sb.AppendLine("        for (long long idx = tid; idx < (long long)n; idx += stride) {");
             EmitScalarBody(sb, graph, inputIsTrailing1D, "            ");
             sb.AppendLine("        }");
             sb.AppendLine("    }");
         }
         else
         {
-            sb.AppendLine("    for (int idx = tid; idx < n; idx += stride) {");
-            sb.AppendLine("        int col = idx % cols;");
+            sb.AppendLine("    for (long long idx = tid; idx < (long long)n; idx += stride) {");
+            sb.AppendLine("        long long col = idx % (long long)cols;");
             EmitScalarBody(sb, graph, inputIsTrailing1D, "        ");
             sb.AppendLine("    }");
         }
 
         sb.AppendLine("}");
 
-        string source = sb.ToString();
+        string templateSource = sb.ToString();
+        string entryPoint = "aidn_nvrtc_fused_" + ComputeSourceSignature(templateSource);
+        string source = templateSource.Replace(EntryPlaceholder, entryPoint);
         var kernel = new NvrtcCodegenKernel(
             dtype,
             graph,
@@ -180,7 +208,8 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
             source,
             totalElements,
             anyTrailingBroadcast,
-            trailingCols);
+            trailingCols,
+            inputRequiredBytes);
         return CodegenEmitResult.Succeeded(kernel, source);
     }
 
@@ -325,26 +354,12 @@ internal sealed class NvrtcGraphEmitter : IKernelEmitter
         return text + "f";
     }
 
-    private static string ComputeGraphSignature(CodegenGraph graph)
+    private static string ComputeSourceSignature(string source)
     {
-        var desc = new StringBuilder(256);
-        for (int i = 0; i < graph.Count; i++)
-        {
-            var n = graph[i];
-            desc.Append((int)n.Op).Append(':');
-            for (int k = 0; k < n.Inputs.Length; k++)
-            {
-                if (k > 0) desc.Append(',');
-                desc.Append(n.Inputs[k]);
-            }
-            if (n.Attribute is not null)
-                desc.Append('@').Append(Convert.ToString(n.Attribute, CultureInfo.InvariantCulture));
-            desc.Append(';');
-        }
         using var sha = SHA256.Create();
-        byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(desc.ToString()));
-        var hex = new StringBuilder(16);
-        for (int i = 0; i < 8; i++) hex.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
+        byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(source));
+        var hex = new StringBuilder(32);
+        for (int i = 0; i < 16; i++) hex.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
         return hex.ToString();
     }
 }

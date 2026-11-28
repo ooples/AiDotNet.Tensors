@@ -569,7 +569,8 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
 
     /// <summary>
     /// Computes the physical allocation capacity matching <see cref="_bufferPool"/>'s bucket ceiling when pooling is active,
-    /// clamping back to <paramref name="requestedSize"/> during stream capture or when rounding would exceed device/budget caps.
+    /// clamping back to <paramref name="requestedSize"/> during stream capture, under a <c>GpuMemoryBudget</c>, or when
+    /// rounding would exceed the device allocation cap.
     /// </summary>
     internal int ResolvePooledAllocationCapacity(int requestedSize, int elementSizeBytes)
     {
@@ -590,7 +591,10 @@ public sealed partial class CudaBackend : IMaxPoolBackwardOverwriteBackend, ICha
             return requestedSize;
         }
 
-        if (_memoryAccount.LimitBytes is long budgetLimit && roundedBytes > budgetLimit)
+        // Under a GpuMemoryBudget the padding is charged at admission, so a padded request could be refused while the
+        // requested size alone fits the remaining headroom. Headroom checked here can change before admission (other
+        // threads, reclaim), so the only guarantee that padding never causes a refusal is not to pad under a budget.
+        if (_memoryAccount.LimitBytes is not null)
         {
             return requestedSize;
         }

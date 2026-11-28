@@ -207,17 +207,22 @@ public sealed partial class CudaBackend
     {
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (outputs is null) throw new ArgumentNullException(nameof(outputs));
-        if (inputs.Count != kernel.InputCount)
+        // Validate against the binding metadata frozen at emission, not the (mutable) source graph: the compiled
+        // entry point's parameter list is fixed by the emitted CUDA C.
+        if (inputs.Count != kernel.BoundInputCount)
             throw new ArgumentException("Input buffer count does not match the generated graph.", nameof(inputs));
         if (outputs.Count != 1)
             throw new ArgumentException("Output buffer count does not match the generated graph.", nameof(outputs));
-        if (elementCount <= 0)
-            return;
+        if (elementCount != kernel.OutputElementCount)
+        {
+            throw new ArgumentException(
+                $"NVRTC kernel is shape-specialized; elementCount ({elementCount}) must match the emitted output ({kernel.OutputElementCount}).",
+                nameof(elementCount));
+        }
 
         for (int i = 0; i < inputs.Count; i++)
         {
-            long requiredBytes = checked(GetElementCount(kernel.Graph[kernel.Graph.InputNodes[i]].Shape) * sizeof(float));
-            ValidateCodegenBuffer(inputs[i], requiredBytes, nameof(inputs));
+            ValidateCodegenBuffer(inputs[i], kernel.InputRequiredBytes[i], nameof(inputs));
         }
         ValidateCodegenBuffer(outputs[0], checked((long)elementCount * sizeof(float)), nameof(outputs));
 
@@ -259,8 +264,9 @@ public sealed partial class CudaBackend
         }
 
         uint blockX = 256;
-        int workItems = !kernel.UsesTrailingBroadcast && elementCount >= 4 ? (elementCount + 3) >> 2 : elementCount;
-        uint gridX = (uint)Math.Min(4096, (workItems + (int)blockX - 1) / (int)blockX);
+        // 64-bit launch sizing so counts near int.MaxValue cannot wrap negative.
+        long workItems = !kernel.UsesTrailingBroadcast && elementCount >= 4 ? ((long)elementCount + 3) >> 2 : elementCount;
+        uint gridX = (uint)Math.Min(4096L, (workItems + blockX - 1) / blockX);
         if (gridX == 0) gridX = 1;
 
         using (PushContext())

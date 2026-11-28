@@ -33,18 +33,24 @@ internal sealed class GpuCompiledPlan<T> : IDisposable
         IDirectGpuBackend? backend = explicitBackend;
         if (backend is null && engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
         {
+            // Backend discovery under an op lease, so engine disposal cannot free the backend mid-read.
+            using var lease = gpuEngine.EnterGpuOp();
             backend = gpuEngine.GetBackend();
         }
 
         if (backend is not null)
         {
             _boundBackend = backend;
-            _graphScope = new StaticShapeCudaGraphScope(
-                backend,
-                CudaGraphExecutionScopeKind.InferenceForward,
-                new StaticShapeCudaGraphOptions { WarmupIterations = 1, SynchronizeOnReplay = true });
+            _graphScope = CreateScope(backend);
         }
     }
+
+    // The plan's steps recompute their outputs from device inputs only, so re-running them after a failed capture
+    // cannot double-apply host-side state.
+    private static StaticShapeCudaGraphScope CreateScope(IDirectGpuBackend backend) => new(
+        backend,
+        CudaGraphExecutionScopeKind.InferenceForward,
+        new StaticShapeCudaGraphOptions { WarmupIterations = 1, SynchronizeOnReplay = true, StepBodyIsReplayable = true });
 
     /// <summary>Whether a CUDA graph has been captured and is active for zero-overhead replay.</summary>
     internal bool IsCaptured => _graphScope?.HasCapturedGraph == true;
@@ -62,10 +68,20 @@ internal sealed class GpuCompiledPlan<T> : IDisposable
         if (_disposed) throw new ObjectDisposedException(nameof(GpuCompiledPlan<T>));
         using var recordingSuspension = GraphMode.SuspendRecording();
 
-        EnsureGraphScopeInitialized();
+        // Hold an engine op lease across backend discovery and graph replay (nested leases are allowed, so the
+        // steps' own ops do not conflict). A closed engine yields an empty lease and the sequential fallback.
+        DirectGpuTensorEngine? gpuEngine = _engine.TryGet<DirectGpuTensorEngine>(out var engineGpu) ? engineGpu : null;
+        using var lease = gpuEngine?.EnterGpuOp();
+
+        EnsureGraphScopeInitialized(gpuEngine);
         if (_graphScope is not null && _watchedTensors.Length > 0)
         {
+            long replaysBefore = _graphScope.GraphReplayCount;
             _graphScope.Execute(RunSequentialSteps, _watchedTensors);
+            if (gpuEngine is not null && _graphScope.GraphReplayCount != replaysBefore)
+            {
+                RearmOutputsAfterReplay(gpuEngine);
+            }
             return _finalOutput;
         }
 
@@ -83,20 +99,36 @@ internal sealed class GpuCompiledPlan<T> : IDisposable
         }
     }
 
-    private void EnsureGraphScopeInitialized()
+    // A graph replay writes the outputs on the device without going through the engine's bind path, so a host copy
+    // that was already downloaded (its pending download consumed) would keep the previous values. Re-arm each written
+    // tensor's download exactly as the eager path does after a kernel writes a resident buffer.
+    private void RearmOutputsAfterReplay(DirectGpuTensorEngine gpuEngine)
     {
-        if (_graphScope is not null) return;
-        if (_engine.TryGet<DirectGpuTensorEngine>(out var gpuEngine))
+        var rearmed = new HashSet<Tensor<T>>(Autodiff.ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < _steps.Length; i++)
         {
-            var backend = gpuEngine.GetBackend();
-            if (backend is not null && !ReferenceEquals(backend, _boundBackend))
-            {
-                _boundBackend = backend;
-                _graphScope = new StaticShapeCudaGraphScope(
-                    backend,
-                    CudaGraphExecutionScopeKind.InferenceForward,
-                    new StaticShapeCudaGraphOptions { WarmupIterations = 1, SynchronizeOnReplay = true });
-            }
+            RearmOne(gpuEngine, _steps[i].OutputBuffer, rearmed);
+        }
+        RearmOne(gpuEngine, _finalOutput, rearmed);
+    }
+
+    private static void RearmOne(DirectGpuTensorEngine gpuEngine, Tensor<T>? tensor, HashSet<Tensor<T>> rearmed)
+    {
+        if (tensor is null || !rearmed.Add(tensor)) return;
+        if (tensor._gpuBuffer is { } buffer && buffer.Handle != IntPtr.Zero)
+        {
+            gpuEngine.RearmStateAfterReplay(tensor, buffer);
+        }
+    }
+
+    private void EnsureGraphScopeInitialized(DirectGpuTensorEngine? gpuEngine)
+    {
+        if (_graphScope is not null || gpuEngine is null) return;
+        var backend = gpuEngine.GetBackend();
+        if (backend is not null && !ReferenceEquals(backend, _boundBackend))
+        {
+            _boundBackend = backend;
+            _graphScope = CreateScope(backend);
         }
     }
 

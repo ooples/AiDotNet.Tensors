@@ -48,6 +48,27 @@ public sealed class StaticShapeCudaGraphOptions
     /// </summary>
     public int MaxCaptureFailuresBeforeFallback { get; init; } = 2;
 
+    /// <summary>
+    /// Declares that the step body has no host-side (managed) effects beyond its device work, so running it a second
+    /// time after a failed capture is safe. Default <c>false</c>: when a capture fails AFTER the body already ran
+    /// (the body threw mid-capture, or ending/instantiating the capture failed), the body's managed effects (for
+    /// example an optimizer step counter) have been applied once while its device work was discarded. Re-running it
+    /// would apply them twice, so the scope instead disables capture for that signature and throws
+    /// <see cref="InvalidOperationException"/>, leaving the caller to decide how to recover. Set this to <c>true</c>
+    /// for pure recompute bodies (outputs derived only from device inputs) to fall back to eager execution instead.
+    /// </summary>
+    public bool StepBodyIsReplayable { get; init; }
+
+    /// <summary>Validates option values; throws <see cref="ArgumentOutOfRangeException"/> on an invalid setting.</summary>
+    internal static void Validate(StaticShapeCudaGraphOptions options, string paramName)
+    {
+        if (options is null) throw new ArgumentNullException(paramName);
+        if (options.WarmupIterations < 0)
+            throw new ArgumentOutOfRangeException(paramName, "WarmupIterations must be non-negative.");
+        if (options.MaxCaptureFailuresBeforeFallback < 1)
+            throw new ArgumentOutOfRangeException(paramName, "MaxCaptureFailuresBeforeFallback must be at least 1.");
+    }
+
     /// <summary>Default options singleton.</summary>
     public static StaticShapeCudaGraphOptions Default { get; } = new();
 }
@@ -114,10 +135,7 @@ public sealed class StaticShapeCudaGraphScope : IDisposable
         _backend = backend ?? throw new ArgumentNullException(nameof(backend));
         ScopeKind = scopeKind;
         _options = options ?? StaticShapeCudaGraphOptions.Default;
-        if (_options.WarmupIterations < 0)
-            throw new ArgumentOutOfRangeException(nameof(options), "WarmupIterations must be non-negative.");
-        if (_options.MaxCaptureFailuresBeforeFallback < 1)
-            throw new ArgumentOutOfRangeException(nameof(options), "MaxCaptureFailuresBeforeFallback must be at least 1.");
+        StaticShapeCudaGraphOptions.Validate(_options, nameof(options));
 
         _captureBackend = backend as IGpuGraphCapture;
     }
@@ -198,6 +216,18 @@ public sealed class StaticShapeCudaGraphScope : IDisposable
                 return;
             }
 
+            // Eligibility first: a cached graph must not be replayed on a dead context or from inside another
+            // capture on this thread (LaunchCapturedGraph / EnqueueCapturedGraph check neither).
+            if (_captureBackend is null
+                || !_captureBackend.SupportsGraphCapture
+                || !_captureBackend.ContextIsLive
+                || _captureBackend.CaptureActiveOnThisThread)
+            {
+                stepBody();
+                System.Threading.Interlocked.Increment(ref _eagerFallbackCount);
+                return;
+            }
+
             if (_graphExec != IntPtr.Zero)
             {
                 if (MatchesCapturedLocked(snapshot, shapeAndScalarSignature, out string? mismatchReason))
@@ -207,16 +237,6 @@ public sealed class StaticShapeCudaGraphScope : IDisposable
                 }
 
                 InvalidateLocked(mismatchReason ?? "Watched buffer binding changed.");
-            }
-
-            if (_captureBackend is null
-                || !_captureBackend.SupportsGraphCapture
-                || !_captureBackend.ContextIsLive
-                || _captureBackend.CaptureActiveOnThisThread)
-            {
-                stepBody();
-                System.Threading.Interlocked.Increment(ref _eagerFallbackCount);
-                return;
             }
 
             // Reset failure counter if the caller transitioned to a new signature/pointer set after a failed capture.
@@ -243,12 +263,31 @@ public sealed class StaticShapeCudaGraphScope : IDisposable
                 return;
             }
 
-            IntPtr captured = _captureBackend.CaptureGraph(stepBody);
+            bool bodyInvoked = false;
+            IntPtr captured = _captureBackend.CaptureGraph(() =>
+            {
+                bodyInvoked = true;
+                stepBody();
+            });
             if (captured == IntPtr.Zero)
             {
                 _lastCaptureFailure = _captureBackend.LastCaptureFailure ?? "CaptureGraph returned IntPtr.Zero.";
                 _captureFailures++;
-                // Stream capture records without executing on failure; execute eagerly so this call still completes.
+                if (bodyInvoked && !_options.StepBodyIsReplayable)
+                {
+                    // The body already ran (its managed effects are applied) but its device work was discarded with
+                    // the failed capture. Re-running it would apply those managed effects a second time, so stop
+                    // capturing this signature and surface the failure instead of silently double-applying.
+                    _captureFailures = Math.Max(_captureFailures, _options.MaxCaptureFailuresBeforeFallback);
+                    throw new InvalidOperationException(
+                        "CUDA graph capture failed after the step body had already run, so its device work was " +
+                        "discarded while its host-side effects were applied once. The step was not re-run to avoid " +
+                        "applying those effects twice; capture is disabled for this signature and later calls run " +
+                        "eagerly. Set StaticShapeCudaGraphOptions.StepBodyIsReplayable for bodies without host-side " +
+                        "effects. Capture failure: " + _lastCaptureFailure);
+                }
+                // Either the body never ran (begin-capture failed) or it is declared replayable: execute eagerly so
+                // this call still completes its device work exactly once.
                 stepBody();
                 System.Threading.Interlocked.Increment(ref _eagerFallbackCount);
                 return;
@@ -291,14 +330,19 @@ public sealed class StaticShapeCudaGraphScope : IDisposable
             if (tensor is null)
                 throw new ArgumentException($"Watched tensor at index {i} is null.", nameof(watchedTensors));
             IGpuBuffer? buf = tensor._gpuBuffer ?? tensor.TryGetGpuBuffer();
-            if (buf is null || buf.Handle == IntPtr.Zero)
+            // A resident buffer whose device copy is stale (a host write bumped the cache version) must not be
+            // replayed: the captured graph would read the pre-write device data.
+            bool deviceCurrent = buf is not null && tensor._gpuBufferVersion == tensor.GpuCacheVersion;
+            if (buf is null || buf.Handle == IntPtr.Zero || !deviceCurrent)
             {
                 lock (_sync)
                 {
                     ThrowIfDisposed();
                     if (_graphExec != IntPtr.Zero)
                     {
-                        InvalidateLocked($"Watched tensor at index {i} is no longer GPU-resident.");
+                        InvalidateLocked(buf is null || buf.Handle == IntPtr.Zero
+                            ? $"Watched tensor at index {i} is no longer GPU-resident."
+                            : $"Watched tensor at index {i} has a stale device copy (host write since upload).");
                     }
                     stepBody();
                     System.Threading.Interlocked.Increment(ref _eagerFallbackCount);

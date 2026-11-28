@@ -189,20 +189,165 @@ public sealed class StaticShapeCudaGraphScopeTests
     }
 
     [Fact]
+    public void CaptureFailureAfterBodyRan_DoesNotRunHostEffectsTwice_AndStopsCapturing()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        harness.FailCapturesAfterInvokingBody = true;
+
+        using var scope = new StaticShapeCudaGraphScope(
+            harness.Backend,
+            CudaGraphExecutionScopeKind.FullStepForwardBackward,
+            new StaticShapeCudaGraphOptions { WarmupIterations = 0, MaxCaptureFailuresBeforeFallback = 3 });
+
+        var watched = new IGpuBuffer[] { new MutableFakeGpuBuffer(new IntPtr(0x100), 64) };
+        int optimizerStep = 0;
+
+        // The capture runs the body (host step counter advances once), then fails: the scope must not re-run it.
+        var ex = Assert.Throws<InvalidOperationException>(() => scope.Execute(() => optimizerStep++, watched, 7L));
+        Assert.Contains("Simulated end-capture failure", ex.Message);
+        Assert.Equal(1, optimizerStep);
+        Assert.Equal(1, harness.CaptureAttempts);
+        Assert.Equal(0, scope.EagerFallbackCount);
+
+        // Capture is disabled for this signature: the next call runs eagerly exactly once, without capturing.
+        scope.Execute(() => optimizerStep++, watched, 7L);
+        Assert.Equal(2, optimizerStep);
+        Assert.Equal(1, harness.CaptureAttempts);
+        Assert.Equal(1, scope.EagerFallbackCount);
+    }
+
+    [Fact]
+    public void CaptureFailureAfterBodyRan_ReplayableBody_FallsBackEagerly()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        harness.FailCapturesAfterInvokingBody = true;
+
+        using var scope = new StaticShapeCudaGraphScope(
+            harness.Backend,
+            CudaGraphExecutionScopeKind.InferenceForward,
+            new StaticShapeCudaGraphOptions { WarmupIterations = 0, StepBodyIsReplayable = true });
+
+        var watched = new IGpuBuffer[] { new MutableFakeGpuBuffer(new IntPtr(0x100), 64) };
+        int runs = 0;
+        scope.Execute(() => runs++, watched, 7L);
+        // Once inside the failed capture, once eagerly: allowed only because the body is declared replayable.
+        Assert.Equal(2, runs);
+        Assert.Equal(1, scope.EagerFallbackCount);
+    }
+
+    [Fact]
+    public void CachedGraph_IsNotReplayed_WhenTheContextIsNoLongerLive()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        using var scope = new StaticShapeCudaGraphScope(
+            harness.Backend,
+            CudaGraphExecutionScopeKind.InferenceForward,
+            new StaticShapeCudaGraphOptions { WarmupIterations = 0 });
+
+        var watched = new IGpuBuffer[] { new MutableFakeGpuBuffer(new IntPtr(0x100), 64) };
+        int runs = 0;
+        scope.Execute(() => runs++, watched, 1L);
+        Assert.True(scope.HasCapturedGraph);
+        Assert.Equal(1, harness.SyncLaunches);
+
+        harness.ContextIsLive = false;
+        scope.Execute(() => runs++, watched, 1L);
+        Assert.Equal(1, harness.SyncLaunches);   // no launch on a dead context
+        Assert.Equal(2, runs);                    // the step ran eagerly instead
+        Assert.Equal(1, scope.EagerFallbackCount);
+    }
+
+    [Fact]
+    public void TensorOverload_FallsBackEagerly_WhenTheDeviceCopyIsStale()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        using var scope = new StaticShapeCudaGraphScope(
+            harness.Backend,
+            CudaGraphExecutionScopeKind.InferenceForward,
+            new StaticShapeCudaGraphOptions { WarmupIterations = 0 });
+
+        var buf = new MutableFakeGpuBuffer(new IntPtr(0xA000), 4);
+        var x = Tensor<float>.FromGpuBuffer(harness.Backend, buf, new[] { 4 }, AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.Activation, ownsBuffer: false);
+        var watched = new[] { x };
+        int runs = 0;
+
+        scope.Execute(() => runs++, watched);
+        Assert.True(scope.HasCapturedGraph);
+        scope.Execute(() => runs++, watched);
+        Assert.Equal(1, runs);                    // replayed
+
+        // A host write marks the device copy stale while _gpuBuffer keeps its pointer: replaying would read the
+        // pre-write device data, so the scope must run the step eagerly and drop the graph.
+        x.MarkModified();
+        scope.Execute(() => runs++, watched);
+        Assert.Equal(2, runs);
+        Assert.False(scope.HasCapturedGraph);
+        Assert.Contains("stale", scope.LastInvalidationReason ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GraphTreePoolAndSegmentRunner_ValidateOptionsBeforeAllocating()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        var bad = new StaticShapeCudaGraphOptions { WarmupIterations = -1 };
+
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new CudaGraphTreePool(harness.Backend, new[] { 1, 2 }, 8, options: bad));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new SegmentedBlockCudaGraphRunner(harness.Backend, 2, 16, bad));
+        Assert.Equal(0, harness.Allocations);
+    }
+
+    [Fact]
+    public void ResidentSchedule_RejectsNonFiniteOrOutOfRangeValues_WithoutChangingStaging()
+    {
+        var harness = FakeGraphCaptureHarness.Create();
+        using var schedule = new GpuResidentScheduleScalars(harness.Backend, (_, _) => { });
+
+        schedule.UpdateSchedule(1e-3f, 0.01f, 0.9f, 0.999f, step: 1);
+        float bc2 = schedule.GetSlotValue(GpuResidentScheduleScalars.BiasCorrection2Slot);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(1e-3f, 0.01f, 0.9f, float.NaN, step: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(1e-3f, 0.01f, 1.0f, 0.999f, step: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(1e-3f, 0.01f, -0.1f, 0.999f, step: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(float.PositiveInfinity, 0.01f, 0.9f, 0.999f, step: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(1e-3f, float.NaN, 0.9f, 0.999f, step: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => schedule.UpdateSchedule(1e-3f, 0.01f, 0.9f, 0.999f, step: 1, maxGradNorm: float.NaN));
+
+        Assert.Equal(0.999f, schedule.GetSlotValue(GpuResidentScheduleScalars.Beta2Slot));
+        Assert.Equal(bc2, schedule.GetSlotValue(GpuResidentScheduleScalars.BiasCorrection2Slot));
+        Assert.Equal(1e-3f, schedule.GetSlotValue(GpuResidentScheduleScalars.LearningRateSlot));
+    }
+
+    [Fact]
+    public void TopKMask_UsesATotalOrder_SoNaNScoresNeverInflateTheSelection()
+    {
+        var mask = new float[3];
+        DevicePredicatedMaskKernels.ComputePredicatedTopKMaskCpu(new[] { float.NaN, 2f, 1f }, mask, 1, 3, 1);
+        Assert.Equal(new[] { 0f, 1f, 0f }, mask);
+
+        // NaN ranks below -inf; equal finite scores keep lower-index tie-breaking.
+        var mask2 = new float[5];
+        DevicePredicatedMaskKernels.ComputePredicatedTopKMaskCpu(
+            new[] { float.NaN, float.NegativeInfinity, 3f, 3f, float.NaN }, mask2, 1, 5, 3);
+        Assert.Equal(new[] { 0f, 1f, 1f, 1f, 0f }, mask2);
+
+        var allNan = new float[3];
+        DevicePredicatedMaskKernels.ComputePredicatedTopKMaskCpu(new[] { float.NaN, float.NaN, float.NaN }, allNan, 1, 3, 2);
+        Assert.Equal(new[] { 1f, 1f, 0f }, allNan);
+    }
+
+    [SkippableFact]
     public void Gpu1Ready_CudaGraphAndFusedKernelsEndToEndVerification()
     {
         // Guarded strictly off by default while GPU 1 is running production workloads.
         // Set AIDOTNET_RUN_GPU1_VERIFICATION=1 once GPU 1 is free to run end-to-end hardware verification.
-        if (Environment.GetEnvironmentVariable("AIDOTNET_RUN_GPU1_VERIFICATION") != "1")
-        {
-            return;
-        }
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_RUN_GPU1_VERIFICATION") != "1",
+            "Set AIDOTNET_RUN_GPU1_VERIFICATION=1 to run end-to-end CUDA graph hardware verification.");
 
         using var backend = new AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend();
-        if (!backend.IsAvailable)
-        {
-            return;
-        }
+        // Verification was explicitly requested: an unavailable backend is a failure, not a silent pass.
+        Assert.True(backend.IsAvailable, "AIDOTNET_RUN_GPU1_VERIFICATION=1 but the CUDA backend is not available.");
 
         using var direct = new DirectGpuEngine(backend);
         using var gpuEngine = new DirectGpuTensorEngine(direct);
@@ -280,6 +425,11 @@ public sealed class StaticShapeCudaGraphScopeTests
                     {
                         action();
                     }
+                    if (Harness.FailCapturesAfterInvokingBody)
+                    {
+                        Harness.LastFailure = "Simulated end-capture failure.";
+                        return IntPtr.Zero;
+                    }
                     Harness.LastFailure = null;
                     return new IntPtr(0x5000 + Harness.CaptureAttempts);
                 }
@@ -292,6 +442,11 @@ public sealed class StaticShapeCudaGraphScopeTests
                 case "DestroyCapturedGraph":
                     Harness.DestroyedGraphs++;
                     return null;
+                case "AllocateBuffer":
+                    Harness.Allocations++;
+                    int size = args is { Length: > 0 } && args[0] is float[] data ? data.Length
+                        : args is { Length: > 0 } && args[0] is int n ? n : 1;
+                    return new MutableFakeGpuBuffer(new IntPtr(0x70000 + 0x1000 * Harness.Allocations), size);
                 case "get_IsAvailable":
                     return true;
                 case "get_BackendName":
@@ -312,6 +467,8 @@ public sealed class StaticShapeCudaGraphScopeTests
         public bool SupportsGraphCapture { get; set; } = true;
         public bool ContextIsLive { get; set; } = true;
         public bool FailCaptures { get; set; }
+        public bool FailCapturesAfterInvokingBody { get; set; }
+        public int Allocations { get; set; }
         public string? LastFailure { get; set; }
         public int CaptureAttempts { get; set; }
         public int SyncLaunches { get; set; }

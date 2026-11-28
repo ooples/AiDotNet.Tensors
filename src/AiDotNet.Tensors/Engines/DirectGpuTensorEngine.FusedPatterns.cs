@@ -116,26 +116,41 @@ public partial class DirectGpuTensorEngine
                     backend, output, new[] { bufX.Buffer, bufRes.Buffer, bufGamma.Buffer }, out var directOut)
                 && directOut is not null)
             {
-                IGpuBuffer? rmsTarget = null;
-                if (TryGetNonAliasingResidentDestBuffer(backend, rmsOut, new[] { directOut }, out var directRms)
-                    && directRms is not null)
+                // The saved-RMS target must not alias any input or the primary output. Only a resident rmsOut buffer
+                // that is distinct from every binding is written in place; otherwise a fresh device buffer receives the
+                // RMS values and is copied into rmsOut afterwards.
+                bool rmsDirect = TryGetNonAliasingResidentDestBuffer(
+                        backend, rmsOut, new[] { bufX.Buffer, bufRes.Buffer, bufGamma.Buffer, directOut }, out var directRms)
+                    && directRms is not null;
+                IGpuBuffer rmsTarget;
+                if (rmsDirect)
                 {
-                    rmsTarget = directRms;
+                    rmsTarget = directRms!;
                 }
                 else
                 {
-                    rmsTarget = PinInputResident(rmsOut);
+                    bufRms = AllocateFullyWrittenOutputBuffer(backend, rows);
+                    rmsTarget = bufRms.Buffer;
                 }
 
-                if (rmsTarget is null
-                    || !CudaBackend.TryDispatchRmsNormResidual(
+                if (!CudaBackend.TryDispatchRmsNormResidual(
                         backend, bufX.Buffer, bufRes.Buffer, bufGamma.Buffer, directOut, rmsTarget, rows, cols, epsilon))
                 {
+                    bufRms.Dispose();
                     return false;
                 }
 
                 RearmStateAfterReplay(output, directOut);
-                RearmStateAfterReplay(rmsOut, rmsTarget);
+                if (rmsDirect)
+                {
+                    RearmStateAfterReplay(rmsOut, rmsTarget);
+                }
+                else
+                {
+                    var directRmsTensor = DeferTensorResult<float>(backend, bufRms.Buffer, rows, (int[])rmsOut._shape.Clone());
+                    transferredRms = true;
+                    CopyResultInto(this, directRmsTensor, rmsOut);
+                }
                 return true;
             }
 
